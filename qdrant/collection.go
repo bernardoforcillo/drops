@@ -57,8 +57,8 @@ type CollectionInfo struct {
 // CreateCollection creates a new collection. Returns nil if the
 // operation succeeds (Qdrant responds with `{"result": true}`).
 func (c *Client) CreateCollection(ctx context.Context, name string, cfg CollectionConfig) error {
-	if name == "" {
-		return errors.New("qdrant: collection name is empty")
+	if err := validateName("collection", name); err != nil {
+		return err
 	}
 	if cfg.Vectors.Size <= 0 {
 		return errors.New("qdrant: CollectionConfig.Vectors.Size must be > 0")
@@ -78,6 +78,9 @@ func (c *Client) CreateCollection(ctx context.Context, name string, cfg Collecti
 
 // DeleteCollection drops a collection. Idempotent on the server side.
 func (c *Client) DeleteCollection(ctx context.Context, name string) error {
+	if err := validateName("collection", name); err != nil {
+		return err
+	}
 	var ok bool
 	return c.Do(ctx, "DELETE", "/collections/"+name, nil, &ok)
 }
@@ -95,6 +98,9 @@ func (c *Client) CollectionExists(ctx context.Context, name string) (bool, error
 
 // CollectionInfo returns metadata about a collection.
 func (c *Client) CollectionInfo(ctx context.Context, name string) (*CollectionInfo, error) {
+	if err := validateName("collection", name); err != nil {
+		return nil, err
+	}
 	var info CollectionInfo
 	if err := c.Do(ctx, "GET", "/collections/"+name, nil, &info); err != nil {
 		return nil, err

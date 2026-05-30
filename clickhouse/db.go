@@ -154,11 +154,10 @@ func (db *DB) InTx(ctx context.Context, fn func(*DB) error) (err error) {
 	return err
 }
 
-// emit invokes the hook, if any.
+// emit invokes the hook, if any. Uses drops.CallHook so a panicking
+// user-supplied hook can't crash the request goroutine.
 func (db *DB) emit(ctx context.Context, e drops.QueryEvent) {
-	if db.hook != nil {
-		db.hook(ctx, e)
-	}
+	drops.CallHook(db.hook, ctx, e)
 }
 
 // ToSQL renders an Expression with the ClickHouse placeholder style.

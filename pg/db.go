@@ -186,9 +186,9 @@ func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, e
 	return db.Exec(ctx, sql, args...)
 }
 
-// emit invokes the hook, if any, with the provided event.
+// emit invokes the hook, if any, with the provided event. Uses
+// drops.CallHook so a panicking user-supplied hook can't crash the
+// request goroutine.
 func (db *DB) emit(ctx context.Context, e drops.QueryEvent) {
-	if db.hook != nil {
-		db.hook(ctx, e)
-	}
+	drops.CallHook(db.hook, ctx, e)
 }

@@ -9,6 +9,89 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Nested (deep) relation eager-loading** (`drops/pg`) — `Find().With`
+  now accepts dot paths such as `With("posts.comments")` to load
+  relations of relations to arbitrary depth. Each relation edge still
+  costs exactly one batched query (no N+1), and paths sharing a prefix
+  are merged so the shared edge is fetched once
+  (`With("posts.comments", "posts.tags")` runs three queries, not four).
+  Nested rows are stitched in place onto the live result structs via
+  pointers into the parent data. Works across `HasMany`, `HasOne`,
+  `BelongsTo`, and `ManyToMany` intermediates. The entire `With` graph
+  is validated against the schema before any query runs, so a typo at
+  any depth fails fast with an `unknown relation` error; malformed
+  paths (e.g. `"posts..comments"`) report `invalid relation path`.
+- **Per-relation filtering & ordering on eager loads** (`drops/pg`) —
+  new `Find().WithRel(name, func(*pg.RelConfig))`. The `RelConfig`
+  callback exposes `Where` (AND-ed onto the relation's batched query),
+  `OrderBy` (sorts each parent's loaded slice), and `With`/`WithRel`
+  for configuring deeper relations — mirroring drizzle's
+  `with: { posts: { where, orderBy } }`. Still one query per edge.
+  For `ManyToMany`, `OrderBy` re-sorts each parent's slice into target
+  order (default remains junction-row order). `WithRel` and `With`
+  merge when they name the same edge, so it is fetched once. Per-parent
+  `LIMIT`/`OFFSET` is intentionally not yet offered (a single `LIMIT`
+  caps the whole batch, not each parent — needs a window-function
+  rewrite).
+- **`drops.CallHook(h, ctx, e)`** — the safe entrypoint every dialect
+  now uses to emit observability events. Tolerates nil hooks and
+  recovers panics, so a buggy user-supplied `Hook` (nil deref in a
+  formatter, out-of-bounds in a metric label, …) can no longer crash
+  the caller's request goroutine. `drops.ChainHooks` also continues
+  to the next hook after a panicking one. Wired into pg, clickhouse,
+  qdrant, cache/memory, cache/redis.
+- `.gitignore` — coverage / profile / OS / editor / env / build
+  artefacts kept out of the tree.
+- **Cache abstraction** (`drops/cache`) — driver-agnostic interface
+  (`Get` / `Set` / `Delete` / `Exists` / `TTL` / `Ping` / `Close`) with
+  `MultiCache` for batch operations. Sentinels: `ErrNotFound`,
+  `ErrClosed`, `ErrInvalidKey`.
+- **In-memory cache** (`drops/cache/memory`) — concurrent-safe,
+  TTL-aware, with an optional janitor goroutine and FIFO eviction once
+  `MaxEntries` is reached. Defensive copies on Get/Set so callers can't
+  mutate stored bytes.
+- **Redis cache** (`drops/cache/redis`) — production backend with a
+  bundled minimal RESP2 client and a bounded connection pool. Zero
+  external dependencies (`net.Conn` + `bufio` only). Supports legacy
+  and ACL `AUTH`, `SELECT db`, key prefixes, context-deadline
+  propagation onto the wire, and the `drops.Hook` contract for
+  observability. `Cache` and `MultiCache` interfaces both implemented.
+- **Redis production hardening**:
+  - Channel-based pool replaces the spin-wait loop; `Get` honours ctx
+    cancellation natively, no CPU burn under contention.
+  - `MinIdleConns` pre-dials connections at startup so the first
+    request after a cold start doesn't pay a full TCP+AUTH RTT.
+  - `MaxLifetime` recycles connections past an age cap regardless of
+    idle status — critical when AUTH tokens rotate or a load balancer
+    wants to drain old conns.
+  - `ReadTimeout` / `WriteTimeout` (defaults: 3s each) apply when the
+    caller's ctx has no deadline so a hung server can't stall the
+    goroutine forever. Set negative to disable.
+  - `MaxRetries` (default 1) retries on transient transport errors
+    (EOF, `net.Error`, `ErrProtocol`) with a fresh connection;
+    app-level `-ERR` replies are never retried.
+  - `ShutdownTimeout` (default 5s) lets `Close` drain in-flight ops
+    before forcing socket closure.
+  - `ClientName` (default `"drops"`) is sent via `CLIENT SETNAME` on
+    connect so the connection is identifiable in `CLIENT LIST` /
+    `SLOWLOG` / `MONITOR`.
+  - `Cache.Stats()` returns a `PoolStats` snapshot for metrics
+    emitters: `TotalConns`, `Hits`, `Misses`, `Timeouts`,
+    `StaleClosed`, `WaitCount`, `WaitDuration`, `Retries`.
+- **Redis auth & transport**:
+  - `redis.CredentialsProvider func(ctx) (Credentials, error)` is
+    called per new connection so short-lived tokens (AWS ElastiCache
+    IAM, Azure AAD, OIDC, Vault leases) can be refreshed without
+    restarting the cache. Provider errors fail the dial cleanly.
+  - `redis.StaticCredentials(user, pass)` helper for the simple case.
+  - `Options.TLS *tls.Config` enables in-transit encryption; the
+    default dialer is wrapped with a `tls.Dialer` so callers don't
+    have to plumb their own.
+  - `redis.ParseURL("redis[s]://[user:pass@]host[:port][/db]")` lifts
+    a connection string into Options — and rediss:// pre-populates a
+    sensible `tls.Config` (`ServerName` = host, MinVersion = TLS1.2).
+  - Existing `Username`/`Password` fields are kept as the static
+    shorthand; if `Credentials` is non-nil it wins.
 - **Qdrant client** (`drops/qdrant`) — focused HTTP client for the Qdrant
   vector database. Zero external deps (net/http + encoding/json only):
   - `Client` with `WithAPIKey` / `WithHTTPClient` / `WithTimeout` options;

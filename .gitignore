@@ -1,0 +1,37 @@
+# Compiled binaries and Go test cache
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and profiling
+*.prof
+coverage.out
+coverage.html
+*.coverprofile
+
+# Editor / OS detritus
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local-only env files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Build artefacts the examples might leave behind
+/examples/*/main
+/_examples/*/main
+/dist/
+/build/
+
+# Go workspace files (per-developer)
+go.work
+go.work.sum

@@ -40,7 +40,9 @@ type QueryEvent struct {
 type Hook func(ctx context.Context, e QueryEvent)
 
 // ChainHooks returns a Hook that invokes each given hook in order.
-// nil hooks are skipped.
+// nil hooks are skipped. A panic inside any hook is recovered so the
+// remaining hooks still run and the caller of CallHook is never
+// crashed by a buggy observer.
 func ChainHooks(hooks ...Hook) Hook {
 	// Common-case fast paths so a chain of zero or one doesn't allocate
 	// an unnecessary closure.
@@ -53,9 +55,26 @@ func ChainHooks(hooks ...Hook) Hook {
 	cp := append([]Hook(nil), hooks...)
 	return func(ctx context.Context, e QueryEvent) {
 		for _, h := range cp {
-			if h != nil {
-				h(ctx, e)
-			}
+			CallHook(h, ctx, e)
 		}
 	}
+}
+
+// CallHook invokes h with (ctx, e), tolerating both a nil hook and a
+// hook that panics. It is the safe entrypoint every dialect uses to
+// emit events: a buggy user-supplied Hook (nil dereference,
+// out-of-bounds index in a logger format string, etc.) must NOT take
+// down the caller's request goroutine.
+//
+// Adapters typically call this from their internal `emit` helper:
+//
+//	func (c *Cache) emit(ctx context.Context, e drops.QueryEvent) {
+//	    drops.CallHook(c.hook, ctx, e)
+//	}
+func CallHook(h Hook, ctx context.Context, e QueryEvent) {
+	if h == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	h(ctx, e)
 }

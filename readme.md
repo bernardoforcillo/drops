@@ -17,6 +17,17 @@ Early. Two dialects ship today:
   extensions, sequences, enums, views, functions, triggers, indexes),
   file-based migrations (Go-native + drizzle-kit compatible), and
   eager-loaded relations (`HasMany`, `HasOne`, `BelongsTo`).
+- **`drops/cache`** — driver-agnostic cache interface (`Get` / `Set` /
+  `Delete` / `Exists` / `TTL` / `Ping` / `Close` plus a `MultiCache`
+  batch extension). Sentinel errors (`ErrNotFound`, `ErrClosed`,
+  `ErrInvalidKey`).
+- **`drops/cache/memory`** — in-process LRU-ish backend with TTL,
+  optional janitor goroutine, FIFO eviction on `MaxEntries`. Zero
+  deps; ideal for tests and the local tier of a two-level cache.
+- **`drops/cache/redis`** — Redis backend with a minimal RESP2 client
+  + bounded connection pool. Zero deps. Supports AUTH (legacy and ACL
+  forms), SELECT db, key prefix, and the same `drops.Hook` contract
+  used elsewhere.
 - **`drops/qdrant`** — Qdrant vector database. Focused HTTP client
   (stdlib only): collections, upsert/delete/retrieve, search /
   recommend / scroll, and a Must/Should/MustNot filter DSL with
@@ -415,6 +426,67 @@ Each kind takes a different shape:
 Relation fields are matched by `db_rel:"<name>"` tag first, then by
 case-insensitive name match.
 
+#### Nested (deep) relations
+
+Eager-load relations of relations with dot paths. Each edge runs exactly
+one batched query — `With("posts.comments")` fetches every parent's posts,
+then every comment of those posts, regardless of how many rows are
+involved. Paths that share a prefix are merged, so the shared edge is
+fetched only once:
+
+```go
+type Comment struct {
+    ID     int64
+    PostID int64 `db:"post_id"`
+    Body   string
+}
+type Post struct {
+    ID       int64
+    UserID   int64     `db:"user_id"`
+    Title    string
+    Comments []Comment `db_rel:"comments"`
+}
+
+pg.NewRelations(Posts).HasMany("comments", Comments, PostID, CommentPostID)
+
+var users []User
+db.Find(Users).
+    With("posts.comments", "posts.tags"). // posts fetched once, fans out
+    All(ctx, &users)
+// users[i].Posts[j].Comments is populated in place.
+```
+
+Unknown relations — at any depth — are reported before a single query
+runs, so a typo in `With("posts.commnets")` fails fast.
+
+#### Filtering and ordering an eager load
+
+`WithRel` configures one relation with a `Where` filter, an `OrderBy`, and
+any deeper relations — all applied to that edge's single batched query, so
+filtering/sorting costs nothing extra:
+
+```go
+var users []User
+db.Find(Users).
+    WithRel("posts", func(p *pg.RelConfig) {
+        p.Where(Published.Eq(true)).      // only published posts
+            OrderBy(PostCreatedAt.Desc()). // newest first, per user
+            With("comments")               // …and load their comments
+    }).
+    All(ctx, &users)
+```
+
+The `Where` is AND-ed onto the `IN (parent keys)` predicate; the `OrderBy`
+sorts the batched result, and because rows are grouped in arrival order
+each parent's slice comes out correctly sorted. For `ManyToMany`, `OrderBy`
+re-sorts each parent's slice into the target query's order (the default,
+without `OrderBy`, follows junction-row order). `WithRel` and `With` merge
+when they name the same edge, so it is still fetched once.
+
+> Per-parent `LIMIT`/`OFFSET` (drizzle's `with: { posts: { limit } }`) is
+> not yet supported — a single `LIMIT` would cap the whole batched result,
+> not each parent's slice, which needs a window-function rewrite.
+
 ### Migrations
 
 Four pieces ship in the box:
@@ -691,6 +763,164 @@ status := pg.Case().
 pg.Cast(UserAge, "text")  // ("users"."age")::text
 ```
 
+## Cache
+
+A driver-agnostic cache interface with two ready backends.
+
+```go
+type Cache interface {
+    Get(ctx context.Context, key string) ([]byte, error)
+    Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+    Delete(ctx context.Context, keys ...string) (int, error)
+    Exists(ctx context.Context, key string) (bool, error)
+    TTL(ctx context.Context, key string) (time.Duration, error)
+    Ping(ctx context.Context) error
+    Close() error
+}
+```
+
+`cache.MultiCache` extends it with `GetMulti` / `SetMulti` for backends
+that can serve batches in one round-trip. Sentinels:
+`cache.ErrNotFound`, `cache.ErrClosed`, `cache.ErrInvalidKey`.
+
+### In-memory (`drops/cache/memory`)
+
+Zero deps, safe for concurrent use, optional janitor goroutine and
+FIFO eviction once `MaxEntries` is reached. Ideal for tests and the
+local tier of a two-level cache.
+
+```go
+import "github.com/bernardoforcillo/drops/cache/memory"
+
+mc := memory.New(memory.Options{
+    MaxEntries: 10_000,
+    SweepEvery: time.Minute,
+})
+defer mc.Close()
+
+_ = mc.Set(ctx, "user:42", payload, 5*time.Minute)
+got, err := mc.Get(ctx, "user:42")
+```
+
+### Redis (`drops/cache/redis`)
+
+Production Redis backend with its own minimal RESP2 client and a
+bounded connection pool. Zero deps. Supports AUTH (legacy + ACL),
+`SELECT db`, key prefixes, and the same `drops.Hook` contract used
+elsewhere.
+
+```go
+import "github.com/bernardoforcillo/drops/cache/redis"
+
+rc := redis.New(redis.Options{
+    Addr:        "127.0.0.1:6379",
+    Password:    os.Getenv("REDIS_PASSWORD"),
+    DB:          0,
+    MaxConns:    25,
+    IdleTimeout: 5 * time.Minute,
+    KeyPrefix:   "app:",
+    Hook:        drops.LoggerHook(log.Printf),
+})
+defer rc.Close()
+
+if err := rc.Ping(ctx); err != nil { /* health-check failed */ }
+
+_ = rc.Set(ctx, "user:42", payload, 5*time.Minute)
+got, err := rc.Get(ctx, "user:42")
+if errors.Is(err, cache.ErrNotFound) {
+    // miss
+}
+```
+
+#### Authentication
+
+Three shapes, pick whichever fits:
+
+```go
+// 1. Static (back-compat shorthand). Set Username + Password (or
+//    Password alone for legacy single-arg AUTH).
+redis.Options{Password: os.Getenv("REDIS_PASSWORD")}
+
+// 2. Explicit static credentials via the provider helper.
+redis.Options{Credentials: redis.StaticCredentials("user", "pw")}
+
+// 3. Dynamic credentials — short-lived tokens (AWS ElastiCache IAM,
+//    Azure AAD, OIDC, HashiCorp Vault). The provider is called once
+//    per new connection, receiving the caller's context so it can
+//    honour deadlines and cancellation.
+redis.Options{
+    Credentials: func(ctx context.Context) (redis.Credentials, error) {
+        tok, err := iam.MintAuthToken(ctx, "my-redis-cluster")
+        if err != nil { return redis.Credentials{}, err }
+        return redis.Credentials{Username: "iam-user", Password: tok}, nil
+    },
+}
+```
+
+If `Credentials` is set it overrides `Username` / `Password`. If both
+are empty, the connection skips AUTH entirely (Redis without
+`requirepass`).
+
+#### TLS
+
+```go
+// Self-managed: pass any *tls.Config you like (custom RootCAs,
+// client certs for mTLS, pinned cipher suites).
+rc := redis.New(redis.Options{
+    Addr: "redis.example.com:6380",
+    TLS:  &tls.Config{ServerName: "redis.example.com", MinVersion: tls.VersionTLS12},
+})
+
+// Or pull a sensible default out of a rediss:// URL:
+opts, _ := redis.ParseURL("rediss://user:pw@redis.example.com:6380/0")
+rc := redis.New(opts) // opts.TLS already populated
+```
+
+#### Connection URL
+
+```go
+opts, err := redis.ParseURL("rediss://iam-user:" + token + "@cluster.example.com:6380/0")
+if err != nil { /* malformed */ }
+rc := redis.New(opts)
+```
+
+Accepted shapes: `redis://[user[:pass]@]host[:port][/db]` and
+`rediss://...` (same but with TLS).
+
+#### Production tuning
+
+Every numeric `Options` field has a sensible default; override when
+your workload says otherwise:
+
+| Field | Default | What it does |
+|---|---|---|
+| `MaxConns` | 10 | Hard cap on simultaneous connections |
+| `MinIdleConns` | 0 | Pre-dial this many connections at startup |
+| `IdleTimeout` | 5 min | Close conns idle longer than this |
+| `MaxLifetime` | 0 (off) | Close conns past this age regardless of idle status — important when AUTH tokens rotate or a load balancer drains |
+| `DialTimeout` | 5 s | Cap on the TCP+TLS+AUTH+SELECT+SETNAME dance |
+| `ReadTimeout` / `WriteTimeout` | 3 s each | Per-op deadlines applied when the caller's ctx has none. Set negative to disable |
+| `MaxRetries` | 1 | Retry-once on transient I/O errors (EOF, network timeout, protocol corruption). App-level `-ERR` replies are never retried |
+| `ShutdownTimeout` | 5 s | How long `Close` waits for in-flight ops to drain before forcing socket closure |
+| `ClientName` | `"drops"` | Sent via `CLIENT SETNAME` on connect so the conn shows up in `CLIENT LIST` / `SLOWLOG` / `MONITOR` |
+
+#### Pool metrics
+
+```go
+s := rc.Stats()
+fmt.Printf("conns=%d hits=%d misses=%d timeouts=%d stale=%d retries=%d wait=%s/%d\n",
+    s.TotalConns, s.Hits, s.Misses, s.Timeouts, s.StaleClosed,
+    s.Retries, s.WaitDuration, s.WaitCount)
+```
+
+`PoolStats` is a snapshot; safe to read concurrently from a metrics
+emitter. Counters are monotonic across the cache's lifetime.
+
+For richer Redis usage (pub/sub, streams, scripts, cluster, sentinel)
+reach for a full-featured client like `github.com/redis/go-redis/v9` —
+this package's scope is the `cache.Cache` contract plus a few utility
+commands.
+
 ## Layout
 
 ```
@@ -700,6 +930,9 @@ drops/pg/                    Postgres schema, query builders, relations,
 drops/clickhouse/            ClickHouse schema, engines, query builder,
                              analytical aggregates
 drops/qdrant/                Qdrant vector-database HTTP client
+drops/cache/                 Cache interface + sentinels
+drops/cache/memory/          in-process cache backend
+drops/cache/redis/           Redis cache backend (own RESP2 client)
 drops/stdlib/                database/sql adapter
 drops/examples/sqlgen/       no-deps SQL-generation demo (pg)
 drops/examples/generate/     drizzle-kit-style migration generation demo
@@ -710,7 +943,7 @@ drops/_examples/postgres/    full DB demo via pgx (excluded from build)
 
 - Other dialects (MySQL, SQLite, MSSQL)
 - Indexes, composite primary keys, composite uniques, check constraints, enums, sequences, views, RLS in the snapshot/diff generator
-- The drizzle-style `query.users.findMany({ with: { posts: { with: ... } } })` nested-relation graph (`With(...)` only goes one level deep)
+- Per-parent `LIMIT`/`OFFSET` on eager loads (drizzle's `with: { posts: { limit } }`) — `WithRel` supports per-relation `Where`/`OrderBy` and dot-path nesting, but a per-parent row cap needs a window-function rewrite
 - Down-migration generation from the diff (only Go-native `pg.Migrator` supports `Down`, and only when the user writes the down SQL themselves)
 
 The structure leaves room to add these later without churning the

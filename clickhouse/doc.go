@@ -26,6 +26,11 @@
 //	sqlDB, _ := sql.Open("clickhouse", "clickhouse://localhost:9000/default")
 //	db := clickhouse.New(stdlib.New(sqlDB))
 //
+// Templates (Timestamps, SoftDelete, Audit, UUIDPrimaryKey) provide
+// reusable column groups that can be applied to any table — see
+// template.go for the pattern. ClickHouse has no foreign keys, so Audit
+// emits plain scalar columns mirroring the target's type.
+//
 // What this package does NOT try to mirror from drops/pg:
 //
 //   - per-row UPDATE/DELETE (ClickHouse mutations are asynchronous and

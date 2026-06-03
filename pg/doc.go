@@ -10,4 +10,9 @@
 // Delete). Each builder is immutable in spirit — methods return the
 // builder to support chaining — and ends with an executor (All, One,
 // Exec, Returning + Scan).
+//
+// Templates (Timestamps, SoftDelete, Audit, UUIDPrimaryKey) are reusable
+// column groups that can be applied to any table — see template.go for
+// the pattern; libraries and applications expose their own templates by
+// following the same recipe.
 package pg

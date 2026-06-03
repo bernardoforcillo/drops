@@ -25,6 +25,7 @@ type SelectBuilder struct {
 	ctes         []*CTE
 	recursiveCTE bool
 	setOps       []setOp // UNION / INTERSECT / EXCEPT continuations
+	unscoped     bool
 }
 
 type setOp struct {
@@ -70,6 +71,10 @@ func (s *SelectBuilder) DistinctOn(exprs ...drops.Expression) *SelectBuilder {
 
 // ForUpdate appends FOR UPDATE row locking.
 func (s *SelectBuilder) ForUpdate() *SelectBuilder { s.forUpdate = true; return s }
+
+// Unscoped opts out of the FROM table's DefaultFilter predicates for
+// this SELECT. Use to bypass a soft-delete or tenant guard.
+func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
 
 // Join appends an INNER JOIN.
 func (s *SelectBuilder) Join(t *Table, on drops.Expression) *SelectBuilder {
@@ -214,9 +219,13 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		b.WriteString(" ON ")
 		b.Append(j.on)
 	}
-	if len(s.wheres) > 0 {
+	wheres := s.wheres
+	if !s.unscoped && s.from != nil && len(s.from.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), s.from.defaultFilters...), wheres...)
+	}
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		writeAnd(b, s.wheres)
+		writeAnd(b, wheres)
 	}
 	if len(s.groupBys) > 0 {
 		b.WriteString(" GROUP BY ")

@@ -27,9 +27,12 @@
 //	db := clickhouse.New(stdlib.New(sqlDB))
 //
 // Templates (Timestamps, SoftDelete, Audit, UUIDPrimaryKey) provide
-// reusable column groups that can be applied to any table — see
-// template.go for the pattern. ClickHouse has no foreign keys, so Audit
-// emits plain scalar columns mirroring the target's type.
+// reusable column groups — see template.go for the function-style
+// pattern and mixin.go for the richer Mixin interface. ClickHouse has
+// no foreign keys, so Audit emits plain scalar columns mirroring the
+// target's type. Lifecycle hooks are limited to OnInsert (no
+// builder-side UPDATE/DELETE); default filters on SelectBuilder
+// honour Unscoped() for opt-out.
 //
 // What this package does NOT try to mirror from drops/pg:
 //

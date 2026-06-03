@@ -10,6 +10,27 @@ type Table struct {
 	columns   []*Column
 	byName    map[string]*Column
 	relations map[string]*Relation
+
+	// indexes is the list of CREATE INDEX statements declared
+	// alongside the table — typically by a Mixin. CreateTable does
+	// not emit them; pair the table with pg.CreateTableWithIndexes if
+	// you want both at once.
+	indexes []*Index
+
+	// insertHooks / updateHooks / deleteHooks are the optional
+	// lifecycle hooks registered on this table. They are invoked by
+	// the corresponding builders during WriteSQL. Empty by default —
+	// a table with no hooks behaves exactly as it did before this
+	// feature shipped.
+	insertHooks []InsertHook
+	updateHooks []UpdateHook
+	deleteHooks []DeleteHook
+
+	// defaultFilters are predicates applied automatically by
+	// SelectBuilder / UpdateBuilder / DeleteBuilder unless the caller
+	// opts out with Unscoped(). Used to implement default scopes
+	// (e.g. SoftDelete's "deleted_at IS NULL" guard).
+	defaultFilters []drops.Expression
 }
 
 // NewTable creates a table in the default ("public") schema. The name
@@ -79,6 +100,54 @@ func Add[T any](t *Table, c *Col[T]) *Col[T] {
 	t.add(c.Column)
 	return c
 }
+
+// OnInsert registers a hook invoked by InsertBuilder.WriteSQL. The
+// hook can fill column values the caller didn't explicitly bind; user
+// values always win.
+func (t *Table) OnInsert(h InsertHook) *Table {
+	t.insertHooks = append(t.insertHooks, h)
+	return t
+}
+
+// OnUpdate registers a hook invoked by UpdateBuilder.WriteSQL.
+func (t *Table) OnUpdate(h UpdateHook) *Table {
+	t.updateHooks = append(t.updateHooks, h)
+	return t
+}
+
+// OnDelete registers a hook invoked by DeleteBuilder.WriteSQL. A hook
+// may return a non-nil expression to replace the rendered DELETE
+// entirely — used by SoftDelete to flip DELETE into UPDATE.
+func (t *Table) OnDelete(h DeleteHook) *Table {
+	t.deleteHooks = append(t.deleteHooks, h)
+	return t
+}
+
+// DefaultFilter appends a predicate applied to every Select / Update /
+// Delete against the table, unless the builder is marked Unscoped().
+// Filters compose with AND.
+func (t *Table) DefaultFilter(e drops.Expression) *Table {
+	t.defaultFilters = append(t.defaultFilters, e)
+	return t
+}
+
+// AddIndex registers an index to be created alongside the table. The
+// index is not emitted by CreateTable; use CreateTableWithIndexes or
+// emit pg.CreateIndex(idx) explicitly.
+func (t *Table) AddIndex(idx *Index) *Table {
+	t.indexes = append(t.indexes, idx)
+	return t
+}
+
+// Indexes returns the indexes registered with AddIndex.
+func (t *Table) Indexes() []*Index { return t.indexes }
+
+// hasHooks reports whether the table has any lifecycle hooks
+// registered — used by builders to skip the hook pipeline when
+// nothing is wired up.
+func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
+func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
+func (t *Table) hasDeleteHooks() bool { return len(t.deleteHooks) > 0 }
 
 // writeName writes only the (schema-qualified) table name, with no alias.
 // Used by DDL where AS clauses are not permitted.

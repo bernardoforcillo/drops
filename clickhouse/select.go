@@ -25,6 +25,7 @@ type SelectBuilder struct {
 	offset    *int64
 	distinct  bool
 	settings  []string // raw "key = value"
+	unscoped  bool
 }
 
 type joinKind string
@@ -110,6 +111,10 @@ func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
 	return s
 }
 
+// Unscoped opts out of the FROM table's DefaultFilter predicates for
+// this SELECT.
+func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
+
 // GroupBy / Having / OrderBy / Limit / Offset.
 func (s *SelectBuilder) GroupBy(exprs ...drops.Expression) *SelectBuilder {
 	s.groupBys = append(s.groupBys, exprs...)
@@ -166,9 +171,13 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" PREWHERE ")
 		writeAnd(b, s.prewheres)
 	}
-	if len(s.wheres) > 0 {
+	wheres := s.wheres
+	if !s.unscoped && s.from != nil && len(s.from.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), s.from.defaultFilters...), wheres...)
+	}
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		writeAnd(b, s.wheres)
+		writeAnd(b, wheres)
 	}
 	if len(s.groupBys) > 0 {
 		b.WriteString(" GROUP BY ")

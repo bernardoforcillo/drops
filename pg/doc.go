@@ -13,6 +13,16 @@
 //
 // Templates (Timestamps, SoftDelete, Audit, UUIDPrimaryKey) are reusable
 // column groups that can be applied to any table — see template.go for
-// the pattern; libraries and applications expose their own templates by
-// following the same recipe.
+// the function-style pattern, mixin.go for the richer Mixin interface
+// that also contributes indexes / lifecycle hooks / default filters.
+// Libraries and applications expose their own templates by following
+// either recipe.
+//
+// Lifecycle hooks (OnInsert / OnUpdate / OnDelete on Table) let
+// templates extend INSERT / UPDATE / DELETE statements automatically.
+// User-supplied values always win, so hooks are safe to register on
+// shared tables. Default scopes (Table.DefaultFilter) apply a
+// predicate to every SELECT / UPDATE / DELETE against the table
+// unless the caller opts out with the builder's Unscoped() method —
+// the mechanism behind soft-delete-aware queries.
 package pg

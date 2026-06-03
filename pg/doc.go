@@ -25,4 +25,10 @@
 // predicate to every SELECT / UPDATE / DELETE against the table
 // unless the caller opts out with the builder's Unscoped() method —
 // the mechanism behind soft-delete-aware queries.
+//
+// Entity[T] (see entity.go) binds a Go struct to a Table and exposes
+// type-safe CRUD shortcuts: Get / Create / Update / Save / Delete /
+// Query. It composes with lifecycle hooks and default scopes, so a
+// SoftDelete mixin makes UserEntity.Delete() automatically rewrite
+// into an UPDATE that flips deleted_at.
 package pg

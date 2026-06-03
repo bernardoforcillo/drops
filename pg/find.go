@@ -136,6 +136,11 @@ func (f *FindBuilder) Limit(n int64) *FindBuilder { f.sel.Limit(n); return f }
 // Offset sets the OFFSET.
 func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
 
+// Unscoped opts out of the table's DefaultFilter predicates for the
+// root SELECT. Eager-loaded relations inherit their own table's
+// scopes independently.
+func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
+
 // With marks one or more relations to eager-load. Names must match
 // relations declared on the table via NewRelations.
 //

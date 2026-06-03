@@ -34,6 +34,10 @@
 // builder-side UPDATE/DELETE); default filters on SelectBuilder
 // honour Unscoped() for opt-out.
 //
+// Entity[T] (see entity.go) binds a Go struct to a Table and exposes
+// Create / CreateMany / Query — the narrow subset of CRUD that maps
+// to ClickHouse's Insert + Select builders.
+//
 // What this package does NOT try to mirror from drops/pg:
 //
 //   - per-row UPDATE/DELETE (ClickHouse mutations are asynchronous and

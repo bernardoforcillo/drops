@@ -45,11 +45,20 @@ import (
 // operation routes through the underlying Insert / Update / Delete
 // builders.
 type Entity[T any] struct {
-	table     *Table
-	pk        *Column
-	pkField   []int
-	colFields []entityColField // columns that map to a struct field
+	table        *Table
+	pk           *Column
+	pkField      []int
+	colFields    []entityColField // columns that map to a struct field
+	validators   []Validator[T]
+	versionCol   *Column // optimistic-locking version column, nil if none
+	versionField []int   // field path on T for the version value
 }
+
+// Validator is called before Create / Update / Save with a pointer
+// to the candidate row. Returning a non-nil error aborts the
+// operation before any SQL is issued. Validators compose: register
+// as many as you need, the first to fail wins.
+type Validator[T any] func(*T) error
 
 // entityColField bundles a column with its field-index path inside T.
 type entityColField struct {
@@ -96,20 +105,61 @@ func NewEntity[T any](t *Table) *Entity[T] {
 	}
 
 	colFields := make([]entityColField, 0, len(t.Columns()))
+	var versionCol *Column
+	var versionField []int
 	for _, c := range t.Columns() {
 		idx, ok := lookupField(fields, c.Name())
 		if !ok {
 			continue
 		}
 		colFields = append(colFields, entityColField{col: c, field: idx})
+		if c.IsOptimisticVersion() {
+			if versionCol != nil {
+				panic(fmt.Sprintf("drops/pg: NewEntity[%s]: table %q declares more than one OptimisticLock column", rt.Name(), t.Name()))
+			}
+			versionCol = c
+			versionField = idx
+		}
+	}
+	if versionCol == nil {
+		// Catch the misconfiguration where the version column exists
+		// but has no matching struct field — the loop above would
+		// silently skip it.
+		for _, c := range t.Columns() {
+			if c.IsOptimisticVersion() {
+				panic(fmt.Sprintf("drops/pg: NewEntity[%s]: OptimisticLock column %q has no matching struct field", rt.Name(), c.Name()))
+			}
+		}
 	}
 
 	return &Entity[T]{
-		table:     t,
-		pk:        pk,
-		pkField:   pkField,
-		colFields: colFields,
+		table:        t,
+		pk:           pk,
+		pkField:      pkField,
+		colFields:    colFields,
+		versionCol:   versionCol,
+		versionField: versionField,
 	}
+}
+
+// Validate registers a validator that runs before Create / Update /
+// Save. Validators are invoked in registration order; the first to
+// return a non-nil error aborts the operation. Returns the entity so
+// the call can be chained next to NewEntity.
+func (e *Entity[T]) Validate(v Validator[T]) *Entity[T] {
+	e.validators = append(e.validators, v)
+	return e
+}
+
+// runValidators runs every registered validator in order. Returns
+// the first non-nil error.
+func (e *Entity[T]) runValidators(r *T) error {
+	for _, v := range e.validators {
+		if err := v(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // lookupField resolves a column name to a field index path using the
@@ -137,6 +187,12 @@ func (e *Entity[T]) PK() *Column { return e.pk }
 // field is the zero value but the operation requires it to be set.
 var ErrPKNotSet = errors.New("drops/pg: primary key field is the zero value")
 
+// ErrStaleObject is returned by Update on an entity whose table
+// declares an OptimisticLock column when no row matches both the PK
+// and the supplied version — another transaction has bumped the
+// version, or the row was deleted between read and write.
+var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock version mismatch")
+
 // Get fetches the row whose primary key equals id. Returns ErrNoRows
 // if no row matches.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
@@ -155,6 +211,9 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 // behaviour for a specific field, set it to a non-zero value before
 // calling Create.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
+	if err := e.runValidators(r); err != nil {
+		return err
+	}
 	v := reflect.ValueOf(r).Elem()
 	bindings := e.collectInsertBindings(v)
 	if len(bindings) == 0 {
@@ -176,6 +235,9 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 // out of scope for now; callers needing finer control use db.Update
 // directly.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
+	if err := e.runValidators(r); err != nil {
+		return err
+	}
 	v := reflect.ValueOf(r).Elem()
 	pkv := v.FieldByIndex(e.pkField)
 	if pkv.IsZero() {
@@ -187,9 +249,25 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		if cf.col == e.pk {
 			continue
 		}
+		if cf.col == e.versionCol {
+			// version column is bumped via "version = version + 1"
+			// below — never bind the caller's value here.
+			continue
+		}
 		upd.Set(&exprBinding{
 			col:  cf.col,
 			expr: drops.Param{Value: v.FieldByIndex(cf.field).Interface()},
+		})
+		wroteSet = true
+	}
+	if e.versionCol != nil {
+		// Add "version = version + 1" and "AND version = current".
+		upd.Set(&exprBinding{
+			col: e.versionCol,
+			expr: drops.ExprFunc(func(b *drops.Builder) {
+				b.WriteIdent(e.versionCol.Name())
+				b.WriteString(" + 1")
+			}),
 		})
 		wroteSet = true
 	}
@@ -197,10 +275,18 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		return errors.New("drops/pg: Update has no fields to set")
 	}
 	upd.Where(Eq(e.pk, pkv.Interface()))
+	if e.versionCol != nil {
+		curVer := v.FieldByIndex(e.versionField).Interface()
+		upd.Where(Eq(e.versionCol, curVer))
+	}
 	for _, c := range e.table.Columns() {
 		upd.Returning(c)
 	}
-	return upd.One(ctx, r)
+	err := upd.One(ctx, r)
+	if err == ErrNoRows && e.versionCol != nil {
+		return ErrStaleObject
+	}
+	return err
 }
 
 // Save inserts r if its primary-key field is the zero value, or
@@ -209,6 +295,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 // straightforward; switch to a hand-written upsert when the
 // race-window between the read and the write matters.
 func (e *Entity[T]) Save(db *DB, ctx context.Context, r *T) error {
+	// Validators run inside Create/Update, no double-call needed here.
 	v := reflect.ValueOf(r).Elem()
 	if v.FieldByIndex(e.pkField).IsZero() {
 		return e.Create(db, ctx, r)

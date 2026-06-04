@@ -2,6 +2,7 @@ package clickhouse_test
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -134,6 +135,50 @@ func TestClickhouseEntityQueryAll(t *testing.T) {
 	}
 	if len(out) != 2 || out[0].ID != "u1" || out[1].UserID != 2 {
 		t.Errorf("unexpected rows: %+v", out)
+	}
+}
+
+func TestClickhouseEntityValidatorBlocksCreate(t *testing.T) {
+	_, ent := entEventsSchema()
+	errBad := errors.New("kind required")
+	ent.Validate(func(e *entEvent) error {
+		if e.Kind == "" {
+			return errBad
+		}
+		return nil
+	})
+	fd := &entFakeDriver{}
+	db := clickhouse.New(fd)
+	ev := entEvent{ID: "u1", UserID: 7}
+	if _, err := ent.Create(db, context.Background(), &ev); !errors.Is(err, errBad) {
+		t.Errorf("expected validator error, got %v", err)
+	}
+	if len(fd.queries) != 0 {
+		t.Errorf("validator must abort before SQL")
+	}
+}
+
+func TestClickhouseEntityValidatorAbortsBatch(t *testing.T) {
+	_, ent := entEventsSchema()
+	errBad := errors.New("invalid")
+	ent.Validate(func(e *entEvent) error {
+		if e.Kind == "bad" {
+			return errBad
+		}
+		return nil
+	})
+	fd := &entFakeDriver{}
+	db := clickhouse.New(fd)
+	evs := []entEvent{
+		{ID: "u1", UserID: 1, Kind: "click"},
+		{ID: "u2", UserID: 2, Kind: "bad"},
+		{ID: "u3", UserID: 3, Kind: "view"},
+	}
+	if _, err := ent.CreateMany(db, context.Background(), evs); !errors.Is(err, errBad) {
+		t.Errorf("expected validator error, got %v", err)
+	}
+	if len(fd.queries) != 0 {
+		t.Errorf("validator failure on any row must abort the whole batch")
 	}
 }
 

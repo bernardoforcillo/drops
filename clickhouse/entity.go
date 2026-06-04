@@ -35,9 +35,15 @@ import (
 //	    EventEnt  = clickhouse.NewEntity[Event](Events)
 //	)
 type Entity[T any] struct {
-	table     *Table
-	colFields []entityColField
+	table      *Table
+	colFields  []entityColField
+	validators []Validator[T]
 }
+
+// Validator is called before Create / CreateMany with a pointer to
+// each candidate row. Returning a non-nil error aborts the operation
+// before any SQL is issued.
+type Validator[T any] func(*T) error
 
 type entityColField struct {
 	col   *Column
@@ -74,10 +80,30 @@ func NewEntity[T any](t *Table) *Entity[T] {
 // Table returns the table the entity is bound to.
 func (e *Entity[T]) Table() *Table { return e.table }
 
+// Validate registers a validator that runs before Create /
+// CreateMany. Validators are invoked in registration order; the
+// first to return a non-nil error aborts the operation.
+func (e *Entity[T]) Validate(v Validator[T]) *Entity[T] {
+	e.validators = append(e.validators, v)
+	return e
+}
+
+func (e *Entity[T]) runValidators(r *T) error {
+	for _, v := range e.validators {
+		if err := v(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Create inserts a single row from r. ClickHouse has no RETURNING,
 // so r is not refreshed — any DEFAULT-driven values (timestamps,
 // UUIDs) stay zero on the Go side.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) (drops.Result, error) {
+	if err := e.runValidators(r); err != nil {
+		return nil, err
+	}
 	v := reflect.ValueOf(r).Elem()
 	bindings := e.collectBindings(v)
 	if len(bindings) == 0 {
@@ -88,10 +114,17 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) (drops.Result, err
 
 // CreateMany inserts a batch of rows. This is the typical analytics
 // pattern; for very large batches drop down to the native columnar
-// protocol via clickhouse-go's Prepare/Exec loop.
+// protocol via clickhouse-go's Prepare/Exec loop. Validators run
+// against every row before any SQL is issued — the first failure
+// aborts the whole batch.
 func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
 	if len(rs) == 0 {
 		return nil, ErrNoRowsToInsert
+	}
+	for i := range rs {
+		if err := e.runValidators(&rs[i]); err != nil {
+			return nil, err
+		}
 	}
 	ins := db.Insert(e.table)
 	for i := range rs {

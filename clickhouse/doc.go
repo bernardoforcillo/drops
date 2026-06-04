@@ -36,7 +36,9 @@
 //
 // Entity[T] (see entity.go) binds a Go struct to a Table and exposes
 // Create / CreateMany / Query — the narrow subset of CRUD that maps
-// to ClickHouse's Insert + Select builders.
+// to ClickHouse's Insert + Select builders. Entity.Validate registers
+// per-row validators that run before Create / CreateMany; on
+// CreateMany the first failing row aborts the whole batch.
 //
 // What this package does NOT try to mirror from drops/pg:
 //

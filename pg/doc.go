@@ -31,4 +31,9 @@
 // Query. It composes with lifecycle hooks and default scopes, so a
 // SoftDelete mixin makes UserEntity.Delete() automatically rewrite
 // into an UPDATE that flips deleted_at.
+//
+// Entity.Validate registers per-row validators that run before
+// Create / Update / Save. A column marked with OptimisticLock turns
+// Update into a guarded "AND version = current, SET version =
+// version + 1" — mismatched versions return ErrStaleObject.
 package pg

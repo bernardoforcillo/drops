@@ -26,6 +26,7 @@ type Column struct {
 	defaultSQL string
 	hasDefault bool
 	ref        *FK
+	version    bool // marked via (*Col[T]).OptimisticLock()
 }
 
 // FK describes a foreign-key reference.
@@ -62,6 +63,11 @@ func (c *Column) DefaultSQL() string { return c.defaultSQL }
 
 // ForeignKey returns the foreign-key reference, or nil if none.
 func (c *Column) ForeignKey() *FK { return c.ref }
+
+// IsOptimisticVersion reports whether the column is the version
+// column used for optimistic locking. Marked via
+// (*Col[T]).OptimisticLock().
+func (c *Column) IsOptimisticVersion() bool { return c.version }
 
 // col returns c. It is the implementation of ColRef for *Column itself;
 // *Col[T] inherits the method via embedding.
@@ -146,6 +152,17 @@ func (c *Col[T]) Unique() *Col[T] {
 func (c *Col[T]) Default(sqlExpr string) *Col[T] {
 	c.Column.hasDefault = true
 	c.Column.defaultSQL = sqlExpr
+	return c
+}
+
+// OptimisticLock marks the column as the version column for
+// optimistic locking. When an Entity bound to the table issues an
+// UPDATE, it automatically guards with "AND version = current" and
+// bumps the column ("SET version = version + 1"). If no row matches
+// the version, ErrStaleObject is returned. Apply this to a single
+// integer column per table.
+func (c *Col[T]) OptimisticLock() *Col[T] {
+	c.Column.version = true
 	return c
 }
 

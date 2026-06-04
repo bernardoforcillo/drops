@@ -237,6 +237,10 @@ func validateRelTree(t *Table, nodes []*relNode) error {
 			return fmt.Errorf("drops/pg: unknown relation %q on table %q", node.name, t.Name())
 		}
 		if len(node.children) > 0 {
+			if rel.Kind == MorphToKind {
+				return fmt.Errorf("drops/pg: relation %q is MorphTo — nested With() is not supported because the loaded parent's type varies row by row",
+					node.name)
+			}
 			if err := validateRelTree(rel.To, node.children); err != nil {
 				return err
 			}
@@ -291,8 +295,11 @@ func (f *FindBuilder) loadOne(
 	rel *Relation,
 	node *relNode,
 ) (reflect.Value, reflect.Type, error) {
-	if rel.Kind == ManyToManyKind {
+	switch rel.Kind {
+	case ManyToManyKind:
 		return f.loadManyToMany(ctx, parentSlice, parentType, parentIsPtr, rel, node)
+	case MorphToKind:
+		return f.loadMorphTo(ctx, parentSlice, parentType, parentIsPtr, rel, node)
 	}
 	return f.loadRelation(ctx, parentSlice, parentType, parentIsPtr, rel, node)
 }
@@ -336,7 +343,7 @@ func (f *FindBuilder) loadRelation(
 
 	var rowKeyCol, targetKeyCol *Column
 	switch rel.Kind {
-	case HasManyKind, HasOneKind:
+	case HasManyKind, HasOneKind, MorphManyKind:
 		rowKeyCol = rel.ParentKey
 		targetKeyCol = rel.ChildKey
 	case BelongsToKind:
@@ -358,7 +365,7 @@ func (f *FindBuilder) loadRelation(
 	}
 	relFieldType := parentType.FieldByIndex(relField).Type
 
-	expectsSlice := rel.Kind == HasManyKind
+	expectsSlice := rel.Kind == HasManyKind || rel.Kind == MorphManyKind
 	if expectsSlice && relFieldType.Kind() != reflect.Slice {
 		return none, nil, fmt.Errorf("drops/pg: relation %q is HasMany — expected slice field, got %s",
 			rel.Name, relFieldType.Kind())
@@ -386,6 +393,9 @@ func (f *FindBuilder) loadRelation(
 	}
 
 	childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
+	if rel.Kind == MorphManyKind {
+		childQuery.Where(Eq(rel.MorphTypeCol, rel.MorphType))
+	}
 	if len(node.wheres) > 0 {
 		childQuery.Where(node.wheres...)
 	}
@@ -769,4 +779,132 @@ func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 		return byName, true
 	}
 	return nil, false
+}
+
+// loadMorphTo handles polymorphic belongs-to: each child carries
+// (morph_type, morph_id), and we have to look up each id in the
+// table registered for its morph_type. We bucket children by
+// morph_type, run one query per bucket, and stitch the loaded parent
+// back into the child's relation field — which must be of interface
+// kind because its concrete type varies row by row.
+func (f *FindBuilder) loadMorphTo(
+	ctx context.Context,
+	parentSlice reflect.Value,
+	parentType reflect.Type,
+	parentIsPtr bool,
+	rel *Relation,
+	node *relNode,
+) (reflect.Value, reflect.Type, error) {
+	var none reflect.Value
+	idField, ok := relationKeyField(parentType, rel.ChildKey)
+	if !ok {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: struct missing field for column %q",
+			rel.Name, rel.ChildKey.Name())
+	}
+	typeField, ok := relationKeyField(parentType, rel.MorphTypeCol)
+	if !ok {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: struct missing field for column %q",
+			rel.Name, rel.MorphTypeCol.Name())
+	}
+	relField, ok := relationTargetField(parentType, rel.Name)
+	if !ok {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: struct has no field tagged db_rel:%q (or matching name)",
+			rel.Name, rel.Name)
+	}
+	relFieldType := parentType.FieldByIndex(relField).Type
+	if relFieldType.Kind() != reflect.Interface {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: polymorphic field %s must be an interface type (typically `any`), got %s",
+			rel.Name, parentType.FieldByIndex(relField).Name, relFieldType.Kind())
+	}
+
+	// Group child rows by morph_type. ids is per-type; revIndex points
+	// back at the parentSlice rows that have to receive the loaded
+	// parent.
+	type bucket struct {
+		ids       []any
+		rowIdxs   []int
+		entry     morphEntry
+		idToParent map[any]reflect.Value
+	}
+	buckets := map[string]*bucket{}
+	for i := 0; i < parentSlice.Len(); i++ {
+		row := parentValue(parentSlice.Index(i), parentIsPtr)
+		typeStr := fmt.Sprintf("%v", row.FieldByIndex(typeField).Interface())
+		if typeStr == "" {
+			continue
+		}
+		entry, ok := rel.MorphMap.lookup(typeStr)
+		if !ok {
+			return none, nil, fmt.Errorf("drops/pg: relation %q: unknown morph type %q (register it via pg.RegisterMorph)",
+				rel.Name, typeStr)
+		}
+		b, ok := buckets[typeStr]
+		if !ok {
+			b = &bucket{entry: entry}
+			buckets[typeStr] = b
+		}
+		b.ids = append(b.ids, row.FieldByIndex(idField).Interface())
+		b.rowIdxs = append(b.rowIdxs, i)
+	}
+
+	// Run one query per bucket and build per-bucket id → parent maps.
+	for _, b := range buckets {
+		ids := dedupeKeys(b.ids)
+		// Identify the target PK column.
+		var targetPK *Column
+		for _, c := range b.entry.table.Columns() {
+			if c.IsPrimaryKey() {
+				targetPK = c
+				break
+			}
+		}
+		if targetPK == nil {
+			return none, nil, fmt.Errorf("drops/pg: relation %q: morph target table %q has no PRIMARY KEY",
+				rel.Name, b.entry.table.Name())
+		}
+		q := f.db.Select().From(b.entry.table).Where(In(targetPK, ids...))
+		if len(node.wheres) > 0 {
+			q.Where(node.wheres...)
+		}
+		if len(node.orderBys) > 0 {
+			q.OrderBy(node.orderBys...)
+		}
+		sliceType := reflect.SliceOf(b.entry.rowType)
+		results := reflect.New(sliceType).Elem()
+		if err := q.All(ctx, results.Addr().Interface()); err != nil {
+			return none, nil, err
+		}
+		pkField, ok := relationKeyField(b.entry.rowType, targetPK)
+		if !ok {
+			return none, nil, fmt.Errorf("drops/pg: relation %q: morph target struct %s missing field for PK column %q",
+				rel.Name, b.entry.rowType.Name(), targetPK.Name())
+		}
+		b.idToParent = map[any]reflect.Value{}
+		for i := 0; i < results.Len(); i++ {
+			row := results.Index(i)
+			k := row.FieldByIndex(pkField).Interface()
+			b.idToParent[k] = row
+		}
+	}
+
+	// Stitch loaded parents back into each child row.
+	for _, b := range buckets {
+		for j, rowIdx := range b.rowIdxs {
+			parent, ok := b.idToParent[b.ids[j]]
+			if !ok {
+				continue
+			}
+			child := parentValue(parentSlice.Index(rowIdx), parentIsPtr)
+			ptr := reflect.New(b.entry.rowType)
+			ptr.Elem().Set(parent)
+			child.FieldByIndex(relField).Set(ptr)
+		}
+	}
+
+	// MorphTo doesn't support deeper relation chains in this iteration
+	// — the loaded parent has a heterogeneous Go type so a single
+	// child slice for recursion doesn't fit. Callers needing this can
+	// fan out manually.
+	_ = node.children
+	return reflect.Value{}, nil, nil
 }

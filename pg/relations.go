@@ -1,5 +1,7 @@
 package pg
 
+import "reflect"
+
 // RelationKind identifies the cardinality of a Relation.
 type RelationKind int
 
@@ -16,6 +18,15 @@ const (
 	// ManyToMany: parent and target are linked through a junction table.
 	// The relation is loaded as a slice on the parent struct.
 	ManyToManyKind
+	// MorphTo: a polymorphic belongs-to — each row references a parent
+	// in one of several possible tables, identified by a type
+	// discriminator column. The relation field is typed `any` and
+	// holds a pointer to the loaded parent struct after eager loading.
+	MorphToKind
+	// MorphMany: the inverse of MorphTo — fetches every child whose
+	// morph_type equals a fixed value and morph_id equals the parent's
+	// PK. The relation is loaded as a slice on the parent struct.
+	MorphManyKind
 )
 
 // Relation describes a foreign-key relationship between two tables.
@@ -46,6 +57,16 @@ type Relation struct {
 	Through    *Table
 	ThroughFK1 *Column
 	ThroughFK2 *Column
+
+	// Polymorphic fields, populated for MorphToKind / MorphManyKind.
+	// MorphTypeCol is the discriminator column.
+	// MorphMap maps the discriminator value to a target table + Go
+	// struct type (MorphToKind only).
+	// MorphType is the discriminator value identifying this side of
+	// the polymorphic edge (MorphManyKind only).
+	MorphTypeCol *Column
+	MorphMap     *MorphMap
+	MorphType    string
 }
 
 // Relations is the registration handle for one table. Use NewRelations
@@ -114,6 +135,105 @@ func (r *Relations) BelongsTo(name string, parent *Table, childFK, parentKey Col
 		ParentKey: parentKey.col(),
 	}
 	return r
+}
+
+// MorphTo declares a polymorphic belongs-to relation. The current
+// table has two columns — typeCol holding a discriminator string and
+// idCol holding the target's primary-key value. Each entry registered
+// on morphs binds a discriminator value to a target table and the
+// Go struct used to scan its rows.
+//
+//	morphs := pg.NewMorphMap()
+//	pg.RegisterMorph[User](morphs, "users", Users)
+//	pg.RegisterMorph[Post](morphs, "posts", Posts)
+//
+//	pg.NewRelations(Comments).
+//	    MorphTo("commentable", CommentCommentableType, CommentCommentableID, morphs)
+//
+// The relation field on the child struct must be declared `any` (or
+// any interface type) — the loader stores a *Parent pointer into it
+// and the caller dispatches with a type switch.
+func (r *Relations) MorphTo(name string, typeCol, idCol ColRef, morphs *MorphMap) *Relations {
+	r.t.relations[name] = &Relation{
+		Name:         name,
+		Kind:         MorphToKind,
+		From:         r.t,
+		ChildKey:     idCol.col(),
+		MorphTypeCol: typeCol.col(),
+		MorphMap:     morphs,
+	}
+	return r
+}
+
+// MorphMany declares the inverse of MorphTo: every row in `child`
+// whose typeCol equals typeValue and whose idCol equals the parent's
+// PK becomes a member of the parent's named relation.
+//
+//	pg.NewRelations(Users).
+//	    MorphMany("comments", Comments,
+//	        CommentCommentableType, CommentCommentableID,
+//	        UserID, "users")
+//
+// typeValue is the literal string the child's typeCol carries when it
+// points at this side of the morph — typically the parent's table
+// name in the MorphMap registered on the MorphTo side.
+func (r *Relations) MorphMany(
+	name string,
+	child *Table,
+	childTypeCol, childIDCol ColRef,
+	parentKey ColRef,
+	typeValue string,
+) *Relations {
+	r.t.relations[name] = &Relation{
+		Name:         name,
+		Kind:         MorphManyKind,
+		From:         r.t,
+		To:           child,
+		ParentKey:    parentKey.col(),
+		ChildKey:     childIDCol.col(),
+		MorphTypeCol: childTypeCol.col(),
+		MorphType:    typeValue,
+	}
+	return r
+}
+
+// MorphMap binds a polymorphic discriminator string to the target
+// table and Go struct it identifies. Build it once and share it
+// between the MorphTo declarations that need it.
+type MorphMap struct {
+	entries map[string]morphEntry
+}
+
+type morphEntry struct {
+	table   *Table
+	rowType reflect.Type
+}
+
+// NewMorphMap returns an empty MorphMap.
+func NewMorphMap() *MorphMap {
+	return &MorphMap{entries: map[string]morphEntry{}}
+}
+
+// RegisterMorph binds value to a target table and the Go struct type
+// T used to scan that table's rows. It is a free function rather than
+// a method because Go does not allow generic methods.
+func RegisterMorph[T any](m *MorphMap, value string, t *Table) *MorphMap {
+	var zero T
+	rt := reflect.TypeOf(zero)
+	for rt.Kind() == reflect.Ptr {
+		rt = rt.Elem()
+	}
+	m.entries[value] = morphEntry{table: t, rowType: rt}
+	return m
+}
+
+// lookup returns the entry registered for value, or ok=false.
+func (m *MorphMap) lookup(value string) (morphEntry, bool) {
+	if m == nil {
+		return morphEntry{}, false
+	}
+	e, ok := m.entries[value]
+	return e, ok
 }
 
 // ManyToMany declares a many-to-many relation through a junction table.

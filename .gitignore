@@ -32,6 +32,9 @@ coverage.html
 /dist/
 /build/
 
+# dropsgen binary produced by `go build ./cmd/dropsgen` at the repo root
+/dropsgen
+
 # Go workspace files (per-developer)
 go.work
 go.work.sum

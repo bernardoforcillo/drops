@@ -38,6 +38,13 @@ type Replicated struct {
 	primary  drops.Driver
 	replicas []drops.Driver
 	cursor   atomic.Uint64
+
+	// LSN-based read-your-writes (see WithLSNTracking). Fields
+	// are populated lazily so the original time-only path
+	// stays allocation-free.
+	lsnEnabled bool
+	lsnTTL     time.Duration
+	lsnCache   *sync.Map // drops.Driver → lsnEntry
 }
 
 // NewReplicated returns a Replicated driver. Pass zero replicas for
@@ -62,19 +69,34 @@ func (r *Replicated) pickReplica() drops.Driver {
 
 // Exec routes through the primary. The call also re-arms any
 // read-your-writes window attached to ctx so subsequent reads on the
-// same context stay sticky.
+// same context stay sticky — and, when LSN tracking is enabled,
+// captures pg_current_wal_lsn() so reads can route to a caught-up
+// replica instead of unconditionally pinning to primary.
 func (r *Replicated) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	res, err := r.primary.Exec(ctx, sql, args...)
 	if s, ok := readYourWrites(ctx); ok {
 		s.mark()
+		if err == nil {
+			r.captureWriteLSN(ctx, s)
+		}
 	}
-	return r.primary.Exec(ctx, sql, args...)
+	return res, err
 }
 
 // Query routes to a replica unless ctx is inside an active
-// read-your-writes window, in which case the primary serves the
-// read for consistency.
+// read-your-writes window. With LSN tracking enabled, reads inside
+// a window route to whichever replica has replayed past the captured
+// write LSN — only falling back to primary when none have caught up.
+// Without LSN tracking, the time-based stickiness pins reads to
+// primary for the configured duration.
 func (r *Replicated) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
 	if s, ok := readYourWrites(ctx); ok && s.active() {
+		if r.lsnEnabled {
+			required := s.requiredLSN()
+			if required > 0 {
+				return r.pickLSNReplica(ctx, required).Query(ctx, sql, args...)
+			}
+		}
 		return r.primary.Query(ctx, sql, args...)
 	}
 	return r.pickReplica().Query(ctx, sql, args...)
@@ -127,11 +149,15 @@ type rywContextKey int
 const rywKey rywContextKey = 1
 
 // rywState tracks the expiry of a per-context read-your-writes
-// window. Reset by each write; checked by each read.
+// window. Reset by each write; checked by each read. When LSN
+// tracking is enabled it also carries the primary's WAL position
+// captured at write time so reads can route to a caught-up replica
+// instead of pinning to primary.
 type rywState struct {
 	duration time.Duration
 	mu       sync.Mutex
 	until    time.Time
+	writeLSN uint64
 }
 
 func (s *rywState) mark() {
@@ -144,6 +170,12 @@ func (s *rywState) active() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return !s.until.IsZero() && time.Now().Before(s.until)
+}
+
+func (s *rywState) requiredLSN() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeLSN
 }
 
 // WithReadYourWrites annotates ctx with a sticky read-your-writes

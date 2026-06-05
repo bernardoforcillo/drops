@@ -11,9 +11,9 @@ import (
 
 // User is the entity fixture used across these tests.
 type entUser struct {
-	ID    int64  `db:"id"`
-	Name  string `db:"name"`
-	Email string `db:"email"`
+	ID    int64  `drop:"id"`
+	Name  string `drop:"name"`
+	Email string `drop:"email"`
 }
 
 func entUsersSchema() (*pg.Table, *pg.Entity[entUser]) {
@@ -41,7 +41,7 @@ func TestNewEntityPanicsWithoutPK(t *testing.T) {
 // PK field is rejected.
 func TestNewEntityPanicsWithoutPKField(t *testing.T) {
 	type noIDUser struct {
-		Name string `db:"name"`
+		Name string `drop:"name"`
 	}
 	defer func() {
 		if r := recover(); r == nil {
@@ -238,8 +238,8 @@ func TestEntityDelete(t *testing.T) {
 // guards Get.
 func TestEntityComposesWithHooks(t *testing.T) {
 	type doc struct {
-		ID    int64  `db:"id"`
-		Title string `db:"title"`
+		ID    int64  `drop:"id"`
+		Title string `drop:"title"`
 	}
 	tbl := pg.NewTable("docs")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())

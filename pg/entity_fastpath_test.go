@@ -94,14 +94,14 @@ func TestEntityFastScanReturnsErrNoRowsOnEmpty(t *testing.T) {
 // use its reflection-based assignment.
 func TestEntityFastScanFallsBackForRelations(t *testing.T) {
 	type post struct {
-		ID     int64 `db:"id"`
-		UserID int64 `db:"user_id"`
+		ID     int64 `drop:"id"`
+		UserID int64 `drop:"user_id"`
 	}
 	type userWithPosts struct {
-		ID    int64  `db:"id"`
-		Name  string `db:"name"`
-		Email string `db:"email"`
-		Posts []post `db_rel:"posts"`
+		ID    int64  `drop:"id"`
+		Name  string `drop:"name"`
+		Email string `drop:"email"`
+		Posts []post `drop_rel:"posts"`
 	}
 
 	users := pg.NewTable("users")

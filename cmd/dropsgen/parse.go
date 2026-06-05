@@ -22,7 +22,7 @@ type entity struct {
 type field struct {
 	GoName string // identifier, e.g. "Email"
 	GoType string // type expression text, e.g. "string", "*int32"
-	Column string // db tag value, e.g. "email"
+	Column string // drop tag value, e.g. "email"
 }
 
 var entityDirective = regexp.MustCompile(`drops:entity\b[^\n]*`)
@@ -108,7 +108,11 @@ func tableFromDirective(directive string) (string, error) {
 }
 
 // collectFields walks a struct's fields and returns the bind/scan
-// metadata for every exported, db-tagged field.
+// metadata for every exported, drop-tagged field. The first
+// comma-separated token is the column name; subsequent tokens
+// (pk, autoinc, notnull, …) are ignored here because dropsgen
+// itself does not generate the schema declaration, only the
+// bind/scan helpers.
 func collectFields(st *ast.StructType) ([]field, error) {
 	var out []field
 	for _, f := range st.Fields.List {
@@ -116,9 +120,13 @@ func collectFields(st *ast.StructType) ([]field, error) {
 			continue
 		}
 		tag := reflect.StructTag(strings.Trim(f.Tag.Value, "`"))
-		col := tag.Get("db")
-		if col == "" || col == "-" {
+		raw := tag.Get("drop")
+		if raw == "" || raw == "-" {
 			continue
+		}
+		col := raw
+		if j := strings.IndexByte(raw, ','); j >= 0 {
+			col = raw[:j]
 		}
 		for _, name := range f.Names {
 			if !ast.IsExported(name.Name) {

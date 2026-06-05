@@ -68,9 +68,9 @@ func (r *entFakeRows) Close() error               { return nil }
 func (r *entFakeRows) Err() error                 { return nil }
 
 type entEvent struct {
-	ID     string `db:"id"`
-	UserID uint64 `db:"user_id"`
-	Kind   string `db:"kind"`
+	ID     string `drop:"id"`
+	UserID uint64 `drop:"user_id"`
+	Kind   string `drop:"kind"`
 }
 
 func entEventsSchema() (*clickhouse.Table, *clickhouse.Entity[entEvent]) {
@@ -192,9 +192,9 @@ func TestClickhouseEntityRespectsDefaultFilter(t *testing.T) {
 	tbl.DefaultFilter(deleted.IsNull())
 
 	type ev struct {
-		ID     string `db:"id"`
-		UserID uint64 `db:"user_id"`
-		Kind   string `db:"kind"`
+		ID     string `drop:"id"`
+		UserID uint64 `drop:"user_id"`
+		Kind   string `drop:"kind"`
 	}
 	ent := clickhouse.NewEntity[ev](tbl)
 	fd := &entFakeDriver{}

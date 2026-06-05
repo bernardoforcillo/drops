@@ -23,10 +23,10 @@ import (
 // Declare an Entity once at package level:
 //
 //	type Event struct {
-//	    ID     string    `db:"id"`
-//	    UserID uint64    `db:"user_id"`
-//	    Kind   string    `db:"kind"`
-//	    Ts     time.Time `db:"ts"`
+//	    ID     string    `drop:"id"`
+//	    UserID uint64    `drop:"user_id"`
+//	    Kind   string    `drop:"kind"`
+//	    Ts     time.Time `drop:"ts"`
 //	}
 //
 //	var (
@@ -54,7 +54,7 @@ type entityColField struct {
 // field index map. It panics on a non-struct type because schema
 // declarations are typically loaded at process startup.
 //
-// Field matching mirrors the row scanner: `db:"colname"` tag wins,
+// Field matching mirrors the row scanner: `drop:"colname"` tag wins,
 // otherwise field name and snake_case form are tried.
 func NewEntity[T any](t *Table) *Entity[T] {
 	var zero T

@@ -46,7 +46,7 @@ func TestParseRejectsMissingTable(t *testing.T) {
 
 //drops:entity
 type Bad struct {
-	ID int64 ` + "`db:\"id\"`" + `
+	ID int64 ` + "`drop:\"id\"`" + `
 }
 `
 	path := filepath.Join(tmp, "bad.go")
@@ -64,10 +64,10 @@ func TestParseSkipsUntaggedFields(t *testing.T) {
 
 //drops:entity table=Foo
 type Foo struct {
-	ID       int64  ` + "`db:\"id\"`" + `
+	ID       int64  ` + "`drop:\"id\"`" + `
 	Internal string
-	Skipped  string ` + "`db:\"-\"`" + `
-	Name     string ` + "`db:\"name\"`" + `
+	Skipped  string ` + "`drop:\"-\"`" + `
+	Name     string ` + "`drop:\"name\"`" + `
 }
 `
 	path := filepath.Join(tmp, "foo.go")

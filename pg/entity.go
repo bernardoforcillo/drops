@@ -18,9 +18,9 @@ import (
 // Declare an Entity once at package level alongside its table:
 //
 //	type User struct {
-//	    ID    int64  `db:"id"`
-//	    Name  string `db:"name"`
-//	    Email string `db:"email"`
+//	    ID    int64  `drop:"id"`
+//	    Name  string `drop:"name"`
+//	    Email string `drop:"email"`
 //	}
 //
 //	var (
@@ -85,9 +85,9 @@ type entityColField struct {
 // init blocks — bad config should fail at startup, not at the first
 // query.
 //
-// Field matching rules mirror the row scanner: `db:"colname"` tag
+// Field matching rules mirror the row scanner: `drop:"colname"` tag
 // wins; otherwise the field name and its snake_case form are tried.
-// Fields tagged `db:"-"` are skipped.
+// Fields tagged `drop:"-"` are skipped.
 func NewEntity[T any](t *Table) *Entity[T] {
 	var zero T
 	rt := reflect.TypeOf(zero)

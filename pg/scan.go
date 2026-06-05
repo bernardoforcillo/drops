@@ -15,7 +15,7 @@ var ErrNoRows = errors.New("drops/pg: no rows in result set")
 
 // scanAll consumes rows into dest, which must be a pointer to a slice
 // of structs or pointer-to-structs. Mapping rules:
-//   - struct field tag `db:"col"` is honoured (use `db:"-"` to skip)
+//   - struct field tag `drop:"col"` is honoured (use `drop:"-"` to skip)
 //   - otherwise, both the field name and its snake_case form match
 //   - embedded structs are walked
 //   - unmatched columns are scanned into a discard sink
@@ -121,13 +121,13 @@ func fieldMap(t reflect.Type) map[string][]int {
 				continue
 			}
 			idx := append(append([]int(nil), prefix...), i)
-			tag := f.Tag.Get("db")
+			tag := f.Tag.Get("drop")
 			if tag == "-" {
 				continue
 			}
 			if tag != "" {
 				// Honour the comma-separated form
-				// (`db:"col,opt,opt=val"`) used by AutoTable so the
+				// (`drop:"col,opt,opt=val"`) used by AutoTable so the
 				// scanner and the auto-declared schema agree on the
 				// column name.
 				name := tag

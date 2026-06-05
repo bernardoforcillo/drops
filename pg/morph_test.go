@@ -19,27 +19,27 @@ import (
 // (commentable_type, commentable_id) pair.
 
 type morphUser struct {
-	ID   int64  `db:"id"`
-	Name string `db:"name"`
+	ID   int64  `drop:"id"`
+	Name string `drop:"name"`
 }
 
 type morphPost struct {
-	ID    int64  `db:"id"`
-	Title string `db:"title"`
+	ID    int64  `drop:"id"`
+	Title string `drop:"title"`
 }
 
 type morphComment struct {
-	ID              int64  `db:"id"`
-	Body            string `db:"body"`
-	CommentableType string `db:"commentable_type"`
-	CommentableID   int64  `db:"commentable_id"`
-	Commentable     any    `db_rel:"commentable"`
+	ID              int64  `drop:"id"`
+	Body            string `drop:"body"`
+	CommentableType string `drop:"commentable_type"`
+	CommentableID   int64  `drop:"commentable_id"`
+	Commentable     any    `drop_rel:"commentable"`
 }
 
 type morphUserWithComments struct {
-	ID       int64          `db:"id"`
-	Name     string         `db:"name"`
-	Comments []morphComment `db_rel:"comments"`
+	ID       int64          `drop:"id"`
+	Name     string         `drop:"name"`
+	Comments []morphComment `drop_rel:"comments"`
 }
 
 func morphSchema() (users, posts, comments *pg.Table, morphs *pg.MorphMap) {

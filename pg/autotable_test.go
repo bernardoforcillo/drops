@@ -11,13 +11,13 @@ import (
 )
 
 type autoUser struct {
-	ID        int64     `db:"id,pk,autoinc"`
-	Email     string    `db:"email,notnull,unique"`
-	Name      string    `db:"name,notnull"`
-	Age       *int32    `db:"age"`
-	CreatedAt time.Time `db:"created_at,notnull,default=now()"`
+	ID        int64     `drop:"id,pk,autoinc"`
+	Email     string    `drop:"email,notnull,unique"`
+	Name      string    `drop:"name,notnull"`
+	Age       *int32    `drop:"age"`
+	CreatedAt time.Time `drop:"created_at,notnull,default=now()"`
 	Internal  string    // untagged — skipped
-	Skip      string    `db:"-"`
+	Skip      string    `drop:"-"`
 }
 
 func TestAutoTableInfersColumns(t *testing.T) {
@@ -82,7 +82,7 @@ func TestNewAutoEntityCRUD(t *testing.T) {
 
 func TestAutoTableUnknownTagOptionPanics(t *testing.T) {
 	type bad struct {
-		ID int64 `db:"id,wat"`
+		ID int64 `drop:"id,wat"`
 	}
 	defer func() {
 		if r := recover(); r == nil {
@@ -94,8 +94,8 @@ func TestAutoTableUnknownTagOptionPanics(t *testing.T) {
 
 func TestAutoTableUnsupportedTypePanics(t *testing.T) {
 	type bad struct {
-		ID  int64       `db:"id,pk"`
-		Bad chan string `db:"bad"`
+		ID  int64       `drop:"id,pk"`
+		Bad chan string `drop:"bad"`
 	}
 	defer func() {
 		if r := recover(); r == nil {
@@ -107,9 +107,9 @@ func TestAutoTableUnsupportedTypePanics(t *testing.T) {
 
 func TestAutoTableVersionMarker(t *testing.T) {
 	type doc struct {
-		ID  int64 `db:"id,pk,autoinc"`
-		V   int32 `db:"version,notnull,default=0,version"`
-		Tag string `db:"tag"`
+		ID  int64 `drop:"id,pk,autoinc"`
+		V   int32 `drop:"version,notnull,default=0,version"`
+		Tag string `drop:"tag"`
 	}
 	tbl := pg.AutoTable[doc]("docs")
 	v := tbl.Col("version")

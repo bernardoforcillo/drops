@@ -8,10 +8,10 @@ import (
 	"time"
 )
 
-// AutoTable derives a Table from the `db` struct tags on T. Tag
+// AutoTable derives a Table from the `drop` struct tags on T. Tag
 // syntax:
 //
-//	db:"<col_name>[,opt[,opt[,...]]]"
+//	drop:"<col_name>[,opt[,opt[,...]]]"
 //
 // where each opt is one of:
 //
@@ -23,7 +23,7 @@ import (
 //	default=<sql>        — raw DEFAULT clause (no parameterisation)
 //	version              — mark as the optimistic-lock version column
 //
-// Use `db:"-"` to skip a field entirely. Untagged exported fields are
+// Use `drop:"-"` to skip a field entirely. Untagged exported fields are
 // also skipped.
 //
 // Go type ↔ ColumnType mapping mirrors the manual constructors:
@@ -82,7 +82,7 @@ func populateTable[T any](tbl *Table) {
 	})
 }
 
-// autoOpts is the parsed metadata from a single `db:` tag.
+// autoOpts is the parsed metadata from a single `drop:` tag.
 type autoOpts struct {
 	Name    string
 	PK      bool
@@ -93,7 +93,7 @@ type autoOpts struct {
 	Version bool
 }
 
-// walkAutoFields applies fn to every exported db-tagged field on rt,
+// walkAutoFields applies fn to every exported drop-tagged field on rt,
 // in declaration order. Anonymous embedded structs are walked into.
 func walkAutoFields(rt reflect.Type, fn func(reflect.StructField, autoOpts)) {
 	for i := 0; i < rt.NumField(); i++ {
@@ -105,7 +105,7 @@ func walkAutoFields(rt reflect.Type, fn func(reflect.StructField, autoOpts)) {
 			walkAutoFields(f.Type, fn)
 			continue
 		}
-		raw, ok := f.Tag.Lookup("db")
+		raw, ok := f.Tag.Lookup("drop")
 		if !ok || raw == "-" {
 			continue
 		}
@@ -117,11 +117,11 @@ func walkAutoFields(rt reflect.Type, fn func(reflect.StructField, autoOpts)) {
 	}
 }
 
-// parseAutoTag turns a `db:"name,opt,opt=val"` string into autoOpts.
+// parseAutoTag turns a `drop:"name,opt,opt=val"` string into autoOpts.
 func parseAutoTag(raw string) (autoOpts, error) {
 	parts := strings.Split(raw, ",")
 	if len(parts) == 0 || parts[0] == "" {
-		return autoOpts{}, fmt.Errorf("empty db tag")
+		return autoOpts{}, fmt.Errorf("empty drop tag")
 	}
 	opts := autoOpts{Name: strings.TrimSpace(parts[0])}
 	for _, p := range parts[1:] {
@@ -147,7 +147,7 @@ func parseAutoTag(raw string) (autoOpts, error) {
 			}
 			opts.Default = v
 		default:
-			return opts, fmt.Errorf("unknown db tag option %q", k)
+			return opts, fmt.Errorf("unknown drop tag option %q", k)
 		}
 	}
 	return opts, nil

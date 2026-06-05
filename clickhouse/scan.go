@@ -12,7 +12,7 @@ import (
 // scanAll consumes rows into dest (pointer to slice of struct or
 // *struct). Mapping rules identical to drops/pg:
 //
-//  1. `db:"name"` tag if present; "-" to skip
+//  1. `drop:"name"` tag if present; "-" to skip
 //  2. exact field-name match
 //  3. snake_case of the field name
 //
@@ -111,12 +111,16 @@ func fieldMap(t reflect.Type) map[string][]int {
 				continue
 			}
 			idx := append(append([]int(nil), prefix...), i)
-			tag := f.Tag.Get("db")
+			tag := f.Tag.Get("drop")
 			if tag == "-" {
 				continue
 			}
 			if tag != "" {
-				m[tag] = idx
+				name := tag
+				if j := strings.IndexByte(tag, ','); j >= 0 {
+					name = tag[:j]
+				}
+				m[name] = idx
 				continue
 			}
 			if f.Anonymous && f.Type.Kind() == reflect.Struct {

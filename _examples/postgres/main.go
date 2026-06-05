@@ -46,7 +46,7 @@ type User struct {
 
 type Post struct {
 	ID     int64
-	UserID int64 `db:"user_id"`
+	UserID int64 `drop:"user_id"`
 	Title  string
 }
 

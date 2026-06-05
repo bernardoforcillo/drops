@@ -90,9 +90,9 @@ func TestValidatorsRunInOrderFirstFailWins(t *testing.T) {
 // ----------------------------------------------------------------------
 
 type versionedUser struct {
-	ID      int64  `db:"id"`
-	Name    string `db:"name"`
-	Version int32  `db:"version"`
+	ID      int64  `drop:"id"`
+	Name    string `drop:"name"`
+	Version int32  `drop:"version"`
 }
 
 func versionedSchema() (*pg.Table, *pg.Entity[versionedUser]) {
@@ -180,9 +180,9 @@ func TestNewEntityPanicsOnMultipleVersionCols(t *testing.T) {
 		}
 	}()
 	type doc struct {
-		ID int64 `db:"id"`
-		A  int32 `db:"a"`
-		B  int32 `db:"b"`
+		ID int64 `drop:"id"`
+		A  int32 `drop:"a"`
+		B  int32 `drop:"b"`
 	}
 	tbl := pg.NewTable("docs")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())

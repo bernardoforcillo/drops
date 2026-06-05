@@ -20,15 +20,15 @@
 //
 // The directive accepts a "table" key naming the *pg.Table variable
 // the entity is bound to. The generator does not resolve column
-// metadata at parse time — it derives it from struct tags (`db:`).
+// metadata at parse time — it derives it from struct tags (`drop:`).
 // At runtime the generated code references the table variable so
 // imports and identifiers stay correct.
 //
 //	//drops:entity table=Users
 //	type User struct {
-//	    ID    int64  `db:"id"`
-//	    Name  string `db:"name"`
-//	    Email string `db:"email"`
+//	    ID    int64  `drop:"id"`
+//	    Name  string `drop:"name"`
+//	    Email string `drop:"email"`
 //	}
 //
 // Polymorphism, relations, and validation are intentionally out of

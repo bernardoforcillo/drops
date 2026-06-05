@@ -126,7 +126,15 @@ func fieldMap(t reflect.Type) map[string][]int {
 				continue
 			}
 			if tag != "" {
-				m[tag] = idx
+				// Honour the comma-separated form
+				// (`db:"col,opt,opt=val"`) used by AutoTable so the
+				// scanner and the auto-declared schema agree on the
+				// column name.
+				name := tag
+				if j := strings.IndexByte(tag, ','); j >= 0 {
+					name = tag[:j]
+				}
+				m[name] = idx
 				continue
 			}
 			if f.Anonymous && f.Type.Kind() == reflect.Struct {

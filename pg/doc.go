@@ -42,4 +42,11 @@
 // Get / EntityQuery.All / EntityQuery.One skip the reflection path
 // entirely. Eager-loaded relations (via With/WithRel) still need
 // reflection, so the slow path kicks in automatically for those.
+//
+// AutoTable[T] / NewAutoEntity[T] derive a Table (and an Entity)
+// from extended `db:"col,pk,autoinc,notnull,unique,default=...,version"`
+// struct tags — the struct becomes the single source of truth, and
+// a working ORM falls out of one declaration:
+//
+//	var UserEntity = pg.NewAutoEntity[User]("users")
 package pg

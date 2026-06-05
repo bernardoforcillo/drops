@@ -403,8 +403,8 @@ type Post struct {
 type User struct {
     ID     int64
     Name   string
-    Posts  []Post  `drop_rel:"posts"`     // matched by tag
-    Groups []Group `drop_rel:"groups"`    // many-to-many through UserGroups
+    Posts  []Post  `dropRel:"posts"`     // matched by tag
+    Groups []Group `dropRel:"groups"`    // many-to-many through UserGroups
 }
 
 var users []User
@@ -423,7 +423,7 @@ Each kind takes a different shape:
 | `BelongsTo` | `Parent` or `*Parent` | row + 1 parent query |
 | `ManyToMany` | `[]Target` or `[]*Target` | parent + 1 junction + 1 target query |
 
-Relation fields are matched by `drop_rel:"<name>"` tag first, then by
+Relation fields are matched by `dropRel:"<name>"` tag first, then by
 case-insensitive name match.
 
 #### Nested (deep) relations
@@ -444,7 +444,7 @@ type Post struct {
     ID       int64
     UserID   int64     `drop:"user_id"`
     Title    string
-    Comments []Comment `drop_rel:"comments"`
+    Comments []Comment `dropRel:"comments"`
 }
 
 pg.NewRelations(Posts).HasMany("comments", Comments, PostID, CommentPostID)

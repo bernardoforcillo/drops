@@ -33,13 +33,13 @@ type morphComment struct {
 	Body            string `drop:"body"`
 	CommentableType string `drop:"commentable_type"`
 	CommentableID   int64  `drop:"commentable_id"`
-	Commentable     any    `drop_rel:"commentable"`
+	Commentable     any    `dropRel:"commentable"`
 }
 
 type morphUserWithComments struct {
 	ID       int64          `drop:"id"`
 	Name     string         `drop:"name"`
-	Comments []morphComment `drop_rel:"comments"`
+	Comments []morphComment `dropRel:"comments"`
 }
 
 func morphSchema() (users, posts, comments *pg.Table, morphs *pg.MorphMap) {

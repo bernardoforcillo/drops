@@ -101,7 +101,7 @@ func TestEntityFastScanFallsBackForRelations(t *testing.T) {
 		ID    int64  `drop:"id"`
 		Name  string `drop:"name"`
 		Email string `drop:"email"`
-		Posts []post `drop_rel:"posts"`
+		Posts []post `dropRel:"posts"`
 	}
 
 	users := pg.NewTable("users")

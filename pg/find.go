@@ -370,7 +370,7 @@ func (f *FindBuilder) loadRelation(
 	}
 	relField, ok := relationTargetField(parentType, rel.Name)
 	if !ok {
-		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged drop_rel:%q (or matching name)",
+		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged dropRel:%q (or matching name)",
 			rel.Name, rel.Name)
 	}
 	relFieldType := parentType.FieldByIndex(relField).Type
@@ -498,7 +498,7 @@ func (f *FindBuilder) loadManyToMany(
 	}
 	relField, ok := relationTargetField(parentType, rel.Name)
 	if !ok {
-		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged drop_rel:%q (or matching name)",
+		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged dropRel:%q (or matching name)",
 			rel.Name, rel.Name)
 	}
 	relFieldType := parentType.FieldByIndex(relField).Type
@@ -756,7 +756,7 @@ func relationKeyField(structT reflect.Type, col *Column) ([]int, bool) {
 }
 
 // relationTargetField returns the index path of the struct field that
-// receives the relation. Lookup order: drop_rel:"<name>" tag, then a
+// receives the relation. Lookup order: dropRel:"<name>" tag, then a
 // case-insensitive name match.
 func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 	var found []int
@@ -769,7 +769,7 @@ func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 				continue
 			}
 			idx := append(append([]int(nil), prefix...), i)
-			if tag := f.Tag.Get("drop_rel"); tag == name {
+			if tag := f.Tag.Get("dropRel"); tag == name {
 				found = idx
 				return
 			}
@@ -818,7 +818,7 @@ func (f *FindBuilder) loadMorphTo(
 	}
 	relField, ok := relationTargetField(parentType, rel.Name)
 	if !ok {
-		return none, nil, fmt.Errorf("drops/pg: relation %q: struct has no field tagged drop_rel:%q (or matching name)",
+		return none, nil, fmt.Errorf("drops/pg: relation %q: struct has no field tagged dropRel:%q (or matching name)",
 			rel.Name, rel.Name)
 	}
 	relFieldType := parentType.FieldByIndex(relField).Type

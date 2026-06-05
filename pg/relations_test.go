@@ -91,7 +91,7 @@ func (t *fakeTx) Rollback(_ context.Context) error { return nil }
 type relUser struct {
 	ID    int64
 	Name  string
-	Posts []relPost `drop_rel:"posts"`
+	Posts []relPost `dropRel:"posts"`
 }
 
 type relPost struct {
@@ -104,7 +104,7 @@ type relPostWithAuthor struct {
 	ID     int64
 	UserID int64 `drop:"user_id"`
 	Title  string
-	Author *relUser `drop_rel:"author"`
+	Author *relUser `dropRel:"author"`
 }
 
 func mkRelSchema() (*pg.Table, *pg.Table, *pg.Col[int64], *pg.Col[int64]) {
@@ -225,7 +225,7 @@ type m2mGroup struct {
 type m2mUser struct {
 	ID     int64
 	Name   string
-	Groups []m2mGroup `drop_rel:"groups"`
+	Groups []m2mGroup `dropRel:"groups"`
 }
 
 func TestFindManyToMany(t *testing.T) {
@@ -323,14 +323,14 @@ func TestFindUnknownRelation(t *testing.T) {
 type nestUser struct {
 	ID    int64
 	Name  string
-	Posts []nestPost `drop_rel:"posts"`
+	Posts []nestPost `dropRel:"posts"`
 }
 
 type nestPost struct {
 	ID       int64
 	UserID   int64 `drop:"user_id"`
 	Title    string
-	Comments []nestComment `drop_rel:"comments"`
+	Comments []nestComment `dropRel:"comments"`
 }
 
 type nestComment struct {
@@ -343,7 +343,7 @@ type nestPostWithAuthor struct {
 	ID     int64
 	UserID int64 `drop:"user_id"`
 	Title  string
-	Author *nestUser `drop_rel:"author"`
+	Author *nestUser `dropRel:"author"`
 }
 
 func mkNestSchema() (users, posts, comments *pg.Table) {
@@ -554,7 +554,7 @@ func TestFindInvalidRelationPath(t *testing.T) {
 type filterUser struct {
 	ID    int64
 	Name  string
-	Posts []filterPost `drop_rel:"posts"`
+	Posts []filterPost `dropRel:"posts"`
 }
 
 type filterPost struct {

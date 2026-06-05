@@ -319,6 +319,99 @@ func (e *Entity[T]) scanAllFast(db *DB, ctx context.Context, sel *SelectBuilder,
 	return rows.Err()
 }
 
+// CreateMany INSERTs every row in rs in a single statement. Compared
+// to looping over Create, this batches the round-trip cost — large
+// payloads stay one network hop. RETURNING is not used (refreshing N
+// rows is rarely what callers want), so generated PKs and
+// hook-supplied values do not flow back into rs; use Create when you
+// need the post-INSERT row.
+func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
+	if len(rs) == 0 {
+		return nil, ErrNoRowsToInsert
+	}
+	for i := range rs {
+		if err := e.runValidators(&rs[i]); err != nil {
+			return nil, err
+		}
+	}
+	ins := db.Insert(e.table)
+	for i := range rs {
+		v := reflect.ValueOf(&rs[i]).Elem()
+		ins.Row(e.collectInsertBindings(v)...)
+	}
+	return ins.Exec(ctx)
+}
+
+// UpsertMany INSERTs rs and, on PK conflict, updates every non-PK
+// column with the new row's value (ON CONFLICT (pk) DO UPDATE SET
+// col = EXCLUDED.col). Returns the underlying Result so callers can
+// inspect rows-affected; row values are not refreshed.
+//
+// Useful for idempotent ingestion: the same set of rows can be
+// replayed safely without producing duplicates.
+func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
+	if len(rs) == 0 {
+		return nil, ErrNoRowsToInsert
+	}
+	for i := range rs {
+		if err := e.runValidators(&rs[i]); err != nil {
+			return nil, err
+		}
+	}
+	ins := db.Insert(e.table)
+	for i := range rs {
+		v := reflect.ValueOf(&rs[i]).Elem()
+		ins.Row(e.collectInsertBindings(v)...)
+	}
+	cu := ins.OnConflictUpdate(e.pk)
+	for _, cf := range e.colFields {
+		if cf.col == e.pk {
+			continue
+		}
+		cu = cu.Set(&exprBinding{col: cf.col, expr: Excluded(cf.col)})
+	}
+	return cu.Done().Exec(ctx)
+}
+
+// Stream iterates the matching rows one at a time, invoking fn for
+// each. Memory stays bounded — Stream never buffers the full result
+// set — which matters for batch jobs and exports. Returning an error
+// from fn aborts the iteration and propagates the error to the
+// caller. Eager-loaded relations are not supported in Stream
+// (relation loaders need the populated parent slice).
+func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
+	if q.fb.HasEagerLoads() {
+		return errors.New("drops/pg: Stream is incompatible with eager-loaded relations; use Query.All instead")
+	}
+	rows, err := q.fb.Select().Rows(ctx)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	var sample T
+	fields := fieldMap(reflect.TypeOf(sample))
+	for rows.Next() {
+		var t T
+		if q.e.fastScan != nil {
+			if err := q.e.fastScan(rows, &t); err != nil {
+				return err
+			}
+		} else {
+			if err := scanRowInto(rows, reflect.ValueOf(&t).Elem(), cols, fields); err != nil {
+				return err
+			}
+		}
+		if err := fn(&t); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // Create INSERTs r and refreshes it from the RETURNING row — useful
 // for picking up generated PKs, server-side defaults, and hook-added
 // values (e.g. createdAt = now()).

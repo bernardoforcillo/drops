@@ -49,4 +49,11 @@
 // a working ORM falls out of one declaration:
 //
 //	var UserEntity = pg.NewAutoEntity[User]("users")
+//
+// Entity.WithCache plugs in a drops/cache backend so Get /
+// EntityQuery.All / EntityQuery.One are read-through and Create /
+// Update / Save / Delete are write-invalidate. A built-in
+// single-flight group dedupes concurrent identical PK misses so a
+// thundering herd resolves to one DB query. Query results are keyed
+// by sha256(SQL+args) and rely on the cache's TTL for freshness.
 package pg

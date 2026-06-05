@@ -58,6 +58,13 @@ type Entity[T any] struct {
 	// When set, the SELECT executors (Get / Query.All / Query.One)
 	// skip the reflection path entirely.
 	fastScan func(Scanner, *T) error
+
+	// cache, when set via WithCache, makes Get / Query.All /
+	// Query.One read-through and Update / Save / Delete
+	// write-invalidate. Provides single-flight protection for the
+	// PK-by-cache-miss path so a thundering herd resolves to one DB
+	// query.
+	cache *EntityCache
 }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
@@ -223,7 +230,14 @@ var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock vers
 
 // Get fetches the row whose primary key equals id. Returns ErrNoRows
 // if no row matches.
+//
+// When a cache is attached via WithCache, Get serves hits from the
+// cache and dedupes concurrent cache misses via single-flight so a
+// thundering herd resolves to one DB query.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
+	if e.cache != nil {
+		return e.getCached(db, ctx, id)
+	}
 	var out T
 	if e.fastScan != nil {
 		err := e.scanOneFast(db, ctx, db.Select().From(e.table).Where(Eq(e.pk, id)), &out)
@@ -231,6 +245,41 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 	}
 	err := db.Find(e.table).Where(Eq(e.pk, id)).One(ctx, &out)
 	return out, err
+}
+
+// getCached is the cache-aware implementation of Get.
+func (e *Entity[T]) getCached(db *DB, ctx context.Context, id any) (T, error) {
+	var out T
+	key := e.pkKey(id)
+
+	// 1. Cache lookup.
+	if hit, err := e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	// 2. Single-flight to dedupe concurrent misses on the same key.
+	v, err := e.cache.sf.do(key, func() (any, error) {
+		// Re-check the cache: another caller may have populated it
+		// while we were queued.
+		var t T
+		if hit, err := e.cache.readPK(ctx, key, &t); err == nil && hit {
+			return t, nil
+		}
+		var err error
+		if e.fastScan != nil {
+			err = e.scanOneFast(db, ctx, db.Select().From(e.table).Where(Eq(e.pk, id)), &t)
+		} else {
+			err = db.Find(e.table).Where(Eq(e.pk, id)).One(ctx, &t)
+		}
+		if err != nil {
+			return t, err
+		}
+		_ = e.cache.writeKey(ctx, key, t)
+		return t, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.(T), nil
 }
 
 // scanOneFast runs sel and decodes the first row via fastScan.
@@ -292,7 +341,16 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	for _, c := range e.table.Columns() {
 		ins.Returning(c)
 	}
-	return ins.One(ctx, r)
+	if err := ins.One(ctx, r); err != nil {
+		return err
+	}
+	if e.cache != nil {
+		// Populate the PK cache with the freshly-inserted row so the
+		// next Get hits immediately.
+		pkv := reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
+		_ = e.cache.writeKey(ctx, e.pkKey(pkv), *r)
+	}
+	return nil
 }
 
 // Update writes r's current field values to the row whose PK equals
@@ -355,6 +413,11 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if err == ErrNoRows && e.versionCol != nil {
 		return ErrStaleObject
 	}
+	if err == nil && e.cache != nil {
+		// Refresh the cached entry with the post-RETURNING values.
+		pkv := reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
+		_ = e.cache.writeKey(ctx, e.pkKey(pkv), *r)
+	}
 	return err
 }
 
@@ -376,7 +439,11 @@ func (e *Entity[T]) Save(db *DB, ctx context.Context, r *T) error {
 // DeleteHooks (e.g. SoftDelete) fire normally — so on a soft-deleted
 // table this rewrites to UPDATE deletedAt = now() instead.
 func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, error) {
-	return db.Delete(e.table).Where(Eq(e.pk, id)).Exec(ctx)
+	res, err := db.Delete(e.table).Where(Eq(e.pk, id)).Exec(ctx)
+	if err == nil {
+		e.invalidatePK(ctx, id)
+	}
+	return res, err
 }
 
 // collectInsertBindings extracts column values from r. Columns whose
@@ -464,9 +531,13 @@ func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 
 // All executes the query and returns the matching rows as a typed
 // slice. Uses the fast-scan path (zero reflection) when available
-// and no eager-loaded relations are queued — relation loaders rely
-// on the reflection-populated slice.
+// and no eager-loaded relations are queued. When the entity has a
+// cache attached and the query has no eager-loaded relations, the
+// result is cached under sha256(SQL+args) with the cache's TTL.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
+	if q.cacheable() {
+		return q.allCached(ctx)
+	}
 	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
 		var out []T
 		err := q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &out)
@@ -478,8 +549,12 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 }
 
 // One executes the query and returns the first matching row. Returns
-// ErrNoRows if the query produces no rows.
+// ErrNoRows if the query produces no rows. Honours the entity cache
+// the same way All does.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
+	if q.cacheable() {
+		return q.oneCached(ctx)
+	}
 	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
 		var out T
 		err := q.e.scanOneFast(q.fb.db, ctx, q.fb.Select(), &out)
@@ -488,4 +563,73 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	var out T
 	err := q.fb.One(ctx, &out)
 	return out, err
+}
+
+// cacheable reports whether this query can be served from cache —
+// the entity must have a cache, and the query must not pull in
+// eager-loaded relations (those need the reflection-populated slice
+// for stitching).
+func (q *EntityQuery[T]) cacheable() bool {
+	return q.e.cache != nil && !q.fb.HasEagerLoads()
+}
+
+func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
+	sql, args := q.fb.Select().ToSQL()
+	key := queryKey(q.e.table.Name(), sql, args)
+	var out []T
+	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := q.e.cache.sf.do(key, func() (any, error) {
+		var hits []T
+		if hit, err := q.e.cache.readPK(ctx, key, &hits); err == nil && hit {
+			return hits, nil
+		}
+		var rs []T
+		var rerr error
+		if q.e.fastScan != nil {
+			rerr = q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &rs)
+		} else {
+			rerr = q.fb.All(ctx, &rs)
+		}
+		if rerr != nil {
+			return rs, rerr
+		}
+		_ = q.e.cache.writeKey(ctx, key, rs)
+		return rs, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.([]T), nil
+}
+
+func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
+	sql, args := q.fb.Select().ToSQL()
+	key := queryKey(q.e.table.Name(), sql, args) + ":one"
+	var out T
+	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := q.e.cache.sf.do(key, func() (any, error) {
+		var t T
+		if hit, err := q.e.cache.readPK(ctx, key, &t); err == nil && hit {
+			return t, nil
+		}
+		var rerr error
+		if q.e.fastScan != nil {
+			rerr = q.e.scanOneFast(q.fb.db, ctx, q.fb.Select(), &t)
+		} else {
+			rerr = q.fb.One(ctx, &t)
+		}
+		if rerr != nil {
+			return t, rerr
+		}
+		_ = q.e.cache.writeKey(ctx, key, t)
+		return t, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.(T), nil
 }

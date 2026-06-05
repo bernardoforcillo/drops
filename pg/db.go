@@ -161,6 +161,7 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
 	start := time.Now()
 	res, err := db.drv.Exec(ctx, sql, args...)
+	err = classifyError(err)
 	db.emit(ctx, drops.QueryEvent{
 		Kind: "exec", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,
@@ -172,6 +173,7 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
 	start := time.Now()
 	rows, err := db.drv.Query(ctx, sql, args...)
+	err = classifyError(err)
 	db.emit(ctx, drops.QueryEvent{
 		Kind: "query", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,

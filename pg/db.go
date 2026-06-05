@@ -27,6 +27,7 @@ type DB struct {
 	drv    drops.Driver
 	hook   drops.Hook
 	tracer Tracer
+	retry  *RetryPolicy
 }
 
 // New wraps a drops.Driver as a DB.
@@ -95,8 +96,41 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 // and rollback alongside the ordinary exec/query events fn produces.
 //
 // Rollback uses a detached context with a short timeout so a cancelled
-// or expired caller-ctx doesn't prevent cleanup.
-func (db *DB) InTx(ctx context.Context, fn func(*DB) error) (err error) {
+// or expired caller-ctx doesn't prevent cleanup. When a RetryPolicy is
+// installed via WithRetry, transient failures (those the policy marks
+// retryable) cause the transaction to be re-opened and fn re-run, up
+// to MaxAttempts times.
+func (db *DB) InTx(ctx context.Context, fn func(*DB) error) error {
+	if db.retry == nil {
+		return db.inTxOnce(ctx, fn)
+	}
+	policy := *db.retry
+	var lastErr error
+	for attempt := 1; attempt <= policy.attempts(); attempt++ {
+		if attempt > 1 && policy.Backoff != nil {
+			if cerr := retrySleep(ctx, policy.Backoff(attempt-1)); cerr != nil {
+				return cerr
+			}
+		}
+		err := db.inTxOnce(ctx, fn)
+		if err == nil {
+			return nil
+		}
+		if !policy.shouldRetry(err) {
+			return err
+		}
+		lastErr = err
+		// Bail out early if the context expired between attempts.
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+	}
+	return lastErr
+}
+
+// inTxOnce runs fn inside a single transaction without any retry
+// logic. Used by InTx — extracted so the retry loop stays readable.
+func (db *DB) inTxOnce(ctx context.Context, fn func(*DB) error) (err error) {
 	bstart := time.Now()
 	tx, berr := db.drv.Begin(ctx)
 	db.emit(ctx, drops.QueryEvent{Kind: "begin", Duration: time.Since(bstart), Err: berr})

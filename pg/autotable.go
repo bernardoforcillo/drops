@@ -13,6 +13,9 @@ import (
 // regardless of T because the on-wire form is encrypted bytes.
 const secretTypePrefix = "Secret["
 
+// moneyTypeName is the exact reflection name of pg.Money.
+const moneyTypeName = "Money"
+
 // secretPkgPath is the package path drops/pg uses for Secret[T].
 // We match both name and package path so a user's own Secret type
 // in a different package doesn't accidentally trigger the bytea
@@ -181,6 +184,12 @@ func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Co
 		applyAutoOpts(c, opts)
 		return c
 	}
+	// pg.Money stores as bigint (minor units).
+	if isMoneyType(ft) {
+		c := &Column{name: opts.Name, typ: simpleType("bigint")}
+		applyAutoOpts(c, opts)
+		return c
+	}
 	ct := autoColumnType(structName, f.Name, ft, opts.AutoInc)
 	c := &Column{name: opts.Name, typ: ct}
 	applyAutoOpts(c, opts)
@@ -219,6 +228,15 @@ func isSecretType(ft reflect.Type) bool {
 		return false
 	}
 	return strings.HasPrefix(ft.Name(), secretTypePrefix) && ft.PkgPath() == secretPkgPath
+}
+
+// isMoneyType reports whether ft is pg.Money. Same name+pkgpath
+// guard as isSecretType.
+func isMoneyType(ft reflect.Type) bool {
+	if ft.Kind() != reflect.Struct {
+		return false
+	}
+	return ft.Name() == moneyTypeName && ft.PkgPath() == secretPkgPath
 }
 
 // autoColumnType maps a Go type to a ColumnType. autoIncrement

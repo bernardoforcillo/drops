@@ -17,6 +17,20 @@ type Table struct {
 	// you want both at once.
 	indexes []*Index
 
+	// compositePK, when non-empty, is the table's PRIMARY KEY when
+	// it spans multiple columns. Single-column PKs continue to
+	// live on the column (via *Col[T].PrimaryKey()).
+	compositePK []*Column
+
+	// compositeUniques are multi-column UNIQUE constraints, keyed
+	// by name so diffs are stable. Single-column uniques continue
+	// to live on the column (via *Col[T].Unique()).
+	compositeUniques map[string][]*Column
+
+	// checks are CHECK constraints, keyed by name. The value is
+	// the raw SQL expression (e.g. "age >= 0").
+	checks map[string]string
+
 	// insertHooks / updateHooks / deleteHooks are the optional
 	// lifecycle hooks registered on this table. They are invoked by
 	// the corresponding builders during WriteSQL. Empty by default —
@@ -141,6 +155,54 @@ func (t *Table) AddIndex(idx *Index) *Table {
 
 // Indexes returns the indexes registered with AddIndex.
 func (t *Table) Indexes() []*Index { return t.indexes }
+
+// PrimaryKey declares a composite PRIMARY KEY spanning cols. Call
+// only when the PK has more than one column; single-column PKs
+// continue to be declared on the column via *Col[T].PrimaryKey().
+func (t *Table) PrimaryKey(cols ...ColRef) *Table {
+	t.compositePK = make([]*Column, len(cols))
+	for i, c := range cols {
+		t.compositePK[i] = c.col()
+	}
+	return t
+}
+
+// CompositePrimaryKey returns the composite PK columns, or nil
+// when the table uses a single-column PK (or none).
+func (t *Table) CompositePrimaryKey() []*Column { return t.compositePK }
+
+// AddUnique declares a multi-column UNIQUE constraint named name
+// spanning cols. Single-column uniques continue to live on the
+// column via *Col[T].Unique().
+func (t *Table) AddUnique(name string, cols ...ColRef) *Table {
+	if t.compositeUniques == nil {
+		t.compositeUniques = map[string][]*Column{}
+	}
+	out := make([]*Column, len(cols))
+	for i, c := range cols {
+		out[i] = c.col()
+	}
+	t.compositeUniques[name] = out
+	return t
+}
+
+// CompositeUniques returns the table's multi-column unique
+// constraints.
+func (t *Table) CompositeUniques() map[string][]*Column { return t.compositeUniques }
+
+// AddCheck declares a CHECK constraint with the given name. expr
+// is the raw SQL expression after CHECK (...), e.g.
+// "age >= 0 AND age < 200".
+func (t *Table) AddCheck(name, expr string) *Table {
+	if t.checks == nil {
+		t.checks = map[string]string{}
+	}
+	t.checks[name] = expr
+	return t
+}
+
+// Checks returns the registered CHECK constraints.
+func (t *Table) Checks() map[string]string { return t.checks }
 
 // hasHooks reports whether the table has any lifecycle hooks
 // registered — used by builders to skip the hook pipeline when

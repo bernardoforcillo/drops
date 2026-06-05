@@ -64,14 +64,29 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 		}
 	}
 	for _, key := range sortedKeys(cur.Tables) {
+		curT := cur.Tables[key]
 		prevT, exists := prev.Tables[key]
 		if !exists {
+			// New table: only emit composite PKs and CHECK
+			// constraints here (columns + inline UNIQUE were
+			// rendered by createTableSQL above).
+			empty := &TableSnapshot{
+				CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
+				CheckConstraints:     map[string]*CheckSnapshot{},
+			}
+			out = append(out, diffCompositePKs(empty, curT, opt.Safe)...)
+			out = append(out, diffChecks(empty, curT, opt.Safe)...)
 			continue
 		}
-		curT := cur.Tables[key]
 		out = append(out, diffColumns(prevT, curT, opt.Safe)...)
 		out = append(out, diffUniques(prevT, curT, opt.Safe)...)
+		out = append(out, diffCompositePKs(prevT, curT, opt.Safe)...)
+		out = append(out, diffChecks(prevT, curT, opt.Safe)...)
 	}
+	// Foreign keys: emitted after CREATE TABLE / column changes
+	// so target columns exist; emitted before indexes so the
+	// supporting unique constraint is in place if a FK depends on
+	// it.
 	for _, key := range sortedKeys(cur.Tables) {
 		curT := cur.Tables[key]
 		prevT, exists := prev.Tables[key]
@@ -79,6 +94,15 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 			prevT = &TableSnapshot{ForeignKeys: map[string]*ForeignKeySnapshot{}}
 		}
 		out = append(out, diffForeignKeys(prevT, curT, opt.Safe)...)
+	}
+	// Indexes after FKs so dependency order is consistent.
+	for _, key := range sortedKeys(cur.Tables) {
+		curT := cur.Tables[key]
+		prevT, exists := prev.Tables[key]
+		if !exists {
+			prevT = &TableSnapshot{Indexes: map[string]*IndexSnapshot{}}
+		}
+		out = append(out, diffIndexes(prevT, curT, opt.Safe)...)
 	}
 
 	return out
@@ -245,6 +269,138 @@ func quoteIdents(names []string) []string {
 		out[i] = `"` + n + `"`
 	}
 	return out
+}
+
+// diffIndexes emits CREATE INDEX / DROP INDEX for indexes that
+// were added or removed between prev and cur. Index changes are
+// not "modified in place" — they are dropped and recreated when
+// any structural field differs.
+func diffIndexes(prev, cur *TableSnapshot, safe bool) []string {
+	var out []string
+	for _, k := range sortedKeys(prev.Indexes) {
+		curIdx, present := cur.Indexes[k]
+		prevIdx := prev.Indexes[k]
+		if !present {
+			out = append(out, dropIndexSQL(k, safe))
+			continue
+		}
+		// Drop-and-recreate when shape changed.
+		if !indexEqual(prevIdx, curIdx) {
+			out = append(out, dropIndexSQL(k, safe))
+		}
+	}
+	for _, k := range sortedKeys(cur.Indexes) {
+		curIdx := cur.Indexes[k]
+		prevIdx, present := prev.Indexes[k]
+		if !present {
+			out = append(out, createIndexSQL(cur.Name, curIdx, safe))
+			continue
+		}
+		if !indexEqual(prevIdx, curIdx) {
+			out = append(out, createIndexSQL(cur.Name, curIdx, safe))
+		}
+	}
+	return out
+}
+
+// diffCompositePKs emits ALTER TABLE ADD/DROP PRIMARY KEY.
+// Single-column PKs continue to live on the column definition
+// and are handled by the column diff.
+func diffCompositePKs(prev, cur *TableSnapshot, safe bool) []string {
+	var out []string
+	for _, k := range sortedKeys(prev.CompositePrimaryKeys) {
+		if _, ok := cur.CompositePrimaryKeys[k]; !ok {
+			out = append(out, dropConstraintSQL(cur.Name, k, safe))
+		}
+	}
+	for _, k := range sortedKeys(cur.CompositePrimaryKeys) {
+		if _, ok := prev.CompositePrimaryKeys[k]; ok {
+			continue
+		}
+		pk := cur.CompositePrimaryKeys[k]
+		cols := strings.Join(quoteIdents(pk.Columns), ", ")
+		out = append(out, fmt.Sprintf(
+			`ALTER TABLE "%s" ADD CONSTRAINT "%s" PRIMARY KEY (%s);`,
+			cur.Name, pk.Name, cols))
+	}
+	return out
+}
+
+// diffChecks emits ALTER TABLE ADD/DROP CONSTRAINT for CHECK
+// constraints.
+func diffChecks(prev, cur *TableSnapshot, safe bool) []string {
+	var out []string
+	for _, k := range sortedKeys(prev.CheckConstraints) {
+		if _, ok := cur.CheckConstraints[k]; !ok {
+			out = append(out, dropConstraintSQL(cur.Name, k, safe))
+		}
+	}
+	for _, k := range sortedKeys(cur.CheckConstraints) {
+		if _, ok := prev.CheckConstraints[k]; ok {
+			continue
+		}
+		c := cur.CheckConstraints[k]
+		out = append(out, fmt.Sprintf(
+			`ALTER TABLE "%s" ADD CONSTRAINT "%s" CHECK (%s);`,
+			cur.Name, c.Name, c.Value))
+	}
+	return out
+}
+
+// createIndexSQL renders a CREATE INDEX statement from a snapshot.
+func createIndexSQL(table string, idx *IndexSnapshot, safe bool) string {
+	var b strings.Builder
+	b.WriteString("CREATE ")
+	if idx.IsUnique {
+		b.WriteString("UNIQUE ")
+	}
+	b.WriteString("INDEX ")
+	if idx.Concurrently {
+		b.WriteString("CONCURRENTLY ")
+	}
+	if safe {
+		b.WriteString("IF NOT EXISTS ")
+	}
+	fmt.Fprintf(&b, `"%s" ON "%s"`, idx.Name, table)
+	if idx.Method != "" && idx.Method != "btree" {
+		fmt.Fprintf(&b, " USING %s", idx.Method)
+	}
+	b.WriteString(" (")
+	b.WriteString(strings.Join(quoteIdents(idx.Columns), ", "))
+	b.WriteByte(')')
+	if idx.Where != "" {
+		fmt.Fprintf(&b, " WHERE %s", idx.Where)
+	}
+	b.WriteByte(';')
+	return b.String()
+}
+
+// dropIndexSQL renders DROP INDEX [IF EXISTS] "name".
+func dropIndexSQL(name string, safe bool) string {
+	if safe {
+		return fmt.Sprintf(`DROP INDEX IF EXISTS "%s";`, name)
+	}
+	return fmt.Sprintf(`DROP INDEX "%s";`, name)
+}
+
+// indexEqual reports whether two index snapshots describe the
+// same logical index.
+func indexEqual(a, b *IndexSnapshot) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.IsUnique != b.IsUnique || a.Method != b.Method || a.Where != b.Where || a.Concurrently != b.Concurrently {
+		return false
+	}
+	if len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	for i := range a.Columns {
+		if a.Columns[i] != b.Columns[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sameStringPtr(a, b *string) bool {

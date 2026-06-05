@@ -36,16 +36,42 @@ type SnapshotMeta struct {
 
 // TableSnapshot is one entry in Snapshot.Tables.
 type TableSnapshot struct {
-	Name                 string                         `json:"name"`
-	Schema               string                         `json:"schema"`
-	Columns              map[string]*ColumnSnapshot     `json:"columns"`
-	Indexes              map[string]any                 `json:"indexes"`
-	ForeignKeys          map[string]*ForeignKeySnapshot `json:"foreignKeys"`
-	CompositePrimaryKeys map[string]any                 `json:"compositePrimaryKeys"`
-	UniqueConstraints    map[string]*UniqueSnapshot     `json:"uniqueConstraints"`
-	Policies             map[string]any                 `json:"policies"`
-	CheckConstraints     map[string]any                 `json:"checkConstraints"`
-	IsRLSEnabled         bool                           `json:"isRLSEnabled"`
+	Name                 string                              `json:"name"`
+	Schema               string                              `json:"schema"`
+	Columns              map[string]*ColumnSnapshot          `json:"columns"`
+	Indexes              map[string]*IndexSnapshot           `json:"indexes"`
+	ForeignKeys          map[string]*ForeignKeySnapshot      `json:"foreignKeys"`
+	CompositePrimaryKeys map[string]*CompositePKSnapshot     `json:"compositePrimaryKeys"`
+	UniqueConstraints    map[string]*UniqueSnapshot          `json:"uniqueConstraints"`
+	Policies             map[string]any                      `json:"policies"`
+	CheckConstraints     map[string]*CheckSnapshot           `json:"checkConstraints"`
+	IsRLSEnabled         bool                                `json:"isRLSEnabled"`
+}
+
+// IndexSnapshot is one entry in TableSnapshot.Indexes. JSON keys
+// follow drizzle-kit's v7 PostgreSQL schema.
+type IndexSnapshot struct {
+	Name             string   `json:"name"`
+	Columns          []string `json:"columns"`
+	IsUnique         bool     `json:"isUnique"`
+	Where            string   `json:"where"`
+	With             map[string]any `json:"with"`
+	Method           string   `json:"method"`
+	Concurrently     bool     `json:"concurrently"`
+	NullsNotDistinct bool     `json:"nullsNotDistinct"`
+}
+
+// CompositePKSnapshot is one entry in TableSnapshot.CompositePrimaryKeys.
+type CompositePKSnapshot struct {
+	Name    string   `json:"name"`
+	Columns []string `json:"columns"`
+}
+
+// CheckSnapshot is one entry in TableSnapshot.CheckConstraints.
+// Value is the SQL expression after CHECK (...).
+type CheckSnapshot struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // ColumnSnapshot is one entry in TableSnapshot.Columns.
@@ -109,13 +135,42 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			Name:                 t.Name(),
 			Schema:               t.Schema(),
 			Columns:              map[string]*ColumnSnapshot{},
-			Indexes:              map[string]any{},
+			Indexes:              map[string]*IndexSnapshot{},
 			ForeignKeys:          map[string]*ForeignKeySnapshot{},
-			CompositePrimaryKeys: map[string]any{},
+			CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
 			Policies:             map[string]any{},
-			CheckConstraints:     map[string]any{},
+			CheckConstraints:     map[string]*CheckSnapshot{},
 			IsRLSEnabled:         false,
+		}
+		// Composite primary key.
+		if pk := t.CompositePrimaryKey(); len(pk) > 0 {
+			cols := make([]string, len(pk))
+			for i, c := range pk {
+				cols[i] = c.Name()
+			}
+			name := compositePKName(t.Name(), cols)
+			ts.CompositePrimaryKeys[name] = &CompositePKSnapshot{
+				Name: name, Columns: cols,
+			}
+		}
+		// Composite uniques registered via Table.AddUnique.
+		for name, cols := range t.CompositeUniques() {
+			names := make([]string, len(cols))
+			for i, c := range cols {
+				names[i] = c.Name()
+			}
+			ts.UniqueConstraints[name] = &UniqueSnapshot{
+				Name: name, Columns: names,
+			}
+		}
+		// CHECK constraints.
+		for name, expr := range t.Checks() {
+			ts.CheckConstraints[name] = &CheckSnapshot{Name: name, Value: expr}
+		}
+		// Indexes.
+		for _, idx := range t.Indexes() {
+			ts.Indexes[idx.Name()] = indexSnapshotOf(idx)
 		}
 		for _, c := range t.Columns() {
 			cs := &ColumnSnapshot{
@@ -200,16 +255,16 @@ func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
 			t.UniqueConstraints = map[string]*UniqueSnapshot{}
 		}
 		if t.Indexes == nil {
-			t.Indexes = map[string]any{}
+			t.Indexes = map[string]*IndexSnapshot{}
 		}
 		if t.CompositePrimaryKeys == nil {
-			t.CompositePrimaryKeys = map[string]any{}
+			t.CompositePrimaryKeys = map[string]*CompositePKSnapshot{}
 		}
 		if t.Policies == nil {
 			t.Policies = map[string]any{}
 		}
 		if t.CheckConstraints == nil {
-			t.CheckConstraints = map[string]any{}
+			t.CheckConstraints = map[string]*CheckSnapshot{}
 		}
 	}
 	return &s, nil
@@ -243,6 +298,47 @@ func uniqueName(table string, cols []string) string {
 	}
 	out += "Unique"
 	return out
+}
+
+// compositePKName builds the composite-primary-key constraint
+// name in camelCase: <table><Col...>Pk.
+func compositePKName(table string, cols []string) string {
+	out := table
+	for _, c := range cols {
+		out += titleCaseFirst(c)
+	}
+	out += "Pk"
+	return out
+}
+
+// indexSnapshotOf extracts the snapshot form of an *Index. Only
+// the well-known shape (simple column refs, btree default) is
+// captured cleanly; functional or expression indexes pass through
+// as empty Columns and the original DDL is recoverable from the
+// schema-level renderer rather than the snapshot.
+func indexSnapshotOf(idx *Index) *IndexSnapshot {
+	is := &IndexSnapshot{
+		Name:         idx.Name(),
+		IsUnique:     idx.unique,
+		Method:       idx.method,
+		Concurrently: idx.concurrently,
+		With:         map[string]any{},
+	}
+	if is.Method == "" {
+		is.Method = "btree"
+	}
+	for _, expr := range idx.columns {
+		if c, ok := expr.(*Column); ok {
+			is.Columns = append(is.Columns, c.Name())
+			continue
+		}
+		// Try to recognise a *Col[T] via the ColRef interface.
+		if cr, ok := expr.(ColRef); ok {
+			is.Columns = append(is.Columns, cr.col().Name())
+			continue
+		}
+	}
+	return is
 }
 
 // titleCaseFirst uppercases the first byte of s. Used to title-case

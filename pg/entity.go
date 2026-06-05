@@ -65,6 +65,11 @@ type Entity[T any] struct {
 	// PK-by-cache-miss path so a thundering herd resolves to one DB
 	// query.
 	cache *EntityCache
+
+	// budget, when configured via WithBudget, caps the cost of each
+	// Entity operation (max args, max rows, max duration). The zero
+	// Budget disables every limit.
+	budget Budget
 }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
@@ -235,6 +240,8 @@ var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock vers
 // cache and dedupes concurrent cache misses via single-flight so a
 // thundering herd resolves to one DB query.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
+	ctx, cancel := e.budgetCtx(ctx)
+	defer cancel()
 	if e.cache != nil {
 		return e.getCached(db, ctx, id)
 	}
@@ -628,6 +635,19 @@ func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 // cache attached and the query has no eager-loaded relations, the
 // result is cached under sha256(SQL+args) with the cache's TTL.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
+	ctx, cancel := q.e.budgetCtx(ctx)
+	defer cancel()
+	if q.e.budget.MaxRows > 0 {
+		// Apply the row-cap LIMIT before rendering. Honour the
+		// user's tighter Limit by leaving it alone.
+		applyBudgetLimit(q.fb.Select(), q.e.budget.MaxRows)
+	}
+	if q.e.budget.MaxArgs > 0 {
+		_, args := q.fb.Select().ToSQL()
+		if err := q.e.checkArgs(args); err != nil {
+			return nil, err
+		}
+	}
 	if q.cacheable() {
 		return q.allCached(ctx)
 	}
@@ -645,6 +665,8 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 // ErrNoRows if the query produces no rows. Honours the entity cache
 // the same way All does.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
+	ctx, cancel := q.e.budgetCtx(ctx)
+	defer cancel()
 	if q.cacheable() {
 		return q.oneCached(ctx)
 	}

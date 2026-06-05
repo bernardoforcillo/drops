@@ -128,6 +128,17 @@ func (s *SelectBuilder) OrderBy(exprs ...drops.Expression) *SelectBuilder {
 // Limit sets the LIMIT.
 func (s *SelectBuilder) Limit(n int64) *SelectBuilder { s.limit = &n; return s }
 
+// applyLimitCap installs cap as the LIMIT unless an explicit Limit
+// has already been set to something tighter. Used by Entity.Budget
+// to bound result sets without overriding the caller's narrower
+// LIMIT.
+func (s *SelectBuilder) applyLimitCap(cap int64) {
+	if s.limit == nil || *s.limit > cap {
+		v := cap
+		s.limit = &v
+	}
+}
+
 // Offset sets the OFFSET.
 func (s *SelectBuilder) Offset(n int64) *SelectBuilder { s.offset = &n; return s }
 

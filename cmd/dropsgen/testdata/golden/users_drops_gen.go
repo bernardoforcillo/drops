@@ -2,7 +2,7 @@
 
 package models
 
-import "github.com/bernardoforcillo/drops"
+import "github.com/bernardoforcillo/drops/pg"
 
 // User bindings ----------------------------------------------------
 
@@ -26,16 +26,25 @@ func BindUser(r *User) []any {
 	}
 }
 
-// ScanUser scans one row from rows into dest. The row's
-// column order must match ColsUser(); use a SELECT that
-// lists the columns explicitly via ColsUser() to keep
-// them aligned.
-func ScanUser(rows drops.Rows, dest *User) error {
+// ScanUser scans one row into dest. The row's column
+// order must match ColsUser(); use a SELECT that lists
+// the columns explicitly via ColsUser() to keep them
+// aligned.
+func ScanUser(rows pg.Scanner, dest *User) error {
 	return rows.Scan(
 		&dest.ID,
 		&dest.Name,
 		&dest.Email,
 	)
+}
+
+// RegisterUser wires the zero-reflection scanner into e
+// so Entity.Get / EntityQuery.All / EntityQuery.One take the
+// fastpath. Call once at init():
+//
+//	func init() { RegisterUser(UsersEntity) }
+func RegisterUser(e *pg.Entity[User]) *pg.Entity[User] {
+	return e.SetFastScan(ScanUser)
 }
 
 // Post bindings ----------------------------------------------------
@@ -60,14 +69,23 @@ func BindPost(r *Post) []any {
 	}
 }
 
-// ScanPost scans one row from rows into dest. The row's
-// column order must match ColsPost(); use a SELECT that
-// lists the columns explicitly via ColsPost() to keep
-// them aligned.
-func ScanPost(rows drops.Rows, dest *Post) error {
+// ScanPost scans one row into dest. The row's column
+// order must match ColsPost(); use a SELECT that lists
+// the columns explicitly via ColsPost() to keep them
+// aligned.
+func ScanPost(rows pg.Scanner, dest *Post) error {
 	return rows.Scan(
 		&dest.ID,
 		&dest.UserID,
 		&dest.Title,
 	)
+}
+
+// RegisterPost wires the zero-reflection scanner into e
+// so Entity.Get / EntityQuery.All / EntityQuery.One take the
+// fastpath. Call once at init():
+//
+//	func init() { RegisterPost(PostsEntity) }
+func RegisterPost(e *pg.Entity[Post]) *pg.Entity[Post] {
+	return e.SetFastScan(ScanPost)
 }

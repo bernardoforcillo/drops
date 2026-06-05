@@ -141,6 +141,16 @@ func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
 // scopes independently.
 func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
 
+// HasEagerLoads reports whether any relations have been queued for
+// eager loading via With / WithRel. Used by Entity[T] to decide
+// whether the fast-scan path is safe — relation loaders need the
+// reflection-populated parent slice.
+func (f *FindBuilder) HasEagerLoads() bool { return len(f.roots) > 0 }
+
+// Select exposes the underlying SELECT builder so callers (typically
+// Entity[T]) can stream results through their own scanner.
+func (f *FindBuilder) Select() *SelectBuilder { return f.sel }
+
 // With marks one or more relations to eager-load. Names must match
 // relations declared on the table via NewRelations.
 //

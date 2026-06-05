@@ -52,6 +52,19 @@ type Entity[T any] struct {
 	validators   []Validator[T]
 	versionCol   *Column // optimistic-locking version column, nil if none
 	versionField []int   // field path on T for the version value
+
+	// fastScan is the optional zero-reflection row scanner — usually
+	// supplied by cmd/dropsgen-emitted Register<T>() at init time.
+	// When set, the SELECT executors (Get / Query.All / Query.One)
+	// skip the reflection path entirely.
+	fastScan func(Scanner, *T) error
+}
+
+// Scanner mirrors the subset of drops.Rows the fast scan helpers
+// need: one Scan call per row. Generated code is written against
+// this narrower interface so it does not depend on drops internals.
+type Scanner interface {
+	Scan(dest ...any) error
 }
 
 // Validator is called before Create / Update / Save with a pointer
@@ -151,6 +164,21 @@ func (e *Entity[T]) Validate(v Validator[T]) *Entity[T] {
 	return e
 }
 
+// SetFastScan registers a zero-reflection per-row scanner — the
+// generated Scan<T> helper from cmd/dropsgen is the canonical
+// implementation. When set, Get / Query.One / Query.All consume rows
+// directly through scan instead of routing through the reflection
+// scanner. Eager-loaded relations still fall back to the reflection
+// path because they rely on field-map introspection of the loaded
+// slice.
+func (e *Entity[T]) SetFastScan(scan func(Scanner, *T) error) *Entity[T] {
+	e.fastScan = scan
+	return e
+}
+
+// HasFastScan reports whether a zero-reflection scanner is wired up.
+func (e *Entity[T]) HasFastScan() bool { return e.fastScan != nil }
+
 // runValidators runs every registered validator in order. Returns
 // the first non-nil error.
 func (e *Entity[T]) runValidators(r *T) error {
@@ -197,8 +225,49 @@ var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock vers
 // if no row matches.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 	var out T
+	if e.fastScan != nil {
+		err := e.scanOneFast(db, ctx, db.Select().From(e.table).Where(Eq(e.pk, id)), &out)
+		return out, err
+	}
 	err := db.Find(e.table).Where(Eq(e.pk, id)).One(ctx, &out)
 	return out, err
+}
+
+// scanOneFast runs sel and decodes the first row via fastScan.
+// Returns ErrNoRows when sel produces no rows.
+func (e *Entity[T]) scanOneFast(db *DB, ctx context.Context, sel *SelectBuilder, dest *T) error {
+	rows, err := sel.Rows(ctx)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return ErrNoRows
+	}
+	if err := e.fastScan(rows, dest); err != nil {
+		return err
+	}
+	return rows.Err()
+}
+
+// scanAllFast runs sel and appends every row to dest via fastScan.
+func (e *Entity[T]) scanAllFast(db *DB, ctx context.Context, sel *SelectBuilder, dest *[]T) error {
+	rows, err := sel.Rows(ctx)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r T
+		if err := e.fastScan(rows, &r); err != nil {
+			return err
+		}
+		*dest = append(*dest, r)
+	}
+	return rows.Err()
 }
 
 // Create INSERTs r and refreshes it from the RETURNING row — useful
@@ -394,8 +463,15 @@ func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 }
 
 // All executes the query and returns the matching rows as a typed
-// slice.
+// slice. Uses the fast-scan path (zero reflection) when available
+// and no eager-loaded relations are queued — relation loaders rely
+// on the reflection-populated slice.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
+	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
+		var out []T
+		err := q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &out)
+		return out, err
+	}
 	var out []T
 	err := q.fb.All(ctx, &out)
 	return out, err
@@ -404,6 +480,11 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 // One executes the query and returns the first matching row. Returns
 // ErrNoRows if the query produces no rows.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
+	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
+		var out T
+		err := q.e.scanOneFast(q.fb.db, ctx, q.fb.Select(), &out)
+		return out, err
+	}
 	var out T
 	err := q.fb.One(ctx, &out)
 	return out, err

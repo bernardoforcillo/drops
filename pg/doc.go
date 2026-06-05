@@ -36,4 +36,10 @@
 // Create / Update / Save. A column marked with OptimisticLock turns
 // Update into a guarded "AND version = current, SET version =
 // version + 1" — mismatched versions return ErrStaleObject.
+//
+// Entity.SetFastScan plugs in a zero-reflection per-row scanner —
+// typically the Scan<T> helper emitted by cmd/dropsgen. When set,
+// Get / EntityQuery.All / EntityQuery.One skip the reflection path
+// entirely. Eager-loaded relations (via With/WithRel) still need
+// reflection, so the slow path kicks in automatically for those.
 package pg

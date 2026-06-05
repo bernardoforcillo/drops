@@ -82,6 +82,12 @@ type Entity[T any] struct {
 	// the tenant onto r before binding.
 	tenantCol   *Column
 	tenantField []int
+
+	// guard, when set by AuthorizeWith, injects an
+	// authorisation predicate into every Get / Query / Update /
+	// Delete. The subject lives on ctx (WithSubject); missing
+	// subject errors out.
+	guard Guard
 }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
@@ -258,7 +264,11 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 	if err != nil {
 		return *new(T), err
 	}
-	if e.cache != nil && tenantPred == nil {
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return *new(T), err
+	}
+	if e.cache != nil && tenantPred == nil && guardPred == nil {
 		return e.getCached(db, ctx, id)
 	}
 	var out T
@@ -267,12 +277,18 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 		if tenantPred != nil {
 			sel.Where(tenantPred)
 		}
+		if guardPred != nil {
+			sel.Where(guardPred)
+		}
 		err := e.scanOneFast(db, ctx, sel, &out)
 		return out, err
 	}
 	fb := db.Find(e.table).Where(Eq(e.pk, id))
 	if tenantPred != nil {
 		fb.Where(tenantPred)
+	}
+	if guardPred != nil {
+		fb.Where(guardPred)
 	}
 	err = fb.One(ctx, &out)
 	return out, err
@@ -513,6 +529,10 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if err != nil {
 		return err
 	}
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return err
+	}
 	doUpdate := func(tx *DB) error {
 		upd := tx.Update(e.table)
 		wroteSet := false
@@ -549,6 +569,9 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		upd.Where(Eq(e.pk, pkv.Interface()))
 		if tenantPred != nil {
 			upd.Where(tenantPred)
+		}
+		if guardPred != nil {
+			upd.Where(guardPred)
 		}
 		if e.versionCol != nil {
 			curVer := v.FieldByIndex(e.versionField).Interface()
@@ -600,11 +623,18 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, e
 	if err != nil {
 		return nil, err
 	}
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var res drops.Result
 	doDelete := func(tx *DB) error {
 		del := tx.Delete(e.table).Where(Eq(e.pk, id))
 		if tenantPred != nil {
 			del.Where(tenantPred)
+		}
+		if guardPred != nil {
+			del.Where(guardPred)
 		}
 		r, derr := del.Exec(ctx)
 		if derr != nil {
@@ -688,6 +718,19 @@ func (q *EntityQuery[T]) applyTenantOnFB(ctx context.Context) error {
 	return nil
 }
 
+// applyGuardOnFB injects the authorisation predicate on q.fb
+// when the entity is guarded.
+func (q *EntityQuery[T]) applyGuardOnFB(ctx context.Context) error {
+	guardPred, err := q.e.guardPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if guardPred != nil {
+		q.fb.Where(guardPred)
+	}
+	return nil
+}
+
 // EntityQuery is the typed counterpart of FindBuilder — same shape,
 // but its executors return ([]T, error) and (T, error) directly.
 type EntityQuery[T any] struct {
@@ -742,6 +785,9 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	if err := q.applyTenantOnFB(ctx); err != nil {
 		return nil, err
 	}
+	if err := q.applyGuardOnFB(ctx); err != nil {
+		return nil, err
+	}
 	if q.e.budget.MaxRows > 0 {
 		// Apply the row-cap LIMIT before rendering. Honour the
 		// user's tighter Limit by leaving it alone.
@@ -773,6 +819,9 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
 	if err := q.applyTenantOnFB(ctx); err != nil {
+		return *new(T), err
+	}
+	if err := q.applyGuardOnFB(ctx); err != nil {
 		return *new(T), err
 	}
 	if q.cacheable() {

@@ -13,6 +13,19 @@ type DiffOptions struct {
 	Safe bool
 }
 
+// DiffDown returns the SQL that reverses the migration from cur
+// back to prev — applying these statements after the corresponding
+// Diff(prev, cur) would restore the original schema. Provided as
+// a distinct entry point so generated migration sets can carry the
+// rollback alongside the forward direction without the caller
+// having to swap arguments.
+//
+//	up := pg.Diff(prev, cur, opts)
+//	down := pg.DiffDown(prev, cur, opts) // = Diff(cur, prev, opts)
+func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
+	return Diff(cur, prev, opts...)
+}
+
 // Diff returns the ordered list of SQL statements that, applied in
 // order, evolve a database from prev's schema to cur's. Output is
 // deterministic for a given (prev, cur, opts) — keys are walked in

@@ -10,25 +10,38 @@ import (
 
 func main() {
 	var (
-		file    = flag.String("file", "", "Go source file to scan for entities")
-		outName = flag.String("o", "", "output file (default: <input>_drops_gen.go)")
+		file     = flag.String("file", "", "Go source file to scan for entities (bind/scan mode)")
+		outName  = flag.String("o", "", "output file (bind/scan mode; default: <input>_drops_gen.go)")
+		snapshot = flag.String("snapshot", "", "drops snapshot JSON to introspect into Go structs")
+		outDir   = flag.String("out", "models", "output directory for introspected structs")
+		pkg      = flag.String("pkg", "", "Go package name for introspected files (default: dir basename)")
 	)
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "dropsgen — generate zero-reflection bind/scan helpers for drops entities")
+		fmt.Fprintln(os.Stderr, "dropsgen — generate bind/scan helpers or introspect schemas")
 		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Usage:")
-		fmt.Fprintln(os.Stderr, "  dropsgen -file <path>")
+		fmt.Fprintln(os.Stderr, "Bind/scan mode:")
+		fmt.Fprintln(os.Stderr, "  dropsgen -file users.go [-o out.go]")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Introspect mode:")
+		fmt.Fprintln(os.Stderr, "  dropsgen -snapshot meta/0001_snapshot.json -out models/ [-pkg models]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if *file == "" {
+	switch {
+	case *snapshot != "":
+		if err := runIntrospect(*snapshot, *outDir, *pkg); err != nil {
+			fmt.Fprintf(os.Stderr, "dropsgen: %v\n", err)
+			os.Exit(1)
+		}
+	case *file != "":
+		if err := run(*file, *outName); err != nil {
+			fmt.Fprintf(os.Stderr, "dropsgen: %v\n", err)
+			os.Exit(1)
+		}
+	default:
 		flag.Usage()
 		os.Exit(2)
-	}
-	if err := run(*file, *outName); err != nil {
-		fmt.Fprintf(os.Stderr, "dropsgen: %v\n", err)
-		os.Exit(1)
 	}
 }
 

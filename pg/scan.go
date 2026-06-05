@@ -13,6 +13,17 @@ import (
 // ErrNoRows is returned by One when the query produced no rows.
 var ErrNoRows = errors.New("drops/pg: no rows in result set")
 
+// ScanOne consumes the first row from rows into dest (pointer to
+// struct), returning ErrNoRows when the cursor is empty. Exported
+// for code generators (cmd/dropsgen sql) that want the
+// reflection scanner without going through a builder.
+func ScanOne(rows drops.Rows, dest any) error { return scanOne(rows, dest) }
+
+// ScanAll consumes every row from rows into dest (pointer to
+// slice of struct or *struct). Exported for the same reason as
+// ScanOne.
+func ScanAll(rows drops.Rows, dest any) error { return scanAll(rows, dest) }
+
 // scanAll consumes rows into dest, which must be a pointer to a slice
 // of structs or pointer-to-structs. Mapping rules:
 //   - struct field tag `drop:"col"` is honoured (use `drop:"-"` to skip)

@@ -24,8 +24,9 @@ import (
 // InTx; with an explicit Begin you must call Commit/Rollback yourself,
 // and those bypass the hook unless you wrap them.
 type DB struct {
-	drv  drops.Driver
-	hook drops.Hook
+	drv    drops.Driver
+	hook   drops.Hook
+	tracer Tracer
 }
 
 // New wraps a drops.Driver as a DB.
@@ -159,9 +160,18 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 
 // Exec runs a raw SQL statement with positional ($1, $2, ...) placeholders.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	spanCtx, span := db.startSpan(ctx, "drops.exec")
+	span.SetAttribute(AttrSystem, AttrSystemPG)
+	span.SetAttribute(AttrOperation, "exec")
+	span.SetAttribute(AttrStatement, sql)
+	span.SetAttribute(AttrArgsCount, len(args))
 	start := time.Now()
-	res, err := db.drv.Exec(ctx, sql, args...)
+	res, err := db.drv.Exec(spanCtx, sql, args...)
 	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
+	span.End()
 	db.emit(ctx, drops.QueryEvent{
 		Kind: "exec", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,
@@ -171,9 +181,18 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 
 // Query runs a raw SQL query.
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	spanCtx, span := db.startSpan(ctx, "drops.query")
+	span.SetAttribute(AttrSystem, AttrSystemPG)
+	span.SetAttribute(AttrOperation, "query")
+	span.SetAttribute(AttrStatement, sql)
+	span.SetAttribute(AttrArgsCount, len(args))
 	start := time.Now()
-	rows, err := db.drv.Query(ctx, sql, args...)
+	rows, err := db.drv.Query(spanCtx, sql, args...)
 	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
+	span.End()
 	db.emit(ctx, drops.QueryEvent{
 		Kind: "query", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,

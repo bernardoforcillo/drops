@@ -11,11 +11,11 @@ import (
 )
 
 type autoUser struct {
-	ID        int64     `drop:"id,pk,autoinc"`
-	Email     string    `drop:"email,notnull,unique"`
-	Name      string    `drop:"name,notnull"`
+	ID        int64     `drop:"id,primaryKey,autoIncrement"`
+	Email     string    `drop:"email,notNull,unique"`
+	Name      string    `drop:"name,notNull"`
 	Age       *int32    `drop:"age"`
-	CreatedAt time.Time `drop:"created_at,notnull,default=now()"`
+	CreatedAt time.Time `drop:"created_at,notNull,default=now()"`
 	Internal  string    // untagged — skipped
 	Skip      string    `drop:"-"`
 }
@@ -94,7 +94,7 @@ func TestAutoTableUnknownTagOptionPanics(t *testing.T) {
 
 func TestAutoTableUnsupportedTypePanics(t *testing.T) {
 	type bad struct {
-		ID  int64       `drop:"id,pk"`
+		ID  int64       `drop:"id,primaryKey"`
 		Bad chan string `drop:"bad"`
 	}
 	defer func() {
@@ -107,8 +107,8 @@ func TestAutoTableUnsupportedTypePanics(t *testing.T) {
 
 func TestAutoTableVersionMarker(t *testing.T) {
 	type doc struct {
-		ID  int64 `drop:"id,pk,autoinc"`
-		V   int32 `drop:"version,notnull,default=0,version"`
+		ID  int64 `drop:"id,primaryKey,autoIncrement"`
+		V   int32 `drop:"version,notNull,default=0,version"`
 		Tag string `drop:"tag"`
 	}
 	tbl := pg.AutoTable[doc]("docs")

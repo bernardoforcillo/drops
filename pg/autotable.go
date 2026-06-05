@@ -15,10 +15,10 @@ import (
 //
 // where each opt is one of:
 //
-//	pk                   — PRIMARY KEY
-//	autoinc              — use the serial family (BigSerial / Serial /
+//	primaryKey           — PRIMARY KEY
+//	autoIncrement        — use the serial family (BigSerial / Serial /
 //	                       SmallSerial) for the column's type
-//	notnull              — NOT NULL
+//	notNull              — NOT NULL
 //	unique               — UNIQUE
 //	default=<sql>        — raw DEFAULT clause (no parameterisation)
 //	version              — mark as the optimistic-lock version column
@@ -29,9 +29,9 @@ import (
 // Go type ↔ ColumnType mapping mirrors the manual constructors:
 //
 //	bool                  → boolean
-//	int16                 → smallint   (smallserial if autoinc)
-//	int32 / int           → integer    (serial      if autoinc)
-//	int64                 → bigint     (bigserial   if autoinc)
+//	int16                 → smallint   (smallserial if autoIncrement)
+//	int32 / int           → integer    (serial      if autoIncrement)
+//	int64                 → bigint     (bigserial   if autoIncrement)
 //	float32               → real
 //	float64               → double precision
 //	string                → text
@@ -39,7 +39,7 @@ import (
 //	time.Time             → timestamptz
 //	json.RawMessage       → jsonb
 //	*T                    → same as T, column is nullable unless
-//	                        `notnull` is set explicitly
+//	                        `notNull` is set explicitly
 //
 // Custom types — uuid, jsonb columns backed by app structs, etc. —
 // fall back to drops.Custom; declare them by hand instead.
@@ -131,11 +131,11 @@ func parseAutoTag(raw string) (autoOpts, error) {
 		}
 		k, v, hasVal := strings.Cut(p, "=")
 		switch k {
-		case "pk":
+		case "primaryKey":
 			opts.PK = true
-		case "autoinc":
+		case "autoIncrement":
 			opts.AutoInc = true
-		case "notnull":
+		case "notNull":
 			opts.NotNull = true
 		case "unique":
 			opts.Unique = true
@@ -154,7 +154,7 @@ func parseAutoTag(raw string) (autoOpts, error) {
 }
 
 // makeAutoColumn assembles a *Column from a parsed field. Pointer
-// types make the column nullable by default unless `notnull` is set.
+// types make the column nullable by default unless `notNull` is set.
 func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Column {
 	ft := f.Type
 	for ft.Kind() == reflect.Ptr {
@@ -182,8 +182,8 @@ func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Co
 	return c
 }
 
-// autoColumnType maps a Go type to a ColumnType. autoinc upgrades
-// integer types to the serial family.
+// autoColumnType maps a Go type to a ColumnType. autoIncrement
+// upgrades integer types to the serial family.
 func autoColumnType(structName, fieldName string, ft reflect.Type, autoinc bool) ColumnType {
 	switch ft.Kind() {
 	case reflect.Bool:

@@ -44,7 +44,7 @@
 // reflection, so the slow path kicks in automatically for those.
 //
 // AutoTable[T] / NewAutoEntity[T] derive a Table (and an Entity)
-// from extended `drop:"col,pk,autoinc,notnull,unique,default=...,version"`
+// from extended `drop:"col,primaryKey,autoIncrement,notNull,unique,default=...,version"`
 // struct tags — the struct becomes the single source of truth, and
 // a working ORM falls out of one declaration:
 //

@@ -110,7 +110,7 @@ func tableFromDirective(directive string) (string, error) {
 // collectFields walks a struct's fields and returns the bind/scan
 // metadata for every exported, drop-tagged field. The first
 // comma-separated token is the column name; subsequent tokens
-// (pk, autoinc, notnull, …) are ignored here because dropsgen
+// (primaryKey, autoIncrement, notNull, …) are ignored here because dropsgen
 // itself does not generate the schema declaration, only the
 // bind/scan helpers.
 func collectFields(st *ast.StructType) ([]field, error) {

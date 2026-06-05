@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+// secretTypePrefix is the reflection name prefix every
+// pg.Secret[T] type carries. AutoTable maps these to bytea
+// regardless of T because the on-wire form is encrypted bytes.
+const secretTypePrefix = "Secret["
+
+// secretPkgPath is the package path drops/pg uses for Secret[T].
+// We match both name and package path so a user's own Secret type
+// in a different package doesn't accidentally trigger the bytea
+// mapping.
+var secretPkgPath = reflect.TypeOf(Secret[string]{}).PkgPath()
+
 // AutoTable derives a Table from the `drop` struct tags on T. Tag
 // syntax:
 //
@@ -160,8 +171,21 @@ func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Co
 	for ft.Kind() == reflect.Ptr {
 		ft = ft.Elem()
 	}
+	// pg.Secret[T] always serialises as encrypted bytea — bypass
+	// the type-table mapping below.
+	if isSecretType(ft) {
+		c := &Column{name: opts.Name, typ: simpleType("bytea")}
+		applyAutoOpts(c, opts)
+		return c
+	}
 	ct := autoColumnType(structName, f.Name, ft, opts.AutoInc)
 	c := &Column{name: opts.Name, typ: ct}
+	applyAutoOpts(c, opts)
+	return c
+}
+
+// applyAutoOpts stamps the parsed flags onto c.
+func applyAutoOpts(c *Column, opts autoOpts) {
 	if opts.PK {
 		c.primary = true
 		c.notNull = true
@@ -179,7 +203,16 @@ func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Co
 	if opts.Version {
 		c.version = true
 	}
-	return c
+}
+
+// isSecretType reports whether ft is a pg.Secret[T] type, matched
+// both by name prefix and package path so user types named
+// "Secret[...]" in other packages don't trigger the special case.
+func isSecretType(ft reflect.Type) bool {
+	if ft.Kind() != reflect.Struct {
+		return false
+	}
+	return strings.HasPrefix(ft.Name(), secretTypePrefix) && ft.PkgPath() == secretPkgPath
 }
 
 // autoColumnType maps a Go type to a ColumnType. autoIncrement

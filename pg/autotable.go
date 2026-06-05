@@ -190,6 +190,12 @@ func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Co
 		applyAutoOpts(c, opts)
 		return c
 	}
+	// pg.Point stores as geography(Point, 4326).
+	if isPointType(ft) {
+		c := &Column{name: opts.Name, typ: simpleType("geography(Point,4326)")}
+		applyAutoOpts(c, opts)
+		return c
+	}
 	ct := autoColumnType(structName, f.Name, ft, opts.AutoInc)
 	c := &Column{name: opts.Name, typ: ct}
 	applyAutoOpts(c, opts)
@@ -237,6 +243,14 @@ func isMoneyType(ft reflect.Type) bool {
 		return false
 	}
 	return ft.Name() == moneyTypeName && ft.PkgPath() == secretPkgPath
+}
+
+// isPointType reports whether ft is pg.Point.
+func isPointType(ft reflect.Type) bool {
+	if ft.Kind() != reflect.Struct {
+		return false
+	}
+	return ft.Name() == "Point" && ft.PkgPath() == secretPkgPath
 }
 
 // autoColumnType maps a Go type to a ColumnType. autoIncrement

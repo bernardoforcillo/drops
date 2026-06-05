@@ -75,6 +75,13 @@ type Entity[T any] struct {
 	// rows in the same transaction as every Create / Update /
 	// Delete.
 	audit *auditWiring
+
+	// tenantCol / tenantField, when set by ScopeByTenant, makes
+	// the entity tenant-aware: every Get / Query / Update / Delete
+	// auto-injects WHERE tenantCol = $ctx-tenant; Create stamps
+	// the tenant onto r before binding.
+	tenantCol   *Column
+	tenantField []int
 }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
@@ -247,15 +254,27 @@ var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock vers
 func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 	ctx, cancel := e.budgetCtx(ctx)
 	defer cancel()
-	if e.cache != nil {
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return *new(T), err
+	}
+	if e.cache != nil && tenantPred == nil {
 		return e.getCached(db, ctx, id)
 	}
 	var out T
 	if e.fastScan != nil {
-		err := e.scanOneFast(db, ctx, db.Select().From(e.table).Where(Eq(e.pk, id)), &out)
+		sel := db.Select().From(e.table).Where(Eq(e.pk, id))
+		if tenantPred != nil {
+			sel.Where(tenantPred)
+		}
+		err := e.scanOneFast(db, ctx, sel, &out)
 		return out, err
 	}
-	err := db.Find(e.table).Where(Eq(e.pk, id)).One(ctx, &out)
+	fb := db.Find(e.table).Where(Eq(e.pk, id))
+	if tenantPred != nil {
+		fb.Where(tenantPred)
+	}
+	err = fb.One(ctx, &out)
 	return out, err
 }
 
@@ -434,6 +453,9 @@ func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 // behaviour for a specific field, set it to a non-zero value before
 // calling Create.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	if err := e.runValidators(r); err != nil {
 		return err
 	}
@@ -487,6 +509,10 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if pkv.IsZero() {
 		return ErrPKNotSet
 	}
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return err
+	}
 	doUpdate := func(tx *DB) error {
 		upd := tx.Update(e.table)
 		wroteSet := false
@@ -521,6 +547,9 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 			return errors.New("drops/pg: Update has no fields to set")
 		}
 		upd.Where(Eq(e.pk, pkv.Interface()))
+		if tenantPred != nil {
+			upd.Where(tenantPred)
+		}
 		if e.versionCol != nil {
 			curVer := v.FieldByIndex(e.versionField).Interface()
 			upd.Where(Eq(e.versionCol, curVer))
@@ -528,16 +557,15 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		for _, c := range e.table.Columns() {
 			upd.Returning(c)
 		}
-		err := upd.One(ctx, r)
-		if err == ErrNoRows && e.versionCol != nil {
+		upderr := upd.One(ctx, r)
+		if upderr == ErrNoRows && e.versionCol != nil {
 			return ErrStaleObject
 		}
-		if err != nil {
-			return err
+		if upderr != nil {
+			return upderr
 		}
 		return e.recordAudit(tx, ctx, "update", r, e.pkValue(r))
 	}
-	var err error
 	if e.audit != nil {
 		err = db.InTx(ctx, doUpdate)
 	} else {
@@ -568,16 +596,23 @@ func (e *Entity[T]) Save(db *DB, ctx context.Context, r *T) error {
 // DeleteHooks (e.g. SoftDelete) fire normally — so on a soft-deleted
 // table this rewrites to UPDATE deletedAt = now() instead.
 func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, error) {
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var res drops.Result
 	doDelete := func(tx *DB) error {
-		r, err := tx.Delete(e.table).Where(Eq(e.pk, id)).Exec(ctx)
-		if err != nil {
-			return err
+		del := tx.Delete(e.table).Where(Eq(e.pk, id))
+		if tenantPred != nil {
+			del.Where(tenantPred)
+		}
+		r, derr := del.Exec(ctx)
+		if derr != nil {
+			return derr
 		}
 		res = r
 		return e.recordAudit(tx, ctx, "delete", nil, id)
 	}
-	var err error
 	if e.audit != nil {
 		err = db.InTx(ctx, doDelete)
 	} else {
@@ -631,8 +666,26 @@ func isImplicitDefault(c *Column) bool {
 
 // Query returns a typed query builder for ad-hoc Where / OrderBy /
 // Limit / Offset / With chains that scan into T or []T.
+//
+// When the entity is tenant-scoped the caller must use the ctx-aware
+// All / One / Stream methods so the tenant predicate can be
+// injected; using the builder methods without a ctx-bound tenant
+// returns ErrTenantMissing.
 func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 	return &EntityQuery[T]{e: e, fb: db.Find(e.table)}
+}
+
+// applyTenantOnFB injects the tenant predicate on q.fb when the
+// entity is scoped. Helper used by All / One / Stream / Page.
+func (q *EntityQuery[T]) applyTenantOnFB(ctx context.Context) error {
+	tenantPred, err := q.e.tenantPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if tenantPred != nil {
+		q.fb.Where(tenantPred)
+	}
+	return nil
 }
 
 // EntityQuery is the typed counterpart of FindBuilder — same shape,
@@ -686,6 +739,9 @@ func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
+	if err := q.applyTenantOnFB(ctx); err != nil {
+		return nil, err
+	}
 	if q.e.budget.MaxRows > 0 {
 		// Apply the row-cap LIMIT before rendering. Honour the
 		// user's tighter Limit by leaving it alone.
@@ -716,6 +772,9 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
+	if err := q.applyTenantOnFB(ctx); err != nil {
+		return *new(T), err
+	}
 	if q.cacheable() {
 		return q.oneCached(ctx)
 	}

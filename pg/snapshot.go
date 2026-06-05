@@ -12,18 +12,55 @@ import (
 // drizzle-kit's PostgreSQL snapshot v7 format so a Snapshot produced by
 // drops is round-trippable through drizzle-kit, and vice versa.
 type Snapshot struct {
-	ID        string                    `json:"id"`
-	PrevID    string                    `json:"prevId"`
-	Version   string                    `json:"version"`
-	Dialect   string                    `json:"dialect"`
-	Tables    map[string]*TableSnapshot `json:"tables"`
-	Enums     map[string]any            `json:"enums"`
-	Schemas   map[string]any            `json:"schemas"`
-	Sequences map[string]any            `json:"sequences"`
-	Roles     map[string]any            `json:"roles"`
-	Policies  map[string]any            `json:"policies"`
-	Views     map[string]any            `json:"views"`
-	Meta      SnapshotMeta              `json:"_meta"`
+	ID        string                       `json:"id"`
+	PrevID    string                       `json:"prevId"`
+	Version   string                       `json:"version"`
+	Dialect   string                       `json:"dialect"`
+	Tables    map[string]*TableSnapshot    `json:"tables"`
+	Enums     map[string]*EnumSnapshot     `json:"enums"`
+	Schemas   map[string]any               `json:"schemas"`
+	Sequences map[string]*SequenceSnapshot `json:"sequences"`
+	Roles     map[string]any               `json:"roles"`
+	Policies  map[string]any               `json:"policies"`
+	Views     map[string]*ViewSnapshot     `json:"views"`
+	Meta      SnapshotMeta                 `json:"_meta"`
+}
+
+// EnumSnapshot is one entry in Snapshot.Enums.
+type EnumSnapshot struct {
+	Name   string   `json:"name"`
+	Schema string   `json:"schema"`
+	Values []string `json:"values"`
+}
+
+// SequenceSnapshot is one entry in Snapshot.Sequences.
+type SequenceSnapshot struct {
+	Name      string  `json:"name"`
+	Schema    string  `json:"schema"`
+	Start     *int64  `json:"startWith,omitempty"`
+	Increment *int64  `json:"incrementBy,omitempty"`
+	MinValue  *int64  `json:"minValue,omitempty"`
+	MaxValue  *int64  `json:"maxValue,omitempty"`
+	Cache     *int64  `json:"cacheSize,omitempty"`
+	Cycle     bool    `json:"cycle"`
+}
+
+// ViewSnapshot is one entry in Snapshot.Views.
+type ViewSnapshot struct {
+	Name         string `json:"name"`
+	Schema       string `json:"schema"`
+	Definition   string `json:"definition"`
+	Materialized bool   `json:"materialized"`
+}
+
+// PolicySnapshot is one entry in TableSnapshot.Policies.
+type PolicySnapshot struct {
+	Name      string   `json:"name"`
+	As        string   `json:"as"`
+	For       string   `json:"for"`
+	To        []string `json:"to"`
+	Using     string   `json:"using"`
+	WithCheck string   `json:"withCheck"`
 }
 
 // SnapshotMeta carries rename-tracking annotations. drops never sets
@@ -43,7 +80,7 @@ type TableSnapshot struct {
 	ForeignKeys          map[string]*ForeignKeySnapshot      `json:"foreignKeys"`
 	CompositePrimaryKeys map[string]*CompositePKSnapshot     `json:"compositePrimaryKeys"`
 	UniqueConstraints    map[string]*UniqueSnapshot          `json:"uniqueConstraints"`
-	Policies             map[string]any                      `json:"policies"`
+	Policies             map[string]*PolicySnapshot          `json:"policies"`
 	CheckConstraints     map[string]*CheckSnapshot           `json:"checkConstraints"`
 	IsRLSEnabled         bool                                `json:"isRLSEnabled"`
 }
@@ -114,12 +151,12 @@ func EmptySnapshot() *Snapshot {
 		Version:   "7",
 		Dialect:   "postgresql",
 		Tables:    map[string]*TableSnapshot{},
-		Enums:     map[string]any{},
+		Enums:     map[string]*EnumSnapshot{},
 		Schemas:   map[string]any{},
-		Sequences: map[string]any{},
+		Sequences: map[string]*SequenceSnapshot{},
 		Roles:     map[string]any{},
 		Policies:  map[string]any{},
-		Views:     map[string]any{},
+		Views:     map[string]*ViewSnapshot{},
 		Meta:      SnapshotMeta{Columns: map[string]any{}, Schemas: map[string]any{}, Tables: map[string]any{}},
 	}
 }
@@ -139,9 +176,20 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			ForeignKeys:          map[string]*ForeignKeySnapshot{},
 			CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
-			Policies:             map[string]any{},
+			Policies:             map[string]*PolicySnapshot{},
 			CheckConstraints:     map[string]*CheckSnapshot{},
-			IsRLSEnabled:         false,
+			IsRLSEnabled:         t.RLSEnabled(),
+		}
+		// Policies attached to the table.
+		for _, p := range t.Policies() {
+			ts.Policies[p.Name()] = &PolicySnapshot{
+				Name:      p.Name(),
+				As:        p.As(),
+				For:       p.Command(),
+				To:        p.Roles(),
+				Using:     p.UsingExpr(),
+				WithCheck: p.WithCheckExpr(),
+			}
 		}
 		// Composite primary key.
 		if pk := t.CompositePrimaryKey(); len(pk) > 0 {
@@ -217,6 +265,37 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 		}
 		s.Tables[tableKey(t)] = ts
 	}
+	// Top-level enums.
+	for _, e := range schema.Enums() {
+		s.Enums[e.Name()] = &EnumSnapshot{
+			Name:   e.Name(),
+			Schema: "public",
+			Values: e.Values(),
+		}
+	}
+	// Top-level sequences.
+	for _, seq := range schema.Sequences() {
+		opts := seq.Options()
+		s.Sequences[seq.Name()] = &SequenceSnapshot{
+			Name:      seq.Name(),
+			Schema:    "public",
+			Start:     opts.Start,
+			Increment: opts.Increment,
+			MinValue:  opts.MinValue,
+			MaxValue:  opts.MaxValue,
+			Cache:     opts.Cache,
+			Cycle:     opts.Cycle,
+		}
+	}
+	// Top-level views.
+	for _, v := range schema.Views() {
+		s.Views[v.Name()] = &ViewSnapshot{
+			Name:         v.Name(),
+			Schema:       "public",
+			Definition:   v.Definition(),
+			Materialized: v.IsMaterialized(),
+		}
+	}
 	return s
 }
 
@@ -261,7 +340,7 @@ func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
 			t.CompositePrimaryKeys = map[string]*CompositePKSnapshot{}
 		}
 		if t.Policies == nil {
-			t.Policies = map[string]any{}
+			t.Policies = map[string]*PolicySnapshot{}
 		}
 		if t.CheckConstraints == nil {
 			t.CheckConstraints = map[string]*CheckSnapshot{}

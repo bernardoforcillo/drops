@@ -97,7 +97,7 @@ func readIntrospectTables(ctx context.Context, db *DB, schemas []string) ([]*Tab
 			ForeignKeys:          map[string]*ForeignKeySnapshot{},
 			CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
-			Policies:             map[string]any{},
+			Policies:             map[string]*PolicySnapshot{},
 			CheckConstraints:     map[string]*CheckSnapshot{},
 			IsRLSEnabled:         false,
 		})

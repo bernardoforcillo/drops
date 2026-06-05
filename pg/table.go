@@ -31,6 +31,13 @@ type Table struct {
 	// the raw SQL expression (e.g. "age >= 0").
 	checks map[string]string
 
+	// policies are RLS policies declared on the table.
+	policies map[string]*Policy
+
+	// rlsEnabled mirrors PG's ALTER TABLE ... ENABLE ROW LEVEL
+	// SECURITY. Policies are only enforced when this is true.
+	rlsEnabled bool
+
 	// insertHooks / updateHooks / deleteHooks are the optional
 	// lifecycle hooks registered on this table. They are invoked by
 	// the corresponding builders during WriteSQL. Empty by default —
@@ -203,6 +210,28 @@ func (t *Table) AddCheck(name, expr string) *Table {
 
 // Checks returns the registered CHECK constraints.
 func (t *Table) Checks() map[string]string { return t.checks }
+
+// EnableRLS marks the table as having Row-Level Security
+// enabled. The snapshot/diff generator emits the matching
+// ALTER TABLE ... ENABLE ROW LEVEL SECURITY when the flag flips
+// from false to true.
+func (t *Table) EnableRLS() *Table { t.rlsEnabled = true; return t }
+
+// RLSEnabled reports whether the table has RLS enabled.
+func (t *Table) RLSEnabled() bool { return t.rlsEnabled }
+
+// AddPolicy attaches a row-level security policy to the table.
+// Policies are inert until EnableRLS is also called.
+func (t *Table) AddPolicy(p *Policy) *Table {
+	if t.policies == nil {
+		t.policies = map[string]*Policy{}
+	}
+	t.policies[p.Name()] = p
+	return t
+}
+
+// Policies returns the registered policies keyed by name.
+func (t *Table) Policies() map[string]*Policy { return t.policies }
 
 // hasHooks reports whether the table has any lifecycle hooks
 // registered — used by builders to skip the hook pipeline when

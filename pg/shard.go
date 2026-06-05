@@ -13,9 +13,9 @@ import (
 // end of the Replicated wrapper: where Replicated splits reads
 // across replicas of a single dataset, Sharded splits the entire
 // dataset across N independent primaries. Use it to scale beyond
-// what a single primary's write throughput allows — X shards
-// timelines by user id, WhatsApp shards messages by chat id,
-// Bolt shards trip records by region.
+// what a single primary's write throughput allows — typical
+// shard axes are user id (social-feed services), chat id
+// (messaging), or geographic region (mobility / dispatch).
 //
 //	shards := []drops.Driver{db1, db2, db3, db4}
 //	sharded := pg.NewSharded(shards, func(key any) int {

@@ -20,7 +20,7 @@ type counterRow struct {
 // typed *Col[T] handles for Inc / SetIfGreater / etc.
 func patchSchema(t *testing.T) (*pg.Entity[counterRow], *pg.Col[int64], *pg.Col[int64], *pg.Col[int64], *pg.Col[string]) {
 	t.Helper()
-	tbl := pg.NewTable("tweets")
+	tbl := pg.NewTable("posts")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	likes := pg.Add(tbl, pg.BigInt("likes").NotNull().Default("0"))
 	views := pg.Add(tbl, pg.BigInt("views").NotNull().Default("0"))
@@ -37,10 +37,10 @@ func TestPatchInc(t *testing.T) {
 		t.Fatalf("Patch: %v", err)
 	}
 	sql := fd.queries[0]
-	if !strings.Contains(sql, `"likes" = "tweets"."likes" + $1`) {
+	if !strings.Contains(sql, `"likes" = "posts"."likes" + $1`) {
 		t.Errorf("Inc must render col = col + arg: %s", sql)
 	}
-	if !strings.Contains(sql, `WHERE ("tweets"."id" = $2)`) {
+	if !strings.Contains(sql, `WHERE ("posts"."id" = $2)`) {
 		t.Errorf("Patch must filter by PK: %s", sql)
 	}
 }
@@ -58,9 +58,9 @@ func TestPatchMultipleOps(t *testing.T) {
 	}
 	sql := fd.queries[0]
 	for _, want := range []string{
-		`"likes" = "tweets"."likes" + $1`,
-		`"views" = "tweets"."views" + $2`,
-		`"score" = GREATEST("tweets"."score", $3)`,
+		`"likes" = "posts"."likes" + $1`,
+		`"views" = "posts"."views" + $2`,
+		`"score" = GREATEST("posts"."score", $3)`,
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("missing fragment %q in:\n%s", want, sql)

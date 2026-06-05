@@ -7,7 +7,7 @@ import (
 	"github.com/bernardoforcillo/drops"
 )
 
-// High-traffic counters (tweet likes, view counts, engagement
+// High-traffic counters (like counts, view counts, engagement
 // scores) hit the same row from thousands of goroutines. Doing
 // "SELECT count, UPDATE count = count + 1" round-trips the value
 // through the application and races on it; doing
@@ -18,12 +18,12 @@ import (
 // SQL-side patch operations, all bound to the entity's PK so
 // the path is type-safe and audit/guard/tenant friendly.
 //
-//	TweetEntity.Patch(db, ctx, tweetID,
-//	    pg.Inc(TweetLikes, 1),
-//	    pg.Inc(TweetEngagement, 1),
-//	    pg.SetIfGreater(TweetMaxScore, currentScore),
+//	PostEntity.Patch(db, ctx, postID,
+//	    pg.Inc(PostLikes, 1),
+//	    pg.Inc(PostEngagement, 1),
+//	    pg.SetIfGreater(PostMaxScore, currentScore),
 //	)
-//	// UPDATE "tweets" SET
+//	// UPDATE "posts" SET
 //	//   "likes"      = "likes" + 1,
 //	//   "engagement" = "engagement" + 1,
 //	//   "maxScore"   = GREATEST("maxScore", $1)

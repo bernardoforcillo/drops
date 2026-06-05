@@ -7,9 +7,9 @@ import (
 )
 
 // MermaidDiagram renders the schema as a Mermaid `erDiagram` block.
-// Pipe it through any Mermaid renderer (mermaid.live, GitHub
-// markdown, VS Code preview) for an up-to-date ER diagram driven
-// directly by the table declarations.
+// Pipe it through any Mermaid-aware renderer (web preview tools,
+// Markdown viewers, IDE previews) for an up-to-date ER diagram
+// driven directly by the table declarations.
 //
 //	fmt.Println(pg.MermaidDiagram(pg.NewSchema(Users, Posts)))
 //	// erDiagram

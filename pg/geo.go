@@ -24,7 +24,7 @@ import (
 //	    Position pg.Point `drop:"position,notNull"`
 //	}
 //
-//	// Bolt-style dispatch: closest drivers inside a bounding box
+//	// Dispatch query: closest drivers inside a bounding box
 //	nearby, _ := DriverEntity.Query(db).
 //	    Where(pg.Within(DriversTable.Col("position"), pg.Box{
 //	        SW: pg.Point{Lat: 41.85, Lon: 12.40},

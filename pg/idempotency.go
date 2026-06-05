@@ -10,9 +10,9 @@ import (
 
 // IdempotencyStore stamps a (response, completed) record per key so
 // retries of the same logical operation observe the original result
-// instead of executing again. Bolt / Stripe call these
-// "idempotency keys"; every POST endpoint that mutates money or
-// emits events needs one.
+// instead of executing again. The pattern is the canonical
+// "idempotency key" used by payment APIs; every POST endpoint that
+// mutates money or emits events needs one.
 //
 //	store := pg.NewIdempotencyStore(db, "idempotency_keys", 24*time.Hour)
 //

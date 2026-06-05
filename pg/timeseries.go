@@ -6,13 +6,13 @@ import (
 	"time"
 )
 
-// Time-series ingestion at scale (Tesla telemetry, WhatsApp
-// message logs, X timeline events) demands partitioned tables —
-// without them the heap turns to soup within days. PostgreSQL
-// supports native PARTITION BY RANGE, but managing the
-// partitions (create the next one before traffic arrives, drop
-// the old ones once retention is over) is the operational
-// burden every team ends up writing a cron for.
+// Time-series ingestion at scale — IoT telemetry, message
+// logs, event streams — demands partitioned tables. Without
+// them the heap turns to soup within days. PostgreSQL supports
+// native PARTITION BY RANGE, but managing the partitions
+// (create the next one before traffic arrives, drop the old
+// ones once retention is over) is the operational burden every
+// team ends up writing a cron for.
 //
 // TimeSeriesTable encodes that pattern:
 //

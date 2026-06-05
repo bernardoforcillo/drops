@@ -10,8 +10,8 @@ import "github.com/bernardoforcillo/drops"
 //
 //	clickhouse.ApplyMixins(Events,
 //	    clickhouse.UUIDPrimaryKeyMixin{},
-//	    clickhouse.TimestampsMixin{},  // adds created_at, updated_at
-//	    clickhouse.SoftDeleteMixin{},  // adds deleted_at + default scope
+//	    clickhouse.TimestampsMixin{},  // adds createdAt, updatedAt
+//	    clickhouse.SoftDeleteMixin{},  // adds deletedAt + default scope
 //	)
 type Mixin interface {
 	Apply(*Table)
@@ -35,7 +35,7 @@ func ApplyMixins(t *Table, mixins ...Mixin) *Table {
 // Built-in rich mixins
 // ----------------------------------------------------------------------
 
-// TimestampsMixin registers "created_at" and "updated_at" DateTime
+// TimestampsMixin registers "createdAt" and "updatedAt" DateTime
 // columns. ClickHouse has no UPDATE builder so there is no UpdateHook
 // equivalent; both columns get DEFAULT now() so INSERT without an
 // explicit value picks up the server clock.
@@ -48,7 +48,7 @@ func (m *TimestampsMixin) Apply(t *Table) {
 	m.Cols = Timestamps(t)
 }
 
-// SoftDeleteMixin registers a Nullable(DateTime) "deleted_at" column
+// SoftDeleteMixin registers a Nullable(DateTime) "deletedAt" column
 // and a default filter that excludes already-deleted rows from
 // SELECTs. ClickHouse has no UPDATE/DELETE builder, so the "soft
 // delete the row" operation is left to the caller as a raw ALTER
@@ -66,7 +66,7 @@ func (m *SoftDeleteMixin) Apply(t *Table) {
 	}))
 }
 
-// AuditMixin registers "created_by" and "updated_by" columns of the
+// AuditMixin registers "createdBy" and "updatedBy" columns of the
 // same SQL type as Target. ClickHouse has no foreign-key enforcement,
 // so the columns are plain scalars.
 type AuditMixin[T any] struct {

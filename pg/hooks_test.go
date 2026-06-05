@@ -16,7 +16,7 @@ func TestInsertHookFillsMissingColumn(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	name := pg.Add(tbl, pg.Text("name").NotNull())
-	stamp := pg.Add(tbl, pg.Timestamp("created_at", true).NotNull().Default("now()"))
+	stamp := pg.Add(tbl, pg.Timestamp("createdAt", true).NotNull().Default("now()"))
 	_ = id
 
 	tbl.OnInsert(pg.InsertHookFunc(func(ctx *pg.InsertHookCtx) {
@@ -26,8 +26,8 @@ func TestInsertHookFillsMissingColumn(t *testing.T) {
 	db := pg.New(nil)
 	sql, args := db.Insert(tbl).Row(name.Val("Alice")).ToSQL()
 
-	if !strings.Contains(sql, `"created_at"`) {
-		t.Errorf("hook should append created_at column: %s", sql)
+	if !strings.Contains(sql, `"createdAt"`) {
+		t.Errorf("hook should append createdAt column: %s", sql)
 	}
 	if !strings.Contains(sql, "now()") {
 		t.Errorf("hook should append now() expression: %s", sql)
@@ -41,7 +41,7 @@ func TestInsertHookYieldsToUserValue(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	name := pg.Add(tbl, pg.Text("name").NotNull())
-	createdAt := pg.Add(tbl, pg.Timestamp("created_at", true).NotNull())
+	createdAt := pg.Add(tbl, pg.Timestamp("createdAt", true).NotNull())
 
 	hookCalled := false
 	tbl.OnInsert(pg.InsertHookFunc(func(ctx *pg.InsertHookCtx) {
@@ -75,7 +75,7 @@ func TestInsertHookAppliesUniformlyAcrossRows(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	name := pg.Add(tbl, pg.Text("name").NotNull())
-	createdAt := pg.Add(tbl, pg.Timestamp("created_at", true).NotNull())
+	createdAt := pg.Add(tbl, pg.Timestamp("createdAt", true).NotNull())
 
 	tbl.OnInsert(pg.InsertHookFunc(func(ctx *pg.InsertHookCtx) {
 		ctx.SetExpr(createdAt.Column, drops.Raw("now()"))
@@ -101,7 +101,7 @@ func TestUpdateHookFillsMissingSet(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	name := pg.Add(tbl, pg.Text("name").NotNull())
-	updatedAt := pg.Add(tbl, pg.Timestamp("updated_at", true).NotNull())
+	updatedAt := pg.Add(tbl, pg.Timestamp("updatedAt", true).NotNull())
 
 	tbl.OnUpdate(pg.UpdateHookFunc(func(ctx *pg.UpdateHookCtx) {
 		ctx.SetExpr(updatedAt.Column, drops.Raw("now()"))
@@ -110,8 +110,8 @@ func TestUpdateHookFillsMissingSet(t *testing.T) {
 	db := pg.New(nil)
 	sql, args := db.Update(tbl).Set(name.Val("Bob")).Where(id.Eq(1)).ToSQL()
 
-	if !strings.Contains(sql, `"updated_at" = now()`) {
-		t.Errorf("hook should bump updated_at: %s", sql)
+	if !strings.Contains(sql, `"updatedAt" = now()`) {
+		t.Errorf("hook should bump updatedAt: %s", sql)
 	}
 	if len(args) != 2 || args[0] != "Bob" {
 		t.Errorf("args mismatch: %v", args)
@@ -122,7 +122,7 @@ func TestUpdateHookYieldsToUserValue(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	name := pg.Add(tbl, pg.Text("name").NotNull())
-	updatedAt := pg.Add(tbl, pg.Timestamp("updated_at", true).NotNull())
+	updatedAt := pg.Add(tbl, pg.Timestamp("updatedAt", true).NotNull())
 
 	tbl.OnUpdate(pg.UpdateHookFunc(func(ctx *pg.UpdateHookCtx) {
 		ctx.SetExpr(updatedAt.Column, drops.Raw("now()"))
@@ -149,7 +149,7 @@ func TestUpdateHookYieldsToUserValue(t *testing.T) {
 func TestDeleteHookRewritesToUpdate(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	deletedAt := pg.Add(tbl, pg.Timestamp("deleted_at", true))
+	deletedAt := pg.Add(tbl, pg.Timestamp("deletedAt", true))
 
 	tbl.OnDelete(pg.DeleteHookFunc(func(d *pg.DeleteBuilder) drops.Expression {
 		upd := d.DB().Update(d.Table()).
@@ -166,7 +166,7 @@ func TestDeleteHookRewritesToUpdate(t *testing.T) {
 	if !strings.HasPrefix(sql, "UPDATE ") {
 		t.Errorf("expected rewritten UPDATE, got: %s", sql)
 	}
-	if !strings.Contains(sql, `"deleted_at" = now()`) {
+	if !strings.Contains(sql, `"deletedAt" = now()`) {
 		t.Errorf("missing SET: %s", sql)
 	}
 }
@@ -174,7 +174,7 @@ func TestDeleteHookRewritesToUpdate(t *testing.T) {
 func TestDeleteHookUnscopedSkipsRewrite(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	deletedAt := pg.Add(tbl, pg.Timestamp("deleted_at", true))
+	deletedAt := pg.Add(tbl, pg.Timestamp("deletedAt", true))
 
 	tbl.OnDelete(pg.DeleteHookFunc(func(d *pg.DeleteBuilder) drops.Expression {
 		return d.DB().Update(d.Table()).Set(deletedAt.Expr(drops.Raw("now()")))
@@ -195,17 +195,17 @@ func TestDeleteHookUnscopedSkipsRewrite(t *testing.T) {
 func TestDefaultFilterAppliedToSelect(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	deletedAt := pg.Add(tbl, pg.Timestamp("deleted_at", true))
+	deletedAt := pg.Add(tbl, pg.Timestamp("deletedAt", true))
 	tbl.DefaultFilter(deletedAt.IsNull())
 
 	db := pg.New(nil)
 	sql, _ := db.Select(id).From(tbl).ToSQL()
-	if !strings.Contains(sql, `"widgets"."deleted_at" IS NULL`) {
+	if !strings.Contains(sql, `"widgets"."deletedAt" IS NULL`) {
 		t.Errorf("default filter missing in SELECT: %s", sql)
 	}
 
 	sql, _ = db.Select(id).From(tbl).Unscoped().ToSQL()
-	if strings.Contains(sql, "deleted_at") {
+	if strings.Contains(sql, "deletedAt") {
 		t.Errorf("Unscoped SELECT must skip default filter: %s", sql)
 	}
 }
@@ -214,17 +214,17 @@ func TestDefaultFilterAppliedToUpdate(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	name := pg.Add(tbl, pg.Text("name").NotNull())
-	deletedAt := pg.Add(tbl, pg.Timestamp("deleted_at", true))
+	deletedAt := pg.Add(tbl, pg.Timestamp("deletedAt", true))
 	tbl.DefaultFilter(deletedAt.IsNull())
 
 	db := pg.New(nil)
 	sql, _ := db.Update(tbl).Set(name.Val("Carol")).Where(id.Eq(1)).ToSQL()
-	if !strings.Contains(sql, "deleted_at") {
+	if !strings.Contains(sql, "deletedAt") {
 		t.Errorf("default filter missing in UPDATE: %s", sql)
 	}
 
 	sql, _ = db.Update(tbl).Set(name.Val("Carol")).Unscoped().Where(id.Eq(1)).ToSQL()
-	if strings.Contains(sql, "deleted_at") {
+	if strings.Contains(sql, "deletedAt") {
 		t.Errorf("Unscoped UPDATE must skip default filter: %s", sql)
 	}
 }
@@ -232,17 +232,17 @@ func TestDefaultFilterAppliedToUpdate(t *testing.T) {
 func TestDefaultFilterAppliedToDelete(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	deletedAt := pg.Add(tbl, pg.Timestamp("deleted_at", true))
+	deletedAt := pg.Add(tbl, pg.Timestamp("deletedAt", true))
 	tbl.DefaultFilter(deletedAt.IsNull())
 
 	db := pg.New(nil)
 	sql, _ := db.Delete(tbl).Where(id.Eq(1)).ToSQL()
-	if !strings.Contains(sql, "deleted_at") {
+	if !strings.Contains(sql, "deletedAt") {
 		t.Errorf("default filter missing in DELETE: %s", sql)
 	}
 
 	sql, _ = db.Delete(tbl).Unscoped().Where(id.Eq(1)).ToSQL()
-	if strings.Contains(sql, "deleted_at") {
+	if strings.Contains(sql, "deletedAt") {
 		t.Errorf("Unscoped DELETE must skip default filter: %s", sql)
 	}
 }

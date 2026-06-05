@@ -142,7 +142,7 @@ func fieldMap(t reflect.Type) map[string][]int {
 				continue
 			}
 			m[f.Name] = idx
-			m[snakeCase(f.Name)] = idx
+			m[camelCase(f.Name)] = idx
 		}
 	}
 	walk(t, nil)
@@ -150,23 +150,63 @@ func fieldMap(t reflect.Type) map[string][]int {
 	return m
 }
 
-// snakeCase converts CamelCase to snake_case. It treats runs of capitals
-// as a single word ("UserID" -> "user_id", "HTTPStatus" -> "http_status").
-func snakeCase(s string) string {
-	var b strings.Builder
-	b.Grow(len(s) + 4)
-	for i := 0; i < len(s); i++ {
+// camelCase converts PascalCase to camelCase. It treats runs of
+// capitals as a single word so the second word's first letter is
+// the boundary marker:
+//
+//	"UserID"     → "userId"
+//	"HTTPStatus" → "httpStatus"
+//	"Name"       → "name"
+//
+// Used as the fallback column-name match for untagged struct fields.
+func camelCase(s string) string {
+	if s == "" {
+		return ""
+	}
+	// First pass: identify word boundaries via the snake_case logic,
+	// then re-stitch with the second-word-onwards title-cased.
+	type word struct{ start, end int }
+	var words []word
+	startW := 0
+	for i := 1; i < len(s); i++ {
 		c := s[i]
 		isUpper := c >= 'A' && c <= 'Z'
 		if isUpper {
-			prevLower := i > 0 && s[i-1] >= 'a' && s[i-1] <= 'z'
+			prev := s[i-1]
+			prevLower := prev >= 'a' && prev <= 'z'
 			nextLower := i+1 < len(s) && s[i+1] >= 'a' && s[i+1] <= 'z'
-			if i > 0 && (prevLower || nextLower) {
-				b.WriteByte('_')
+			if prevLower || nextLower {
+				words = append(words, word{startW, i})
+				startW = i
 			}
-			c += 'a' - 'A'
 		}
-		b.WriteByte(c)
+	}
+	words = append(words, word{startW, len(s)})
+
+	var b strings.Builder
+	b.Grow(len(s))
+	for wi, w := range words {
+		if wi == 0 {
+			// Lowercase the entire first word.
+			for i := w.start; i < w.end; i++ {
+				c := s[i]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				b.WriteByte(c)
+			}
+			continue
+		}
+		// Capitalise the first letter, lowercase the rest.
+		first := s[w.start]
+		b.WriteByte(first) // already uppercase by construction
+		for i := w.start + 1; i < w.end; i++ {
+			c := s[i]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			b.WriteByte(c)
+		}
 	}
 	return b.String()
 }

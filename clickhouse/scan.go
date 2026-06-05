@@ -128,7 +128,7 @@ func fieldMap(t reflect.Type) map[string][]int {
 				continue
 			}
 			m[f.Name] = idx
-			m[snakeCase(f.Name)] = idx
+			m[camelCase(f.Name)] = idx
 		}
 	}
 	walk(t, nil)
@@ -136,21 +136,54 @@ func fieldMap(t reflect.Type) map[string][]int {
 	return m
 }
 
-func snakeCase(s string) string {
-	var b strings.Builder
-	b.Grow(len(s) + 4)
-	for i := 0; i < len(s); i++ {
+// camelCase converts PascalCase to camelCase. Used as the fallback
+// column-name match for untagged struct fields:
+//
+//	"UserID"     → "userId"
+//	"HTTPStatus" → "httpStatus"
+func camelCase(s string) string {
+	if s == "" {
+		return ""
+	}
+	type word struct{ start, end int }
+	var words []word
+	startW := 0
+	for i := 1; i < len(s); i++ {
 		c := s[i]
 		isUpper := c >= 'A' && c <= 'Z'
 		if isUpper {
-			prevLower := i > 0 && s[i-1] >= 'a' && s[i-1] <= 'z'
+			prev := s[i-1]
+			prevLower := prev >= 'a' && prev <= 'z'
 			nextLower := i+1 < len(s) && s[i+1] >= 'a' && s[i+1] <= 'z'
-			if i > 0 && (prevLower || nextLower) {
-				b.WriteByte('_')
+			if prevLower || nextLower {
+				words = append(words, word{startW, i})
+				startW = i
 			}
-			c += 'a' - 'A'
 		}
-		b.WriteByte(c)
+	}
+	words = append(words, word{startW, len(s)})
+
+	var b strings.Builder
+	b.Grow(len(s))
+	for wi, w := range words {
+		if wi == 0 {
+			for i := w.start; i < w.end; i++ {
+				c := s[i]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				b.WriteByte(c)
+			}
+			continue
+		}
+		b.WriteByte(s[w.start]) // already uppercase
+		for i := w.start + 1; i < w.end; i++ {
+			c := s[i]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			b.WriteByte(c)
+		}
 	}
 	return b.String()
 }

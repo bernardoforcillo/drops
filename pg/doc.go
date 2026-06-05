@@ -30,7 +30,7 @@
 // type-safe CRUD shortcuts: Get / Create / Update / Save / Delete /
 // Query. It composes with lifecycle hooks and default scopes, so a
 // SoftDelete mixin makes UserEntity.Delete() automatically rewrite
-// into an UPDATE that flips deleted_at.
+// into an UPDATE that flips deletedAt.
 //
 // Entity.Validate registers per-row validators that run before
 // Create / Update / Save. A column marked with OptimisticLock turns

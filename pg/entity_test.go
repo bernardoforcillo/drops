@@ -266,7 +266,7 @@ func TestEntityComposesWithHooks(t *testing.T) {
 	}
 	_, _ = ent.Get(db, context.Background(), int64(1))
 	sel := fd.queries[0]
-	if !strings.Contains(sel, "deleted_at") {
+	if !strings.Contains(sel, "deletedAt") {
 		t.Errorf("Get should pick up default scope: %s", sel)
 	}
 }

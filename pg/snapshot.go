@@ -215,34 +215,47 @@ func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
 	return &s, nil
 }
 
-// Naming helpers — drizzle-kit's conventions ---------------------------
+// Naming helpers ------------------------------------------------------
 
-// fkName builds drizzle-kit's foreign-key constraint name:
+// fkName builds the foreign-key constraint name in camelCase:
 //
-//	<tableFrom>_<colFrom...>_<tableTo>_<colTo...>_fk
+//	<tableFrom><ColFrom...><TableTo><ColTo...>Fk
 func fkName(tableFrom string, cols []string, tableTo string, targetCols []string) string {
 	out := tableFrom
 	for _, c := range cols {
-		out += "_" + c
+		out += titleCaseFirst(c)
 	}
-	out += "_" + tableTo
+	out += titleCaseFirst(tableTo)
 	for _, c := range targetCols {
-		out += "_" + c
+		out += titleCaseFirst(c)
 	}
-	out += "_fk"
+	out += "Fk"
 	return out
 }
 
-// uniqueName builds drizzle-kit's unique-constraint name:
+// uniqueName builds the unique-constraint name in camelCase:
 //
-//	<table>_<col...>_unique
+//	<table><Col...>Unique
 func uniqueName(table string, cols []string) string {
 	out := table
 	for _, c := range cols {
-		out += "_" + c
+		out += titleCaseFirst(c)
 	}
-	out += "_unique"
+	out += "Unique"
 	return out
+}
+
+// titleCaseFirst uppercases the first byte of s. Used to title-case
+// each column name when concatenating constraint identifiers.
+func titleCaseFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	first := s[0]
+	if first >= 'a' && first <= 'z' {
+		first -= 'a' - 'A'
+	}
+	return string(first) + s[1:]
 }
 
 // normaliseAction converts a possibly-empty referential action ("CASCADE",

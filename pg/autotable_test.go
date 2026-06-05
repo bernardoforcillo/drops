@@ -15,7 +15,7 @@ type autoUser struct {
 	Email     string    `drop:"email,notNull,unique"`
 	Name      string    `drop:"name,notNull"`
 	Age       *int32    `drop:"age"`
-	CreatedAt time.Time `drop:"created_at,notNull,default=now()"`
+	CreatedAt time.Time `drop:"createdAt,notNull,default=now()"`
 	Internal  string    // untagged — skipped
 	Skip      string    `drop:"-"`
 }
@@ -29,7 +29,7 @@ func TestAutoTableInfersColumns(t *testing.T) {
 		`"email" text NOT NULL UNIQUE`,
 		`"name" text NOT NULL`,
 		`"age" integer`,
-		`"created_at" timestamptz NOT NULL DEFAULT now()`,
+		`"createdAt" timestamptz NOT NULL DEFAULT now()`,
 	}
 	for _, w := range wantFragments {
 		if !strings.Contains(got, w) {
@@ -57,7 +57,7 @@ func TestNewAutoEntityCRUD(t *testing.T) {
 
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{
-			cols: []string{"id", "email", "name", "age", "created_at"},
+			cols: []string{"id", "email", "name", "age", "createdAt"},
 			data: [][]any{{int64(7), "a@x", "Alice", (*int32)(nil), time.Now()}},
 		}, nil
 	}}

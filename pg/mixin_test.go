@@ -17,7 +17,7 @@ func timeMustParse(s string) time.Time {
 }
 
 // TestTimestampsMixin verifies that the rich mixin variant adds the
-// columns AND registers an UpdateHook that bumps updated_at.
+// columns AND registers an UpdateHook that bumps updatedAt.
 func TestTimestampsMixin(t *testing.T) {
 	tbl := pg.NewTable("widgets")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
@@ -33,10 +33,10 @@ func TestTimestampsMixin(t *testing.T) {
 	id, _ := pg.Add(tbl, pg.Integer("dummy")), 1
 	_ = id
 
-	// UPDATE without an explicit updated_at must auto-set it.
+	// UPDATE without an explicit updatedAt must auto-set it.
 	sql, _ := db.Update(tbl).Set(name.Val("Alice")).ToSQL()
-	if !strings.Contains(sql, `"updated_at" = now()`) {
-		t.Errorf("UpdateHook should bump updated_at: %s", sql)
+	if !strings.Contains(sql, `"updatedAt" = now()`) {
+		t.Errorf("UpdateHook should bump updatedAt: %s", sql)
 	}
 
 	// User-supplied value wins.
@@ -44,7 +44,7 @@ func TestTimestampsMixin(t *testing.T) {
 		Set(name.Val("Alice"), m.Cols.UpdatedAt.Val(timeMustParse("2030-01-01"))).
 		ToSQL()
 	if strings.Contains(sql, "now()") {
-		t.Errorf("explicit updated_at must override hook: %s", sql)
+		t.Errorf("explicit updatedAt must override hook: %s", sql)
 	}
 }
 
@@ -65,20 +65,20 @@ func TestSoftDeleteMixin(t *testing.T) {
 
 	// SELECT picks up the default filter automatically.
 	sql, _ := db.Select(id).From(tbl).ToSQL()
-	if !strings.Contains(sql, `"widgets"."deleted_at" IS NULL`) {
+	if !strings.Contains(sql, `"widgets"."deletedAt" IS NULL`) {
 		t.Errorf("default filter missing: %s", sql)
 	}
 
-	// DELETE is rewritten into UPDATE deleted_at = now().
+	// DELETE is rewritten into UPDATE deletedAt = now().
 	sql, _ = db.Delete(tbl).Where(id.Eq(1)).ToSQL()
 	if !strings.HasPrefix(sql, "UPDATE ") {
 		t.Errorf("DELETE must be rewritten to UPDATE: %s", sql)
 	}
-	if !strings.Contains(sql, `"deleted_at" = now()`) {
-		t.Errorf("rewrite must set deleted_at: %s", sql)
+	if !strings.Contains(sql, `"deletedAt" = now()`) {
+		t.Errorf("rewrite must set deletedAt: %s", sql)
 	}
-	if !strings.Contains(sql, `"widgets"."deleted_at" IS NULL`) {
-		t.Errorf("rewritten UPDATE must keep the deleted_at IS NULL guard: %s", sql)
+	if !strings.Contains(sql, `"widgets"."deletedAt" IS NULL`) {
+		t.Errorf("rewritten UPDATE must keep the deletedAt IS NULL guard: %s", sql)
 	}
 
 	// Unscoped DELETE bypasses both the rewrite and the filter.
@@ -86,7 +86,7 @@ func TestSoftDeleteMixin(t *testing.T) {
 	if !strings.HasPrefix(sql, "DELETE ") {
 		t.Errorf("Unscoped DELETE must produce a real DELETE: %s", sql)
 	}
-	if strings.Contains(sql, "deleted_at") {
+	if strings.Contains(sql, "deletedAt") {
 		t.Errorf("Unscoped DELETE must drop the default filter: %s", sql)
 	}
 }
@@ -119,7 +119,7 @@ func TestAuditMixin(t *testing.T) {
 		t.Fatal("AuditMixin must populate Cols on Apply")
 	}
 	if m.Cols.CreatedBy.ForeignKey() == nil {
-		t.Error("created_by must reference target")
+		t.Error("createdBy must reference target")
 	}
 }
 
@@ -141,16 +141,16 @@ func TestMixinsCompose(t *testing.T) {
 
 	// SELECT: default filter applied (from soft-delete).
 	sql, _ := db.Select(pkm.Cols.ID, title).From(docs).ToSQL()
-	if !strings.Contains(sql, `"docs"."deleted_at" IS NULL`) {
+	if !strings.Contains(sql, `"docs"."deletedAt" IS NULL`) {
 		t.Errorf("compose: select filter missing: %s", sql)
 	}
 
-	// UPDATE: hook bumps updated_at AND default filter applied.
+	// UPDATE: hook bumps updatedAt AND default filter applied.
 	sql, _ = db.Update(docs).Set(title.Val("hi")).ToSQL()
-	if !strings.Contains(sql, `"updated_at" = now()`) {
-		t.Errorf("compose: updated_at hook missing: %s", sql)
+	if !strings.Contains(sql, `"updatedAt" = now()`) {
+		t.Errorf("compose: updatedAt hook missing: %s", sql)
 	}
-	if !strings.Contains(sql, "deleted_at") {
+	if !strings.Contains(sql, "deletedAt") {
 		t.Errorf("compose: default filter missing in UPDATE: %s", sql)
 	}
 
@@ -159,11 +159,11 @@ func TestMixinsCompose(t *testing.T) {
 	if !strings.HasPrefix(sql, "UPDATE ") {
 		t.Errorf("compose: DELETE must be rewritten: %s", sql)
 	}
-	if !strings.Contains(sql, `"deleted_at" = now()`) {
-		t.Errorf("compose: rewritten UPDATE must set deleted_at: %s", sql)
+	if !strings.Contains(sql, `"deletedAt" = now()`) {
+		t.Errorf("compose: rewritten UPDATE must set deletedAt: %s", sql)
 	}
-	// And the timestamps hook should also bump updated_at on the rewrite.
-	if !strings.Contains(sql, `"updated_at" = now()`) {
-		t.Errorf("compose: rewrite should also bump updated_at: %s", sql)
+	// And the timestamps hook should also bump updatedAt on the rewrite.
+	if !strings.Contains(sql, `"updatedAt" = now()`) {
+		t.Errorf("compose: rewrite should also bump updatedAt: %s", sql)
 	}
 }

@@ -10,7 +10,7 @@ import "time"
 //	var (
 //	    Events   = clickhouse.NewTable("events").Engine(clickhouse.MergeTree())
 //	    EventID  = clickhouse.Add(Events, clickhouse.UUID("id"))
-//	    EventTS  = clickhouse.Timestamps(Events) // created_at, updated_at
+//	    EventTS  = clickhouse.Timestamps(Events) // createdAt, updatedAt
 //	    EventName = clickhouse.Add(Events, clickhouse.String("name"))
 //	)
 //
@@ -24,12 +24,12 @@ type TimestampsCols struct {
 	UpdatedAt *Col[time.Time]
 }
 
-// Timestamps appends "created_at" and "updated_at" DateTime columns
+// Timestamps appends "createdAt" and "updatedAt" DateTime columns
 // defaulting to now() to t.
 func Timestamps(t *Table) TimestampsCols {
 	return TimestampsCols{
-		CreatedAt: Add(t, DateTime("created_at", "").Default("now()")),
-		UpdatedAt: Add(t, DateTime("updated_at", "").Default("now()")),
+		CreatedAt: Add(t, DateTime("createdAt", "").Default("now()")),
+		UpdatedAt: Add(t, DateTime("updatedAt", "").Default("now()")),
 	}
 }
 
@@ -38,11 +38,11 @@ type SoftDeleteCols struct {
 	DeletedAt *Col[time.Time]
 }
 
-// SoftDelete appends a Nullable(DateTime) "deleted_at" column to t. A
-// row is treated as live while deleted_at IS NULL.
+// SoftDelete appends a Nullable(DateTime) "deletedAt" column to t. A
+// row is treated as live while deletedAt IS NULL.
 func SoftDelete(t *Table) SoftDeleteCols {
 	return SoftDeleteCols{
-		DeletedAt: Add(t, DateTime("deleted_at", "").Nullable()),
+		DeletedAt: Add(t, DateTime("deletedAt", "").Nullable()),
 	}
 }
 
@@ -53,15 +53,15 @@ type AuditCols[T any] struct {
 	UpdatedBy *Col[T]
 }
 
-// Audit appends "created_by" and "updated_by" columns to t, mirroring
+// Audit appends "createdBy" and "updatedBy" columns to t, mirroring
 // target's SQL type. ClickHouse has no foreign-key enforcement, so the
 // columns are plain scalars; the typed handles let queries still
 // compare them against target safely.
 func Audit[T any](t *Table, target *Col[T]) AuditCols[T] {
 	typeSQL := target.Type().TypeSQL()
 	return AuditCols[T]{
-		CreatedBy: Add(t, Custom[T]("created_by", typeSQL)),
-		UpdatedBy: Add(t, Custom[T]("updated_by", typeSQL)),
+		CreatedBy: Add(t, Custom[T]("createdBy", typeSQL)),
+		UpdatedBy: Add(t, Custom[T]("updatedBy", typeSQL)),
 	}
 }
 

@@ -24,7 +24,7 @@ import (
 //
 //	type Event struct {
 //	    ID     string    `drop:"id"`
-//	    UserID uint64    `drop:"user_id"`
+//	    UserID uint64    `drop:"userId"`
 //	    Kind   string    `drop:"kind"`
 //	    Ts     time.Time `drop:"ts"`
 //	}

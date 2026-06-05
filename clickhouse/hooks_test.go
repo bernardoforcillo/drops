@@ -11,7 +11,7 @@ import (
 func TestClickhouseInsertHookFillsColumn(t *testing.T) {
 	tbl := clickhouse.NewTable("widgets").Engine(clickhouse.MergeTree())
 	id := clickhouse.Add(tbl, clickhouse.UUID("id"))
-	created := clickhouse.Add(tbl, clickhouse.DateTime("created_at", "").Default("now()"))
+	created := clickhouse.Add(tbl, clickhouse.DateTime("createdAt", "").Default("now()"))
 	tbl.OrderBy(id)
 
 	tbl.OnInsert(clickhouse.InsertHookFunc(func(ctx *clickhouse.InsertHookCtx) {
@@ -20,15 +20,15 @@ func TestClickhouseInsertHookFillsColumn(t *testing.T) {
 
 	db := clickhouse.New(nil)
 	sql, _ := db.Insert(tbl).Row(id.Val("u1")).ToSQL()
-	if !strings.Contains(sql, `"created_at"`) || !strings.Contains(sql, "now()") {
-		t.Errorf("hook should append created_at = now(): %s", sql)
+	if !strings.Contains(sql, `"createdAt"`) || !strings.Contains(sql, "now()") {
+		t.Errorf("hook should append createdAt = now(): %s", sql)
 	}
 }
 
 func TestClickhouseInsertHookYieldsToUser(t *testing.T) {
 	tbl := clickhouse.NewTable("widgets").Engine(clickhouse.MergeTree())
 	id := clickhouse.Add(tbl, clickhouse.UUID("id"))
-	created := clickhouse.Add(tbl, clickhouse.DateTime("created_at", ""))
+	created := clickhouse.Add(tbl, clickhouse.DateTime("createdAt", ""))
 	tbl.OrderBy(id)
 
 	tbl.OnInsert(clickhouse.InsertHookFunc(func(ctx *clickhouse.InsertHookCtx) {
@@ -50,18 +50,18 @@ func TestClickhouseInsertHookYieldsToUser(t *testing.T) {
 func TestClickhouseDefaultFilterApplied(t *testing.T) {
 	tbl := clickhouse.NewTable("widgets").Engine(clickhouse.MergeTree())
 	id := clickhouse.Add(tbl, clickhouse.UUID("id"))
-	deleted := clickhouse.Add(tbl, clickhouse.DateTime("deleted_at", "").Nullable())
+	deleted := clickhouse.Add(tbl, clickhouse.DateTime("deletedAt", "").Nullable())
 	tbl.OrderBy(id)
 	tbl.DefaultFilter(deleted.IsNull())
 
 	db := clickhouse.New(nil)
 	sql, _ := db.Select(id).From(tbl).ToSQL()
-	if !strings.Contains(sql, "deleted_at") {
+	if !strings.Contains(sql, "deletedAt") {
 		t.Errorf("default filter missing in SELECT: %s", sql)
 	}
 
 	sql, _ = db.Select(id).From(tbl).Unscoped().ToSQL()
-	if strings.Contains(sql, "deleted_at") {
+	if strings.Contains(sql, "deletedAt") {
 		t.Errorf("Unscoped SELECT must skip default filter: %s", sql)
 	}
 }
@@ -77,8 +77,8 @@ func TestClickhouseTimestampsMixin(t *testing.T) {
 		t.Fatal("TimestampsMixin must populate Cols")
 	}
 	got, _ := clickhouse.ToSQL(clickhouse.CreateTable(tbl))
-	if !strings.Contains(got, `"created_at" DateTime DEFAULT now()`) {
-		t.Errorf("missing created_at column: %s", got)
+	if !strings.Contains(got, `"createdAt" DateTime DEFAULT now()`) {
+		t.Errorf("missing createdAt column: %s", got)
 	}
 }
 
@@ -91,11 +91,11 @@ func TestClickhouseSoftDeleteMixin(t *testing.T) {
 
 	db := clickhouse.New(nil)
 	sql, _ := db.Select(id).From(tbl).ToSQL()
-	if !strings.Contains(sql, `"widgets"."deleted_at" IS NULL`) {
+	if !strings.Contains(sql, `"widgets"."deletedAt" IS NULL`) {
 		t.Errorf("default scope missing on SELECT: %s", sql)
 	}
 	sql, _ = db.Select(id).From(tbl).Unscoped().ToSQL()
-	if strings.Contains(sql, "deleted_at") {
+	if strings.Contains(sql, "deletedAt") {
 		t.Errorf("Unscoped must drop the filter: %s", sql)
 	}
 }

@@ -10,8 +10,8 @@ import "time"
 //	var (
 //	    Users   = pg.NewTable("users")
 //	    UserID  = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
-//	    UserTS  = pg.Timestamps(Users)   // created_at, updated_at
-//	    UserSD  = pg.SoftDelete(Users)   // deleted_at
+//	    UserTS  = pg.Timestamps(Users)   // createdAt, updatedAt
+//	    UserSD  = pg.SoftDelete(Users)   // deletedAt
 //	    UserName = pg.Add(Users, pg.Text("name").NotNull())
 //	)
 //
@@ -38,12 +38,12 @@ type TimestampsCols struct {
 	UpdatedAt *Col[time.Time]
 }
 
-// Timestamps appends NOT NULL "created_at" and "updated_at" TIMESTAMPTZ
+// Timestamps appends NOT NULL "createdAt" and "updatedAt" TIMESTAMPTZ
 // columns defaulting to now() to t.
 func Timestamps(t *Table) TimestampsCols {
 	return TimestampsCols{
-		CreatedAt: Add(t, Timestamp("created_at", true).NotNull().Default("now()")),
-		UpdatedAt: Add(t, Timestamp("updated_at", true).NotNull().Default("now()")),
+		CreatedAt: Add(t, Timestamp("createdAt", true).NotNull().Default("now()")),
+		UpdatedAt: Add(t, Timestamp("updatedAt", true).NotNull().Default("now()")),
 	}
 }
 
@@ -52,11 +52,11 @@ type SoftDeleteCols struct {
 	DeletedAt *Col[time.Time]
 }
 
-// SoftDelete appends a nullable "deleted_at" TIMESTAMPTZ column. A
-// record is treated as live while deleted_at IS NULL.
+// SoftDelete appends a nullable "deletedAt" TIMESTAMPTZ column. A
+// record is treated as live while deletedAt IS NULL.
 func SoftDelete(t *Table) SoftDeleteCols {
 	return SoftDeleteCols{
-		DeletedAt: Add(t, Timestamp("deleted_at", true)),
+		DeletedAt: Add(t, Timestamp("deletedAt", true)),
 	}
 }
 
@@ -67,7 +67,7 @@ type AuditCols[T any] struct {
 	UpdatedBy *Col[T]
 }
 
-// Audit appends nullable "created_by" and "updated_by" columns to t and
+// Audit appends nullable "createdBy" and "updatedBy" columns to t and
 // declares foreign keys against target — typically a users.id PK. The
 // referencing columns' SQL type is derived from target; serial-family
 // types are mapped to their underlying integer type (bigserial→bigint,
@@ -75,8 +75,8 @@ type AuditCols[T any] struct {
 func Audit[T any](t *Table, target *Col[T]) AuditCols[T] {
 	refType := referenceTypeOf(target.Type().TypeSQL())
 	return AuditCols[T]{
-		CreatedBy: Add(t, Custom[T]("created_by", refType).References(target)),
-		UpdatedBy: Add(t, Custom[T]("updated_by", refType).References(target)),
+		CreatedBy: Add(t, Custom[T]("createdBy", refType).References(target)),
+		UpdatedBy: Add(t, Custom[T]("updatedBy", refType).References(target)),
 	}
 }
 

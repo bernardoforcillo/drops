@@ -13,10 +13,10 @@ import (
 //
 //	users:    id, name
 //	posts:    id, title
-//	comments: id, body, commentable_type, commentable_id
+//	comments: id, body, commentableType, commentableId
 //
 // A comment points to either a user or a post via the
-// (commentable_type, commentable_id) pair.
+// (commentableType, commentableId) pair.
 
 type morphUser struct {
 	ID   int64  `drop:"id"`
@@ -31,8 +31,8 @@ type morphPost struct {
 type morphComment struct {
 	ID              int64  `drop:"id"`
 	Body            string `drop:"body"`
-	CommentableType string `drop:"commentable_type"`
-	CommentableID   int64  `drop:"commentable_id"`
+	CommentableType string `drop:"commentableType"`
+	CommentableID   int64  `drop:"commentableId"`
 	Commentable     any    `dropRel:"commentable"`
 }
 
@@ -54,8 +54,8 @@ func morphSchema() (users, posts, comments *pg.Table, morphs *pg.MorphMap) {
 	comments = pg.NewTable("comments")
 	pg.Add(comments, pg.BigSerial("id").PrimaryKey())
 	pg.Add(comments, pg.Text("body").NotNull())
-	cType := pg.Add(comments, pg.Text("commentable_type").NotNull())
-	cID := pg.Add(comments, pg.BigInt("commentable_id").NotNull())
+	cType := pg.Add(comments, pg.Text("commentableType").NotNull())
+	cID := pg.Add(comments, pg.BigInt("commentableId").NotNull())
 
 	morphs = pg.NewMorphMap()
 	pg.RegisterMorph[morphUser](morphs, "users", users)
@@ -69,7 +69,7 @@ func morphSchema() (users, posts, comments *pg.Table, morphs *pg.MorphMap) {
 }
 
 // TestMorphToLoadsPolymorphicParent verifies that a child whose
-// commentable_type/commentable_id pair points at a User receives a
+// commentableType/commentableId pair points at a User receives a
 // *morphUser, and one pointing at a Post receives a *morphPost.
 func TestMorphToLoadsPolymorphicParent(t *testing.T) {
 	_, _, comments, _ := morphSchema()
@@ -78,7 +78,7 @@ func TestMorphToLoadsPolymorphicParent(t *testing.T) {
 		switch {
 		case strings.Contains(sql, `FROM "comments"`):
 			return &fakeRows{
-				cols: []string{"id", "body", "commentable_type", "commentable_id"},
+				cols: []string{"id", "body", "commentableType", "commentableId"},
 				data: [][]any{
 					{int64(1), "great post", "posts", int64(10)},
 					{int64(2), "hi alice", "users", int64(7)},
@@ -133,7 +133,7 @@ func TestMorphToBatchesByType(t *testing.T) {
 		switch {
 		case strings.Contains(sql, `FROM "comments"`):
 			return &fakeRows{
-				cols: []string{"id", "body", "commentable_type", "commentable_id"},
+				cols: []string{"id", "body", "commentableType", "commentableId"},
 				data: [][]any{
 					{int64(1), "x", "users", int64(1)},
 					{int64(2), "y", "users", int64(2)},
@@ -176,7 +176,7 @@ func TestMorphToUnknownTypeReturnsError(t *testing.T) {
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		return &fakeRows{
-			cols: []string{"id", "body", "commentable_type", "commentable_id"},
+			cols: []string{"id", "body", "commentableType", "commentableId"},
 			data: [][]any{
 				{int64(1), "x", "rocks", int64(99)}, // unregistered
 			},
@@ -196,7 +196,7 @@ func TestMorphToRejectsNestedWith(t *testing.T) {
 	_, _, comments, _ := morphSchema()
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		return &fakeRows{
-			cols: []string{"id", "body", "commentable_type", "commentable_id"},
+			cols: []string{"id", "body", "commentableType", "commentableId"},
 			data: [][]any{{int64(1), "x", "users", int64(1)}},
 		}, nil
 	}}
@@ -209,8 +209,8 @@ func TestMorphToRejectsNestedWith(t *testing.T) {
 }
 
 // TestMorphManyLoadsTypedSlice verifies the inverse direction —
-// a User's "comments" collects only comments whose commentable_type
-// is "users" and commentable_id is the user's id.
+// a User's "comments" collects only comments whose commentableType
+// is "users" and commentableId is the user's id.
 func TestMorphManyLoadsTypedSlice(t *testing.T) {
 	users, _, _, _ := morphSchema()
 
@@ -226,11 +226,11 @@ func TestMorphManyLoadsTypedSlice(t *testing.T) {
 			}, nil
 		case strings.Contains(sql, `FROM "comments"`):
 			// Verify the morph_type guard is on the WHERE.
-			if !strings.Contains(sql, "commentable_type") {
-				t.Errorf("MorphMany query must include the commentable_type guard: %s", sql)
+			if !strings.Contains(sql, "commentableType") {
+				t.Errorf("MorphMany query must include the commentableType guard: %s", sql)
 			}
 			return &fakeRows{
-				cols: []string{"id", "body", "commentable_type", "commentable_id"},
+				cols: []string{"id", "body", "commentableType", "commentableId"},
 				data: [][]any{
 					{int64(11), "hi", "users", int64(1)},
 					{int64(12), "bye", "users", int64(1)},

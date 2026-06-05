@@ -15,20 +15,20 @@ func TestTimestampsTemplate(t *testing.T) {
 	if ts.CreatedAt == nil || ts.UpdatedAt == nil {
 		t.Fatalf("Timestamps must return non-nil column handles")
 	}
-	if ts.CreatedAt.Name() != "created_at" || ts.UpdatedAt.Name() != "updated_at" {
+	if ts.CreatedAt.Name() != "createdAt" || ts.UpdatedAt.Name() != "updatedAt" {
 		t.Fatalf("unexpected column names: %q, %q", ts.CreatedAt.Name(), ts.UpdatedAt.Name())
 	}
 	if !ts.CreatedAt.Column.IsNotNull() || !ts.UpdatedAt.Column.IsNotNull() {
 		t.Fatalf("timestamps columns must be NOT NULL")
 	}
 	if !ts.CreatedAt.HasDefault() || ts.CreatedAt.DefaultSQL() != "now()" {
-		t.Fatalf("created_at default: got %q", ts.CreatedAt.DefaultSQL())
+		t.Fatalf("createdAt default: got %q", ts.CreatedAt.DefaultSQL())
 	}
 
 	want := "CREATE TABLE \"widgets\" (\n" +
 		"  \"id\" bigserial PRIMARY KEY,\n" +
-		"  \"created_at\" timestamptz NOT NULL DEFAULT now(),\n" +
-		"  \"updated_at\" timestamptz NOT NULL DEFAULT now()\n" +
+		"  \"createdAt\" timestamptz NOT NULL DEFAULT now(),\n" +
+		"  \"updatedAt\" timestamptz NOT NULL DEFAULT now()\n" +
 		")"
 	got, _ := drops.String(pg.CreateTable(table))
 	if got != want {
@@ -44,16 +44,16 @@ func TestSoftDeleteTemplate(t *testing.T) {
 	if sd.DeletedAt == nil {
 		t.Fatalf("SoftDelete must return a non-nil column handle")
 	}
-	if sd.DeletedAt.Name() != "deleted_at" {
+	if sd.DeletedAt.Name() != "deletedAt" {
 		t.Fatalf("unexpected column name: %q", sd.DeletedAt.Name())
 	}
 	if sd.DeletedAt.Column.IsNotNull() {
-		t.Fatalf("deleted_at must be nullable")
+		t.Fatalf("deletedAt must be nullable")
 	}
 
 	// Typed handle is usable in a query filter.
 	sql, _ := drops.String(sd.DeletedAt.IsNull())
-	if sql != "(\"widgets\".\"deleted_at\" IS NULL)" {
+	if sql != "(\"widgets\".\"deletedAt\" IS NULL)" {
 		t.Errorf("filter mismatch: %s", sql)
 	}
 }
@@ -70,16 +70,16 @@ func TestAuditTemplateBigSerial(t *testing.T) {
 		t.Fatalf("Audit must return non-nil column handles")
 	}
 	if ac.CreatedBy.Type().TypeSQL() != "bigint" {
-		t.Fatalf("created_by type: got %q, want bigint", ac.CreatedBy.Type().TypeSQL())
+		t.Fatalf("createdBy type: got %q, want bigint", ac.CreatedBy.Type().TypeSQL())
 	}
 	if ac.CreatedBy.ForeignKey() == nil || ac.CreatedBy.ForeignKey().Target != uid.Column {
-		t.Fatalf("created_by FK must target users.id")
+		t.Fatalf("createdBy FK must target users.id")
 	}
 
 	want := "CREATE TABLE \"posts\" (\n" +
 		"  \"id\" bigserial PRIMARY KEY,\n" +
-		"  \"created_by\" bigint REFERENCES \"users\" (\"id\"),\n" +
-		"  \"updated_by\" bigint REFERENCES \"users\" (\"id\")\n" +
+		"  \"createdBy\" bigint REFERENCES \"users\" (\"id\"),\n" +
+		"  \"updatedBy\" bigint REFERENCES \"users\" (\"id\")\n" +
 		")"
 	got, _ := drops.String(pg.CreateTable(posts))
 	if got != want {
@@ -96,7 +96,7 @@ func TestAuditTemplateUUID(t *testing.T) {
 	ac := pg.Audit(docs, tid)
 
 	if ac.CreatedBy.Type().TypeSQL() != "uuid" {
-		t.Fatalf("created_by type: got %q, want uuid", ac.CreatedBy.Type().TypeSQL())
+		t.Fatalf("createdBy type: got %q, want uuid", ac.CreatedBy.Type().TypeSQL())
 	}
 }
 
@@ -168,11 +168,11 @@ func TestCombinedTemplates(t *testing.T) {
 	want := "CREATE TABLE \"docs\" (\n" +
 		"  \"id\" uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n" +
 		"  \"title\" text NOT NULL,\n" +
-		"  \"created_at\" timestamptz NOT NULL DEFAULT now(),\n" +
-		"  \"updated_at\" timestamptz NOT NULL DEFAULT now(),\n" +
-		"  \"deleted_at\" timestamptz,\n" +
-		"  \"created_by\" bigint REFERENCES \"users\" (\"id\"),\n" +
-		"  \"updated_by\" bigint REFERENCES \"users\" (\"id\")\n" +
+		"  \"createdAt\" timestamptz NOT NULL DEFAULT now(),\n" +
+		"  \"updatedAt\" timestamptz NOT NULL DEFAULT now(),\n" +
+		"  \"deletedAt\" timestamptz,\n" +
+		"  \"createdBy\" bigint REFERENCES \"users\" (\"id\"),\n" +
+		"  \"updatedBy\" bigint REFERENCES \"users\" (\"id\")\n" +
 		")"
 	got, _ := drops.String(pg.CreateTable(docs))
 	if got != want {

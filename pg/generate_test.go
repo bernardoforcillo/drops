@@ -25,7 +25,7 @@ func TestBuildSnapshotShape(t *testing.T) {
 
 	posts := pg.NewTable("posts")
 	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	pg.Add(posts, pg.BigInt("user_id").NotNull().References(uid, pg.OnDelete("CASCADE")))
+	pg.Add(posts, pg.BigInt("userId").NotNull().References(uid, pg.OnDelete("CASCADE")))
 	pg.Add(posts, pg.Text("title").NotNull())
 
 	snap := pg.BuildSnapshot(pg.NewSchema(users, posts))
@@ -51,20 +51,20 @@ func TestBuildSnapshotShape(t *testing.T) {
 	if c, ok := usersT.Columns["age"]; !ok || c.Default == nil || *c.Default != "0" {
 		t.Errorf(`bad "age" column default: %+v`, c)
 	}
-	uc, ok := usersT.UniqueConstraints["users_email_unique"]
+	uc, ok := usersT.UniqueConstraints["usersEmailUnique"]
 	if !ok {
 		dumpJSON(t, "unique constraints", usersT.UniqueConstraints)
-		t.Fatal(`missing "users_email_unique"`)
+		t.Fatal(`missing "usersEmailUnique"`)
 	}
 	if len(uc.Columns) != 1 || uc.Columns[0] != "email" {
 		t.Errorf("unique columns: %v", uc.Columns)
 	}
 
 	postsT := snap.Tables["public.posts"]
-	fk, ok := postsT.ForeignKeys["posts_user_id_users_id_fk"]
+	fk, ok := postsT.ForeignKeys["postsUserIdUsersIdFk"]
 	if !ok {
 		dumpJSON(t, "foreign keys", postsT.ForeignKeys)
-		t.Fatal(`missing "posts_user_id_users_id_fk"`)
+		t.Fatal(`missing "postsUserIdUsersIdFk"`)
 	}
 	if fk.TableTo != "users" || fk.ColumnsTo[0] != "id" {
 		t.Errorf("fk target: %+v", fk)
@@ -200,18 +200,18 @@ func TestDiffAddForeignKey(t *testing.T) {
 	pg.Add(usersBefore, pg.BigSerial("id").PrimaryKey())
 	postsBefore := pg.NewTable("posts")
 	pg.Add(postsBefore, pg.BigSerial("id").PrimaryKey())
-	pg.Add(postsBefore, pg.BigInt("user_id").NotNull())
+	pg.Add(postsBefore, pg.BigInt("userId").NotNull())
 	prev := pg.BuildSnapshot(pg.NewSchema(usersBefore, postsBefore))
 
 	usersAfter := pg.NewTable("users")
 	uid := pg.Add(usersAfter, pg.BigSerial("id").PrimaryKey())
 	postsAfter := pg.NewTable("posts")
 	pg.Add(postsAfter, pg.BigSerial("id").PrimaryKey())
-	pg.Add(postsAfter, pg.BigInt("user_id").NotNull().References(uid, pg.OnDelete("CASCADE")))
+	pg.Add(postsAfter, pg.BigInt("userId").NotNull().References(uid, pg.OnDelete("CASCADE")))
 	cur := pg.BuildSnapshot(pg.NewSchema(usersAfter, postsAfter))
 
 	stmts := pg.Diff(prev, cur)
-	want := `ALTER TABLE "posts" ADD CONSTRAINT "posts_user_id_users_id_fk" FOREIGN KEY ("user_id") REFERENCES "users"("id") ON DELETE cascade ON UPDATE no action;`
+	want := `ALTER TABLE "posts" ADD CONSTRAINT "postsUserIdUsersIdFk" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE cascade ON UPDATE no action;`
 	for _, s := range stmts {
 		if s == want {
 			return
@@ -235,8 +235,8 @@ func TestDiffAddAndDropUnique(t *testing.T) {
 	stmts := pg.Diff(prev, cur)
 	joined := strings.Join(stmts, "\n")
 	for _, want := range []string{
-		`ALTER TABLE "users" DROP CONSTRAINT "users_nickname_unique";`,
-		`ALTER TABLE "users" ADD CONSTRAINT "users_email_unique" UNIQUE("email");`,
+		`ALTER TABLE "users" DROP CONSTRAINT "usersNicknameUnique";`,
+		`ALTER TABLE "users" ADD CONSTRAINT "usersEmailUnique" UNIQUE("email");`,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing: %s\nactual:\n%s", want, joined)

@@ -17,10 +17,10 @@ var (
 	events    = clickhouse.NewTable("events")
 	eventID   = clickhouse.Add(events, clickhouse.UUID("id"))
 	eventTS   = clickhouse.Add(events, clickhouse.DateTime("ts", "UTC"))
-	eventUser = clickhouse.Add(events, clickhouse.UInt64("user_id"))
+	eventUser = clickhouse.Add(events, clickhouse.UInt64("userId"))
 	eventKind = clickhouse.Add(events, clickhouse.String("kind").LowCardinality())
 	eventTags = clickhouse.Add(events, clickhouse.Custom[string]("tags", "Array(String)"))
-	eventDur  = clickhouse.Add(events, clickhouse.Float64("duration_ms"))
+	eventDur  = clickhouse.Add(events, clickhouse.Float64("durationMs"))
 )
 
 func init() {
@@ -91,12 +91,12 @@ func TestCreateTableMergeTree(t *testing.T) {
 		`CREATE TABLE "events"`,
 		`"id" UUID`,
 		`"ts" DateTime('UTC')`,
-		`"user_id" UInt64`,
+		`"userId" UInt64`,
 		`"kind" LowCardinality(String)`,
 		`"tags" Array(String)`,
-		`"duration_ms" Float64`,
+		`"durationMs" Float64`,
 		`ENGINE = MergeTree()`,
-		`ORDER BY ("events"."ts", "events"."user_id")`,
+		`ORDER BY ("events"."ts", "events"."userId")`,
 		`PARTITION BY (toYYYYMM("events"."ts"))`,
 		`SETTINGS index_granularity = 8192`,
 	} {
@@ -165,11 +165,11 @@ func TestOperators(t *testing.T) {
 	}{
 		{"eq", eventKind.Eq("click"), `("events"."kind" = ?)`, []any{"click"}},
 		{"ne", eventKind.Ne("hit"), `("events"."kind" != ?)`, []any{"hit"}},
-		{"gt", eventDur.Gt(0.5), `("events"."duration_ms" > ?)`, []any{0.5}},
+		{"gt", eventDur.Gt(0.5), `("events"."durationMs" > ?)`, []any{0.5}},
 		{"in", eventKind.In("a", "b"), `("events"."kind" IN (?, ?))`, []any{"a", "b"}},
-		{"between", eventDur.Between(0, 1), `("events"."duration_ms" BETWEEN ? AND ?)`, []any{0.0, 1.0}},
+		{"between", eventDur.Between(0, 1), `("events"."durationMs" BETWEEN ? AND ?)`, []any{0.0, 1.0}},
 		{"and", clickhouse.And(eventUser.Eq(1), eventKind.Eq("c")),
-			`(("events"."user_id" = ?) AND ("events"."kind" = ?))`,
+			`(("events"."userId" = ?) AND ("events"."kind" = ?))`,
 			[]any{uint64(1), "c"}},
 		{"in empty", clickhouse.In(eventKind), `(false)`, nil},
 		{"not in empty", clickhouse.NotIn(eventKind), `(true)`, nil},
@@ -184,15 +184,15 @@ func TestOperators(t *testing.T) {
 // --- Aggregates / functions -----------------------------------------
 
 func TestClickHouseSpecificAggregates(t *testing.T) {
-	checkExpr(t, clickhouse.Uniq(eventUser), `uniq("events"."user_id")`)
-	checkExpr(t, clickhouse.UniqExact(eventUser), `uniqExact("events"."user_id")`)
+	checkExpr(t, clickhouse.Uniq(eventUser), `uniq("events"."userId")`)
+	checkExpr(t, clickhouse.UniqExact(eventUser), `uniqExact("events"."userId")`)
 	checkExpr(t, clickhouse.Quantile(0.95, eventDur),
-		`quantile(?)("events"."duration_ms")`, 0.95)
+		`quantile(?)("events"."durationMs")`, 0.95)
 	checkExpr(t, clickhouse.QuantileTiming(0.99, eventDur),
-		`quantileTiming(?)("events"."duration_ms")`, 0.99)
+		`quantileTiming(?)("events"."durationMs")`, 0.99)
 	checkExpr(t, clickhouse.GroupArray(eventKind), `groupArray("events"."kind")`)
 	checkExpr(t, clickhouse.ArgMax(eventUser, eventTS),
-		`argMax("events"."user_id", "events"."ts")`)
+		`argMax("events"."userId", "events"."ts")`)
 }
 
 // --- SELECT builder --------------------------------------------------
@@ -228,7 +228,7 @@ func TestSelectFinalSamplePrewhereSettings(t *testing.T) {
 		`FROM "events" FINAL`,
 		` SAMPLE ?`,
 		` PREWHERE ("events"."kind" = ?)`,
-		` WHERE ("events"."duration_ms" > ?)`,
+		` WHERE ("events"."durationMs" > ?)`,
 		` SETTINGS max_threads = 4`,
 	} {
 		if !strings.Contains(got, want) {
@@ -263,7 +263,7 @@ func TestInsertSingleRow(t *testing.T) {
 		eventDur.Val(0.25),
 	)
 	got, args := q.ToSQL()
-	want := `INSERT INTO "events" ("id", "user_id", "kind", "duration_ms") VALUES (?, ?, ?, ?)`
+	want := `INSERT INTO "events" ("id", "userId", "kind", "durationMs") VALUES (?, ?, ?, ?)`
 	if got != want {
 		t.Errorf("sql\n  got:  %s\n  want: %s", got, want)
 	}

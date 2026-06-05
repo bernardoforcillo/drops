@@ -12,8 +12,8 @@ import "github.com/bernardoforcillo/drops"
 //
 //	pg.ApplyMixins(Users,
 //	    pg.UUIDPrimaryKeyMixin{},
-//	    pg.TimestampsMixin{},   // adds timestamps + bumps updated_at on UPDATE
-//	    pg.SoftDeleteMixin{},   // adds deleted_at, default-scopes queries,
+//	    pg.TimestampsMixin{},   // adds timestamps + bumps updatedAt on UPDATE
+//	    pg.SoftDeleteMixin{},   // adds deletedAt, default-scopes queries,
 //	                            // and rewrites DELETE into UPDATE
 //	)
 //
@@ -45,8 +45,8 @@ func ApplyMixins(t *Table, mixins ...Mixin) *Table {
 // Built-in rich mixins
 // ----------------------------------------------------------------------
 
-// TimestampsMixin registers "created_at" and "updated_at" columns and
-// an UpdateHook that bumps updated_at to now() on every UPDATE the
+// TimestampsMixin registers "createdAt" and "updatedAt" columns and
+// an UpdateHook that bumps updatedAt to now() on every UPDATE the
 // caller hasn't already touched. INSERT is left to the column's
 // DEFAULT now() — no hook needed.
 //
@@ -65,9 +65,9 @@ func (m *TimestampsMixin) Apply(t *Table) {
 	}))
 }
 
-// SoftDeleteMixin registers a "deleted_at" column, a DefaultFilter
-// (deleted_at IS NULL), and a DeleteHook that rewrites DELETE
-// statements as UPDATE deleted_at = now() — i.e. the row stays in
+// SoftDeleteMixin registers a "deletedAt" column, a DefaultFilter
+// (deletedAt IS NULL), and a DeleteHook that rewrites DELETE
+// statements as UPDATE deletedAt = now() — i.e. the row stays in
 // the table but is hidden by default. Use Unscoped() on any builder
 // to bypass the guard and operate on every row (including the
 // already-deleted ones).
@@ -93,7 +93,7 @@ func (m *SoftDeleteMixin) Apply(t *Table) {
 	}))
 }
 
-// AuditMixin registers nullable "created_by" / "updated_by" foreign
+// AuditMixin registers nullable "createdBy" / "updatedBy" foreign
 // keys to target — typically a users.id PK — and exposes typed
 // handles to the rest of the application. Audit information is
 // populated by the caller (e.g. via context-aware middleware); the

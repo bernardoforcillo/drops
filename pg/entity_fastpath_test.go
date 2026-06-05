@@ -95,7 +95,7 @@ func TestEntityFastScanReturnsErrNoRowsOnEmpty(t *testing.T) {
 func TestEntityFastScanFallsBackForRelations(t *testing.T) {
 	type post struct {
 		ID     int64 `drop:"id"`
-		UserID int64 `drop:"user_id"`
+		UserID int64 `drop:"userId"`
 	}
 	type userWithPosts struct {
 		ID    int64  `drop:"id"`
@@ -110,7 +110,7 @@ func TestEntityFastScanFallsBackForRelations(t *testing.T) {
 	pg.Add(users, pg.Text("email").NotNull())
 	posts := pg.NewTable("posts")
 	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	pUID := pg.Add(posts, pg.BigInt("user_id").NotNull())
+	pUID := pg.Add(posts, pg.BigInt("userId").NotNull())
 	pg.NewRelations(users).HasMany("posts", posts, uid, pUID)
 
 	ent := pg.NewEntity[userWithPosts](users)
@@ -131,7 +131,7 @@ func TestEntityFastScanFallsBackForRelations(t *testing.T) {
 			}, nil
 		default:
 			return &fakeRows{
-				cols: []string{"id", "user_id"},
+				cols: []string{"id", "userId"},
 				data: [][]any{{int64(10), int64(1)}},
 			}, nil
 		}

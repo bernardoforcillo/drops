@@ -21,52 +21,52 @@ func TestCreateSchemaAndExtension(t *testing.T) {
 func TestSequenceDDL(t *testing.T) {
 	start := int64(100)
 	checkExpr(t,
-		pg.CreateSequenceIfNotExists("user_id_seq", pg.SequenceOptions{Start: &start}),
-		`CREATE SEQUENCE IF NOT EXISTS "user_id_seq" START WITH 100`,
+		pg.CreateSequenceIfNotExists("userIdSeq", pg.SequenceOptions{Start: &start}),
+		`CREATE SEQUENCE IF NOT EXISTS "userIdSeq" START WITH 100`,
 	)
-	checkExpr(t, pg.NextVal("user_id_seq"), `nextval('user_id_seq'::regclass)`)
-	checkExpr(t, pg.DropSequenceIfExists("user_id_seq"), `DROP SEQUENCE IF EXISTS "user_id_seq"`)
+	checkExpr(t, pg.NextVal("userIdSeq"), `nextval('userIdSeq'::regclass)`)
+	checkExpr(t, pg.DropSequenceIfExists("userIdSeq"), `DROP SEQUENCE IF EXISTS "userIdSeq"`)
 }
 
 func TestViewDDL(t *testing.T) {
 	db := pg.New(nil)
 	q := db.Select(userID, userName).From(users)
 	checkExpr(t,
-		pg.CreateOrReplaceView("active_users", q),
-		`CREATE OR REPLACE VIEW "active_users" AS SELECT "users"."id", "users"."name" FROM "users"`,
+		pg.CreateOrReplaceView("activeUsers", q),
+		`CREATE OR REPLACE VIEW "activeUsers" AS SELECT "users"."id", "users"."name" FROM "users"`,
 	)
 	checkExpr(t,
-		pg.CreateMaterializedView("mv_users", q, true),
-		`CREATE MATERIALIZED VIEW "mv_users" AS SELECT "users"."id", "users"."name" FROM "users" WITH DATA`,
+		pg.CreateMaterializedView("mvUsers", q, true),
+		`CREATE MATERIALIZED VIEW "mvUsers" AS SELECT "users"."id", "users"."name" FROM "users" WITH DATA`,
 	)
 	checkExpr(t,
-		pg.RefreshMaterializedView("mv_users", true),
-		`REFRESH MATERIALIZED VIEW CONCURRENTLY "mv_users"`,
+		pg.RefreshMaterializedView("mvUsers", true),
+		`REFRESH MATERIALIZED VIEW CONCURRENTLY "mvUsers"`,
 	)
 }
 
 func TestFunctionAndTriggerDDL(t *testing.T) {
-	stmt, _ := drops.String(pg.CreateFunction("touch_updated_at", pg.FunctionOptions{
+	stmt, _ := drops.String(pg.CreateFunction("touchUpdatedAt", pg.FunctionOptions{
 		Args:    "",
 		Returns: "trigger",
-		Body:    "BEGIN NEW.updated_at = now(); RETURN NEW; END;",
+		Body:    "BEGIN NEW.updatedAt = now(); RETURN NEW; END;",
 	}))
-	want := "CREATE FUNCTION \"touch_updated_at\"() RETURNS trigger LANGUAGE plpgsql AS $func$ BEGIN NEW.updated_at = now(); RETURN NEW; END; $func$"
+	want := "CREATE FUNCTION \"touchUpdatedAt\"() RETURNS trigger LANGUAGE plpgsql AS $func$ BEGIN NEW.updatedAt = now(); RETURN NEW; END; $func$"
 	if stmt != want {
 		t.Errorf("CreateFunction\n  got:  %s\n  want: %s", stmt, want)
 	}
 
 	checkExpr(t,
-		pg.CreateTrigger("users_touch", pg.TriggerOptions{
+		pg.CreateTrigger("usersTouch", pg.TriggerOptions{
 			Timing:  "BEFORE",
 			Events:  "UPDATE",
 			Table:   users,
-			Execute: "touch_updated_at()",
+			Execute: "touchUpdatedAt()",
 		}),
-		`CREATE TRIGGER "users_touch" BEFORE UPDATE ON "users" FOR EACH ROW EXECUTE FUNCTION touch_updated_at()`,
+		`CREATE TRIGGER "usersTouch" BEFORE UPDATE ON "users" FOR EACH ROW EXECUTE FUNCTION touchUpdatedAt()`,
 	)
-	checkExpr(t, pg.DropTriggerIfExists("users_touch", users),
-		`DROP TRIGGER IF EXISTS "users_touch" ON "users"`)
+	checkExpr(t, pg.DropTriggerIfExists("usersTouch", users),
+		`DROP TRIGGER IF EXISTS "usersTouch" ON "users"`)
 }
 
 func TestCommentDDL(t *testing.T) {
@@ -83,33 +83,33 @@ func TestCommentDDL(t *testing.T) {
 // --- Indexes ---------------------------------------------------------
 
 func TestCreateIndexUniqueWhereInclude(t *testing.T) {
-	idx := pg.NewIndex("users_active_email_idx", users, userName).
+	idx := pg.NewIndex("usersActiveEmailIdx", users, userName).
 		Unique().
 		Using("btree").
 		Include(userID.Column).
 		Where(userAge.Gte(18))
 	checkExpr(t, pg.CreateIndex(idx),
-		`CREATE UNIQUE INDEX "users_active_email_idx" ON "users" USING btree ("users"."name") INCLUDE ("id") WHERE ("users"."age" >= $1)`,
+		`CREATE UNIQUE INDEX "usersActiveEmailIdx" ON "users" USING btree ("users"."name") INCLUDE ("id") WHERE ("users"."age" >= $1)`,
 		int32(18),
 	)
 }
 
 func TestDropIndex(t *testing.T) {
-	checkExpr(t, pg.DropIndexIfExists("users_email_idx"), `DROP INDEX IF EXISTS "users_email_idx"`)
+	checkExpr(t, pg.DropIndexIfExists("usersEmailIdx"), `DROP INDEX IF EXISTS "usersEmailIdx"`)
 }
 
 // --- Enums -----------------------------------------------------------
 
 func TestEnumDDLAndColumn(t *testing.T) {
-	status := pg.NewEnum("user_status", "active", "pending", "banned")
+	status := pg.NewEnum("userStatus", "active", "pending", "banned")
 	checkExpr(t, pg.CreateEnum(status),
-		`CREATE TYPE "user_status" AS ENUM ('active', 'pending', 'banned')`,
+		`CREATE TYPE "userStatus" AS ENUM ('active', 'pending', 'banned')`,
 	)
-	checkExpr(t, pg.AlterEnumAddValue("user_status", "archived", "", "banned"),
-		`ALTER TYPE "user_status" ADD VALUE 'archived' AFTER 'banned'`,
+	checkExpr(t, pg.AlterEnumAddValue("userStatus", "archived", "", "banned"),
+		`ALTER TYPE "userStatus" ADD VALUE 'archived' AFTER 'banned'`,
 	)
 	col := status.Col("status").NotNull()
-	if col.Type().TypeSQL() != "user_status" {
+	if col.Type().TypeSQL() != "userStatus" {
 		t.Errorf("enum col type SQL: %s", col.Type().TypeSQL())
 	}
 }
@@ -224,7 +224,7 @@ func TestExistsSubquery(t *testing.T) {
 	sub := db.Select(postID).From(posts).Where(postUserID.EqCol(userID))
 	q := db.Select(userID).From(users).Where(pg.Exists(sub))
 	check(t, q,
-		`SELECT "users"."id" FROM "users" WHERE EXISTS (SELECT "posts"."id" FROM "posts" WHERE ("posts"."user_id" = "users"."id"))`,
+		`SELECT "users"."id" FROM "users" WHERE EXISTS (SELECT "posts"."id" FROM "posts" WHERE ("posts"."userId" = "users"."id"))`,
 	)
 }
 

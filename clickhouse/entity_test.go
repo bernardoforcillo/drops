@@ -69,14 +69,14 @@ func (r *entFakeRows) Err() error                 { return nil }
 
 type entEvent struct {
 	ID     string `drop:"id"`
-	UserID uint64 `drop:"user_id"`
+	UserID uint64 `drop:"userId"`
 	Kind   string `drop:"kind"`
 }
 
 func entEventsSchema() (*clickhouse.Table, *clickhouse.Entity[entEvent]) {
 	tbl := clickhouse.NewTable("events").Engine(clickhouse.MergeTree())
 	id := clickhouse.Add(tbl, clickhouse.UUID("id"))
-	clickhouse.Add(tbl, clickhouse.UInt64("user_id"))
+	clickhouse.Add(tbl, clickhouse.UInt64("userId"))
 	clickhouse.Add(tbl, clickhouse.String("kind"))
 	tbl.OrderBy(id)
 	return tbl, clickhouse.NewEntity[entEvent](tbl)
@@ -121,7 +121,7 @@ func TestClickhouseEntityQueryAll(t *testing.T) {
 	_, ent := entEventsSchema()
 	fd := &entFakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &entFakeRows{
-			cols: []string{"id", "user_id", "kind"},
+			cols: []string{"id", "userId", "kind"},
 			data: [][]any{
 				{"u1", uint64(1), "click"},
 				{"u2", uint64(2), "view"},
@@ -185,28 +185,28 @@ func TestClickhouseEntityValidatorAbortsBatch(t *testing.T) {
 func TestClickhouseEntityRespectsDefaultFilter(t *testing.T) {
 	tbl := clickhouse.NewTable("events").Engine(clickhouse.MergeTree())
 	id := clickhouse.Add(tbl, clickhouse.UUID("id"))
-	clickhouse.Add(tbl, clickhouse.UInt64("user_id"))
+	clickhouse.Add(tbl, clickhouse.UInt64("userId"))
 	clickhouse.Add(tbl, clickhouse.String("kind"))
-	deleted := clickhouse.Add(tbl, clickhouse.DateTime("deleted_at", "").Nullable())
+	deleted := clickhouse.Add(tbl, clickhouse.DateTime("deletedAt", "").Nullable())
 	tbl.OrderBy(id)
 	tbl.DefaultFilter(deleted.IsNull())
 
 	type ev struct {
 		ID     string `drop:"id"`
-		UserID uint64 `drop:"user_id"`
+		UserID uint64 `drop:"userId"`
 		Kind   string `drop:"kind"`
 	}
 	ent := clickhouse.NewEntity[ev](tbl)
 	fd := &entFakeDriver{}
 	db := clickhouse.New(fd)
 	_, _ = ent.Query(db).All(context.Background())
-	if !strings.Contains(fd.queries[0], "deleted_at") {
+	if !strings.Contains(fd.queries[0], "deletedAt") {
 		t.Errorf("default filter missing on entity query: %s", fd.queries[0])
 	}
 
 	fd.queries = nil
 	_, _ = ent.Query(db).Unscoped().All(context.Background())
-	if strings.Contains(fd.queries[0], "deleted_at") {
+	if strings.Contains(fd.queries[0], "deletedAt") {
 		t.Errorf("Unscoped must drop default filter: %s", fd.queries[0])
 	}
 }

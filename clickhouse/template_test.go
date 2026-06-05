@@ -16,17 +16,17 @@ func TestTimestampsTemplateClickhouse(t *testing.T) {
 	if ts.CreatedAt == nil || ts.UpdatedAt == nil {
 		t.Fatalf("Timestamps must return non-nil column handles")
 	}
-	if ts.CreatedAt.Name() != "created_at" || ts.UpdatedAt.Name() != "updated_at" {
+	if ts.CreatedAt.Name() != "createdAt" || ts.UpdatedAt.Name() != "updatedAt" {
 		t.Fatalf("unexpected column names: %q, %q", ts.CreatedAt.Name(), ts.UpdatedAt.Name())
 	}
 	if !ts.CreatedAt.Column.HasDefault() || ts.CreatedAt.Column.DefaultSQL() != "now()" {
-		t.Fatalf("created_at default: got %q", ts.CreatedAt.Column.DefaultSQL())
+		t.Fatalf("createdAt default: got %q", ts.CreatedAt.Column.DefaultSQL())
 	}
 
 	got, _ := clickhouse.ToSQL(clickhouse.CreateTable(table))
 	for _, want := range []string{
-		`"created_at" DateTime DEFAULT now()`,
-		`"updated_at" DateTime DEFAULT now()`,
+		`"createdAt" DateTime DEFAULT now()`,
+		`"updatedAt" DateTime DEFAULT now()`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in DDL:\n%s", want, got)
@@ -44,12 +44,12 @@ func TestSoftDeleteTemplateClickhouse(t *testing.T) {
 		t.Fatalf("SoftDelete must return a non-nil column handle")
 	}
 	if !sd.DeletedAt.Column.IsNullable() {
-		t.Fatalf("deleted_at must be Nullable")
+		t.Fatalf("deletedAt must be Nullable")
 	}
 
 	got, _ := clickhouse.ToSQL(clickhouse.CreateTable(table))
-	if !strings.Contains(got, `"deleted_at" Nullable(DateTime)`) {
-		t.Errorf("missing nullable deleted_at in DDL:\n%s", got)
+	if !strings.Contains(got, `"deletedAt" Nullable(DateTime)`) {
+		t.Errorf("missing nullable deletedAt in DDL:\n%s", got)
 	}
 }
 
@@ -67,13 +67,13 @@ func TestAuditTemplateClickhouse(t *testing.T) {
 		t.Fatalf("Audit must return non-nil column handles")
 	}
 	if ac.CreatedBy.Type().TypeSQL() != "UUID" {
-		t.Fatalf("created_by type: got %q, want UUID", ac.CreatedBy.Type().TypeSQL())
+		t.Fatalf("createdBy type: got %q, want UUID", ac.CreatedBy.Type().TypeSQL())
 	}
 
 	got, _ := clickhouse.ToSQL(clickhouse.CreateTable(posts))
 	for _, want := range []string{
-		`"created_by" UUID`,
-		`"updated_by" UUID`,
+		`"createdBy" UUID`,
+		`"updatedBy" UUID`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in DDL:\n%s", want, got)

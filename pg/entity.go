@@ -272,7 +272,7 @@ func (e *Entity[T]) scanAllFast(db *DB, ctx context.Context, sel *SelectBuilder,
 
 // Create INSERTs r and refreshes it from the RETURNING row — useful
 // for picking up generated PKs, server-side defaults, and hook-added
-// values (e.g. created_at = now()).
+// values (e.g. createdAt = now()).
 //
 // Columns whose Go field is the zero value are omitted from the
 // INSERT when the column either has a declared DEFAULT or is the
@@ -374,7 +374,7 @@ func (e *Entity[T]) Save(db *DB, ctx context.Context, r *T) error {
 
 // Delete removes the row whose primary key equals id. The table's
 // DeleteHooks (e.g. SoftDelete) fire normally — so on a soft-deleted
-// table this rewrites to UPDATE deleted_at = now() instead.
+// table this rewrites to UPDATE deletedAt = now() instead.
 func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, error) {
 	return db.Delete(e.table).Where(Eq(e.pk, id)).Exec(ctx)
 }

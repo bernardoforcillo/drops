@@ -29,6 +29,11 @@ type relNode struct {
 	name     string
 	wheres   []drops.Expression
 	orderBys []drops.Expression
+	// limit / offset are per-parent caps applied via a
+	// ROW_NUMBER() OVER (PARTITION BY <parentKey>) rewrite.
+	// Without them the relation loader fetches every related row.
+	limit    int
+	offset   int
 	children []*relNode
 }
 
@@ -81,6 +86,36 @@ func (c *RelConfig) Where(preds ...drops.Expression) *RelConfig {
 // Each parent's loaded slice ends up in this order.
 func (c *RelConfig) OrderBy(exprs ...drops.Expression) *RelConfig {
 	c.node.orderBys = append(c.node.orderBys, exprs...)
+	return c
+}
+
+// Limit caps the number of related rows attached PER PARENT.
+// Implemented via a ROW_NUMBER() window over the join key:
+//
+//	SELECT * FROM (
+//	  SELECT *, ROW_NUMBER() OVER (PARTITION BY <fk> ORDER BY <orderBy>) AS _rn
+//	  FROM <child> WHERE <fk> IN (...)
+//	) AS _ranked
+//	WHERE _rn > <offset> AND _rn <= <offset> + <limit>
+//
+// so each parent's slice gets the first N children (after the
+// configured ORDER BY), not the first N rows globally. Mirrors
+// drizzle's with: { posts: { limit: 5 } } shape.
+//
+// Limit only applies to HasMany / MorphMany / ManyToMany —
+// single-row relations (HasOne / BelongsTo) already cap at 1.
+// Limit ≤ 0 disables the cap.
+func (c *RelConfig) Limit(n int) *RelConfig {
+	c.node.limit = n
+	return c
+}
+
+// Offset skips the first N matching rows per parent. Requires
+// Limit to be set (offset alone produces every row past N which
+// rarely matches caller intent — when you really need that,
+// combine Offset with a very large Limit).
+func (c *RelConfig) Offset(n int) *RelConfig {
+	c.node.offset = n
 	return c
 }
 
@@ -402,20 +437,36 @@ func (f *FindBuilder) loadRelation(
 		return none, childStructType, nil
 	}
 
-	childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
-	if rel.Kind == MorphManyKind {
-		childQuery.Where(Eq(rel.MorphTypeCol, rel.MorphType))
-	}
-	if len(node.wheres) > 0 {
-		childQuery.Where(node.wheres...)
-	}
-	if len(node.orderBys) > 0 {
-		childQuery.OrderBy(node.orderBys...)
-	}
 	childSliceType := reflect.SliceOf(childStructType)
 	childSlice := reflect.New(childSliceType).Elem()
-	if err := childQuery.All(ctx, childSlice.Addr().Interface()); err != nil {
-		return none, nil, err
+
+	// Per-parent LIMIT/OFFSET (HasMany / MorphMany) rewrites the
+	// child query via a ROW_NUMBER() window so each parent gets
+	// at most node.limit children — drizzle's
+	// "with: { posts: { limit: N } }" shape.
+	if expectsSlice && node.limit > 0 {
+		sql, args := f.buildPerParentLimitedSQL(rel, targetKeyCol, rowKeys, node)
+		rows, err := f.db.Query(ctx, sql, args...)
+		if err != nil {
+			return none, nil, err
+		}
+		if err := scanAll(rows, childSlice.Addr().Interface()); err != nil {
+			return none, nil, err
+		}
+	} else {
+		childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
+		if rel.Kind == MorphManyKind {
+			childQuery.Where(Eq(rel.MorphTypeCol, rel.MorphType))
+		}
+		if len(node.wheres) > 0 {
+			childQuery.Where(node.wheres...)
+		}
+		if len(node.orderBys) > 0 {
+			childQuery.OrderBy(node.orderBys...)
+		}
+		if err := childQuery.All(ctx, childSlice.Addr().Interface()); err != nil {
+			return none, nil, err
+		}
 	}
 
 	targetKeyField, ok := relationKeyField(childStructType, targetKeyCol)
@@ -742,6 +793,78 @@ func coerceSlice(src reflect.Value, dstType reflect.Type) reflect.Value {
 		}
 	}
 	return out
+}
+
+// buildPerParentLimitedSQL renders the window-function rewrite used
+// when a relation has node.limit > 0. The query has shape:
+//
+//	SELECT * FROM (
+//	  SELECT <cols>, ROW_NUMBER() OVER (
+//	    PARTITION BY <fk> ORDER BY <orderBy or fallback>
+//	  ) AS _rn
+//	  FROM <child>
+//	  WHERE <fk> IN (...) [AND <wheres>] [AND morph guard]
+//	) AS _ranked
+//	WHERE _rn > <offset> AND _rn <= <offset + limit>
+//
+// Each parent's slice gets at most limit children, skipping the
+// first offset. Mirrors drizzle's "with: { posts: { limit } }"
+// semantics. The extra _rn column is discarded by scanAll since
+// no struct field matches the name.
+func (f *FindBuilder) buildPerParentLimitedSQL(
+	rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
+) (string, []any) {
+	b := drops.NewBuilder()
+	b.WriteString("SELECT * FROM (SELECT ")
+	cols := rel.To.Columns()
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		c.WriteSQL(b)
+	}
+	b.WriteString(", ROW_NUMBER() OVER (PARTITION BY ")
+	targetKeyCol.WriteSQL(b)
+	b.WriteString(" ORDER BY ")
+	if len(node.orderBys) > 0 {
+		for i, e := range node.orderBys {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			e.WriteSQL(b)
+		}
+	} else {
+		// Default: order by PK so partitioning is stable.
+		var pk *Column
+		for _, c := range cols {
+			if c.IsPrimaryKey() {
+				pk = c
+				break
+			}
+		}
+		if pk != nil {
+			pk.WriteSQL(b)
+		} else {
+			targetKeyCol.WriteSQL(b)
+		}
+	}
+	b.WriteString(") AS _rn FROM ")
+	rel.To.writeFrom(b)
+	b.WriteString(" WHERE ")
+	In(targetKeyCol, rowKeys...).WriteSQL(b)
+	if rel.Kind == MorphManyKind {
+		b.WriteString(" AND ")
+		Eq(rel.MorphTypeCol, rel.MorphType).WriteSQL(b)
+	}
+	for _, w := range node.wheres {
+		b.WriteString(" AND ")
+		w.WriteSQL(b)
+	}
+	b.WriteString(") AS _ranked WHERE _rn > ")
+	b.AddArg(node.offset)
+	b.WriteString(" AND _rn <= ")
+	b.AddArg(node.offset + node.limit)
+	return b.SQL()
 }
 
 // relationKeyField returns the index path of the struct field that maps

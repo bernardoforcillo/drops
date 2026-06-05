@@ -481,10 +481,14 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 			// below — never bind the caller's value here.
 			continue
 		}
-		upd.Set(&exprBinding{
-			col:  cf.col,
-			expr: drops.Param{Value: v.FieldByIndex(cf.field).Interface()},
-		})
+		val := v.FieldByIndex(cf.field).Interface()
+		var expr drops.Expression
+		if cf.col.IsPII() {
+			expr = PIIParam{Value: val}
+		} else {
+			expr = drops.Param{Value: val}
+		}
+		upd.Set(&exprBinding{col: cf.col, expr: expr})
 		wroteSet = true
 	}
 	if e.versionCol != nil {
@@ -548,7 +552,9 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, e
 
 // collectInsertBindings extracts column values from r. Columns whose
 // Go field is the zero value are omitted when they have a DEFAULT or
-// are the primary key — letting the DB fill them in.
+// are the primary key — letting the DB fill them in. PII-flagged
+// columns get their values wrapped in pg.PIIParam so any
+// hook / tracer formatting them sees "<redacted>".
 func (e *Entity[T]) collectInsertBindings(v reflect.Value) []ColumnValue {
 	out := make([]ColumnValue, 0, len(e.colFields))
 	for _, cf := range e.colFields {
@@ -556,10 +562,14 @@ func (e *Entity[T]) collectInsertBindings(v reflect.Value) []ColumnValue {
 		if fv.IsZero() && (cf.col.HasDefault() || cf.col == e.pk || isImplicitDefault(cf.col)) {
 			continue
 		}
-		out = append(out, &exprBinding{
-			col:  cf.col,
-			expr: drops.Param{Value: fv.Interface()},
-		})
+		val := fv.Interface()
+		var expr drops.Expression
+		if cf.col.IsPII() {
+			expr = PIIParam{Value: val}
+		} else {
+			expr = drops.Param{Value: val}
+		}
+		out = append(out, &exprBinding{col: cf.col, expr: expr})
 	}
 	return out
 }

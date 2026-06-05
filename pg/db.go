@@ -200,7 +200,13 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 	span.SetAttribute(AttrStatement, sql)
 	span.SetAttribute(AttrArgsCount, len(args))
 	start := time.Now()
-	res, err := db.drv.Exec(spanCtx, sql, args...)
+	// Unwrap PII markers before reaching the driver — they're a
+	// pure observability concept and must not affect the wire form.
+	driverArgs := args
+	if containsPII(args) {
+		driverArgs = unwrapPII(args)
+	}
+	res, err := db.drv.Exec(spanCtx, sql, driverArgs...)
 	err = classifyError(err)
 	if err != nil {
 		span.RecordError(err)
@@ -221,7 +227,11 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 	span.SetAttribute(AttrStatement, sql)
 	span.SetAttribute(AttrArgsCount, len(args))
 	start := time.Now()
-	rows, err := db.drv.Query(spanCtx, sql, args...)
+	driverArgs := args
+	if containsPII(args) {
+		driverArgs = unwrapPII(args)
+	}
+	rows, err := db.drv.Query(spanCtx, sql, driverArgs...)
 	err = classifyError(err)
 	if err != nil {
 		span.RecordError(err)

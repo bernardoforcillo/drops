@@ -102,6 +102,7 @@ type autoOpts struct {
 	Unique  bool
 	Default string
 	Version bool
+	PII     bool
 }
 
 // walkAutoFields applies fn to every exported drop-tagged field on rt,
@@ -152,6 +153,8 @@ func parseAutoTag(raw string) (autoOpts, error) {
 			opts.Unique = true
 		case "version":
 			opts.Version = true
+		case "pii":
+			opts.PII = true
 		case "default":
 			if !hasVal {
 				return opts, fmt.Errorf("`default` option requires a value: default=<sql>")
@@ -202,6 +205,9 @@ func applyAutoOpts(c *Column, opts autoOpts) {
 	}
 	if opts.Version {
 		c.version = true
+	}
+	if opts.PII {
+		c.pii = true
 	}
 }
 

@@ -27,6 +27,7 @@ type Column struct {
 	hasDefault bool
 	ref        *FK
 	version    bool // marked via (*Col[T]).OptimisticLock()
+	pii        bool // marked via (*Col[T]).AsPII()
 }
 
 // FK describes a foreign-key reference.

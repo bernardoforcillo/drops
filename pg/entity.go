@@ -70,6 +70,11 @@ type Entity[T any] struct {
 	// Entity operation (max args, max rows, max duration). The zero
 	// Budget disables every limit.
 	budget Budget
+
+	// audit, when attached via WithAudit, records who-changed-what
+	// rows in the same transaction as every Create / Update /
+	// Delete.
+	audit *auditWiring
 }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
@@ -437,11 +442,23 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if len(bindings) == 0 {
 		return errors.New("drops/pg: Create has nothing to insert")
 	}
-	ins := db.Insert(e.table).Row(bindings...)
-	for _, c := range e.table.Columns() {
-		ins.Returning(c)
+	doCreate := func(tx *DB) error {
+		ins := tx.Insert(e.table).Row(bindings...)
+		for _, c := range e.table.Columns() {
+			ins.Returning(c)
+		}
+		if err := ins.One(ctx, r); err != nil {
+			return err
+		}
+		return e.recordAudit(tx, ctx, "create", r, e.pkValue(r))
 	}
-	if err := ins.One(ctx, r); err != nil {
+	var err error
+	if e.audit != nil {
+		err = db.InTx(ctx, doCreate)
+	} else {
+		err = doCreate(db)
+	}
+	if err != nil {
 		return err
 	}
 	if e.cache != nil {
@@ -470,57 +487,65 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if pkv.IsZero() {
 		return ErrPKNotSet
 	}
-	upd := db.Update(e.table)
-	wroteSet := false
-	for _, cf := range e.colFields {
-		if cf.col == e.pk {
-			continue
+	doUpdate := func(tx *DB) error {
+		upd := tx.Update(e.table)
+		wroteSet := false
+		for _, cf := range e.colFields {
+			if cf.col == e.pk {
+				continue
+			}
+			if cf.col == e.versionCol {
+				continue
+			}
+			val := v.FieldByIndex(cf.field).Interface()
+			var expr drops.Expression
+			if cf.col.IsPII() {
+				expr = PIIParam{Value: val}
+			} else {
+				expr = drops.Param{Value: val}
+			}
+			upd.Set(&exprBinding{col: cf.col, expr: expr})
+			wroteSet = true
 		}
-		if cf.col == e.versionCol {
-			// version column is bumped via "version = version + 1"
-			// below — never bind the caller's value here.
-			continue
+		if e.versionCol != nil {
+			upd.Set(&exprBinding{
+				col: e.versionCol,
+				expr: drops.ExprFunc(func(b *drops.Builder) {
+					b.WriteIdent(e.versionCol.Name())
+					b.WriteString(" + 1")
+				}),
+			})
+			wroteSet = true
 		}
-		val := v.FieldByIndex(cf.field).Interface()
-		var expr drops.Expression
-		if cf.col.IsPII() {
-			expr = PIIParam{Value: val}
-		} else {
-			expr = drops.Param{Value: val}
+		if !wroteSet && !e.table.hasUpdateHooks() {
+			return errors.New("drops/pg: Update has no fields to set")
 		}
-		upd.Set(&exprBinding{col: cf.col, expr: expr})
-		wroteSet = true
+		upd.Where(Eq(e.pk, pkv.Interface()))
+		if e.versionCol != nil {
+			curVer := v.FieldByIndex(e.versionField).Interface()
+			upd.Where(Eq(e.versionCol, curVer))
+		}
+		for _, c := range e.table.Columns() {
+			upd.Returning(c)
+		}
+		err := upd.One(ctx, r)
+		if err == ErrNoRows && e.versionCol != nil {
+			return ErrStaleObject
+		}
+		if err != nil {
+			return err
+		}
+		return e.recordAudit(tx, ctx, "update", r, e.pkValue(r))
 	}
-	if e.versionCol != nil {
-		// Add "version = version + 1" and "AND version = current".
-		upd.Set(&exprBinding{
-			col: e.versionCol,
-			expr: drops.ExprFunc(func(b *drops.Builder) {
-				b.WriteIdent(e.versionCol.Name())
-				b.WriteString(" + 1")
-			}),
-		})
-		wroteSet = true
-	}
-	if !wroteSet && !e.table.hasUpdateHooks() {
-		return errors.New("drops/pg: Update has no fields to set")
-	}
-	upd.Where(Eq(e.pk, pkv.Interface()))
-	if e.versionCol != nil {
-		curVer := v.FieldByIndex(e.versionField).Interface()
-		upd.Where(Eq(e.versionCol, curVer))
-	}
-	for _, c := range e.table.Columns() {
-		upd.Returning(c)
-	}
-	err := upd.One(ctx, r)
-	if err == ErrNoRows && e.versionCol != nil {
-		return ErrStaleObject
+	var err error
+	if e.audit != nil {
+		err = db.InTx(ctx, doUpdate)
+	} else {
+		err = doUpdate(db)
 	}
 	if err == nil && e.cache != nil {
-		// Refresh the cached entry with the post-RETURNING values.
-		pkv := reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
-		_ = e.cache.writeKey(ctx, e.pkKey(pkv), *r)
+		pk := reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
+		_ = e.cache.writeKey(ctx, e.pkKey(pk), *r)
 	}
 	return err
 }
@@ -543,7 +568,21 @@ func (e *Entity[T]) Save(db *DB, ctx context.Context, r *T) error {
 // DeleteHooks (e.g. SoftDelete) fire normally — so on a soft-deleted
 // table this rewrites to UPDATE deletedAt = now() instead.
 func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, error) {
-	res, err := db.Delete(e.table).Where(Eq(e.pk, id)).Exec(ctx)
+	var res drops.Result
+	doDelete := func(tx *DB) error {
+		r, err := tx.Delete(e.table).Where(Eq(e.pk, id)).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		res = r
+		return e.recordAudit(tx, ctx, "delete", nil, id)
+	}
+	var err error
+	if e.audit != nil {
+		err = db.InTx(ctx, doDelete)
+	} else {
+		err = doDelete(db)
+	}
 	if err == nil {
 		e.invalidatePK(ctx, id)
 	}

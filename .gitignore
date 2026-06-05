@@ -38,3 +38,4 @@ coverage.html
 # Go workspace files (per-developer)
 go.work
 go.work.sum
+/drops

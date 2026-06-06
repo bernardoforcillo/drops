@@ -1,5 +1,13 @@
 package pg
 
+import (
+	"encoding/hex"
+	"fmt"
+	"regexp"
+	"strconv"
+	"time"
+)
+
 // Schema-level objects: sequences, views, and (table-scoped) RLS
 // policies — the runtime descriptors the snapshot/diff layer
 // reads to emit CREATE / DROP / ALTER DDL during a migration.
@@ -61,6 +69,138 @@ func (v *PgView) Definition() string { return v.definition }
 
 // IsMaterialized reports whether this is a materialized view.
 func (v *PgView) IsMaterialized() bool { return v.materialized }
+
+// View opens a fluent builder for a regular view. Chain As (typed
+// SelectBuilder) or AsSQL (raw SELECT text), optionally
+// Materialized, to finalise:
+//
+//	pg.View("activeUsers").As(
+//	    db.Select(Users.ID, Users.Name).
+//	        From(Users).
+//	        Where(Users.Active.Eq(true)))
+//
+//	pg.View("playerStats").
+//	    Materialized().
+//	    As(query)
+//
+// NewView / NewMaterializedView remain available for the
+// definition-as-string fast path.
+func View(name string) *PgView {
+	return &PgView{name: name}
+}
+
+// MaterializedView is the materialised counterpart of View — the
+// same fluent builder with the materialised flag pre-set so the
+// chain reads naturally.
+func MaterializedView(name string) *PgView {
+	return &PgView{name: name, materialized: true}
+}
+
+// As wires the view body from a SelectBuilder. Parameter bindings
+// ($1, $2, ...) are inlined as SQL literals because view
+// definitions are static SQL — CREATE VIEW doesn't accept bound
+// parameters. Unsupported parameter types panic at declaration
+// time so the schema fails loudly at startup instead of producing
+// broken DDL.
+func (v *PgView) As(sel *SelectBuilder) *PgView {
+	sql, args := sel.ToSQL()
+	body, err := inlineSQLLiterals(sql, args)
+	if err != nil {
+		panic(fmt.Sprintf("drops/pg: View(%q).As: %v", v.name, err))
+	}
+	v.definition = body
+	return v
+}
+
+// AsSQL sets the view body from raw SQL — escape hatch for
+// SELECT shapes the builder doesn't cover (recursive CTEs,
+// dialect-specific functions, hand-tuned plans). Caller is
+// responsible for any literal escaping.
+func (v *PgView) AsSQL(definition string) *PgView {
+	v.definition = definition
+	return v
+}
+
+// Materialized flips the view kind to materialised. Returns the
+// same *PgView for chaining.
+func (v *PgView) Materialized() *PgView {
+	v.materialized = true
+	return v
+}
+
+// paramRE matches a PostgreSQL parameter placeholder ($1, $2, ...).
+// drops only emits these via Builder.AddArg, so they never appear
+// inside quoted literals in generated SQL.
+var paramRE = regexp.MustCompile(`\$(\d+)`)
+
+// inlineSQLLiterals substitutes every $N in sql with the SQL
+// literal form of args[N-1]. Used by PgView.As because view
+// definitions are static SQL.
+func inlineSQLLiterals(sql string, args []any) (string, error) {
+	var firstErr error
+	out := paramRE.ReplaceAllStringFunc(sql, func(match string) string {
+		n, _ := strconv.Atoi(match[1:])
+		if n < 1 || n > len(args) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("placeholder $%d out of range (have %d args)", n, len(args))
+			}
+			return match
+		}
+		lit, err := sqlLiteral(args[n-1])
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return lit
+	})
+	return out, firstErr
+}
+
+// sqlLiteral renders v as a PostgreSQL literal suitable for
+// embedding directly in DDL. The supported set covers the common
+// view-definition cases — extend as needed.
+func sqlLiteral(v any) (string, error) {
+	switch x := v.(type) {
+	case nil:
+		return "NULL", nil
+	case bool:
+		if x {
+			return "true", nil
+		}
+		return "false", nil
+	case int:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int8:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int16:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int32:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int64:
+		return strconv.FormatInt(x, 10), nil
+	case uint:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint8:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint16:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint32:
+		return strconv.FormatUint(uint64(x), 10), nil
+	case uint64:
+		return strconv.FormatUint(x, 10), nil
+	case float32:
+		return strconv.FormatFloat(float64(x), 'f', -1, 32), nil
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64), nil
+	case string:
+		return quoteLiteral(x), nil
+	case time.Time:
+		return quoteLiteral(x.UTC().Format(time.RFC3339Nano)) + "::timestamptz", nil
+	case []byte:
+		return `'\x` + hex.EncodeToString(x) + `'::bytea`, nil
+	default:
+		return "", fmt.Errorf("unsupported parameter type %T", v)
+	}
+}
 
 // ----------------------------------------------------------------------
 // RLS Policies

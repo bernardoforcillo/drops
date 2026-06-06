@@ -51,13 +51,24 @@ type GenerateOptions struct {
 	// Safe wraps every destructive or creative DDL in IF [NOT] EXISTS
 	// so the migration can be re-run idempotently. See DiffOptions.Safe.
 	Safe bool
+
+	// WithDown enables auto-generated rollback SQL. When true, the
+	// generator emits a paired <tag>.down.sql file alongside the
+	// up SQL containing DiffDown(prev, cur). The down direction is
+	// best-effort and applies cleanly only when the up direction's
+	// inverse is itself well-defined (column ADD ↔ DROP, type ↔
+	// type swap, etc.); DROP COLUMN can never be reversed
+	// losslessly because the data is gone — review generated down
+	// scripts before relying on them.
+	WithDown bool
 }
 
 // GenerateResult describes what a Run produced.
 type GenerateResult struct {
 	Tag      string // e.g. "0003_warm_iron_man"; empty when NoOp
 	Idx      int    // sequence index for the new migration
-	SQL      string // statement-breakpoint-joined migration SQL
+	SQL      string // statement-breakpoint-joined migration SQL (up)
+	DownSQL  string // rollback SQL; empty unless WithDown was set
 	NoOp     bool   // true when prev and cur snapshots are equivalent
 	Snapshot []byte // bytes written to meta/<idx>_snapshot.json
 	Journal  []byte // bytes written to meta/_journal.json
@@ -142,8 +153,21 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 		return nil, err
 	}
 
+	var downSQL string
+	if opts.WithDown {
+		downStmts := DiffDown(prev, cur, DiffOptions{Safe: opts.Safe})
+		if len(downStmts) > 0 {
+			downSQL = strings.Join(downStmts, "\n--> statement-breakpoint\n") + "\n"
+		}
+	}
+
 	if err := opts.Write(tag+".sql", []byte(sql)); err != nil {
 		return nil, fmt.Errorf("drops/pg: write migration SQL: %w", err)
+	}
+	if downSQL != "" {
+		if err := opts.Write(tag+".down.sql", []byte(downSQL)); err != nil {
+			return nil, fmt.Errorf("drops/pg: write down SQL: %w", err)
+		}
 	}
 	if err := opts.Write(fmt.Sprintf("meta/%04d_snapshot.json", idx), snapshotBytes); err != nil {
 		return nil, fmt.Errorf("drops/pg: write snapshot: %w", err)
@@ -156,6 +180,7 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 		Tag:      tag,
 		Idx:      idx,
 		SQL:      sql,
+		DownSQL:  downSQL,
 		Snapshot: snapshotBytes,
 		Journal:  journalBytes,
 	}, nil

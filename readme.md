@@ -323,7 +323,7 @@ Operators come in two flavours:
 `All(ctx, &dest)` and `One(ctx, &dest)` scan rows into struct values.
 Field-to-column mapping rules:
 
-1. `db:"name"` struct tag, if present (`db:"-"` to skip)
+1. `drop:"name"` struct tag, if present (`drop:"-"` to skip)
 2. exact field name match
 3. snake_case of the field name (`UserID` → `user_id`)
 
@@ -397,14 +397,14 @@ pg.NewRelations(Posts).
 
 type Post struct {
     ID     int64
-    UserID int64 `db:"user_id"`
+    UserID int64 `drop:"user_id"`
     Title  string
 }
 type User struct {
     ID     int64
     Name   string
-    Posts  []Post  `db_rel:"posts"`     // matched by tag
-    Groups []Group `db_rel:"groups"`    // many-to-many through UserGroups
+    Posts  []Post  `dropRel:"posts"`     // matched by tag
+    Groups []Group `dropRel:"groups"`    // many-to-many through UserGroups
 }
 
 var users []User
@@ -423,7 +423,7 @@ Each kind takes a different shape:
 | `BelongsTo` | `Parent` or `*Parent` | row + 1 parent query |
 | `ManyToMany` | `[]Target` or `[]*Target` | parent + 1 junction + 1 target query |
 
-Relation fields are matched by `db_rel:"<name>"` tag first, then by
+Relation fields are matched by `dropRel:"<name>"` tag first, then by
 case-insensitive name match.
 
 #### Nested (deep) relations
@@ -437,14 +437,14 @@ fetched only once:
 ```go
 type Comment struct {
     ID     int64
-    PostID int64 `db:"post_id"`
+    PostID int64 `drop:"post_id"`
     Body   string
 }
 type Post struct {
     ID       int64
-    UserID   int64     `db:"user_id"`
+    UserID   int64     `drop:"user_id"`
     Title    string
-    Comments []Comment `db_rel:"comments"`
+    Comments []Comment `dropRel:"comments"`
 }
 
 pg.NewRelations(Posts).HasMany("comments", Comments, PostID, CommentPostID)

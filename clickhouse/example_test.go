@@ -14,7 +14,7 @@ var (
 	exEvents   = clickhouse.NewTable("events")
 	exEventID  = clickhouse.Add(exEvents, clickhouse.UUID("id"))
 	exEventTS  = clickhouse.Add(exEvents, clickhouse.DateTime("ts", "UTC"))
-	exEventUID = clickhouse.Add(exEvents, clickhouse.UInt64("user_id"))
+	exEventUID = clickhouse.Add(exEvents, clickhouse.UInt64("userId"))
 	exEventDur = clickhouse.Add(exEvents, clickhouse.Float64("duration_ms"))
 )
 

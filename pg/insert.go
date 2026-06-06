@@ -160,17 +160,21 @@ func Excluded(c ColRef) drops.Expression {
 
 // WriteSQL renders the INSERT statement.
 func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
+	cols, rows := i.cols, i.rows
+	if i.table.hasInsertHooks() {
+		cols, rows = i.applyInsertHooks()
+	}
 	b.WriteString("INSERT INTO ")
 	i.table.writeFrom(b)
 	b.WriteString(" (")
-	for j, c := range i.cols {
+	for j, c := range cols {
 		if j > 0 {
 			b.WriteString(", ")
 		}
 		b.WriteIdent(c.Name())
 	}
 	b.WriteString(") VALUES ")
-	for r, row := range i.rows {
+	for r, row := range rows {
 		if r > 0 {
 			b.WriteString(", ")
 		}
@@ -190,6 +194,33 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" RETURNING ")
 		b.AppendList(", ", i.returning)
 	}
+}
+
+// applyInsertHooks runs every InsertHook registered on the table and
+// returns the (possibly extended) column list and rows. Hook-supplied
+// columns are appended after the user-bound ones and apply to every
+// row uniformly.
+func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]drops.Expression) {
+	ctx := &InsertHookCtx{bound: make(map[*Column]bool, len(i.cols))}
+	for _, c := range i.cols {
+		ctx.bound[c] = true
+	}
+	for _, h := range i.table.insertHooks {
+		h.BeforeInsert(ctx)
+	}
+	if len(ctx.addCols) == 0 {
+		return i.cols, i.rows
+	}
+	cols := append([]*Column(nil), i.cols...)
+	cols = append(cols, ctx.addCols...)
+	rows := make([][]drops.Expression, len(i.rows))
+	for r, row := range i.rows {
+		extended := make([]drops.Expression, 0, len(row)+len(ctx.addExprs))
+		extended = append(extended, row...)
+		extended = append(extended, ctx.addExprs...)
+		rows[r] = extended
+	}
+	return cols, rows
 }
 
 func writeConflict(b *drops.Builder, c *conflictClause) {

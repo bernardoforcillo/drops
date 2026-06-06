@@ -1,0 +1,262 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"go/format"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"text/template"
+)
+
+// runSQL parses every *.sql file under dir, extracts the typed
+// queries declared via "-- name:" directives, and emits a single
+// queries_gen.go file containing one Go function per query. The
+// generated functions wrap drops/pg so the project stays a thin
+// runtime — they call db.Query / db.Exec and route the result
+// through pg.ScanOne / pg.ScanAll for typed results.
+//
+// Directive syntax:
+//
+//	-- name: <FunctionName>(<arg1> <type1>, <arg2> <type2>, ...) :one|:many|:exec [<ResultType>]
+//	SELECT ...;
+//
+// :one  → returns (ResultType, error)
+// :many → returns ([]ResultType, error)
+// :exec → returns (drops.Result, error) — ResultType omitted
+//
+// Arguments are listed in the same order they appear as $1, $2,
+// ... in the SQL body. The Go types must already exist in the
+// target package; dropsgen does not generate the result struct —
+// pair this with `dropsgen introspect` if you need that too.
+func runSQL(in, out, pkg string) error {
+	files, err := collectSQLFiles(in)
+	if err != nil {
+		return err
+	}
+	var queries []sqlQuery
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		parsed, err := parseSQLFile(string(raw))
+		if err != nil {
+			return fmt.Errorf("%s: %w", f, err)
+		}
+		queries = append(queries, parsed...)
+	}
+	if len(queries) == 0 {
+		return fmt.Errorf("no `-- name:` directives found under %s", in)
+	}
+	sort.Slice(queries, func(i, j int) bool { return queries[i].Name < queries[j].Name })
+
+	if pkg == "" {
+		pkg = filepath.Base(filepath.Clean(out))
+		if pkg == "." || pkg == "/" {
+			pkg = "queries"
+		}
+	}
+	src, err := emitSQL(pkg, queries)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(out, "queries_gen.go"), src, 0o644)
+}
+
+// collectSQLFiles returns every *.sql file under dir, sorted for
+// determinism. Plain ReadDir — no recursion in v1.
+func collectSQLFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		out = append(out, filepath.Join(dir, e.Name()))
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// sqlQuery is the parsed form of one query block.
+type sqlQuery struct {
+	Name       string
+	Args       []sqlArg
+	Kind       string // "one" | "many" | "exec"
+	ResultType string
+	SQL        string
+}
+
+type sqlArg struct {
+	Name string
+	Type string
+}
+
+// directiveRE matches the `-- name: …` line. Captures: name,
+// args block (may be empty), kind, result type (optional).
+var directiveRE = regexp.MustCompile(`^--\s*name:\s*(\w+)\s*\(([^)]*)\)\s*:(one|many|exec)\s*(\w+)?\s*$`)
+
+// parseSQLFile splits a file into directive + SQL pairs.
+func parseSQLFile(text string) ([]sqlQuery, error) {
+	lines := strings.Split(text, "\n")
+	var queries []sqlQuery
+	var current *sqlQuery
+	flush := func() {
+		if current == nil {
+			return
+		}
+		current.SQL = strings.TrimSpace(current.SQL)
+		// Strip trailing semicolon to keep the wire form clean —
+		// drivers don't need it.
+		current.SQL = strings.TrimSuffix(current.SQL, ";")
+		queries = append(queries, *current)
+		current = nil
+	}
+	for _, line := range lines {
+		trim := strings.TrimSpace(line)
+		if m := directiveRE.FindStringSubmatch(trim); m != nil {
+			flush()
+			q := sqlQuery{Name: m[1], Kind: m[3], ResultType: m[4]}
+			args, err := parseArgs(m[2])
+			if err != nil {
+				return nil, fmt.Errorf("query %s: %w", m[1], err)
+			}
+			q.Args = args
+			if q.Kind != "exec" && q.ResultType == "" {
+				return nil, fmt.Errorf("query %s: :%s requires a result type", q.Name, q.Kind)
+			}
+			current = &q
+			continue
+		}
+		if current == nil {
+			// Skip free-floating comments / blank lines / file
+			// headers — only lines after a directive count as SQL.
+			continue
+		}
+		current.SQL += line + "\n"
+	}
+	flush()
+	return queries, nil
+}
+
+// parseArgs splits "a int64, b string" into typed entries.
+// Empty input returns an empty slice.
+func parseArgs(raw string) ([]sqlArg, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]sqlArg, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// "<name> <type>" — split on the first whitespace.
+		fields := strings.Fields(p)
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("argument %q is missing a type", p)
+		}
+		out = append(out, sqlArg{
+			Name: fields[0],
+			Type: strings.Join(fields[1:], " "),
+		})
+	}
+	return out, nil
+}
+
+// emitSQL renders the generated source.
+const sqlEmitTpl = `// Code generated by dropsgen sql. DO NOT EDIT.
+
+package {{.Package}}
+
+import (
+	"context"
+
+	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/pg"
+)
+
+var _ drops.Expression // keep imports honest when no exec query exists
+{{range .Queries}}
+// {{.Name}} runs:
+//
+//	{{.SQL | docIndent}}
+func {{.Name}}(db *pg.DB, ctx context.Context{{range .Args}}, {{.Name}} {{.Type}}{{end}}) {{returnSig .}} {
+{{- if eq .Kind "exec"}}
+	return db.Exec(ctx, ` + "`{{.SQL}}`" + `{{range .Args}}, {{.Name}}{{end}})
+{{- else if eq .Kind "one"}}
+	var out {{.ResultType}}
+	rows, err := db.Query(ctx, ` + "`{{.SQL}}`" + `{{range .Args}}, {{.Name}}{{end}})
+	if err != nil {
+		return out, err
+	}
+	if err := pg.ScanOne(rows, &out); err != nil {
+		return out, err
+	}
+	return out, nil
+{{- else}}
+	var out []{{.ResultType}}
+	rows, err := db.Query(ctx, ` + "`{{.SQL}}`" + `{{range .Args}}, {{.Name}}{{end}})
+	if err != nil {
+		return out, err
+	}
+	if err := pg.ScanAll(rows, &out); err != nil {
+		return out, err
+	}
+	return out, nil
+{{- end}}
+}
+{{end}}`
+
+func emitSQL(pkg string, queries []sqlQuery) ([]byte, error) {
+	funcs := template.FuncMap{
+		"returnSig": func(q sqlQuery) string {
+			switch q.Kind {
+			case "exec":
+				return "(drops.Result, error)"
+			case "one":
+				return fmt.Sprintf("(%s, error)", q.ResultType)
+			default:
+				return fmt.Sprintf("([]%s, error)", q.ResultType)
+			}
+		},
+		"docIndent": func(sql string) string {
+			lines := strings.Split(strings.TrimSpace(sql), "\n")
+			for i := range lines {
+				lines[i] = strings.TrimSpace(lines[i])
+			}
+			return strings.Join(lines, "\n//\t")
+		},
+	}
+	tpl, err := template.New("sqlgen").Funcs(funcs).Parse(sqlEmitTpl)
+	if err != nil {
+		return nil, fmt.Errorf("internal template: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, struct {
+		Package string
+		Queries []sqlQuery
+	}{Package: pkg, Queries: queries}); err != nil {
+		return nil, err
+	}
+	out, err := format.Source(buf.Bytes())
+	if err != nil {
+		return buf.Bytes(), fmt.Errorf("gofmt: %w", err)
+	}
+	return out, nil
+}

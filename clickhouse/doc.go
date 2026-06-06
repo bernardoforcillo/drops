@@ -26,6 +26,20 @@
 //	sqlDB, _ := sql.Open("clickhouse", "clickhouse://localhost:9000/default")
 //	db := clickhouse.New(stdlib.New(sqlDB))
 //
+// Templates (Timestamps, SoftDelete, Audit, UUIDPrimaryKey) provide
+// reusable column groups — see template.go for the function-style
+// pattern and mixin.go for the richer Mixin interface. ClickHouse has
+// no foreign keys, so Audit emits plain scalar columns mirroring the
+// target's type. Lifecycle hooks are limited to OnInsert (no
+// builder-side UPDATE/DELETE); default filters on SelectBuilder
+// honour Unscoped() for opt-out.
+//
+// Entity[T] (see entity.go) binds a Go struct to a Table and exposes
+// Create / CreateMany / Query — the narrow subset of CRUD that maps
+// to ClickHouse's Insert + Select builders. Entity.Validate registers
+// per-row validators that run before Create / CreateMany; on
+// CreateMany the first failing row aborts the whole batch.
+//
 // What this package does NOT try to mirror from drops/pg:
 //
 //   - per-row UPDATE/DELETE (ClickHouse mutations are asynchronous and

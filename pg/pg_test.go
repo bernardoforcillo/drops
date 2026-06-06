@@ -18,7 +18,7 @@ var (
 
 	posts      = pg.NewTable("posts")
 	postID     = pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	postUserID = pg.Add(posts, pg.BigInt("user_id").NotNull().References(userID, pg.OnDelete("CASCADE")))
+	postUserID = pg.Add(posts, pg.BigInt("userId").NotNull().References(userID, pg.OnDelete("CASCADE")))
 	postTitle  = pg.Add(posts, pg.Text("title").NotNull())
 )
 
@@ -69,7 +69,7 @@ func TestTypedOperators(t *testing.T) {
 		args    []any
 	}{
 		{"col.Eq", userID.Eq(1), `("users"."id" = $1)`, []any{int64(1)}},
-		{"col.EqCol", userID.EqCol(postUserID), `("users"."id" = "posts"."user_id")`, nil},
+		{"col.EqCol", userID.EqCol(postUserID), `("users"."id" = "posts"."userId")`, nil},
 		{"col.Ne", userAge.Ne(0), `("users"."age" <> $1)`, []any{int32(0)}},
 		{"col.Gt", userAge.Gt(18), `("users"."age" > $1)`, []any{int32(18)}},
 		{"col.IsNull", userAge.IsNull(), `("users"."age" IS NULL)`, nil},
@@ -170,7 +170,7 @@ func TestSelectLeftJoinGroupBy(t *testing.T) {
 		OrderBy(userName.Asc())
 	check(t,
 		q,
-		`SELECT "users"."name", count(*) AS "n" FROM "users" LEFT JOIN "posts" ON ("posts"."user_id" = "users"."id") GROUP BY "users"."id", "users"."name" ORDER BY "users"."name" ASC`,
+		`SELECT "users"."name", count(*) AS "n" FROM "users" LEFT JOIN "posts" ON ("posts"."userId" = "users"."id") GROUP BY "users"."id", "users"."name" ORDER BY "users"."name" ASC`,
 	)
 }
 
@@ -191,7 +191,7 @@ func TestSelectSubquery(t *testing.T) {
 	q := db.Select().From(posts).Where(pg.In(postUserID, sub))
 	check(t,
 		q,
-		`SELECT * FROM "posts" WHERE ("posts"."user_id" IN ((SELECT "users"."id" FROM "users" WHERE ("users"."age" > $1)) AS "u"))`,
+		`SELECT * FROM "posts" WHERE ("posts"."userId" IN ((SELECT "users"."id" FROM "users" WHERE ("users"."age" > $1)) AS "u"))`,
 		int32(30),
 	)
 }
@@ -300,7 +300,7 @@ func TestCreateTableUsers(t *testing.T) {
 }
 
 func TestCreateTablePostsForeignKey(t *testing.T) {
-	want := "CREATE TABLE \"posts\" (\n  \"id\" bigserial PRIMARY KEY,\n  \"user_id\" bigint NOT NULL REFERENCES \"users\" (\"id\") ON DELETE CASCADE,\n  \"title\" text NOT NULL\n)"
+	want := "CREATE TABLE \"posts\" (\n  \"id\" bigserial PRIMARY KEY,\n  \"userId\" bigint NOT NULL REFERENCES \"users\" (\"id\") ON DELETE CASCADE,\n  \"title\" text NOT NULL\n)"
 	got, _ := drops.String(pg.CreateTable(posts))
 	if got != want {
 		t.Errorf("CREATE TABLE mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)

@@ -13,7 +13,30 @@ type DeleteBuilder struct {
 	using     []*Table
 	wheres    []drops.Expression
 	returning []drops.Expression
+	unscoped  bool
 }
+
+// Table returns the target table.
+func (d *DeleteBuilder) Table() *Table { return d.table }
+
+// Wheres returns a copy of the predicate slice — exposed so custom
+// DeleteHooks (e.g. soft-delete rewrites) can read the original WHERE
+// clauses when synthesising replacement SQL.
+func (d *DeleteBuilder) Wheres() []drops.Expression {
+	return append([]drops.Expression(nil), d.wheres...)
+}
+
+// ReturningClauses returns a copy of the RETURNING projection list.
+func (d *DeleteBuilder) ReturningClauses() []drops.Expression {
+	return append([]drops.Expression(nil), d.returning...)
+}
+
+// IsUnscoped reports whether the caller opted out of default scopes.
+func (d *DeleteBuilder) IsUnscoped() bool { return d.unscoped }
+
+// DB returns the executing DB. Hooks that need to build a replacement
+// statement (an UPDATE for soft-delete, for instance) use it.
+func (d *DeleteBuilder) DB() *DB { return d.db }
 
 // Using adds tables to a PostgreSQL DELETE ... USING clause for joins.
 func (d *DeleteBuilder) Using(tables ...*Table) *DeleteBuilder {
@@ -33,8 +56,30 @@ func (d *DeleteBuilder) Returning(cols ...drops.Expression) *DeleteBuilder {
 	return d
 }
 
-// WriteSQL renders the DELETE.
+// Unscoped opts out of both DeleteHooks and DefaultFilters for this
+// statement. On a soft-deleted table it forces a real, hard DELETE
+// that bypasses the rewrite-to-UPDATE behaviour.
+func (d *DeleteBuilder) Unscoped() *DeleteBuilder {
+	d.unscoped = true
+	return d
+}
+
+// WriteSQL renders the DELETE. If the table has DeleteHooks and the
+// caller has not opted out via Unscoped, hooks may replace the
+// statement entirely — used by SoftDelete to flip DELETE into UPDATE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
+	if !d.unscoped {
+		for _, h := range d.table.deleteHooks {
+			if rep := h.BeforeDelete(d); rep != nil {
+				rep.WriteSQL(b)
+				return
+			}
+		}
+	}
+	wheres := d.wheres
+	if !d.unscoped && len(d.table.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), d.table.defaultFilters...), wheres...)
+	}
 	b.WriteString("DELETE FROM ")
 	d.table.writeFrom(b)
 	if len(d.using) > 0 {
@@ -46,9 +91,9 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 			t.writeFrom(b)
 		}
 	}
-	if len(d.wheres) > 0 {
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		writeAnd(b, d.wheres)
+		writeAnd(b, wheres)
 	}
 	if len(d.returning) > 0 {
 		b.WriteString(" RETURNING ")

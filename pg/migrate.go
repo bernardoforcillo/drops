@@ -163,7 +163,7 @@ func (m *Migrator) ensureTable(ctx context.Context) error {
 	stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		version VARCHAR(255) PRIMARY KEY,
 		name TEXT NOT NULL,
-		applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		appliedAt TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`, quoteIdent(m.table))
 	_, err := m.db.Exec(ctx, stmt)
 	return err
@@ -173,7 +173,7 @@ func (m *Migrator) ensureTable(ctx context.Context) error {
 func (m *Migrator) applied(ctx context.Context) (map[string]time.Time, error) {
 	out := map[string]time.Time{}
 	rows, err := m.db.Query(ctx,
-		fmt.Sprintf("SELECT version, applied_at FROM %s", quoteIdent(m.table)))
+		fmt.Sprintf("SELECT version, appliedAt FROM %s", quoteIdent(m.table)))
 	if err != nil {
 		return nil, err
 	}

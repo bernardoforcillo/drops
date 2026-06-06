@@ -12,18 +12,55 @@ import (
 // drizzle-kit's PostgreSQL snapshot v7 format so a Snapshot produced by
 // drops is round-trippable through drizzle-kit, and vice versa.
 type Snapshot struct {
-	ID        string                    `json:"id"`
-	PrevID    string                    `json:"prevId"`
-	Version   string                    `json:"version"`
-	Dialect   string                    `json:"dialect"`
-	Tables    map[string]*TableSnapshot `json:"tables"`
-	Enums     map[string]any            `json:"enums"`
-	Schemas   map[string]any            `json:"schemas"`
-	Sequences map[string]any            `json:"sequences"`
-	Roles     map[string]any            `json:"roles"`
-	Policies  map[string]any            `json:"policies"`
-	Views     map[string]any            `json:"views"`
-	Meta      SnapshotMeta              `json:"_meta"`
+	ID        string                       `json:"id"`
+	PrevID    string                       `json:"prevId"`
+	Version   string                       `json:"version"`
+	Dialect   string                       `json:"dialect"`
+	Tables    map[string]*TableSnapshot    `json:"tables"`
+	Enums     map[string]*EnumSnapshot     `json:"enums"`
+	Schemas   map[string]any               `json:"schemas"`
+	Sequences map[string]*SequenceSnapshot `json:"sequences"`
+	Roles     map[string]any               `json:"roles"`
+	Policies  map[string]any               `json:"policies"`
+	Views     map[string]*ViewSnapshot     `json:"views"`
+	Meta      SnapshotMeta                 `json:"_meta"`
+}
+
+// EnumSnapshot is one entry in Snapshot.Enums.
+type EnumSnapshot struct {
+	Name   string   `json:"name"`
+	Schema string   `json:"schema"`
+	Values []string `json:"values"`
+}
+
+// SequenceSnapshot is one entry in Snapshot.Sequences.
+type SequenceSnapshot struct {
+	Name      string  `json:"name"`
+	Schema    string  `json:"schema"`
+	Start     *int64  `json:"startWith,omitempty"`
+	Increment *int64  `json:"incrementBy,omitempty"`
+	MinValue  *int64  `json:"minValue,omitempty"`
+	MaxValue  *int64  `json:"maxValue,omitempty"`
+	Cache     *int64  `json:"cacheSize,omitempty"`
+	Cycle     bool    `json:"cycle"`
+}
+
+// ViewSnapshot is one entry in Snapshot.Views.
+type ViewSnapshot struct {
+	Name         string `json:"name"`
+	Schema       string `json:"schema"`
+	Definition   string `json:"definition"`
+	Materialized bool   `json:"materialized"`
+}
+
+// PolicySnapshot is one entry in TableSnapshot.Policies.
+type PolicySnapshot struct {
+	Name      string   `json:"name"`
+	As        string   `json:"as"`
+	For       string   `json:"for"`
+	To        []string `json:"to"`
+	Using     string   `json:"using"`
+	WithCheck string   `json:"withCheck"`
 }
 
 // SnapshotMeta carries rename-tracking annotations. drops never sets
@@ -36,16 +73,42 @@ type SnapshotMeta struct {
 
 // TableSnapshot is one entry in Snapshot.Tables.
 type TableSnapshot struct {
-	Name                 string                         `json:"name"`
-	Schema               string                         `json:"schema"`
-	Columns              map[string]*ColumnSnapshot     `json:"columns"`
-	Indexes              map[string]any                 `json:"indexes"`
-	ForeignKeys          map[string]*ForeignKeySnapshot `json:"foreignKeys"`
-	CompositePrimaryKeys map[string]any                 `json:"compositePrimaryKeys"`
-	UniqueConstraints    map[string]*UniqueSnapshot     `json:"uniqueConstraints"`
-	Policies             map[string]any                 `json:"policies"`
-	CheckConstraints     map[string]any                 `json:"checkConstraints"`
-	IsRLSEnabled         bool                           `json:"isRLSEnabled"`
+	Name                 string                              `json:"name"`
+	Schema               string                              `json:"schema"`
+	Columns              map[string]*ColumnSnapshot          `json:"columns"`
+	Indexes              map[string]*IndexSnapshot           `json:"indexes"`
+	ForeignKeys          map[string]*ForeignKeySnapshot      `json:"foreignKeys"`
+	CompositePrimaryKeys map[string]*CompositePKSnapshot     `json:"compositePrimaryKeys"`
+	UniqueConstraints    map[string]*UniqueSnapshot          `json:"uniqueConstraints"`
+	Policies             map[string]*PolicySnapshot          `json:"policies"`
+	CheckConstraints     map[string]*CheckSnapshot           `json:"checkConstraints"`
+	IsRLSEnabled         bool                                `json:"isRLSEnabled"`
+}
+
+// IndexSnapshot is one entry in TableSnapshot.Indexes. JSON keys
+// follow drizzle-kit's v7 PostgreSQL schema.
+type IndexSnapshot struct {
+	Name             string   `json:"name"`
+	Columns          []string `json:"columns"`
+	IsUnique         bool     `json:"isUnique"`
+	Where            string   `json:"where"`
+	With             map[string]any `json:"with"`
+	Method           string   `json:"method"`
+	Concurrently     bool     `json:"concurrently"`
+	NullsNotDistinct bool     `json:"nullsNotDistinct"`
+}
+
+// CompositePKSnapshot is one entry in TableSnapshot.CompositePrimaryKeys.
+type CompositePKSnapshot struct {
+	Name    string   `json:"name"`
+	Columns []string `json:"columns"`
+}
+
+// CheckSnapshot is one entry in TableSnapshot.CheckConstraints.
+// Value is the SQL expression after CHECK (...).
+type CheckSnapshot struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // ColumnSnapshot is one entry in TableSnapshot.Columns.
@@ -88,12 +151,12 @@ func EmptySnapshot() *Snapshot {
 		Version:   "7",
 		Dialect:   "postgresql",
 		Tables:    map[string]*TableSnapshot{},
-		Enums:     map[string]any{},
+		Enums:     map[string]*EnumSnapshot{},
 		Schemas:   map[string]any{},
-		Sequences: map[string]any{},
+		Sequences: map[string]*SequenceSnapshot{},
 		Roles:     map[string]any{},
 		Policies:  map[string]any{},
-		Views:     map[string]any{},
+		Views:     map[string]*ViewSnapshot{},
 		Meta:      SnapshotMeta{Columns: map[string]any{}, Schemas: map[string]any{}, Tables: map[string]any{}},
 	}
 }
@@ -109,13 +172,53 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			Name:                 t.Name(),
 			Schema:               t.Schema(),
 			Columns:              map[string]*ColumnSnapshot{},
-			Indexes:              map[string]any{},
+			Indexes:              map[string]*IndexSnapshot{},
 			ForeignKeys:          map[string]*ForeignKeySnapshot{},
-			CompositePrimaryKeys: map[string]any{},
+			CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
-			Policies:             map[string]any{},
-			CheckConstraints:     map[string]any{},
-			IsRLSEnabled:         false,
+			Policies:             map[string]*PolicySnapshot{},
+			CheckConstraints:     map[string]*CheckSnapshot{},
+			IsRLSEnabled:         t.RLSEnabled(),
+		}
+		// Policies attached to the table.
+		for _, p := range t.Policies() {
+			ts.Policies[p.Name()] = &PolicySnapshot{
+				Name:      p.Name(),
+				As:        p.As(),
+				For:       p.Command(),
+				To:        p.Roles(),
+				Using:     p.UsingExpr(),
+				WithCheck: p.WithCheckExpr(),
+			}
+		}
+		// Composite primary key.
+		if pk := t.CompositePrimaryKey(); len(pk) > 0 {
+			cols := make([]string, len(pk))
+			for i, c := range pk {
+				cols[i] = c.Name()
+			}
+			name := compositePKName(t.Name(), cols)
+			ts.CompositePrimaryKeys[name] = &CompositePKSnapshot{
+				Name: name, Columns: cols,
+			}
+		}
+		// Composite uniques registered via Table.AddUnique.
+		for name, cols := range t.CompositeUniques() {
+			names := make([]string, len(cols))
+			for i, c := range cols {
+				names[i] = c.Name()
+			}
+			ts.UniqueConstraints[name] = &UniqueSnapshot{
+				Name: name, Columns: names,
+			}
+		}
+		// CHECK constraints.
+		for name, expr := range t.Checks() {
+			ts.CheckConstraints[name] = &CheckSnapshot{Name: name, Value: expr}
+		}
+		// Indexes.
+		for _, idx := range t.Indexes() {
+			ts.Indexes[idx.Name()] = indexSnapshotOf(idx)
 		}
 		for _, c := range t.Columns() {
 			cs := &ColumnSnapshot{
@@ -162,6 +265,37 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 		}
 		s.Tables[tableKey(t)] = ts
 	}
+	// Top-level enums.
+	for _, e := range schema.Enums() {
+		s.Enums[e.Name()] = &EnumSnapshot{
+			Name:   e.Name(),
+			Schema: "public",
+			Values: e.Values(),
+		}
+	}
+	// Top-level sequences.
+	for _, seq := range schema.Sequences() {
+		opts := seq.Options()
+		s.Sequences[seq.Name()] = &SequenceSnapshot{
+			Name:      seq.Name(),
+			Schema:    "public",
+			Start:     opts.Start,
+			Increment: opts.Increment,
+			MinValue:  opts.MinValue,
+			MaxValue:  opts.MaxValue,
+			Cache:     opts.Cache,
+			Cycle:     opts.Cycle,
+		}
+	}
+	// Top-level views.
+	for _, v := range schema.Views() {
+		s.Views[v.Name()] = &ViewSnapshot{
+			Name:         v.Name(),
+			Schema:       "public",
+			Definition:   v.Definition(),
+			Materialized: v.IsMaterialized(),
+		}
+	}
 	return s
 }
 
@@ -200,49 +334,103 @@ func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
 			t.UniqueConstraints = map[string]*UniqueSnapshot{}
 		}
 		if t.Indexes == nil {
-			t.Indexes = map[string]any{}
+			t.Indexes = map[string]*IndexSnapshot{}
 		}
 		if t.CompositePrimaryKeys == nil {
-			t.CompositePrimaryKeys = map[string]any{}
+			t.CompositePrimaryKeys = map[string]*CompositePKSnapshot{}
 		}
 		if t.Policies == nil {
-			t.Policies = map[string]any{}
+			t.Policies = map[string]*PolicySnapshot{}
 		}
 		if t.CheckConstraints == nil {
-			t.CheckConstraints = map[string]any{}
+			t.CheckConstraints = map[string]*CheckSnapshot{}
 		}
 	}
 	return &s, nil
 }
 
-// Naming helpers — drizzle-kit's conventions ---------------------------
+// Naming helpers ------------------------------------------------------
 
-// fkName builds drizzle-kit's foreign-key constraint name:
+// fkName builds the foreign-key constraint name in camelCase:
 //
-//	<tableFrom>_<colFrom...>_<tableTo>_<colTo...>_fk
+//	<tableFrom><ColFrom...><TableTo><ColTo...>Fk
 func fkName(tableFrom string, cols []string, tableTo string, targetCols []string) string {
 	out := tableFrom
 	for _, c := range cols {
-		out += "_" + c
+		out += titleCaseFirst(c)
 	}
-	out += "_" + tableTo
+	out += titleCaseFirst(tableTo)
 	for _, c := range targetCols {
-		out += "_" + c
+		out += titleCaseFirst(c)
 	}
-	out += "_fk"
+	out += "Fk"
 	return out
 }
 
-// uniqueName builds drizzle-kit's unique-constraint name:
+// uniqueName builds the unique-constraint name in camelCase:
 //
-//	<table>_<col...>_unique
+//	<table><Col...>Unique
 func uniqueName(table string, cols []string) string {
 	out := table
 	for _, c := range cols {
-		out += "_" + c
+		out += titleCaseFirst(c)
 	}
-	out += "_unique"
+	out += "Unique"
 	return out
+}
+
+// compositePKName builds the composite-primary-key constraint
+// name in camelCase: <table><Col...>Pk.
+func compositePKName(table string, cols []string) string {
+	out := table
+	for _, c := range cols {
+		out += titleCaseFirst(c)
+	}
+	out += "Pk"
+	return out
+}
+
+// indexSnapshotOf extracts the snapshot form of an *Index. Only
+// the well-known shape (simple column refs, btree default) is
+// captured cleanly; functional or expression indexes pass through
+// as empty Columns and the original DDL is recoverable from the
+// schema-level renderer rather than the snapshot.
+func indexSnapshotOf(idx *Index) *IndexSnapshot {
+	is := &IndexSnapshot{
+		Name:         idx.Name(),
+		IsUnique:     idx.unique,
+		Method:       idx.method,
+		Concurrently: idx.concurrently,
+		With:         map[string]any{},
+	}
+	if is.Method == "" {
+		is.Method = "btree"
+	}
+	for _, expr := range idx.columns {
+		if c, ok := expr.(*Column); ok {
+			is.Columns = append(is.Columns, c.Name())
+			continue
+		}
+		// Try to recognise a *Col[T] via the ColRef interface.
+		if cr, ok := expr.(ColRef); ok {
+			is.Columns = append(is.Columns, cr.col().Name())
+			continue
+		}
+	}
+	return is
+}
+
+// titleCaseFirst uppercases the first byte of s. Used to title-case
+// each column name when concatenating constraint identifiers.
+func titleCaseFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	first := s[0]
+	if first >= 'a' && first <= 'z' {
+		first -= 'a' - 'A'
+	}
+	return string(first) + s[1:]
 }
 
 // normaliseAction converts a possibly-empty referential action ("CASCADE",

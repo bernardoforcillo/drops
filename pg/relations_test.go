@@ -91,20 +91,20 @@ func (t *fakeTx) Rollback(_ context.Context) error { return nil }
 type relUser struct {
 	ID    int64
 	Name  string
-	Posts []relPost `db_rel:"posts"`
+	Posts []relPost `dropRel:"posts"`
 }
 
 type relPost struct {
 	ID     int64
-	UserID int64 `db:"user_id"`
+	UserID int64 `drop:"userId"`
 	Title  string
 }
 
 type relPostWithAuthor struct {
 	ID     int64
-	UserID int64 `db:"user_id"`
+	UserID int64 `drop:"userId"`
 	Title  string
-	Author *relUser `db_rel:"author"`
+	Author *relUser `dropRel:"author"`
 }
 
 func mkRelSchema() (*pg.Table, *pg.Table, *pg.Col[int64], *pg.Col[int64]) {
@@ -114,7 +114,7 @@ func mkRelSchema() (*pg.Table, *pg.Table, *pg.Col[int64], *pg.Col[int64]) {
 
 	postsT := pg.NewTable("posts")
 	pg.Add(postsT, pg.BigSerial("id").PrimaryKey())
-	postUIDc := pg.Add(postsT, pg.BigInt("user_id").NotNull())
+	postUIDc := pg.Add(postsT, pg.BigInt("userId").NotNull())
 	pg.Add(postsT, pg.Text("title").NotNull())
 
 	pg.NewRelations(usersT).
@@ -140,7 +140,7 @@ func TestFindHasMany(t *testing.T) {
 			}, nil
 		case strings.Contains(sql, `FROM "posts"`):
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title"},
+				cols: []string{"id", "userId", "title"},
 				data: [][]any{
 					{int64(10), int64(1), "Hello"},
 					{int64(11), int64(1), "World"},
@@ -182,7 +182,7 @@ func TestFindBelongsTo(t *testing.T) {
 		switch {
 		case strings.Contains(sql, `FROM "posts"`):
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title"},
+				cols: []string{"id", "userId", "title"},
 				data: [][]any{
 					{int64(10), int64(1), "Hello"},
 					{int64(11), int64(2), "Hi"},
@@ -225,7 +225,7 @@ type m2mGroup struct {
 type m2mUser struct {
 	ID     int64
 	Name   string
-	Groups []m2mGroup `db_rel:"groups"`
+	Groups []m2mGroup `dropRel:"groups"`
 }
 
 func TestFindManyToMany(t *testing.T) {
@@ -237,9 +237,9 @@ func TestFindManyToMany(t *testing.T) {
 	groupIDc := pg.Add(groupsT, pg.BigSerial("id").PrimaryKey())
 	pg.Add(groupsT, pg.Text("name").NotNull())
 
-	userGroupsT := pg.NewTable("user_groups")
-	ugUserIDc := pg.Add(userGroupsT, pg.BigInt("user_id").NotNull())
-	ugGroupIDc := pg.Add(userGroupsT, pg.BigInt("group_id").NotNull())
+	userGroupsT := pg.NewTable("userGroups")
+	ugUserIDc := pg.Add(userGroupsT, pg.BigInt("userId").NotNull())
+	ugGroupIDc := pg.Add(userGroupsT, pg.BigInt("groupId").NotNull())
 
 	pg.NewRelations(usersT).
 		ManyToMany("groups", groupsT, userGroupsT, ugUserIDc, ugGroupIDc, userIDc, groupIDc)
@@ -254,9 +254,9 @@ func TestFindManyToMany(t *testing.T) {
 					{int64(2), "Bob"},
 				},
 			}, nil
-		case strings.Contains(sql, `FROM "user_groups"`):
+		case strings.Contains(sql, `FROM "userGroups"`):
 			return &fakeRows{
-				cols: []string{"user_id", "group_id"},
+				cols: []string{"userId", "groupId"},
 				data: [][]any{
 					{int64(1), int64(10)},
 					{int64(1), int64(11)},
@@ -323,27 +323,27 @@ func TestFindUnknownRelation(t *testing.T) {
 type nestUser struct {
 	ID    int64
 	Name  string
-	Posts []nestPost `db_rel:"posts"`
+	Posts []nestPost `dropRel:"posts"`
 }
 
 type nestPost struct {
 	ID       int64
-	UserID   int64 `db:"user_id"`
+	UserID   int64 `drop:"userId"`
 	Title    string
-	Comments []nestComment `db_rel:"comments"`
+	Comments []nestComment `dropRel:"comments"`
 }
 
 type nestComment struct {
 	ID     int64
-	PostID int64 `db:"post_id"`
+	PostID int64 `drop:"postId"`
 	Body   string
 }
 
 type nestPostWithAuthor struct {
 	ID     int64
-	UserID int64 `db:"user_id"`
+	UserID int64 `drop:"userId"`
 	Title  string
-	Author *nestUser `db_rel:"author"`
+	Author *nestUser `dropRel:"author"`
 }
 
 func mkNestSchema() (users, posts, comments *pg.Table) {
@@ -353,12 +353,12 @@ func mkNestSchema() (users, posts, comments *pg.Table) {
 
 	postsT := pg.NewTable("posts")
 	pID := pg.Add(postsT, pg.BigSerial("id").PrimaryKey())
-	pUID := pg.Add(postsT, pg.BigInt("user_id").NotNull())
+	pUID := pg.Add(postsT, pg.BigInt("userId").NotNull())
 	pg.Add(postsT, pg.Text("title").NotNull())
 
 	commentsT := pg.NewTable("comments")
 	pg.Add(commentsT, pg.BigSerial("id").PrimaryKey())
-	cPID := pg.Add(commentsT, pg.BigInt("post_id").NotNull())
+	cPID := pg.Add(commentsT, pg.BigInt("postId").NotNull())
 	pg.Add(commentsT, pg.Text("body").NotNull())
 
 	pg.NewRelations(usersT).
@@ -382,7 +382,7 @@ func TestFindNestedHasManyHasMany(t *testing.T) {
 			}, nil
 		case strings.Contains(sql, `FROM "posts"`):
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title"},
+				cols: []string{"id", "userId", "title"},
 				data: [][]any{
 					{int64(10), int64(1), "Hello"},
 					{int64(11), int64(1), "World"},
@@ -391,7 +391,7 @@ func TestFindNestedHasManyHasMany(t *testing.T) {
 			}, nil
 		case strings.Contains(sql, `FROM "comments"`):
 			return &fakeRows{
-				cols: []string{"id", "post_id", "body"},
+				cols: []string{"id", "postId", "body"},
 				data: [][]any{
 					{int64(100), int64(10), "c-a"},
 					{int64(101), int64(10), "c-b"},
@@ -441,10 +441,10 @@ func TestFindNestedBelongsToHasMany(t *testing.T) {
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
 		case strings.Contains(sql, `FROM "comments"`):
-			return &fakeRows{cols: []string{"id", "post_id", "body"}}, nil
+			return &fakeRows{cols: []string{"id", "postId", "body"}}, nil
 		case strings.Contains(sql, `FROM "posts"`):
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title"},
+				cols: []string{"id", "userId", "title"},
 				data: [][]any{
 					{int64(10), int64(1), "Hello"},
 					{int64(20), int64(1), "Again"},
@@ -497,11 +497,11 @@ func TestFindNestedSharedPrefixMergedIntoOneQuery(t *testing.T) {
 			return &fakeRows{cols: []string{"id", "name"}, data: [][]any{{int64(1), "Alice"}}}, nil
 		case strings.Contains(sql, `FROM "posts"`):
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title"},
+				cols: []string{"id", "userId", "title"},
 				data: [][]any{{int64(10), int64(1), "Hello"}},
 			}, nil
 		case strings.Contains(sql, `FROM "comments"`):
-			return &fakeRows{cols: []string{"id", "post_id", "body"}}, nil
+			return &fakeRows{cols: []string{"id", "postId", "body"}}, nil
 		}
 		return nil, fmt.Errorf("unexpected query: %s", sql)
 	}}
@@ -554,12 +554,12 @@ func TestFindInvalidRelationPath(t *testing.T) {
 type filterUser struct {
 	ID    int64
 	Name  string
-	Posts []filterPost `db_rel:"posts"`
+	Posts []filterPost `dropRel:"posts"`
 }
 
 type filterPost struct {
 	ID        int64
-	UserID    int64 `db:"user_id"`
+	UserID    int64 `drop:"userId"`
 	Title     string
 	Published bool
 }
@@ -571,7 +571,7 @@ func TestFindWithRelWhereFilters(t *testing.T) {
 
 	postsT := pg.NewTable("posts")
 	pg.Add(postsT, pg.BigSerial("id").PrimaryKey())
-	pUID := pg.Add(postsT, pg.BigInt("user_id").NotNull())
+	pUID := pg.Add(postsT, pg.BigInt("userId").NotNull())
 	pg.Add(postsT, pg.Text("title").NotNull())
 	published := pg.Add(postsT, pg.Boolean("published").NotNull())
 
@@ -584,7 +584,7 @@ func TestFindWithRelWhereFilters(t *testing.T) {
 		case strings.Contains(sql, `FROM "posts"`):
 			// Pretend the DB honoured the filter and returned published only.
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title", "published"},
+				cols: []string{"id", "userId", "title", "published"},
 				data: [][]any{{int64(10), int64(1), "Live", true}},
 			}, nil
 		}
@@ -632,7 +632,7 @@ func TestFindWithRelOrderByEmitsClauseAndPreservesOrder(t *testing.T) {
 
 	postsT := pg.NewTable("posts")
 	pg.Add(postsT, pg.BigSerial("id").PrimaryKey())
-	pUID := pg.Add(postsT, pg.BigInt("user_id").NotNull())
+	pUID := pg.Add(postsT, pg.BigInt("userId").NotNull())
 	title := pg.Add(postsT, pg.Text("title").NotNull())
 	pg.Add(postsT, pg.Boolean("published").NotNull())
 
@@ -645,7 +645,7 @@ func TestFindWithRelOrderByEmitsClauseAndPreservesOrder(t *testing.T) {
 		case strings.Contains(sql, `FROM "posts"`):
 			// Returned already sorted by title (as the DB would).
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title", "published"},
+				cols: []string{"id", "userId", "title", "published"},
 				data: [][]any{
 					{int64(11), int64(1), "Apple", true},
 					{int64(10), int64(1), "Banana", true},
@@ -688,12 +688,12 @@ func TestFindWithRelNestedFilterAndDepth(t *testing.T) {
 			return &fakeRows{cols: []string{"id", "name"}, data: [][]any{{int64(1), "Alice"}}}, nil
 		case strings.Contains(sql, `FROM "posts"`):
 			return &fakeRows{
-				cols: []string{"id", "user_id", "title"},
+				cols: []string{"id", "userId", "title"},
 				data: [][]any{{int64(10), int64(1), "Hello"}},
 			}, nil
 		case strings.Contains(sql, `FROM "comments"`):
 			return &fakeRows{
-				cols: []string{"id", "post_id", "body"},
+				cols: []string{"id", "postId", "body"},
 				data: [][]any{{int64(100), int64(10), "c-a"}},
 			}, nil
 		}
@@ -738,9 +738,9 @@ func TestFindManyToManyOrderByUsesTargetOrder(t *testing.T) {
 	groupIDc := pg.Add(groupsT, pg.BigSerial("id").PrimaryKey())
 	groupName := pg.Add(groupsT, pg.Text("name").NotNull())
 
-	userGroupsT := pg.NewTable("user_groups")
-	ugUserIDc := pg.Add(userGroupsT, pg.BigInt("user_id").NotNull())
-	ugGroupIDc := pg.Add(userGroupsT, pg.BigInt("group_id").NotNull())
+	userGroupsT := pg.NewTable("userGroups")
+	ugUserIDc := pg.Add(userGroupsT, pg.BigInt("userId").NotNull())
+	ugGroupIDc := pg.Add(userGroupsT, pg.BigInt("groupId").NotNull())
 
 	pg.NewRelations(usersT).
 		ManyToMany("groups", groupsT, userGroupsT, ugUserIDc, ugGroupIDc, userIDc, groupIDc)
@@ -749,10 +749,10 @@ func TestFindManyToManyOrderByUsesTargetOrder(t *testing.T) {
 		switch {
 		case strings.Contains(sql, `FROM "users"`):
 			return &fakeRows{cols: []string{"id", "name"}, data: [][]any{{int64(1), "Alice"}}}, nil
-		case strings.Contains(sql, `FROM "user_groups"`):
+		case strings.Contains(sql, `FROM "userGroups"`):
 			// Junction order: Editors(11) before Admins(10).
 			return &fakeRows{
-				cols: []string{"user_id", "group_id"},
+				cols: []string{"userId", "groupId"},
 				data: [][]any{{int64(1), int64(11)}, {int64(1), int64(10)}},
 			}, nil
 		case strings.Contains(sql, `FROM "groups"`):
@@ -842,7 +842,7 @@ func TestMigrateUpAndDown(t *testing.T) {
 			for v := range applied {
 				rows = append(rows, []any{v, time.Time{}})
 			}
-			return &fakeRows{cols: []string{"version", "applied_at"}, data: rows}, nil
+			return &fakeRows{cols: []string{"version", "appliedAt"}, data: rows}, nil
 		},
 	}
 	db := pg.New(fd)

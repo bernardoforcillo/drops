@@ -29,6 +29,11 @@ type relNode struct {
 	name     string
 	wheres   []drops.Expression
 	orderBys []drops.Expression
+	// limit / offset are per-parent caps applied via a
+	// ROW_NUMBER() OVER (PARTITION BY <parentKey>) rewrite.
+	// Without them the relation loader fetches every related row.
+	limit    int
+	offset   int
 	children []*relNode
 }
 
@@ -84,6 +89,36 @@ func (c *RelConfig) OrderBy(exprs ...drops.Expression) *RelConfig {
 	return c
 }
 
+// Limit caps the number of related rows attached PER PARENT.
+// Implemented via a ROW_NUMBER() window over the join key:
+//
+//	SELECT * FROM (
+//	  SELECT *, ROW_NUMBER() OVER (PARTITION BY <fk> ORDER BY <orderBy>) AS _rn
+//	  FROM <child> WHERE <fk> IN (...)
+//	) AS _ranked
+//	WHERE _rn > <offset> AND _rn <= <offset> + <limit>
+//
+// so each parent's slice gets the first N children (after the
+// configured ORDER BY), not the first N rows globally. Mirrors
+// drizzle's with: { posts: { limit: 5 } } shape.
+//
+// Limit only applies to HasMany / MorphMany / ManyToMany —
+// single-row relations (HasOne / BelongsTo) already cap at 1.
+// Limit ≤ 0 disables the cap.
+func (c *RelConfig) Limit(n int) *RelConfig {
+	c.node.limit = n
+	return c
+}
+
+// Offset skips the first N matching rows per parent. Requires
+// Limit to be set (offset alone produces every row past N which
+// rarely matches caller intent — when you really need that,
+// combine Offset with a very large Limit).
+func (c *RelConfig) Offset(n int) *RelConfig {
+	c.node.offset = n
+	return c
+}
+
 // With declares deeper relations to eager-load beneath this one, using
 // the same dot-path syntax as FindBuilder.With.
 func (c *RelConfig) With(names ...string) *RelConfig {
@@ -135,6 +170,21 @@ func (f *FindBuilder) Limit(n int64) *FindBuilder { f.sel.Limit(n); return f }
 
 // Offset sets the OFFSET.
 func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
+
+// Unscoped opts out of the table's DefaultFilter predicates for the
+// root SELECT. Eager-loaded relations inherit their own table's
+// scopes independently.
+func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
+
+// HasEagerLoads reports whether any relations have been queued for
+// eager loading via With / WithRel. Used by Entity[T] to decide
+// whether the fast-scan path is safe — relation loaders need the
+// reflection-populated parent slice.
+func (f *FindBuilder) HasEagerLoads() bool { return len(f.roots) > 0 }
+
+// Select exposes the underlying SELECT builder so callers (typically
+// Entity[T]) can stream results through their own scanner.
+func (f *FindBuilder) Select() *SelectBuilder { return f.sel }
 
 // With marks one or more relations to eager-load. Names must match
 // relations declared on the table via NewRelations.
@@ -232,6 +282,10 @@ func validateRelTree(t *Table, nodes []*relNode) error {
 			return fmt.Errorf("drops/pg: unknown relation %q on table %q", node.name, t.Name())
 		}
 		if len(node.children) > 0 {
+			if rel.Kind == MorphToKind {
+				return fmt.Errorf("drops/pg: relation %q is MorphTo — nested With() is not supported because the loaded parent's type varies row by row",
+					node.name)
+			}
 			if err := validateRelTree(rel.To, node.children); err != nil {
 				return err
 			}
@@ -286,8 +340,11 @@ func (f *FindBuilder) loadOne(
 	rel *Relation,
 	node *relNode,
 ) (reflect.Value, reflect.Type, error) {
-	if rel.Kind == ManyToManyKind {
+	switch rel.Kind {
+	case ManyToManyKind:
 		return f.loadManyToMany(ctx, parentSlice, parentType, parentIsPtr, rel, node)
+	case MorphToKind:
+		return f.loadMorphTo(ctx, parentSlice, parentType, parentIsPtr, rel, node)
 	}
 	return f.loadRelation(ctx, parentSlice, parentType, parentIsPtr, rel, node)
 }
@@ -331,7 +388,7 @@ func (f *FindBuilder) loadRelation(
 
 	var rowKeyCol, targetKeyCol *Column
 	switch rel.Kind {
-	case HasManyKind, HasOneKind:
+	case HasManyKind, HasOneKind, MorphManyKind:
 		rowKeyCol = rel.ParentKey
 		targetKeyCol = rel.ChildKey
 	case BelongsToKind:
@@ -348,12 +405,12 @@ func (f *FindBuilder) loadRelation(
 	}
 	relField, ok := relationTargetField(parentType, rel.Name)
 	if !ok {
-		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged db_rel:%q (or matching name)",
+		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged dropRel:%q (or matching name)",
 			rel.Name, rel.Name)
 	}
 	relFieldType := parentType.FieldByIndex(relField).Type
 
-	expectsSlice := rel.Kind == HasManyKind
+	expectsSlice := rel.Kind == HasManyKind || rel.Kind == MorphManyKind
 	if expectsSlice && relFieldType.Kind() != reflect.Slice {
 		return none, nil, fmt.Errorf("drops/pg: relation %q is HasMany — expected slice field, got %s",
 			rel.Name, relFieldType.Kind())
@@ -380,17 +437,36 @@ func (f *FindBuilder) loadRelation(
 		return none, childStructType, nil
 	}
 
-	childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
-	if len(node.wheres) > 0 {
-		childQuery.Where(node.wheres...)
-	}
-	if len(node.orderBys) > 0 {
-		childQuery.OrderBy(node.orderBys...)
-	}
 	childSliceType := reflect.SliceOf(childStructType)
 	childSlice := reflect.New(childSliceType).Elem()
-	if err := childQuery.All(ctx, childSlice.Addr().Interface()); err != nil {
-		return none, nil, err
+
+	// Per-parent LIMIT/OFFSET (HasMany / MorphMany) rewrites the
+	// child query via a ROW_NUMBER() window so each parent gets
+	// at most node.limit children — drizzle's
+	// "with: { posts: { limit: N } }" shape.
+	if expectsSlice && node.limit > 0 {
+		sql, args := f.buildPerParentLimitedSQL(rel, targetKeyCol, rowKeys, node)
+		rows, err := f.db.Query(ctx, sql, args...)
+		if err != nil {
+			return none, nil, err
+		}
+		if err := scanAll(rows, childSlice.Addr().Interface()); err != nil {
+			return none, nil, err
+		}
+	} else {
+		childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
+		if rel.Kind == MorphManyKind {
+			childQuery.Where(Eq(rel.MorphTypeCol, rel.MorphType))
+		}
+		if len(node.wheres) > 0 {
+			childQuery.Where(node.wheres...)
+		}
+		if len(node.orderBys) > 0 {
+			childQuery.OrderBy(node.orderBys...)
+		}
+		if err := childQuery.All(ctx, childSlice.Addr().Interface()); err != nil {
+			return none, nil, err
+		}
 	}
 
 	targetKeyField, ok := relationKeyField(childStructType, targetKeyCol)
@@ -473,7 +549,7 @@ func (f *FindBuilder) loadManyToMany(
 	}
 	relField, ok := relationTargetField(parentType, rel.Name)
 	if !ok {
-		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged db_rel:%q (or matching name)",
+		return none, nil, fmt.Errorf("drops/pg: relation %q: parent struct has no field tagged dropRel:%q (or matching name)",
 			rel.Name, rel.Name)
 	}
 	relFieldType := parentType.FieldByIndex(relField).Type
@@ -719,6 +795,78 @@ func coerceSlice(src reflect.Value, dstType reflect.Type) reflect.Value {
 	return out
 }
 
+// buildPerParentLimitedSQL renders the window-function rewrite used
+// when a relation has node.limit > 0. The query has shape:
+//
+//	SELECT * FROM (
+//	  SELECT <cols>, ROW_NUMBER() OVER (
+//	    PARTITION BY <fk> ORDER BY <orderBy or fallback>
+//	  ) AS _rn
+//	  FROM <child>
+//	  WHERE <fk> IN (...) [AND <wheres>] [AND morph guard]
+//	) AS _ranked
+//	WHERE _rn > <offset> AND _rn <= <offset + limit>
+//
+// Each parent's slice gets at most limit children, skipping the
+// first offset. Mirrors drizzle's "with: { posts: { limit } }"
+// semantics. The extra _rn column is discarded by scanAll since
+// no struct field matches the name.
+func (f *FindBuilder) buildPerParentLimitedSQL(
+	rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
+) (string, []any) {
+	b := drops.NewBuilder()
+	b.WriteString("SELECT * FROM (SELECT ")
+	cols := rel.To.Columns()
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		c.WriteSQL(b)
+	}
+	b.WriteString(", ROW_NUMBER() OVER (PARTITION BY ")
+	targetKeyCol.WriteSQL(b)
+	b.WriteString(" ORDER BY ")
+	if len(node.orderBys) > 0 {
+		for i, e := range node.orderBys {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			e.WriteSQL(b)
+		}
+	} else {
+		// Default: order by PK so partitioning is stable.
+		var pk *Column
+		for _, c := range cols {
+			if c.IsPrimaryKey() {
+				pk = c
+				break
+			}
+		}
+		if pk != nil {
+			pk.WriteSQL(b)
+		} else {
+			targetKeyCol.WriteSQL(b)
+		}
+	}
+	b.WriteString(") AS _rn FROM ")
+	rel.To.writeFrom(b)
+	b.WriteString(" WHERE ")
+	In(targetKeyCol, rowKeys...).WriteSQL(b)
+	if rel.Kind == MorphManyKind {
+		b.WriteString(" AND ")
+		Eq(rel.MorphTypeCol, rel.MorphType).WriteSQL(b)
+	}
+	for _, w := range node.wheres {
+		b.WriteString(" AND ")
+		w.WriteSQL(b)
+	}
+	b.WriteString(") AS _ranked WHERE _rn > ")
+	b.AddArg(node.offset)
+	b.WriteString(" AND _rn <= ")
+	b.AddArg(node.offset + node.limit)
+	return b.SQL()
+}
+
 // relationKeyField returns the index path of the struct field that maps
 // to col, using the same matching rules as scan (db tag, exact name,
 // snake_case name).
@@ -731,7 +879,7 @@ func relationKeyField(structT reflect.Type, col *Column) ([]int, bool) {
 }
 
 // relationTargetField returns the index path of the struct field that
-// receives the relation. Lookup order: db_rel:"<name>" tag, then a
+// receives the relation. Lookup order: dropRel:"<name>" tag, then a
 // case-insensitive name match.
 func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 	var found []int
@@ -744,7 +892,7 @@ func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 				continue
 			}
 			idx := append(append([]int(nil), prefix...), i)
-			if tag := f.Tag.Get("db_rel"); tag == name {
+			if tag := f.Tag.Get("dropRel"); tag == name {
 				found = idx
 				return
 			}
@@ -764,4 +912,132 @@ func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 		return byName, true
 	}
 	return nil, false
+}
+
+// loadMorphTo handles polymorphic belongs-to: each child carries
+// (morph_type, morph_id), and we have to look up each id in the
+// table registered for its morph_type. We bucket children by
+// morph_type, run one query per bucket, and stitch the loaded parent
+// back into the child's relation field — which must be of interface
+// kind because its concrete type varies row by row.
+func (f *FindBuilder) loadMorphTo(
+	ctx context.Context,
+	parentSlice reflect.Value,
+	parentType reflect.Type,
+	parentIsPtr bool,
+	rel *Relation,
+	node *relNode,
+) (reflect.Value, reflect.Type, error) {
+	var none reflect.Value
+	idField, ok := relationKeyField(parentType, rel.ChildKey)
+	if !ok {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: struct missing field for column %q",
+			rel.Name, rel.ChildKey.Name())
+	}
+	typeField, ok := relationKeyField(parentType, rel.MorphTypeCol)
+	if !ok {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: struct missing field for column %q",
+			rel.Name, rel.MorphTypeCol.Name())
+	}
+	relField, ok := relationTargetField(parentType, rel.Name)
+	if !ok {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: struct has no field tagged dropRel:%q (or matching name)",
+			rel.Name, rel.Name)
+	}
+	relFieldType := parentType.FieldByIndex(relField).Type
+	if relFieldType.Kind() != reflect.Interface {
+		return none, nil, fmt.Errorf("drops/pg: relation %q: polymorphic field %s must be an interface type (typically `any`), got %s",
+			rel.Name, parentType.FieldByIndex(relField).Name, relFieldType.Kind())
+	}
+
+	// Group child rows by morph_type. ids is per-type; revIndex points
+	// back at the parentSlice rows that have to receive the loaded
+	// parent.
+	type bucket struct {
+		ids       []any
+		rowIdxs   []int
+		entry     morphEntry
+		idToParent map[any]reflect.Value
+	}
+	buckets := map[string]*bucket{}
+	for i := 0; i < parentSlice.Len(); i++ {
+		row := parentValue(parentSlice.Index(i), parentIsPtr)
+		typeStr := fmt.Sprintf("%v", row.FieldByIndex(typeField).Interface())
+		if typeStr == "" {
+			continue
+		}
+		entry, ok := rel.MorphMap.lookup(typeStr)
+		if !ok {
+			return none, nil, fmt.Errorf("drops/pg: relation %q: unknown morph type %q (register it via pg.RegisterMorph)",
+				rel.Name, typeStr)
+		}
+		b, ok := buckets[typeStr]
+		if !ok {
+			b = &bucket{entry: entry}
+			buckets[typeStr] = b
+		}
+		b.ids = append(b.ids, row.FieldByIndex(idField).Interface())
+		b.rowIdxs = append(b.rowIdxs, i)
+	}
+
+	// Run one query per bucket and build per-bucket id → parent maps.
+	for _, b := range buckets {
+		ids := dedupeKeys(b.ids)
+		// Identify the target PK column.
+		var targetPK *Column
+		for _, c := range b.entry.table.Columns() {
+			if c.IsPrimaryKey() {
+				targetPK = c
+				break
+			}
+		}
+		if targetPK == nil {
+			return none, nil, fmt.Errorf("drops/pg: relation %q: morph target table %q has no PRIMARY KEY",
+				rel.Name, b.entry.table.Name())
+		}
+		q := f.db.Select().From(b.entry.table).Where(In(targetPK, ids...))
+		if len(node.wheres) > 0 {
+			q.Where(node.wheres...)
+		}
+		if len(node.orderBys) > 0 {
+			q.OrderBy(node.orderBys...)
+		}
+		sliceType := reflect.SliceOf(b.entry.rowType)
+		results := reflect.New(sliceType).Elem()
+		if err := q.All(ctx, results.Addr().Interface()); err != nil {
+			return none, nil, err
+		}
+		pkField, ok := relationKeyField(b.entry.rowType, targetPK)
+		if !ok {
+			return none, nil, fmt.Errorf("drops/pg: relation %q: morph target struct %s missing field for PK column %q",
+				rel.Name, b.entry.rowType.Name(), targetPK.Name())
+		}
+		b.idToParent = map[any]reflect.Value{}
+		for i := 0; i < results.Len(); i++ {
+			row := results.Index(i)
+			k := row.FieldByIndex(pkField).Interface()
+			b.idToParent[k] = row
+		}
+	}
+
+	// Stitch loaded parents back into each child row.
+	for _, b := range buckets {
+		for j, rowIdx := range b.rowIdxs {
+			parent, ok := b.idToParent[b.ids[j]]
+			if !ok {
+				continue
+			}
+			child := parentValue(parentSlice.Index(rowIdx), parentIsPtr)
+			ptr := reflect.New(b.entry.rowType)
+			ptr.Elem().Set(parent)
+			child.FieldByIndex(relField).Set(ptr)
+		}
+	}
+
+	// MorphTo doesn't support deeper relation chains in this iteration
+	// — the loaded parent has a heterogeneous Go type so a single
+	// child slice for recursion doesn't fit. Callers needing this can
+	// fan out manually.
+	_ = node.children
+	return reflect.Value{}, nil, nil
 }

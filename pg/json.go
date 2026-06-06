@@ -11,11 +11,13 @@ func JSONGet(e, key any) drops.Expression { return binOp(e, "->", key) }
 // JSONGetText renders <e> ->> <key> (as text).
 func JSONGetText(e, key any) drops.Expression { return binOp(e, "->>", key) }
 
-// JSONPath renders <e> #> <path> (path is text[] — pass a Go []string).
-func JSONPath(e, path any) drops.Expression { return binOp(e, "#>", path) }
+// JSONGetPath renders <e> #> <path> (path is text[] — pass a Go []string).
+// Renamed from JSONPath to free that name for the typed accessor in
+// jsonpath.go.
+func JSONGetPath(e, path any) drops.Expression { return binOp(e, "#>", path) }
 
-// JSONPathText renders <e> #>> <path>.
-func JSONPathText(e, path any) drops.Expression { return binOp(e, "#>>", path) }
+// JSONGetPathText renders <e> #>> <path>.
+func JSONGetPathText(e, path any) drops.Expression { return binOp(e, "#>>", path) }
 
 // JSONBContains renders <a> @> <b> (does a contain b? jsonb only).
 func JSONBContains(a, b any) drops.Expression { return binOp(a, "@>", b) }

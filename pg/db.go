@@ -24,8 +24,10 @@ import (
 // InTx; with an explicit Begin you must call Commit/Rollback yourself,
 // and those bypass the hook unless you wrap them.
 type DB struct {
-	drv  drops.Driver
-	hook drops.Hook
+	drv    drops.Driver
+	hook   drops.Hook
+	tracer Tracer
+	retry  *RetryPolicy
 }
 
 // New wraps a drops.Driver as a DB.
@@ -94,8 +96,41 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 // and rollback alongside the ordinary exec/query events fn produces.
 //
 // Rollback uses a detached context with a short timeout so a cancelled
-// or expired caller-ctx doesn't prevent cleanup.
-func (db *DB) InTx(ctx context.Context, fn func(*DB) error) (err error) {
+// or expired caller-ctx doesn't prevent cleanup. When a RetryPolicy is
+// installed via WithRetry, transient failures (those the policy marks
+// retryable) cause the transaction to be re-opened and fn re-run, up
+// to MaxAttempts times.
+func (db *DB) InTx(ctx context.Context, fn func(*DB) error) error {
+	if db.retry == nil {
+		return db.inTxOnce(ctx, fn)
+	}
+	policy := *db.retry
+	var lastErr error
+	for attempt := 1; attempt <= policy.attempts(); attempt++ {
+		if attempt > 1 && policy.Backoff != nil {
+			if cerr := retrySleep(ctx, policy.Backoff(attempt-1)); cerr != nil {
+				return cerr
+			}
+		}
+		err := db.inTxOnce(ctx, fn)
+		if err == nil {
+			return nil
+		}
+		if !policy.shouldRetry(err) {
+			return err
+		}
+		lastErr = err
+		// Bail out early if the context expired between attempts.
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+	}
+	return lastErr
+}
+
+// inTxOnce runs fn inside a single transaction without any retry
+// logic. Used by InTx — extracted so the retry loop stays readable.
+func (db *DB) inTxOnce(ctx context.Context, fn func(*DB) error) (err error) {
 	bstart := time.Now()
 	tx, berr := db.drv.Begin(ctx)
 	db.emit(ctx, drops.QueryEvent{Kind: "begin", Duration: time.Since(bstart), Err: berr})
@@ -159,8 +194,24 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 
 // Exec runs a raw SQL statement with positional ($1, $2, ...) placeholders.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	spanCtx, span := db.startSpan(ctx, "drops.exec")
+	span.SetAttribute(AttrSystem, AttrSystemPG)
+	span.SetAttribute(AttrOperation, "exec")
+	span.SetAttribute(AttrStatement, sql)
+	span.SetAttribute(AttrArgsCount, len(args))
 	start := time.Now()
-	res, err := db.drv.Exec(ctx, sql, args...)
+	// Unwrap PII markers before reaching the driver — they're a
+	// pure observability concept and must not affect the wire form.
+	driverArgs := args
+	if containsPII(args) {
+		driverArgs = unwrapPII(args)
+	}
+	res, err := db.drv.Exec(spanCtx, sql, driverArgs...)
+	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
+	span.End()
 	db.emit(ctx, drops.QueryEvent{
 		Kind: "exec", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,
@@ -170,8 +221,22 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 
 // Query runs a raw SQL query.
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	spanCtx, span := db.startSpan(ctx, "drops.query")
+	span.SetAttribute(AttrSystem, AttrSystemPG)
+	span.SetAttribute(AttrOperation, "query")
+	span.SetAttribute(AttrStatement, sql)
+	span.SetAttribute(AttrArgsCount, len(args))
 	start := time.Now()
-	rows, err := db.drv.Query(ctx, sql, args...)
+	driverArgs := args
+	if containsPII(args) {
+		driverArgs = unwrapPII(args)
+	}
+	rows, err := db.drv.Query(spanCtx, sql, driverArgs...)
+	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
+	span.End()
 	db.emit(ctx, drops.QueryEvent{
 		Kind: "query", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,

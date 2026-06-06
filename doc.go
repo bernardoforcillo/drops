@@ -14,7 +14,10 @@
 //   - [github.com/bernardoforcillo/drops/pg] — PostgreSQL. Full surface:
 //     SELECT / INSERT / UPDATE / DELETE, DDL (schemas, enums, sequences,
 //     views, functions, triggers, indexes), file-based migrations, and
-//     eager-loaded relations (HasMany, HasOne, BelongsTo, ManyToMany).
+//     eager-loaded relations (HasMany, HasOne, BelongsTo, ManyToMany,
+//     MorphTo, MorphMany). Includes opt-in ORM features: lifecycle
+//     hooks (OnInsert / OnUpdate / OnDelete), default scopes, typed
+//     Entity[T] with validators and optimistic locking.
 //
 //   - [github.com/bernardoforcillo/drops/clickhouse] — ClickHouse. Typed
 //     columns (Array, Nullable, LowCardinality, Decimal, DateTime64, Tuple,
@@ -42,4 +45,11 @@
 //
 //   - [github.com/bernardoforcillo/drops/stdlib] — wraps a *sql.DB as a
 //     drops.Driver so any database/sql driver works with drops out of the box.
+//
+// # Code generation
+//
+//   - [github.com/bernardoforcillo/drops/cmd/dropsgen] — optional
+//     binary that emits zero-reflection bind/scan helpers from
+//     `//drops:entity`-annotated structs. Pair with `go:generate` to
+//     skip reflection on the hot row-binding path.
 package drops

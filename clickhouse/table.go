@@ -20,6 +20,12 @@ type Table struct {
 	sampleBy   drops.Expression
 	ttl        string
 	settings   []string // "key = value" raw pairs
+
+	// Lifecycle hooks and default filters — ClickHouse has no
+	// builder-side UPDATE/DELETE, so only InsertHook and
+	// SelectBuilder default filters are honoured. Empty by default.
+	insertHooks    []InsertHook
+	defaultFilters []drops.Expression
 }
 
 // NewTable creates a table in the default database. The name is
@@ -110,6 +116,23 @@ func (t *Table) Setting(key, value string) *Table {
 	t.settings = append(t.settings, key+" = "+value)
 	return t
 }
+
+// Hooks / default filters --------------------------------------------
+
+// OnInsert registers a hook invoked by InsertBuilder.WriteSQL.
+func (t *Table) OnInsert(h InsertHook) *Table {
+	t.insertHooks = append(t.insertHooks, h)
+	return t
+}
+
+// DefaultFilter appends a predicate applied to every Select against
+// the table, unless the builder is marked Unscoped().
+func (t *Table) DefaultFilter(e drops.Expression) *Table {
+	t.defaultFilters = append(t.defaultFilters, e)
+	return t
+}
+
+func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
 
 // Rendering helpers --------------------------------------------------
 

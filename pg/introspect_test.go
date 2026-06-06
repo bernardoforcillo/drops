@@ -67,7 +67,7 @@ func TestDiffSafeIfExistsDropColumnAndConstraint(t *testing.T) {
 	joined := strings.Join(stmts, "\n")
 	for _, want := range []string{
 		`ALTER TABLE "users" DROP COLUMN IF EXISTS "nickname";`,
-		`ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "users_email_unique";`,
+		`ALTER TABLE "users" DROP CONSTRAINT IF EXISTS "usersEmailUnique";`,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing %q in:\n%s", want, joined)
@@ -177,7 +177,7 @@ func introspectFake() *fakeDriver {
 					{"public", "posts", "id", "int8",
 						sql.NullInt64{}, sql.NullInt64{Int64: 64, Valid: true}, sql.NullInt64{Int64: 0, Valid: true},
 						"NO", sql.NullString{String: "nextval('posts_id_seq'::regclass)", Valid: true}},
-					{"public", "posts", "user_id", "int8",
+					{"public", "posts", "userId", "int8",
 						sql.NullInt64{}, sql.NullInt64{Int64: 64, Valid: true}, sql.NullInt64{Int64: 0, Valid: true},
 						"NO", sql.NullString{}},
 				},
@@ -194,7 +194,7 @@ func introspectFake() *fakeDriver {
 			return &fakeRows{
 				cols: []string{"table_schema", "table_name", "constraint_name", "column_name"},
 				data: [][]any{
-					{"public", "users", "users_email_unique", "email"},
+					{"public", "users", "usersEmailUnique", "email"},
 				},
 			}, nil
 		case strings.Contains(q, "constraint_type = 'FOREIGN KEY'"):
@@ -205,7 +205,7 @@ func introspectFake() *fakeDriver {
 					"delete_rule", "update_rule",
 				},
 				data: [][]any{
-					{"public", "posts", "posts_user_id_users_id_fk", "user_id",
+					{"public", "posts", "postsUserIdUsersIdFk", "userId",
 						"public", "users", "id", "CASCADE", "NO ACTION"},
 				},
 			}, nil
@@ -239,12 +239,12 @@ func TestIntrospectBuildsSnapshot(t *testing.T) {
 		t.Errorf("users.id default should be hidden for serial, got %q", *idCol.Default)
 	}
 
-	if _, ok := usersT.UniqueConstraints["users_email_unique"]; !ok {
+	if _, ok := usersT.UniqueConstraints["usersEmailUnique"]; !ok {
 		t.Errorf("missing unique constraint")
 	}
 
 	postsT := snap.Tables["public.posts"]
-	fk := postsT.ForeignKeys["posts_user_id_users_id_fk"]
+	fk := postsT.ForeignKeys["postsUserIdUsersIdFk"]
 	if fk == nil {
 		t.Fatal("missing FK")
 	}
@@ -276,7 +276,7 @@ func TestIntrospectThenDiffAgainstGoSchemaProducesAddColumn(t *testing.T) {
 	pg.Add(users, pg.Integer("age")) // new
 	posts := pg.NewTable("posts")
 	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	pg.Add(posts, pg.BigInt("user_id").NotNull().References(uid, pg.OnDelete("CASCADE")))
+	pg.Add(posts, pg.BigInt("userId").NotNull().References(uid, pg.OnDelete("CASCADE")))
 
 	desired := pg.BuildSnapshot(pg.NewSchema(users, posts))
 	stmts := pg.Diff(current, desired)
@@ -300,7 +300,7 @@ func TestPushDryRunReturnsStatementsWithoutExec(t *testing.T) {
 	pg.Add(users, pg.Integer("age"))
 	posts := pg.NewTable("posts")
 	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	pg.Add(posts, pg.BigInt("user_id").NotNull().References(uid, pg.OnDelete("CASCADE")))
+	pg.Add(posts, pg.BigInt("userId").NotNull().References(uid, pg.OnDelete("CASCADE")))
 
 	res, err := pg.Push(context.Background(), db, pg.NewSchema(users, posts),
 		pg.PushOptions{DryRun: true, Safe: true})
@@ -341,7 +341,7 @@ func TestPushAppliesStatementsInTransaction(t *testing.T) {
 	pg.Add(users, pg.Integer("age"))
 	posts := pg.NewTable("posts")
 	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	pg.Add(posts, pg.BigInt("user_id").NotNull())
+	pg.Add(posts, pg.BigInt("userId").NotNull())
 
 	res, err := pg.Push(context.Background(), db, pg.NewSchema(users, posts))
 	if err != nil {
@@ -376,7 +376,7 @@ func TestPushNoOpWhenSchemaMatches(t *testing.T) {
 	pg.Add(users, pg.Text("email").NotNull().Unique())
 	posts := pg.NewTable("posts")
 	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	pg.Add(posts, pg.BigInt("user_id").NotNull().References(uid, pg.OnDelete("CASCADE")))
+	pg.Add(posts, pg.BigInt("userId").NotNull().References(uid, pg.OnDelete("CASCADE")))
 
 	res, err := pg.Push(context.Background(), db, pg.NewSchema(users, posts))
 	if err != nil {

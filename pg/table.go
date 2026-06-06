@@ -10,6 +10,48 @@ type Table struct {
 	columns   []*Column
 	byName    map[string]*Column
 	relations map[string]*Relation
+
+	// indexes is the list of CREATE INDEX statements declared
+	// alongside the table — typically by a Mixin. CreateTable does
+	// not emit them; pair the table with pg.CreateTableWithIndexes if
+	// you want both at once.
+	indexes []*Index
+
+	// compositePK, when non-empty, is the table's PRIMARY KEY when
+	// it spans multiple columns. Single-column PKs continue to
+	// live on the column (via *Col[T].PrimaryKey()).
+	compositePK []*Column
+
+	// compositeUniques are multi-column UNIQUE constraints, keyed
+	// by name so diffs are stable. Single-column uniques continue
+	// to live on the column (via *Col[T].Unique()).
+	compositeUniques map[string][]*Column
+
+	// checks are CHECK constraints, keyed by name. The value is
+	// the raw SQL expression (e.g. "age >= 0").
+	checks map[string]string
+
+	// policies are RLS policies declared on the table.
+	policies map[string]*Policy
+
+	// rlsEnabled mirrors PG's ALTER TABLE ... ENABLE ROW LEVEL
+	// SECURITY. Policies are only enforced when this is true.
+	rlsEnabled bool
+
+	// insertHooks / updateHooks / deleteHooks are the optional
+	// lifecycle hooks registered on this table. They are invoked by
+	// the corresponding builders during WriteSQL. Empty by default —
+	// a table with no hooks behaves exactly as it did before this
+	// feature shipped.
+	insertHooks []InsertHook
+	updateHooks []UpdateHook
+	deleteHooks []DeleteHook
+
+	// defaultFilters are predicates applied automatically by
+	// SelectBuilder / UpdateBuilder / DeleteBuilder unless the caller
+	// opts out with Unscoped(). Used to implement default scopes
+	// (e.g. SoftDelete's "deleted_at IS NULL" guard).
+	defaultFilters []drops.Expression
 }
 
 // NewTable creates a table in the default ("public") schema. The name
@@ -79,6 +121,124 @@ func Add[T any](t *Table, c *Col[T]) *Col[T] {
 	t.add(c.Column)
 	return c
 }
+
+// OnInsert registers a hook invoked by InsertBuilder.WriteSQL. The
+// hook can fill column values the caller didn't explicitly bind; user
+// values always win.
+func (t *Table) OnInsert(h InsertHook) *Table {
+	t.insertHooks = append(t.insertHooks, h)
+	return t
+}
+
+// OnUpdate registers a hook invoked by UpdateBuilder.WriteSQL.
+func (t *Table) OnUpdate(h UpdateHook) *Table {
+	t.updateHooks = append(t.updateHooks, h)
+	return t
+}
+
+// OnDelete registers a hook invoked by DeleteBuilder.WriteSQL. A hook
+// may return a non-nil expression to replace the rendered DELETE
+// entirely — used by SoftDelete to flip DELETE into UPDATE.
+func (t *Table) OnDelete(h DeleteHook) *Table {
+	t.deleteHooks = append(t.deleteHooks, h)
+	return t
+}
+
+// DefaultFilter appends a predicate applied to every Select / Update /
+// Delete against the table, unless the builder is marked Unscoped().
+// Filters compose with AND.
+func (t *Table) DefaultFilter(e drops.Expression) *Table {
+	t.defaultFilters = append(t.defaultFilters, e)
+	return t
+}
+
+// AddIndex registers an index to be created alongside the table. The
+// index is not emitted by CreateTable; use CreateTableWithIndexes or
+// emit pg.CreateIndex(idx) explicitly.
+func (t *Table) AddIndex(idx *Index) *Table {
+	t.indexes = append(t.indexes, idx)
+	return t
+}
+
+// Indexes returns the indexes registered with AddIndex.
+func (t *Table) Indexes() []*Index { return t.indexes }
+
+// PrimaryKey declares a composite PRIMARY KEY spanning cols. Call
+// only when the PK has more than one column; single-column PKs
+// continue to be declared on the column via *Col[T].PrimaryKey().
+func (t *Table) PrimaryKey(cols ...ColRef) *Table {
+	t.compositePK = make([]*Column, len(cols))
+	for i, c := range cols {
+		t.compositePK[i] = c.col()
+	}
+	return t
+}
+
+// CompositePrimaryKey returns the composite PK columns, or nil
+// when the table uses a single-column PK (or none).
+func (t *Table) CompositePrimaryKey() []*Column { return t.compositePK }
+
+// AddUnique declares a multi-column UNIQUE constraint named name
+// spanning cols. Single-column uniques continue to live on the
+// column via *Col[T].Unique().
+func (t *Table) AddUnique(name string, cols ...ColRef) *Table {
+	if t.compositeUniques == nil {
+		t.compositeUniques = map[string][]*Column{}
+	}
+	out := make([]*Column, len(cols))
+	for i, c := range cols {
+		out[i] = c.col()
+	}
+	t.compositeUniques[name] = out
+	return t
+}
+
+// CompositeUniques returns the table's multi-column unique
+// constraints.
+func (t *Table) CompositeUniques() map[string][]*Column { return t.compositeUniques }
+
+// AddCheck declares a CHECK constraint with the given name. expr
+// is the raw SQL expression after CHECK (...), e.g.
+// "age >= 0 AND age < 200".
+func (t *Table) AddCheck(name, expr string) *Table {
+	if t.checks == nil {
+		t.checks = map[string]string{}
+	}
+	t.checks[name] = expr
+	return t
+}
+
+// Checks returns the registered CHECK constraints.
+func (t *Table) Checks() map[string]string { return t.checks }
+
+// EnableRLS marks the table as having Row-Level Security
+// enabled. The snapshot/diff generator emits the matching
+// ALTER TABLE ... ENABLE ROW LEVEL SECURITY when the flag flips
+// from false to true.
+func (t *Table) EnableRLS() *Table { t.rlsEnabled = true; return t }
+
+// RLSEnabled reports whether the table has RLS enabled.
+func (t *Table) RLSEnabled() bool { return t.rlsEnabled }
+
+// AddPolicy attaches a row-level security policy to the table.
+// Policies are inert until EnableRLS is also called.
+func (t *Table) AddPolicy(p *Policy) *Table {
+	if t.policies == nil {
+		t.policies = map[string]*Policy{}
+	}
+	t.policies[p.Name()] = p
+	return t
+}
+
+// Policies returns the registered policies keyed by name.
+func (t *Table) Policies() map[string]*Policy { return t.policies }
+
+// hasHooks reports whether the table has any lifecycle hooks
+// registered — used by builders to skip the hook pipeline when
+// nothing is wired up.
+func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
+func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
+func (t *Table) hasDeleteHooks() bool { return len(t.deleteHooks) > 0 }
 
 // writeName writes only the (schema-qualified) table name, with no alias.
 // Used by DDL where AS clauses are not permitted.

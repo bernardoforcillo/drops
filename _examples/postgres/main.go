@@ -34,7 +34,7 @@ var (
 
 	Posts      = pg.NewTable("posts")
 	PostID     = pg.Add(Posts, pg.BigSerial("id").PrimaryKey())
-	PostUserID = pg.Add(Posts, pg.BigInt("user_id").NotNull().References(UserID, pg.OnDelete("CASCADE")))
+	PostUserID = pg.Add(Posts, pg.BigInt("userId").NotNull().References(UserID, pg.OnDelete("CASCADE")))
 	PostTitle  = pg.Add(Posts, pg.Text("title").NotNull())
 )
 
@@ -46,7 +46,7 @@ type User struct {
 
 type Post struct {
 	ID     int64
-	UserID int64 `db:"user_id"`
+	UserID int64 `drop:"userId"`
 	Title  string
 }
 

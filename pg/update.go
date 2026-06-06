@@ -14,6 +14,7 @@ type UpdateBuilder struct {
 	from      []*Table
 	wheres    []drops.Expression
 	returning []drops.Expression
+	unscoped  bool
 }
 
 // Set adds one or more assignments. Use (*Col[T]).Val(v) to bind a typed
@@ -41,12 +42,28 @@ func (u *UpdateBuilder) Returning(cols ...drops.Expression) *UpdateBuilder {
 	return u
 }
 
+// Unscoped opts out of the table's DefaultFilter predicates for this
+// UPDATE. Use when an administrative job must bypass a soft-delete or
+// tenant guard registered on the table.
+func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
+	u.unscoped = true
+	return u
+}
+
 // WriteSQL renders the UPDATE.
 func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
+	sets := u.sets
+	if u.table.hasUpdateHooks() {
+		sets = u.applyUpdateHooks()
+	}
+	wheres := u.wheres
+	if !u.unscoped && len(u.table.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), wheres...)
+	}
 	b.WriteString("UPDATE ")
 	u.table.writeFrom(b)
 	b.WriteString(" SET ")
-	for j, s := range u.sets {
+	for j, s := range sets {
 		if j > 0 {
 			b.WriteString(", ")
 		}
@@ -63,14 +80,32 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 			t.writeFrom(b)
 		}
 	}
-	if len(u.wheres) > 0 {
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		writeAnd(b, u.wheres)
+		writeAnd(b, wheres)
 	}
 	if len(u.returning) > 0 {
 		b.WriteString(" RETURNING ")
 		b.AppendList(", ", u.returning)
 	}
+}
+
+// applyUpdateHooks runs every UpdateHook registered on the table and
+// returns the (possibly extended) SET list.
+func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
+	ctx := &UpdateHookCtx{bound: make(map[*Column]bool, len(u.sets))}
+	for _, s := range u.sets {
+		ctx.bound[s.column()] = true
+	}
+	for _, h := range u.table.updateHooks {
+		h.BeforeUpdate(ctx)
+	}
+	if len(ctx.add) == 0 {
+		return u.sets
+	}
+	out := append([]ColumnValue(nil), u.sets...)
+	out = append(out, ctx.add...)
+	return out
 }
 
 // ToSQL renders the statement.
@@ -82,7 +117,7 @@ func (u *UpdateBuilder) ToSQL() (string, []any) {
 
 // Exec runs the UPDATE.
 func (u *UpdateBuilder) Exec(ctx context.Context) (drops.Result, error) {
-	if len(u.sets) == 0 {
+	if len(u.sets) == 0 && !u.table.hasUpdateHooks() {
 		return nil, ErrNoUpdateAssignments
 	}
 	sql, args := u.ToSQL()

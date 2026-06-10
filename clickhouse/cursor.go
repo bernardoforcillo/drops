@@ -286,20 +286,22 @@ func (s *SelectBuilder) OrderByCursor(spec CursorSpec) *SelectBuilder {
 }
 
 // AfterCursor appends the keyset WHERE clause for forward paging
-// past cursor c. Decoding errors fall through to the next builder
-// method — execution-time scan will surface the wrapped error so
-// callers don't have to guard every chained call.
+// past cursor c. Decoding errors are stored on the builder and
+// returned by Rows / All / One so callers don't have to guard every
+// chained call.
 func (s *SelectBuilder) AfterCursor(spec CursorSpec, c Cursor) *SelectBuilder {
 	if c == "" {
 		return s
 	}
 	values, err := c.Decode()
 	if err != nil {
-		s.wheres = append(s.wheres, cursorErrExpr(err))
+		s.err = err
+		s.wheres = append(s.wheres, falseExpr)
 		return s
 	}
 	if len(values) != len(spec.Keys) {
-		s.wheres = append(s.wheres, cursorErrExpr(fmt.Errorf("drops/clickhouse: cursor has %d values, spec wants %d", len(values), len(spec.Keys))))
+		s.err = fmt.Errorf("drops/clickhouse: cursor has %d values, spec wants %d", len(values), len(spec.Keys))
+		s.wheres = append(s.wheres, falseExpr)
 		return s
 	}
 	s.wheres = append(s.wheres, keysetWhere(spec, values, true))
@@ -316,11 +318,13 @@ func (s *SelectBuilder) BeforeCursor(spec CursorSpec, c Cursor) *SelectBuilder {
 	}
 	values, err := c.Decode()
 	if err != nil {
-		s.wheres = append(s.wheres, cursorErrExpr(err))
+		s.err = err
+		s.wheres = append(s.wheres, falseExpr)
 		return s
 	}
 	if len(values) != len(spec.Keys) {
-		s.wheres = append(s.wheres, cursorErrExpr(fmt.Errorf("drops/clickhouse: cursor has %d values, spec wants %d", len(values), len(spec.Keys))))
+		s.err = fmt.Errorf("drops/clickhouse: cursor has %d values, spec wants %d", len(values), len(spec.Keys))
+		s.wheres = append(s.wheres, falseExpr)
 		return s
 	}
 	s.wheres = append(s.wheres, keysetWhere(spec, values, false))
@@ -387,13 +391,9 @@ func keysetStrict(k OrderKey, v any, forward bool) drops.Expression {
 	return Gt(k.Col, v)
 }
 
-// cursorErrExpr renders as a guaranteed-false predicate that also
-// carries an error tag so callers see something go wrong when a
-// malformed cursor lands.
-func cursorErrExpr(err error) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("FALSE /* drops cursor: ")
-		b.WriteString(err.Error())
-		b.WriteString(" */")
-	})
-}
+// falseExpr is a guaranteed-false predicate emitted when a cursor
+// decode error is stored on the builder. It contains no dynamic
+// content so malformed cursor payloads cannot inject SQL.
+var falseExpr = drops.ExprFunc(func(b *drops.Builder) {
+	b.WriteString("FALSE")
+})

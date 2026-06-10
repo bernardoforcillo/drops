@@ -26,6 +26,7 @@ type SelectBuilder struct {
 	recursiveCTE bool
 	setOps       []setOp // UNION / INTERSECT / EXCEPT continuations
 	unscoped     bool
+	err          error // deferred error (e.g. cursor decode failure) surfaced at Rows()
 }
 
 type setOp struct {
@@ -272,6 +273,9 @@ func (s *SelectBuilder) ToSQL() (string, []any) {
 
 // Rows executes the SELECT and returns the raw cursor for manual scanning.
 func (s *SelectBuilder) Rows(ctx context.Context) (drops.Rows, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	sql, args := s.ToSQL()
 	return s.db.Query(ctx, sql, args...)
 }

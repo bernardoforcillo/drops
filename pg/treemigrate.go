@@ -2,8 +2,11 @@ package pg
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"path"
 	"sort"
@@ -21,26 +24,48 @@ import (
 //	                          ↘
 //	main (merge):              M   ← merge commit, two parents
 //
+// Security model
+//
 // All tracking lives in a dedicated "drops" schema so framework tables
-// never pollute the application schema. The migration folder is the source
-// of truth; the DB records only what has been applied and when.
+// never pollute the application schema.
+//
+// Before any write, the migrator acquires a session-level advisory lock
+// (pg_advisory_lock) keyed on the schema name. This prevents two processes
+// from migrating concurrently and avoids the race condition of check-then-
+// insert on the nodes table.
+//
+// Every up.sql's text is SHA-256 hashed and stored in drops.nodes.checksum
+// when the migration is recorded. On every subsequent run, Up() and Plan()
+// compare the stored hash against the current file content. A mismatch
+// returns ErrTreeMigrationTampered before any schema change is attempted —
+// a developer (or attacker) modified an already-applied migration file.
+//
+// Usage
 //
 //	// Load from a branch-per-folder layout:
 //	//   migrations/main/main-001_create_users.up.sql
-//	//   migrations/feat/payments/pay-001_create_payments.up.sql
+//	//   migrations/feat/payments/pay-001_create_payments.up.sql  (-- drops:parents: main-002)
 //	m := pg.NewTreeMigrator(db)
-//	m.AddFS(os.DirFS("."), "migrations")
+//	_ = m.AddFS(os.DirFS("."), "migrations")
 //
-//	m.Up(ctx)                       // apply all pending
-//	m.DownTo(ctx, "main-003")       // roll back feat/payments
-//	m.Checkout(ctx, "main-003")     // git-style: land exactly there
+//	steps, _ := m.Plan(ctx)       // dry-run: see what would run
+//	m.Up(ctx)                     // apply all pending
+//	m.DownTo(ctx, "main-003")     // roll back feat/payments
+//	m.Checkout(ctx, "main-003")   // git-style: land exactly there
 
 const defaultTreeSchema = "drops"
+
+// advisoryLockKey computes a deterministic int64 from the schema name so
+// the lock is scoped to a specific drops schema within the same PG session.
+func advisoryLockKey(schema string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte("drops:tree:" + schema))
+	return int64(h.Sum64())
+}
 
 // TreeMigration is one node in the migration DAG.
 type TreeMigration struct {
 	// ID is the stable unique identifier — no commas allowed.
-	// Recommended format: "<branch>-<seq>" e.g. "main-001", "pay-002".
 	ID string
 
 	// Name is a human-readable label used in Status output.
@@ -54,24 +79,49 @@ type TreeMigration struct {
 	// one. Empty slice = root node. Two parents = merge commit.
 	Parents []string
 
+	// Description is a one-line human summary shown in Status output.
+	// Populated from the -- drops:description: header in .up.sql files.
+	Description string
+
 	// Up applies the migration. nil means the node is a no-op (rare).
 	Up func(ctx context.Context, db *DB) error
 
-	// Down reverses the migration. nil means the migration is
-	// irreversible — Down() will refuse to roll it back.
+	// Down reverses the migration. nil = irreversible.
 	Down func(ctx context.Context, db *DB) error
+
+	// upSQL is the raw SQL text used for checksum computation. Only
+	// populated when the migration was registered via AddSQL or AddFS;
+	// programmatic migrations (func-only) have an empty string and are
+	// exempt from tamper checking.
+	upSQL string
 }
 
 // TreeStatus is one row produced by Status.
 type TreeStatus struct {
-	ID        string
-	Name      string
-	Branch    string
-	Parents   []string
-	Applied   bool
-	AppliedAt time.Time // zero if not applied
-	IsHead    bool      // applied with no applied successors (current branch tip)
-	IsReady   bool      // unapplied but all parents applied (next to run)
+	ID          string
+	Name        string
+	Branch      string
+	Parents     []string
+	Description string
+	Applied     bool
+	AppliedAt   time.Time // zero if not applied
+	IsHead      bool      // applied with no applied successors (current branch tip)
+	IsReady     bool      // unapplied but all parents applied (next to run)
+	// Checksum is the SHA-256 (truncated to 16 hex chars) of Up SQL stored
+	// at apply time. Empty for programmatic migrations or legacy rows.
+	Checksum string
+	// Tampered is true when the stored checksum differs from the current
+	// file's checksum — the migration SQL was modified after it was applied.
+	Tampered bool
+}
+
+// PlanStep is one action in the dry-run output of Plan().
+type PlanStep struct {
+	ID          string
+	Name        string
+	Branch      string
+	Description string
+	Action      string // "apply" or "rollback"
 }
 
 // TreeMigrator manages a DAG of migrations tracked in the drops schema.
@@ -89,6 +139,10 @@ var (
 	ErrTreeIrreversible        = errors.New("drops/pg: migration has no Down (irreversible)")
 	ErrTreeNoMigrationsApplied = errors.New("drops/pg: no tree migrations applied")
 	ErrTreeUnknownMigration    = errors.New("drops/pg: unknown migration ID")
+	// ErrTreeMigrationTampered is returned when an already-applied
+	// migration's SQL checksum no longer matches what was recorded at
+	// apply time. Investigate the change before running again.
+	ErrTreeMigrationTampered = errors.New("drops/pg: applied migration SQL has changed — investigate before proceeding")
 )
 
 // NewTreeMigrator returns a migrator bound to db.
@@ -109,6 +163,12 @@ func (m *TreeMigrator) WithSchema(schema string) *TreeMigrator {
 // Add registers a migration node. Panics on duplicate ID so schema
 // declaration bugs surface immediately at process startup.
 func (m *TreeMigrator) Add(mig TreeMigration) *TreeMigrator {
+	if mig.ID == "" {
+		panic("drops/pg: TreeMigration.ID must not be empty")
+	}
+	if strings.ContainsRune(mig.ID, ',') {
+		panic(fmt.Sprintf("drops/pg: migration ID %q must not contain commas", mig.ID))
+	}
 	if _, exists := m.nodes[mig.ID]; exists {
 		panic(fmt.Sprintf("drops/pg: duplicate tree migration ID %q", mig.ID))
 	}
@@ -123,18 +183,18 @@ func (m *TreeMigrator) Add(mig TreeMigration) *TreeMigrator {
 // AddSQL is a convenience wrapper for SQL-only migrations.
 // downSQL may be empty (irreversible).
 func (m *TreeMigrator) AddSQL(id, name, branch string, parents []string, upSQL, downSQL string) *TreeMigrator {
-	mig := TreeMigration{ID: id, Name: name, Branch: branch, Parents: parents}
+	mig := TreeMigration{ID: id, Name: name, Branch: branch, Parents: parents, upSQL: upSQL}
 	if upSQL != "" {
-		upSQL := upSQL
+		u := upSQL
 		mig.Up = func(ctx context.Context, db *DB) error {
-			_, err := db.Exec(ctx, upSQL)
+			_, err := db.Exec(ctx, u)
 			return err
 		}
 	}
 	if downSQL != "" {
-		downSQL := downSQL
+		d := downSQL
 		mig.Down = func(ctx context.Context, db *DB) error {
-			_, err := db.Exec(ctx, downSQL)
+			_, err := db.Exec(ctx, d)
 			return err
 		}
 	}
@@ -149,15 +209,16 @@ func (m *TreeMigrator) AddSQL(id, name, branch string, parents []string, upSQL, 
 //	  main/
 //	    main-001_create_users.up.sql
 //	    main-001_create_users.down.sql
-//	    main-002_add_email.up.sql        ← contains: -- drops:parents: main-001
+//	    main-002_add_email.up.sql        ← -- drops:parents: main-001
 //	  feat/payments/
-//	    pay-001_create_payments.up.sql   ← contains: -- drops:parents: main-002
+//	    pay-001_create_payments.up.sql   ← -- drops:parents: main-002
 //	  merges/
-//	    merge-001_unified.up.sql         ← contains: -- drops:parents: main-003,pay-002
+//	    merge-001_unified.up.sql         ← -- drops:parents: main-003,pay-002
 //
 // Each immediate subdirectory under dir is the branch name.
-// File naming follows the linear migrator: <id>_<name>.{up,down}.sql
+// File naming: <id>_<name>.{up,down}.sql
 // Root nodes omit the -- drops:parents: header entirely.
+// Optional: -- drops:description: one-line summary
 func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
@@ -165,8 +226,8 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 	}
 
 	type fileEntry struct {
-		id, name, branch, upSQL, downSQL string
-		parents                          []string
+		id, name, branch, upSQL, downSQL, description string
+		parents                                        []string
 	}
 	all := map[string]*fileEntry{}
 
@@ -199,7 +260,7 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 			}
 			switch kind {
 			case "up":
-				e.parents = parseTreeParentsHeader(string(body))
+				e.parents, e.description = parseTreeHeaders(string(body))
 				e.upSQL = stripTreeHeaders(string(body))
 			case "down":
 				e.downSQL = string(body)
@@ -214,14 +275,36 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 	sort.Strings(ids)
 	for _, id := range ids {
 		e := all[id]
-		m.AddSQL(e.id, e.name, e.branch, e.parents, e.upSQL, e.downSQL)
+		mig := TreeMigration{
+			ID:          e.id,
+			Name:        e.name,
+			Branch:      e.branch,
+			Parents:     e.parents,
+			Description: e.description,
+			upSQL:       e.upSQL,
+		}
+		if e.upSQL != "" {
+			u := e.upSQL
+			mig.Up = func(ctx context.Context, db *DB) error {
+				_, err := db.Exec(ctx, u)
+				return err
+			}
+		}
+		if e.downSQL != "" {
+			d := e.downSQL
+			mig.Down = func(ctx context.Context, db *DB) error {
+				_, err := db.Exec(ctx, d)
+				return err
+			}
+		}
+		m.Add(mig)
 	}
 	return nil
 }
 
-// parseTreeParentsHeader reads "-- drops:parents: a,b" from the header of
-// an up.sql file. Returns nil for root nodes (no header present).
-func parseTreeParentsHeader(sql string) []string {
+// parseTreeHeaders reads -- drops:parents: and -- drops:description:
+// from the leading comment block of an up.sql file.
+func parseTreeHeaders(sql string) (parents []string, description string) {
 	for _, line := range strings.SplitN(sql, "\n", 20) {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -231,26 +314,23 @@ func parseTreeParentsHeader(sql string) []string {
 			break
 		}
 		rest := strings.TrimSpace(strings.TrimPrefix(line, "--"))
-		if !strings.HasPrefix(rest, "drops:parents:") {
-			continue
-		}
-		val := strings.TrimSpace(strings.TrimPrefix(rest, "drops:parents:"))
-		if val == "" {
-			return nil
-		}
-		parts := strings.Split(val, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if p = strings.TrimSpace(p); p != "" {
-				out = append(out, p)
+		switch {
+		case strings.HasPrefix(rest, "drops:parents:"):
+			val := strings.TrimSpace(strings.TrimPrefix(rest, "drops:parents:"))
+			for _, p := range strings.Split(val, ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					parents = append(parents, p)
+				}
 			}
+		case strings.HasPrefix(rest, "drops:description:"):
+			description = strings.TrimSpace(strings.TrimPrefix(rest, "drops:description:"))
 		}
-		return out
 	}
-	return nil
+	return
 }
 
-// stripTreeHeaders removes -- drops:* comment lines from the top of sql.
+// stripTreeHeaders removes -- drops:* comment lines from the top of sql
+// so the actual DDL is clean when executed.
 func stripTreeHeaders(sql string) string {
 	lines := strings.Split(sql, "\n")
 	out := make([]string, 0, len(lines))
@@ -287,14 +367,59 @@ func (m *TreeMigrator) Validate() error {
 	return err
 }
 
+// Plan returns the ordered list of migrations that Up() would apply,
+// without touching the schema. Use it for CI previews or human review
+// before running in production. Returns ErrTreeMigrationTampered if any
+// already-applied migration's SQL has changed.
+func (m *TreeMigrator) Plan(ctx context.Context) ([]PlanStep, error) {
+	if err := m.ensureSchema(ctx); err != nil {
+		return nil, err
+	}
+	applied, err := m.appliedSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.checkTampering(applied); err != nil {
+		return nil, err
+	}
+	pending := make([]string, 0, len(m.nodes))
+	for _, id := range m.order {
+		if _, ok := applied[id]; !ok {
+			pending = append(pending, id)
+		}
+	}
+	sorted, err := m.topoSortSubset(pending)
+	if err != nil {
+		return nil, err
+	}
+	steps := make([]PlanStep, 0, len(sorted))
+	for _, id := range sorted {
+		mig := m.nodes[id]
+		steps = append(steps, PlanStep{
+			ID: id, Name: mig.Name, Branch: mig.Branch,
+			Description: mig.Description, Action: "apply",
+		})
+	}
+	return steps, nil
+}
+
 // Up applies every pending migration in topological order, each in its
-// own transaction.
+// own transaction. Acquires a session-level advisory lock before writing
+// so concurrent processes block rather than racing.
 func (m *TreeMigrator) Up(ctx context.Context) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
+	if err := m.acquireLock(ctx); err != nil {
+		return err
+	}
+	defer m.releaseLock(ctx)
+
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
+		return err
+	}
+	if err := m.checkTampering(applied); err != nil {
 		return err
 	}
 	pending := make([]string, 0, len(m.nodes))
@@ -311,7 +436,7 @@ func (m *TreeMigrator) Up(ctx context.Context) error {
 		if err := m.applyOne(ctx, m.nodes[id]); err != nil {
 			return err
 		}
-		applied[id] = time.Now()
+		applied[id] = appliedEntry{at: time.Now()}
 	}
 	return nil
 }
@@ -322,8 +447,16 @@ func (m *TreeMigrator) UpTo(ctx context.Context, id string) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
+	if err := m.acquireLock(ctx); err != nil {
+		return err
+	}
+	defer m.releaseLock(ctx)
+
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
+		return err
+	}
+	if err := m.checkTampering(applied); err != nil {
 		return err
 	}
 	if _, ok := applied[id]; ok {
@@ -347,7 +480,7 @@ func (m *TreeMigrator) UpTo(ctx context.Context, id string) error {
 		if err := m.applyOne(ctx, m.nodes[nid]); err != nil {
 			return err
 		}
-		applied[nid] = time.Now()
+		applied[nid] = appliedEntry{at: time.Now()}
 	}
 	return nil
 }
@@ -358,6 +491,11 @@ func (m *TreeMigrator) Checkout(ctx context.Context, id string) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
+	if err := m.acquireLock(ctx); err != nil {
+		return err
+	}
+	defer m.releaseLock(ctx)
+
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -412,6 +550,11 @@ func (m *TreeMigrator) Down(ctx context.Context) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
+	if err := m.acquireLock(ctx); err != nil {
+		return err
+	}
+	defer m.releaseLock(ctx)
+
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -441,6 +584,11 @@ func (m *TreeMigrator) DownTo(ctx context.Context, id string) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
+	if err := m.acquireLock(ctx); err != nil {
+		return err
+	}
+	defer m.releaseLock(ctx)
+
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -483,9 +631,11 @@ func (m *TreeMigrator) Heads(ctx context.Context) ([]TreeStatus, error) {
 	out := make([]TreeStatus, 0, len(heads))
 	for _, id := range heads {
 		mig := m.nodes[id]
+		e := applied[id]
 		out = append(out, TreeStatus{
 			ID: id, Name: mig.Name, Branch: mig.Branch, Parents: mig.Parents,
-			Applied: true, AppliedAt: applied[id], IsHead: true,
+			Description: mig.Description, Applied: true, AppliedAt: e.at,
+			Checksum: e.checksum, IsHead: true,
 		})
 	}
 	return out, nil
@@ -507,6 +657,8 @@ func (m *TreeMigrator) Branches() []string {
 }
 
 // Status returns the full DAG status in topological order.
+// Tampered is set true for any applied migration whose SQL has changed
+// since it was applied.
 func (m *TreeMigrator) Status(ctx context.Context) ([]TreeStatus, error) {
 	if err := m.ensureSchema(ctx); err != nil {
 		return nil, err
@@ -531,11 +683,18 @@ func (m *TreeMigrator) Status(ctx context.Context) ([]TreeStatus, error) {
 	out := make([]TreeStatus, 0, len(sorted))
 	for _, id := range sorted {
 		mig := m.nodes[id]
-		s := TreeStatus{ID: id, Name: mig.Name, Branch: mig.Branch, Parents: mig.Parents}
-		if t, ok := applied[id]; ok {
+		s := TreeStatus{
+			ID: id, Name: mig.Name, Branch: mig.Branch,
+			Parents: mig.Parents, Description: mig.Description,
+		}
+		if e, ok := applied[id]; ok {
 			s.Applied = true
-			s.AppliedAt = t
+			s.AppliedAt = e.at
+			s.Checksum = e.checksum
 			s.IsHead = headSet[id]
+			if e.checksum != "" && mig.upSQL != "" {
+				s.Tampered = migrationChecksum(mig.upSQL) != e.checksum
+			}
 		} else {
 			s.IsReady = true
 			for _, p := range mig.Parents {
@@ -554,17 +713,34 @@ func (m *TreeMigrator) Status(ctx context.Context) ([]TreeStatus, error) {
 // Internal helpers
 // ----------------------------------------------------------------------
 
+// appliedEntry holds the state of one applied migration.
+type appliedEntry struct {
+	at       time.Time
+	checksum string // SHA-256 hex stored at apply time; empty for legacy rows
+}
+
 func (m *TreeMigrator) ensureSchema(ctx context.Context) error {
 	schema := quoteIdent(m.schema)
 	for _, stmt := range []string{
 		fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schema),
+		// Restrict PUBLIC from creating objects in the drops schema.
+		// This is best-effort; it fails gracefully if the role lacks
+		// GRANT OPTION — in that case the DBA must set permissions manually.
+		fmt.Sprintf(`DO $$ BEGIN
+			REVOKE CREATE ON SCHEMA %s FROM PUBLIC;
+		EXCEPTION WHEN insufficient_privilege THEN NULL; END $$`, schema),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.nodes (
-			id         TEXT        PRIMARY KEY,
-			name       TEXT        NOT NULL,
-			branch     TEXT        NOT NULL DEFAULT 'main',
-			parents    TEXT        NOT NULL DEFAULT '',
-			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			id          TEXT        PRIMARY KEY,
+			name        TEXT        NOT NULL,
+			branch      TEXT        NOT NULL DEFAULT 'main',
+			parents     TEXT        NOT NULL DEFAULT '',
+			checksum    TEXT        NOT NULL DEFAULT '',
+			description TEXT        NOT NULL DEFAULT '',
+			applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`, schema),
+		// Add columns that may not exist in databases created before this version.
+		fmt.Sprintf(`ALTER TABLE %s.nodes ADD COLUMN IF NOT EXISTS checksum    TEXT NOT NULL DEFAULT ''`, schema),
+		fmt.Sprintf(`ALTER TABLE %s.nodes ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`, schema),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.branches (
 			name       TEXT        PRIMARY KEY,
 			head_id    TEXT        NOT NULL,
@@ -578,30 +754,62 @@ func (m *TreeMigrator) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
-func (m *TreeMigrator) appliedSet(ctx context.Context) (map[string]time.Time, error) {
+func (m *TreeMigrator) acquireLock(ctx context.Context) error {
+	_, err := m.db.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryLockKey(m.schema))
+	return err
+}
+
+func (m *TreeMigrator) releaseLock(ctx context.Context) {
+	// Use a detached context so a cancelled caller-ctx doesn't skip unlock.
+	rctx, cancel := rollbackCtx(ctx)
+	defer cancel()
+	_, _ = m.db.Exec(rctx, "SELECT pg_advisory_unlock($1)", advisoryLockKey(m.schema))
+}
+
+func (m *TreeMigrator) appliedSet(ctx context.Context) (map[string]appliedEntry, error) {
 	rows, err := m.db.Query(ctx,
-		fmt.Sprintf(`SELECT id, applied_at FROM %s.nodes`, quoteIdent(m.schema)))
+		fmt.Sprintf(`SELECT id, checksum, applied_at FROM %s.nodes`, quoteIdent(m.schema)))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]time.Time{}
+	out := map[string]appliedEntry{}
 	for rows.Next() {
-		var id string
+		var id, checksum string
 		var t time.Time
-		if err := rows.Scan(&id, &t); err != nil {
+		if err := rows.Scan(&id, &checksum, &t); err != nil {
 			return nil, err
 		}
-		out[id] = t
+		out[id] = appliedEntry{at: t, checksum: checksum}
 	}
 	return out, rows.Err()
 }
 
+// checkTampering returns ErrTreeMigrationTampered if any applied
+// migration's stored checksum no longer matches its current SQL.
+func (m *TreeMigrator) checkTampering(applied map[string]appliedEntry) error {
+	for id, e := range applied {
+		if e.checksum == "" {
+			continue // legacy row, no checksum stored
+		}
+		node, ok := m.nodes[id]
+		if !ok || node.upSQL == "" {
+			continue // not registered or programmatic
+		}
+		if migrationChecksum(node.upSQL) != e.checksum {
+			return fmt.Errorf("%w: migration %q (applied at %s)",
+				ErrTreeMigrationTampered, id, e.at.Format(time.RFC3339))
+		}
+	}
+	return nil
+}
+
 func (m *TreeMigrator) markApplied(ctx context.Context, tx *DB, mig TreeMigration) error {
+	checksum := migrationChecksum(mig.upSQL)
 	_, err := tx.Exec(ctx,
-		fmt.Sprintf(`INSERT INTO %s.nodes (id, name, branch, parents)
-			VALUES ($1, $2, $3, $4)`, quoteIdent(m.schema)),
-		mig.ID, mig.Name, mig.Branch, strings.Join(mig.Parents, ","),
+		fmt.Sprintf(`INSERT INTO %s.nodes (id, name, branch, parents, checksum, description)
+			VALUES ($1, $2, $3, $4, $5, $6)`, quoteIdent(m.schema)),
+		mig.ID, mig.Name, mig.Branch, strings.Join(mig.Parents, ","), checksum, mig.Description,
 	)
 	if err != nil {
 		return err
@@ -694,8 +902,7 @@ func (m *TreeMigrator) topoSortSubset(names []string) ([]string, error) {
 }
 
 // ancestorsOf returns the transitive parent closure of target, including
-// target itself. Returns ErrTreeMissingParent if any referenced ID is
-// not registered.
+// target itself.
 func (m *TreeMigrator) ancestorsOf(target string) (map[string]bool, error) {
 	if _, ok := m.nodes[target]; !ok {
 		return nil, fmt.Errorf("%w: %q", ErrTreeUnknownMigration, target)
@@ -742,7 +949,7 @@ func (m *TreeMigrator) descendantsOf(target string) map[string]bool {
 }
 
 // computeHeads returns applied nodes with no applied successors.
-func (m *TreeMigrator) computeHeads(applied map[string]time.Time) []string {
+func (m *TreeMigrator) computeHeads(applied map[string]appliedEntry) []string {
 	var heads []string
 	for id := range applied {
 		isHead := true
@@ -764,4 +971,13 @@ func (m *TreeMigrator) computeHeads(applied map[string]time.Time) []string {
 	}
 	sort.Strings(heads)
 	return heads
+}
+
+// migrationChecksum returns a hex-encoded SHA-256 of sql.
+func migrationChecksum(sql string) string {
+	if sql == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(sql))
+	return hex.EncodeToString(h[:])
 }

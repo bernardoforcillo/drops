@@ -2,6 +2,8 @@ package clickhouse
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -21,36 +23,63 @@ import (
 //   - MergeTree for the nodes table; ReplacingMergeTree for branches.
 //   - Lightweight DELETE (CH 22.8+) for rollback bookkeeping.
 //
-// Usage mirrors the PostgreSQL variant exactly:
+// Security model
+//
+// Every up.sql's text is SHA-256 hashed and stored in drops.nodes.checksum
+// at apply time. On every subsequent run, Up() and Plan() compare the stored
+// hash against the current file. A mismatch returns ErrTreeMigrationTampered
+// before any change is attempted.
+//
+// Note: ClickHouse has no advisory locks equivalent to pg_advisory_lock.
+// For environments with concurrent migration runners, use an external
+// distributed lock (Redis SETNX, ZooKeeper ephemeral node, etc.) around
+// Up / Down calls.
+//
+// Usage
 //
 //	m := clickhouse.NewTreeMigrator(db)
-//	m.AddFS(os.DirFS("."), "migrations")
+//	_ = m.AddFS(os.DirFS("."), "migrations")
+//	steps, _ := m.Plan(ctx)        // dry-run
 //	m.Up(ctx)
-//	m.DownTo(ctx, "main-003")   // retract a feature branch
-//	m.Checkout(ctx, "main-003") // git-style land
+//	m.DownTo(ctx, "main-003")
+//	m.Checkout(ctx, "main-003")
 
 const defaultTreeDatabase = "drops"
 
 // TreeMigration is one node in the migration DAG.
 type TreeMigration struct {
-	ID      string
-	Name    string
-	Branch  string   // defaults to "main"
-	Parents []string // empty = root; two entries = merge commit
-	Up      func(ctx context.Context, db *DB) error
-	Down    func(ctx context.Context, db *DB) error
+	ID          string
+	Name        string
+	Branch      string   // defaults to "main"
+	Parents     []string // empty = root; two entries = merge commit
+	Description string   // from -- drops:description: header
+	Up          func(ctx context.Context, db *DB) error
+	Down        func(ctx context.Context, db *DB) error
+	upSQL       string // stored for checksum; empty for programmatic migrations
 }
 
 // TreeStatus is one row produced by Status.
 type TreeStatus struct {
-	ID        string
-	Name      string
-	Branch    string
-	Parents   []string
-	Applied   bool
-	AppliedAt time.Time
-	IsHead    bool // applied with no applied successors
-	IsReady   bool // unapplied, all parents applied
+	ID          string
+	Name        string
+	Branch      string
+	Parents     []string
+	Description string
+	Applied     bool
+	AppliedAt   time.Time
+	IsHead      bool  // applied with no applied successors
+	IsReady     bool  // unapplied, all parents applied
+	Checksum    string
+	Tampered    bool  // stored checksum differs from current SQL
+}
+
+// PlanStep is one action in the dry-run output of Plan().
+type PlanStep struct {
+	ID          string
+	Name        string
+	Branch      string
+	Description string
+	Action      string // "apply" or "rollback"
 }
 
 // TreeMigrator manages a DAG of migrations tracked in the drops database.
@@ -68,6 +97,10 @@ var (
 	ErrTreeIrreversible        = errors.New("drops/clickhouse: migration has no Down (irreversible)")
 	ErrTreeNoMigrationsApplied = errors.New("drops/clickhouse: no tree migrations applied")
 	ErrTreeUnknownMigration    = errors.New("drops/clickhouse: unknown migration ID")
+	// ErrTreeMigrationTampered is returned when an already-applied
+	// migration's SQL checksum no longer matches what was recorded at
+	// apply time.
+	ErrTreeMigrationTampered = errors.New("drops/clickhouse: applied migration SQL has changed — investigate before proceeding")
 )
 
 // NewTreeMigrator returns a migrator bound to db.
@@ -87,6 +120,12 @@ func (m *TreeMigrator) WithDatabase(database string) *TreeMigrator {
 
 // Add registers a migration node. Panics on duplicate ID.
 func (m *TreeMigrator) Add(mig TreeMigration) *TreeMigrator {
+	if mig.ID == "" {
+		panic("drops/clickhouse: TreeMigration.ID must not be empty")
+	}
+	if strings.ContainsRune(mig.ID, ',') {
+		panic(fmt.Sprintf("drops/clickhouse: migration ID %q must not contain commas", mig.ID))
+	}
 	if _, exists := m.nodes[mig.ID]; exists {
 		panic(fmt.Sprintf("drops/clickhouse: duplicate tree migration ID %q", mig.ID))
 	}
@@ -100,18 +139,18 @@ func (m *TreeMigrator) Add(mig TreeMigration) *TreeMigrator {
 
 // AddSQL registers a SQL-only migration.
 func (m *TreeMigrator) AddSQL(id, name, branch string, parents []string, upSQL, downSQL string) *TreeMigrator {
-	mig := TreeMigration{ID: id, Name: name, Branch: branch, Parents: parents}
+	mig := TreeMigration{ID: id, Name: name, Branch: branch, Parents: parents, upSQL: upSQL}
 	if upSQL != "" {
-		upSQL := upSQL
+		u := upSQL
 		mig.Up = func(ctx context.Context, db *DB) error {
-			_, err := db.Exec(ctx, upSQL)
+			_, err := db.Exec(ctx, u)
 			return err
 		}
 	}
 	if downSQL != "" {
-		downSQL := downSQL
+		d := downSQL
 		mig.Down = func(ctx context.Context, db *DB) error {
-			_, err := db.Exec(ctx, downSQL)
+			_, err := db.Exec(ctx, d)
 			return err
 		}
 	}
@@ -119,7 +158,8 @@ func (m *TreeMigrator) AddSQL(id, name, branch string, parents []string, upSQL, 
 }
 
 // AddFS loads migrations from a branch-per-subdirectory layout.
-// Identical convention to pg.TreeMigrator.AddFS:
+//
+// Folder structure:
 //
 //	<dir>/
 //	  main/
@@ -127,6 +167,10 @@ func (m *TreeMigrator) AddSQL(id, name, branch string, parents []string, upSQL, 
 //	    main-001_create_events.down.sql
 //	  feat/payments/
 //	    pay-001_payments_table.up.sql   ← -- drops:parents: main-002
+//	  merges/
+//	    merge-001_unified.up.sql        ← -- drops:parents: main-003,pay-002
+//
+// Optional header: -- drops:description: one-line summary
 func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
@@ -134,8 +178,8 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 	}
 
 	type fileEntry struct {
-		id, name, branch, upSQL, downSQL string
-		parents                          []string
+		id, name, branch, upSQL, downSQL, description string
+		parents                                        []string
 	}
 	all := map[string]*fileEntry{}
 
@@ -168,7 +212,7 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 			}
 			switch kind {
 			case "up":
-				e.parents = parseCHParentsHeader(string(body))
+				e.parents, e.description = parseCHTreeHeaders(string(body))
 				e.upSQL = stripCHHeaders(string(body))
 			case "down":
 				e.downSQL = string(body)
@@ -183,7 +227,25 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 	sort.Strings(ids)
 	for _, id := range ids {
 		e := all[id]
-		m.AddSQL(e.id, e.name, e.branch, e.parents, e.upSQL, e.downSQL)
+		mig := TreeMigration{
+			ID: e.id, Name: e.name, Branch: e.branch,
+			Parents: e.parents, Description: e.description, upSQL: e.upSQL,
+		}
+		if e.upSQL != "" {
+			u := e.upSQL
+			mig.Up = func(ctx context.Context, db *DB) error {
+				_, err := db.Exec(ctx, u)
+				return err
+			}
+		}
+		if e.downSQL != "" {
+			d := e.downSQL
+			mig.Down = func(ctx context.Context, db *DB) error {
+				_, err := db.Exec(ctx, d)
+				return err
+			}
+		}
+		m.Add(mig)
 	}
 	return nil
 }
@@ -209,7 +271,9 @@ func parseCHMigrationName(filename string) (id, name, kind string, ok bool) {
 	return stem[:idx], stem[idx+1:], kind, true
 }
 
-func parseCHParentsHeader(sql string) []string {
+// parseCHTreeHeaders reads -- drops:parents: and -- drops:description:
+// from the leading comment block of an up.sql file.
+func parseCHTreeHeaders(sql string) (parents []string, description string) {
 	for _, line := range strings.SplitN(sql, "\n", 20) {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -219,23 +283,19 @@ func parseCHParentsHeader(sql string) []string {
 			break
 		}
 		rest := strings.TrimSpace(strings.TrimPrefix(line, "--"))
-		if !strings.HasPrefix(rest, "drops:parents:") {
-			continue
-		}
-		val := strings.TrimSpace(strings.TrimPrefix(rest, "drops:parents:"))
-		if val == "" {
-			return nil
-		}
-		parts := strings.Split(val, ",")
-		out := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if p = strings.TrimSpace(p); p != "" {
-				out = append(out, p)
+		switch {
+		case strings.HasPrefix(rest, "drops:parents:"):
+			val := strings.TrimSpace(strings.TrimPrefix(rest, "drops:parents:"))
+			for _, p := range strings.Split(val, ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					parents = append(parents, p)
+				}
 			}
+		case strings.HasPrefix(rest, "drops:description:"):
+			description = strings.TrimSpace(strings.TrimPrefix(rest, "drops:description:"))
 		}
-		return out
 	}
-	return nil
+	return
 }
 
 func stripCHHeaders(sql string) string {
@@ -272,13 +332,54 @@ func (m *TreeMigrator) Validate() error {
 	return err
 }
 
+// Plan returns the ordered list of migrations that Up() would apply,
+// without touching the schema. Returns ErrTreeMigrationTampered if any
+// applied migration's SQL has changed.
+func (m *TreeMigrator) Plan(ctx context.Context) ([]PlanStep, error) {
+	if err := m.ensureDatabase(ctx); err != nil {
+		return nil, err
+	}
+	applied, err := m.appliedSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.checkTampering(applied); err != nil {
+		return nil, err
+	}
+	pending := make([]string, 0, len(m.nodes))
+	for _, id := range m.order {
+		if _, ok := applied[id]; !ok {
+			pending = append(pending, id)
+		}
+	}
+	sorted, err := m.topoSortSubset(pending)
+	if err != nil {
+		return nil, err
+	}
+	steps := make([]PlanStep, 0, len(sorted))
+	for _, id := range sorted {
+		mig := m.nodes[id]
+		steps = append(steps, PlanStep{
+			ID: id, Name: mig.Name, Branch: mig.Branch,
+			Description: mig.Description, Action: "apply",
+		})
+	}
+	return steps, nil
+}
+
 // Up applies every pending migration in topological order.
+// No transaction wrapper — CH transaction support is limited.
+// If markApplied fails after a successful Up, re-running is safe
+// only when Up is idempotent (recommended for CH migrations).
 func (m *TreeMigrator) Up(ctx context.Context) error {
 	if err := m.ensureDatabase(ctx); err != nil {
 		return err
 	}
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
+		return err
+	}
+	if err := m.checkTampering(applied); err != nil {
 		return err
 	}
 	pending := make([]string, 0, len(m.nodes))
@@ -295,7 +396,7 @@ func (m *TreeMigrator) Up(ctx context.Context) error {
 		if err := m.applyOne(ctx, m.nodes[id]); err != nil {
 			return err
 		}
-		applied[id] = time.Now()
+		applied[id] = appliedEntry{at: time.Now()}
 	}
 	return nil
 }
@@ -307,6 +408,9 @@ func (m *TreeMigrator) UpTo(ctx context.Context, id string) error {
 	}
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
+		return err
+	}
+	if err := m.checkTampering(applied); err != nil {
 		return err
 	}
 	if _, ok := applied[id]; ok {
@@ -330,7 +434,7 @@ func (m *TreeMigrator) UpTo(ctx context.Context, id string) error {
 		if err := m.applyOne(ctx, m.nodes[nid]); err != nil {
 			return err
 		}
-		applied[nid] = time.Now()
+		applied[nid] = appliedEntry{at: time.Now()}
 	}
 	return nil
 }
@@ -458,9 +562,11 @@ func (m *TreeMigrator) Heads(ctx context.Context) ([]TreeStatus, error) {
 	out := make([]TreeStatus, 0, len(heads))
 	for _, id := range heads {
 		mig := m.nodes[id]
+		e := applied[id]
 		out = append(out, TreeStatus{
 			ID: id, Name: mig.Name, Branch: mig.Branch, Parents: mig.Parents,
-			Applied: true, AppliedAt: applied[id], IsHead: true,
+			Description: mig.Description, Applied: true, AppliedAt: e.at,
+			Checksum: e.checksum, IsHead: true,
 		})
 	}
 	return out, nil
@@ -480,7 +586,8 @@ func (m *TreeMigrator) Branches() []string {
 	return out
 }
 
-// Status returns the full DAG status in topological order.
+// Status returns the full DAG status in topological order. Tampered is
+// set true for applied migrations whose SQL has changed since apply time.
 func (m *TreeMigrator) Status(ctx context.Context) ([]TreeStatus, error) {
 	if err := m.ensureDatabase(ctx); err != nil {
 		return nil, err
@@ -505,11 +612,18 @@ func (m *TreeMigrator) Status(ctx context.Context) ([]TreeStatus, error) {
 	out := make([]TreeStatus, 0, len(sorted))
 	for _, id := range sorted {
 		mig := m.nodes[id]
-		s := TreeStatus{ID: id, Name: mig.Name, Branch: mig.Branch, Parents: mig.Parents}
-		if t, ok := applied[id]; ok {
+		s := TreeStatus{
+			ID: id, Name: mig.Name, Branch: mig.Branch,
+			Parents: mig.Parents, Description: mig.Description,
+		}
+		if e, ok := applied[id]; ok {
 			s.Applied = true
-			s.AppliedAt = t
+			s.AppliedAt = e.at
+			s.Checksum = e.checksum
 			s.IsHead = headSet[id]
+			if e.checksum != "" && mig.upSQL != "" {
+				s.Tampered = chMigrationChecksum(mig.upSQL) != e.checksum
+			}
 		} else {
 			s.IsReady = true
 			for _, p := range mig.Parents {
@@ -528,6 +642,11 @@ func (m *TreeMigrator) Status(ctx context.Context) ([]TreeStatus, error) {
 // Internal helpers
 // ----------------------------------------------------------------------
 
+type appliedEntry struct {
+	at       time.Time
+	checksum string
+}
+
 func (m *TreeMigrator) dbPrefix() string {
 	return quoteIdent(m.database) + "."
 }
@@ -539,11 +658,13 @@ func (m *TreeMigrator) ensureDatabase(ctx context.Context) error {
 	}
 	if _, err := m.db.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %snodes (
-			id         String NOT NULL,
-			name       String NOT NULL,
-			branch     LowCardinality(String) NOT NULL,
-			parents    String NOT NULL,
-			applied_at DateTime64(9, 'UTC') NOT NULL
+			id          String NOT NULL,
+			name        String NOT NULL,
+			branch      LowCardinality(String) NOT NULL,
+			parents     String NOT NULL,
+			checksum    String NOT NULL,
+			description String NOT NULL,
+			applied_at  DateTime64(9, 'UTC') NOT NULL
 		) ENGINE = MergeTree() ORDER BY id`, m.dbPrefix())); err != nil {
 		return err
 	}
@@ -558,23 +679,40 @@ func (m *TreeMigrator) ensureDatabase(ctx context.Context) error {
 	return nil
 }
 
-func (m *TreeMigrator) appliedSet(ctx context.Context) (map[string]time.Time, error) {
+func (m *TreeMigrator) appliedSet(ctx context.Context) (map[string]appliedEntry, error) {
 	rows, err := m.db.Query(ctx,
-		fmt.Sprintf(`SELECT id, applied_at FROM %snodes`, m.dbPrefix()))
+		fmt.Sprintf(`SELECT id, checksum, applied_at FROM %snodes`, m.dbPrefix()))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]time.Time{}
+	out := map[string]appliedEntry{}
 	for rows.Next() {
-		var id string
+		var id, checksum string
 		var t time.Time
-		if err := rows.Scan(&id, &t); err != nil {
+		if err := rows.Scan(&id, &checksum, &t); err != nil {
 			return nil, err
 		}
-		out[id] = t
+		out[id] = appliedEntry{at: t, checksum: checksum}
 	}
 	return out, rows.Err()
+}
+
+func (m *TreeMigrator) checkTampering(applied map[string]appliedEntry) error {
+	for id, e := range applied {
+		if e.checksum == "" {
+			continue
+		}
+		node, ok := m.nodes[id]
+		if !ok || node.upSQL == "" {
+			continue
+		}
+		if chMigrationChecksum(node.upSQL) != e.checksum {
+			return fmt.Errorf("%w: migration %q (applied at %s)",
+				ErrTreeMigrationTampered, id, e.at.Format(time.RFC3339))
+		}
+	}
+	return nil
 }
 
 func (m *TreeMigrator) markApplied(ctx context.Context, db *DB, mig TreeMigration) error {
@@ -590,12 +728,14 @@ func (m *TreeMigrator) markApplied(ctx context.Context, db *DB, mig TreeMigratio
 	}
 	rows.Close()
 	if n > 0 {
-		return nil // already recorded
+		return nil
 	}
+	checksum := chMigrationChecksum(mig.upSQL)
 	if _, err := db.Exec(ctx,
-		fmt.Sprintf(`INSERT INTO %snodes (id, name, branch, parents, applied_at)
-			VALUES (?, ?, ?, ?, ?)`, m.dbPrefix()),
-		mig.ID, mig.Name, mig.Branch, strings.Join(mig.Parents, ","), time.Now().UTC(),
+		fmt.Sprintf(`INSERT INTO %snodes (id, name, branch, parents, checksum, description, applied_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`, m.dbPrefix()),
+		mig.ID, mig.Name, mig.Branch, strings.Join(mig.Parents, ","),
+		checksum, mig.Description, time.Now().UTC(),
 	); err != nil {
 		return err
 	}
@@ -614,9 +754,6 @@ func (m *TreeMigrator) markUnapplied(ctx context.Context, db *DB, id string) err
 	return err
 }
 
-// applyOne runs Up then records the migration. No transaction wrapper
-// (CH transaction support is limited). If markApplied fails after a
-// successful Up, re-running is safe only if Up is idempotent.
 func (m *TreeMigrator) applyOne(ctx context.Context, mig TreeMigration) error {
 	if mig.Up == nil {
 		return fmt.Errorf("drops/clickhouse: migration %q has no Up function", mig.ID)
@@ -724,7 +861,7 @@ func (m *TreeMigrator) descendantsOf(target string) map[string]bool {
 	return visited
 }
 
-func (m *TreeMigrator) computeHeads(applied map[string]time.Time) []string {
+func (m *TreeMigrator) computeHeads(applied map[string]appliedEntry) []string {
 	var heads []string
 	for id := range applied {
 		isHead := true
@@ -746,4 +883,12 @@ func (m *TreeMigrator) computeHeads(applied map[string]time.Time) []string {
 	}
 	sort.Strings(heads)
 	return heads
+}
+
+func chMigrationChecksum(sql string) string {
+	if sql == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(sql))
+	return hex.EncodeToString(h[:])
 }

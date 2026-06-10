@@ -404,17 +404,12 @@ func (m *TreeMigrator) Plan(ctx context.Context) ([]PlanStep, error) {
 }
 
 // Up applies every pending migration in topological order, each in its
-// own transaction. Acquires a session-level advisory lock before writing
-// so concurrent processes block rather than racing.
+// own transaction. Each transaction acquires a pg_advisory_xact_lock so
+// concurrent callers block per-migration rather than racing.
 func (m *TreeMigrator) Up(ctx context.Context) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
-	if err := m.acquireLock(ctx); err != nil {
-		return err
-	}
-	defer m.releaseLock(ctx)
-
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -447,11 +442,6 @@ func (m *TreeMigrator) UpTo(ctx context.Context, id string) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
-	if err := m.acquireLock(ctx); err != nil {
-		return err
-	}
-	defer m.releaseLock(ctx)
-
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -491,11 +481,6 @@ func (m *TreeMigrator) Checkout(ctx context.Context, id string) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
-	if err := m.acquireLock(ctx); err != nil {
-		return err
-	}
-	defer m.releaseLock(ctx)
-
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -550,11 +535,6 @@ func (m *TreeMigrator) Down(ctx context.Context) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
-	if err := m.acquireLock(ctx); err != nil {
-		return err
-	}
-	defer m.releaseLock(ctx)
-
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -584,11 +564,6 @@ func (m *TreeMigrator) DownTo(ctx context.Context, id string) error {
 	if err := m.ensureSchema(ctx); err != nil {
 		return err
 	}
-	if err := m.acquireLock(ctx); err != nil {
-		return err
-	}
-	defer m.releaseLock(ctx)
-
 	applied, err := m.appliedSet(ctx)
 	if err != nil {
 		return err
@@ -754,17 +729,6 @@ func (m *TreeMigrator) ensureSchema(ctx context.Context) error {
 	return nil
 }
 
-func (m *TreeMigrator) acquireLock(ctx context.Context) error {
-	_, err := m.db.Exec(ctx, "SELECT pg_advisory_lock($1)", advisoryLockKey(m.schema))
-	return err
-}
-
-func (m *TreeMigrator) releaseLock(ctx context.Context) {
-	// Use a detached context so a cancelled caller-ctx doesn't skip unlock.
-	rctx, cancel := rollbackCtx(ctx)
-	defer cancel()
-	_, _ = m.db.Exec(rctx, "SELECT pg_advisory_unlock($1)", advisoryLockKey(m.schema))
-}
 
 func (m *TreeMigrator) appliedSet(ctx context.Context) (map[string]appliedEntry, error) {
 	rows, err := m.db.Query(ctx,
@@ -835,6 +799,29 @@ func (m *TreeMigrator) applyOne(ctx context.Context, mig TreeMigration) error {
 		return fmt.Errorf("drops/pg: migration %q has no Up function", mig.ID)
 	}
 	return m.db.InTx(ctx, func(tx *DB) error {
+		// Transaction-scoped advisory lock: held until this tx commits or
+		// rolls back, guaranteed to run on the same connection as the DDL.
+		// Prevents two concurrent callers from applying the same migration.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey(m.schema)); err != nil {
+			return err
+		}
+		// Re-check after acquiring the lock: a concurrent caller may have
+		// applied this migration while we were waiting.
+		rows, err := tx.Query(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM %s.nodes WHERE id = $1`, quoteIdent(m.schema)), mig.ID)
+		if err != nil {
+			return err
+		}
+		var n int
+		if rows.Next() {
+			_ = rows.Scan(&n)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if n > 0 {
+			return nil // already applied by a concurrent caller
+		}
 		if err := mig.Up(ctx, tx); err != nil {
 			return fmt.Errorf("drops/pg: applying %q: %w", mig.ID, err)
 		}
@@ -847,6 +834,26 @@ func (m *TreeMigrator) rollbackOne(ctx context.Context, mig TreeMigration) error
 		return fmt.Errorf("%w: %q", ErrTreeIrreversible, mig.ID)
 	}
 	return m.db.InTx(ctx, func(tx *DB) error {
+		// Transaction-scoped advisory lock — see applyOne.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockKey(m.schema)); err != nil {
+			return err
+		}
+		// Re-check: a concurrent caller may have already rolled this back.
+		rows, err := tx.Query(ctx,
+			fmt.Sprintf(`SELECT COUNT(*) FROM %s.nodes WHERE id = $1`, quoteIdent(m.schema)), mig.ID)
+		if err != nil {
+			return err
+		}
+		var n int
+		if rows.Next() {
+			_ = rows.Scan(&n)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if n == 0 {
+			return nil // already rolled back by a concurrent caller
+		}
 		if err := mig.Down(ctx, tx); err != nil {
 			return fmt.Errorf("drops/pg: rolling back %q: %w", mig.ID, err)
 		}

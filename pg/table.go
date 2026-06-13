@@ -97,6 +97,22 @@ func (t *Table) Col(name string) *Column { return t.byName[name] }
 // Columns returns all registered columns in declaration order.
 func (t *Table) Columns() []*Column { return t.columns }
 
+// ForeignKey attaches a foreign-key constraint from col to target on this
+// table. Both must be non-nil registered columns. It is the untyped companion
+// to (*Col[T]).References — use it to add FKs to AutoTable-derived columns. The
+// FK is recorded on the column, so CreateTable and the schema diff/Push see it.
+func (t *Table) ForeignKey(col, target *Column, opts ...func(*FK)) *Table {
+	if col == nil || target == nil {
+		panic("drops/pg: ForeignKey requires non-nil columns")
+	}
+	fk := &FK{Target: target}
+	for _, o := range opts {
+		o(fk)
+	}
+	col.ref = fk
+	return t
+}
+
 // add is the internal registration step used by Add. It does not return
 // anything because callers (the Add helper) need to preserve the typed
 // *Col[T] handle they were passed.

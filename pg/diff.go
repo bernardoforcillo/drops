@@ -34,10 +34,12 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 //
 // Operation order:
 //  1. DROP TABLE   for tables removed entirely
-//  2. CREATE TABLE for new tables (column defs + inline UNIQUE only)
+//  2. CREATE TABLE for new tables (column defs only — every
+//     composite key, UNIQUE, FOREIGN KEY and CHECK constraint is
+//     emitted as a separate ALTER TABLE below, never inline)
 //  3. ALTER TABLE  for column-level changes on surviving tables
 //     (drop, add, type, NOT NULL, DEFAULT)
-//  4. UNIQUE       constraint adds/drops on surviving tables
+//  4. UNIQUE       constraint adds/drops on every table
 //  5. FOREIGN KEY  adds/drops on every table — emitted after CREATE
 //     TABLEs so cross-table references resolve.
 func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
@@ -67,14 +69,19 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 		curT := cur.Tables[key]
 		prevT, exists := prev.Tables[key]
 		if !exists {
-			// New table: only emit composite PKs and CHECK
-			// constraints here (columns + inline UNIQUE were
-			// rendered by createTableSQL above).
+			// New table: createTableSQL above emitted the bare
+			// column definitions only. Every table-level
+			// constraint — composite PK, UNIQUE and CHECK — is
+			// emitted here as a separate ALTER TABLE statement so
+			// the CREATE TABLE stays constraint-free. (Foreign
+			// keys are handled in the dedicated pass below.)
 			empty := &TableSnapshot{
 				CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
+				UniqueConstraints:    map[string]*UniqueSnapshot{},
 				CheckConstraints:     map[string]*CheckSnapshot{},
 			}
 			out = append(out, diffCompositePKs(empty, curT, opt.Safe)...)
+			out = append(out, diffUniques(empty, curT, opt.Safe)...)
 			out = append(out, diffChecks(empty, curT, opt.Safe)...)
 			continue
 		}
@@ -409,6 +416,11 @@ func escapeLit(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }
 
+// createTableSQL renders the bare CREATE TABLE — column definitions
+// only. Composite keys, UNIQUE, FOREIGN KEY and CHECK constraints are
+// never inlined here; Diff emits each of them as a separate raw SQL
+// ALTER TABLE statement so constraint changes stay independently
+// diffable and re-orderable across migrations.
 func createTableSQL(t *TableSnapshot, safe bool) string {
 	var b strings.Builder
 	if safe {
@@ -426,10 +438,6 @@ func createTableSQL(t *TableSnapshot, safe bool) string {
 		first = false
 		b.WriteByte('\t')
 		b.WriteString(columnDefSQL(t.Columns[k]))
-	}
-	for _, k := range sortedKeys(t.UniqueConstraints) {
-		b.WriteString(",\n\t")
-		b.WriteString(uniqueInlineSQL(t.UniqueConstraints[k]))
 	}
 	b.WriteString("\n);")
 	return b.String()
@@ -459,10 +467,6 @@ func columnDefSQL(c *ColumnSnapshot) string {
 		b.WriteString(*c.Default)
 	}
 	return b.String()
-}
-
-func uniqueInlineSQL(u *UniqueSnapshot) string {
-	return fmt.Sprintf(`CONSTRAINT "%s" UNIQUE(%s)`, u.Name, strings.Join(quoteIdents(u.Columns), ", "))
 }
 
 func diffColumns(prev, cur *TableSnapshot, safe bool) []string {

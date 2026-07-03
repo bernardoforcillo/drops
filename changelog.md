@@ -193,6 +193,15 @@ once a 1.0 is cut.
 - MIT license (`license.md`).
 
 ### Changed
+- **Migration diff generator never inlines constraints into `CREATE
+  TABLE`** (`drops/pg`) — `Diff` now emits every composite primary
+  key, UNIQUE, FOREIGN KEY and CHECK constraint as its own raw SQL
+  `ALTER TABLE … ADD CONSTRAINT` statement, and enums as a separate
+  `CREATE TYPE`. Previously UNIQUE constraints were rendered inline
+  in the `CREATE TABLE` body; new tables now produce a bare column-only
+  `CREATE TABLE` followed by the constraint statements (matching how
+  composite PKs, FKs and CHECKs were already handled). This keeps each
+  constraint independently diffable and re-orderable across migrations.
 - `InTx` (both the root `drops.InTx` helper and `pg.DB.InTx`) now uses a
   detached context with a 5-second timeout for the deferred `Rollback`,
   so a cancelled or expired caller-ctx no longer prevents the cleanup

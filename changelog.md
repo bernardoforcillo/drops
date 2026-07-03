@@ -9,6 +9,20 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Migration data hooks** (`drops/pg`) — both migrators now expose
+  `BeforeEach` / `AfterEach` hooks that run inside each migration's
+  transaction, the seam for data migrations that must run between
+  schema migrations (backfilling a new column, copying rows into a
+  split-out table, rewriting a value before an old column is dropped).
+  On the native `Migrator`, `MigrationHook` receives the tx-scoped
+  `*DB`, the `Migration`, and a `MigrationDirection` (`DirectionUp` /
+  `DirectionDown`) so a data step can be scoped to a specific version
+  and direction; hooks fire around both `Up` and `Down`. On
+  `DrizzleMigrator` — where migration files are pure SQL and there is
+  otherwise no place for Go logic — `DrizzleHook` receives the
+  tx-scoped `*DB` and the `DrizzleEntry`, letting a backfill run
+  atomically with the file's statements. A hook that returns an error
+  aborts the migration and the whole transaction rolls back.
 - **Nested (deep) relation eager-loading** (`drops/pg`) — `Find().With`
   now accepts dot paths such as `With("posts.comments")` to load
   relations of relations to arbitrary depth. Each relation edge still

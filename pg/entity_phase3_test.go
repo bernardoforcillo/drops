@@ -95,18 +95,18 @@ type versionedUser struct {
 	Version int32  `drop:"version"`
 }
 
-func versionedSchema() (*pg.Table, *pg.Entity[versionedUser]) {
+func versionedSchema() *pg.Entity[versionedUser] {
 	tbl := pg.NewTable("v_users")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	pg.Add(tbl, pg.Text("name").NotNull())
 	pg.Add(tbl, pg.Integer("version").NotNull().Default("0").OptimisticLock())
-	return tbl, pg.NewEntity[versionedUser](tbl)
+	return pg.NewEntity[versionedUser](tbl)
 }
 
 // TestOptimisticUpdateAppendsVersionGuard verifies the generated SQL
 // includes the AND version = current guard and the version + 1 bump.
 func TestOptimisticUpdateAppendsVersionGuard(t *testing.T) {
-	_, ent := versionedSchema()
+	ent := versionedSchema()
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		// RETURNING produces the post-bump version.
 		return &fakeRows{
@@ -134,7 +134,7 @@ func TestOptimisticUpdateAppendsVersionGuard(t *testing.T) {
 // TestOptimisticUpdateReturnsStaleObject verifies that ErrNoRows on a
 // versioned table becomes ErrStaleObject.
 func TestOptimisticUpdateReturnsStaleObject(t *testing.T) {
-	_, ent := versionedSchema()
+	ent := versionedSchema()
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		// No rows returned ⇒ version mismatch.
 		return &fakeRows{cols: []string{"id", "name", "version"}}, nil
@@ -151,7 +151,7 @@ func TestOptimisticUpdateReturnsStaleObject(t *testing.T) {
 // column never leaks the caller's value into the SET list — even if
 // the user accidentally bumps it themselves.
 func TestOptimisticVersionColumnNotInSetByCaller(t *testing.T) {
-	_, ent := versionedSchema()
+	ent := versionedSchema()
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{
 			cols: []string{"id", "name", "version"},
@@ -164,7 +164,7 @@ func TestOptimisticVersionColumnNotInSetByCaller(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 	sql := fd.queries[0]
-	setPart := sql[:strings.Index(sql, " WHERE")]
+	setPart, _, _ := strings.Cut(sql, " WHERE")
 	// Make sure the SET clause uses the self-bump expression, not a
 	// "version = $N" parameter binding from the caller's value.
 	if strings.Contains(setPart, `"version" = $`) {

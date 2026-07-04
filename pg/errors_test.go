@@ -18,8 +18,8 @@ type pgxLikeError struct {
 	msg        string
 }
 
-func (e *pgxLikeError) Error() string         { return e.msg }
-func (e *pgxLikeError) SQLState() string      { return e.code }
+func (e *pgxLikeError) Error() string          { return e.msg }
+func (e *pgxLikeError) SQLState() string       { return e.code }
 func (e *pgxLikeError) ConstraintName() string { return e.constraint }
 
 // lib/pq-style error: exposes Code() returning a 5-char SQLSTATE.

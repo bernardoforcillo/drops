@@ -16,7 +16,7 @@ import (
 // drizzle migration table and return the captured hashes on subsequent
 // SELECT hash queries — the minimum surface needed to drive
 // DrizzleMigrator from end to end.
-func drizzleFakeDB() (*pg.DB, *fakeDriver, *map[string]bool) {
+func drizzleFakeDB() (*pg.DB, *fakeDriver, map[string]bool) {
 	applied := map[string]bool{}
 	fd := &fakeDriver{
 		exec: func(sql string, args []any) (drops.Result, error) {
@@ -38,7 +38,7 @@ func drizzleFakeDB() (*pg.DB, *fakeDriver, *map[string]bool) {
 			return &fakeRows{cols: []string{"hash"}}, nil
 		},
 	}
-	return pg.New(fd), fd, &applied
+	return pg.New(fd), fd, applied
 }
 
 const journalJSON = `{
@@ -116,7 +116,7 @@ func TestDrizzleUpAppliesEverythingThenIsIdempotent(t *testing.T) {
 	if err := m.Up(ctx); err != nil {
 		t.Fatalf("Up #1: %v", err)
 	}
-	if got := len(*applied); got != 3 {
+	if got := len(applied); got != 3 {
 		t.Fatalf("after first Up, applied = %d, want 3", got)
 	}
 

@@ -58,7 +58,10 @@ func TestReplicatedRoundRobinsQueriesAcrossReplicas(t *testing.T) {
 
 	// 10 reads across 2 replicas → 5 each.
 	for i := 0; i < 10; i++ {
-		_, _ = db.Query(context.Background(), "SELECT ...")
+		rows, _ := db.Query(context.Background(), "SELECT ...")
+		if rows != nil {
+			_ = rows.Close()
+		}
 	}
 	if r1.reads.Load() != 5 || r2.reads.Load() != 5 {
 		t.Errorf("expected 5+5 reads across replicas, got %d + %d",
@@ -73,7 +76,10 @@ func TestReplicatedFallsBackToPrimaryWithoutReplicas(t *testing.T) {
 	primary := &taggedDriver{name: "primary"}
 	repl := pg.NewReplicated(primary)
 	db := pg.New(repl)
-	_, _ = db.Query(context.Background(), "SELECT ...")
+	rows, _ := db.Query(context.Background(), "SELECT ...")
+	if rows != nil {
+		_ = rows.Close()
+	}
 	if primary.reads.Load() != 1 {
 		t.Errorf("primary should serve the read when no replicas, got %d", primary.reads.Load())
 	}
@@ -88,7 +94,10 @@ func TestReadYourWritesStickyAfterExec(t *testing.T) {
 	ctx := pg.WithReadYourWrites(context.Background(), 200*time.Millisecond)
 
 	// Pre-write read: no active window yet → replica.
-	_, _ = db.Query(ctx, "SELECT pre-write")
+	preRows, _ := db.Query(ctx, "SELECT pre-write")
+	if preRows != nil {
+		_ = preRows.Close()
+	}
 	if r1.reads.Load() != 1 {
 		t.Errorf("pre-write read should hit replica, got %d on primary, %d on replica",
 			primary.reads.Load(), r1.reads.Load())
@@ -99,7 +108,10 @@ func TestReadYourWritesStickyAfterExec(t *testing.T) {
 
 	// Subsequent reads within the window → primary.
 	for i := 0; i < 3; i++ {
-		_, _ = db.Query(ctx, "SELECT post-write")
+		rows, _ := db.Query(ctx, "SELECT post-write")
+		if rows != nil {
+			_ = rows.Close()
+		}
 	}
 	if primary.reads.Load() != 3 {
 		t.Errorf("post-write reads should hit primary, got %d", primary.reads.Load())
@@ -107,7 +119,10 @@ func TestReadYourWritesStickyAfterExec(t *testing.T) {
 
 	// After the window expires, reads fall back to replica.
 	time.Sleep(220 * time.Millisecond)
-	_, _ = db.Query(ctx, "SELECT after-window")
+	afterRows, _ := db.Query(ctx, "SELECT after-window")
+	if afterRows != nil {
+		_ = afterRows.Close()
+	}
 	// Expect at least one more replica read.
 	if r1.reads.Load() < 2 {
 		t.Errorf("post-window read should return to replica, got %d", r1.reads.Load())
@@ -123,7 +138,10 @@ func TestReadYourWritesDoesNotApplyWithoutCtx(t *testing.T) {
 	// No WithReadYourWrites: Exec then Query → write on primary,
 	// read on replica.
 	_, _ = db.Exec(context.Background(), "UPDATE ...")
-	_, _ = db.Query(context.Background(), "SELECT ...")
+	rows, _ := db.Query(context.Background(), "SELECT ...")
+	if rows != nil {
+		_ = rows.Close()
+	}
 	if r1.reads.Load() != 1 {
 		t.Errorf("untagged ctx should hit replica, got %d", r1.reads.Load())
 	}

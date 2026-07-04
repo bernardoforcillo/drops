@@ -166,7 +166,7 @@ type BackfillStatus struct {
 // Status loads the current persisted state. Returns a zero status
 // with LastID=0 when the job has never run.
 func (b *Backfill) Status(ctx context.Context) (BackfillStatus, error) {
-	sql := fmt.Sprintf(`SELECT "name", "lastID", "processed", "completedAt", "lastError", "updatedAt" FROM "%s" WHERE "name" = $1`, b.stateTable)
+	sql := fmt.Sprintf(`SELECT "name", "lastID", "processed", "completedAt", "lastError", "updatedAt" FROM %s WHERE "name" = $1`, quoteIdent(b.stateTable))
 	rows, err := b.db.Query(ctx, sql, b.name)
 	if err != nil {
 		return BackfillStatus{}, err
@@ -193,7 +193,7 @@ func (b *Backfill) Status(ctx context.Context) (BackfillStatus, error) {
 // re-executing a completed backfill from scratch.
 func (b *Backfill) Reset(ctx context.Context) error {
 	_, err := b.db.Exec(ctx,
-		fmt.Sprintf(`DELETE FROM "%s" WHERE "name" = $1`, b.stateTable), b.name)
+		fmt.Sprintf(`DELETE FROM %s WHERE "name" = $1`, quoteIdent(b.stateTable)), b.name)
 	return err
 }
 
@@ -263,13 +263,13 @@ func (b *Backfill) Run(ctx context.Context) error {
 // persistProgress upserts the current state row.
 func (b *Backfill) persistProgress(ctx context.Context, lastID, processed int64) error {
 	sql := fmt.Sprintf(`
-		INSERT INTO "%s" ("name", "lastID", "processed", "updatedAt")
+		INSERT INTO %s ("name", "lastID", "processed", "updatedAt")
 		VALUES ($1, $2, $3, now())
 		ON CONFLICT ("name") DO UPDATE
 		SET "lastID" = EXCLUDED."lastID",
 		    "processed" = EXCLUDED."processed",
 		    "lastError" = NULL,
-		    "updatedAt" = EXCLUDED."updatedAt"`, b.stateTable)
+		    "updatedAt" = EXCLUDED."updatedAt"`, quoteIdent(b.stateTable))
 	_, err := b.db.Exec(ctx, sql, b.name, lastID, processed)
 	return err
 }
@@ -278,13 +278,13 @@ func (b *Backfill) persistProgress(ctx context.Context, lastID, processed int64)
 // Run calls return immediately.
 func (b *Backfill) persistComplete(ctx context.Context, lastID, processed int64) error {
 	sql := fmt.Sprintf(`
-		INSERT INTO "%s" ("name", "lastID", "processed", "completedAt", "updatedAt")
+		INSERT INTO %s ("name", "lastID", "processed", "completedAt", "updatedAt")
 		VALUES ($1, $2, $3, now(), now())
 		ON CONFLICT ("name") DO UPDATE
 		SET "lastID" = EXCLUDED."lastID",
 		    "processed" = EXCLUDED."processed",
 		    "completedAt" = EXCLUDED."completedAt",
-		    "updatedAt" = EXCLUDED."updatedAt"`, b.stateTable)
+		    "updatedAt" = EXCLUDED."updatedAt"`, quoteIdent(b.stateTable))
 	_, err := b.db.Exec(ctx, sql, b.name, lastID, processed)
 	return err
 }
@@ -293,13 +293,13 @@ func (b *Backfill) persistComplete(ctx context.Context, lastID, processed int64)
 // terminal state — the operator decides whether to retry.
 func (b *Backfill) persistError(ctx context.Context, lastID, processed int64, fail error) error {
 	sql := fmt.Sprintf(`
-		INSERT INTO "%s" ("name", "lastID", "processed", "lastError", "updatedAt")
+		INSERT INTO %s ("name", "lastID", "processed", "lastError", "updatedAt")
 		VALUES ($1, $2, $3, $4, now())
 		ON CONFLICT ("name") DO UPDATE
 		SET "lastID" = EXCLUDED."lastID",
 		    "processed" = EXCLUDED."processed",
 		    "lastError" = EXCLUDED."lastError",
-		    "updatedAt" = EXCLUDED."updatedAt"`, b.stateTable)
+		    "updatedAt" = EXCLUDED."updatedAt"`, quoteIdent(b.stateTable))
 	_, err := b.db.Exec(ctx, sql, b.name, lastID, processed, fail.Error())
 	return err
 }

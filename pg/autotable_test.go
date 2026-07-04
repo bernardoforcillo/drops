@@ -107,8 +107,8 @@ func TestAutoTableUnsupportedTypePanics(t *testing.T) {
 
 func TestAutoTableVersionMarker(t *testing.T) {
 	type doc struct {
-		ID  int64 `drop:"id,primaryKey,autoIncrement"`
-		V   int32 `drop:"version,notNull,default=0,version"`
+		ID  int64  `drop:"id,primaryKey,autoIncrement"`
+		V   int32  `drop:"version,notNull,default=0,version"`
 		Tag string `drop:"tag"`
 	}
 	tbl := pg.AutoTable[doc]("docs")

@@ -213,7 +213,7 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 }
 
 // ToSQL renders the statement using the ClickHouse placeholder style.
-func (s *SelectBuilder) ToSQL() (string, []any) {
+func (s *SelectBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder(Placeholder)
 	s.WriteSQL(b)
 	return b.SQL()

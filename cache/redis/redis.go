@@ -346,7 +346,7 @@ func (c *Cache) cmd(ctx context.Context, cn *conn, args []any) (reply, error) {
 	dl := c.deadline(ctx)
 	if !dl.IsZero() {
 		_ = cn.nc.SetDeadline(dl)
-		defer cn.nc.SetDeadline(time.Time{})
+		defer func() { _ = cn.nc.SetDeadline(time.Time{}) }()
 	}
 	if err := writeCommand(cn.w, args...); err != nil {
 		return reply{}, err
@@ -491,10 +491,7 @@ func isRetryable(err error) bool {
 		return true
 	}
 	var netErr net.Error
-	if errors.As(err, &netErr) {
-		return true
-	}
-	return false
+	return errors.As(err, &netErr)
 }
 
 // --- Cache implementation ------------------------------------------

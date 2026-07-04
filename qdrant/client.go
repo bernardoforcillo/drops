@@ -131,7 +131,7 @@ func (c *Client) WithHookFn(hook drops.Hook) *Client {
 // readiness probe shape.
 func (c *Client) Ping(ctx context.Context) error {
 	// /healthz returns 200 with body "healthz check passed" on success.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/healthz", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/healthz", http.NoBody)
 	if err != nil {
 		return err
 	}

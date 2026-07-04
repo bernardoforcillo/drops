@@ -107,7 +107,7 @@ type relPostWithAuthor struct {
 	Author *relUser `dropRel:"author"`
 }
 
-func mkRelSchema() (*pg.Table, *pg.Table, *pg.Col[int64], *pg.Col[int64]) {
+func mkRelSchema() (users, posts *pg.Table) {
 	usersT := pg.NewTable("users")
 	userIDc := pg.Add(usersT, pg.BigSerial("id").PrimaryKey())
 	pg.Add(usersT, pg.Text("name").NotNull())
@@ -122,11 +122,11 @@ func mkRelSchema() (*pg.Table, *pg.Table, *pg.Col[int64], *pg.Col[int64]) {
 	pg.NewRelations(postsT).
 		BelongsTo("author", usersT, postUIDc, userIDc)
 
-	return usersT, postsT, userIDc, postUIDc
+	return usersT, postsT
 }
 
 func TestFindHasMany(t *testing.T) {
-	usersT, _, _, _ := mkRelSchema()
+	usersT, _ := mkRelSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -176,7 +176,7 @@ func TestFindHasMany(t *testing.T) {
 }
 
 func TestFindBelongsTo(t *testing.T) {
-	_, postsT, _, _ := mkRelSchema()
+	_, postsT := mkRelSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -306,7 +306,7 @@ func TestFindManyToMany(t *testing.T) {
 }
 
 func TestFindUnknownRelation(t *testing.T) {
-	usersT, _, _, _ := mkRelSchema()
+	usersT, _ := mkRelSchema()
 	db := pg.New(&fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{cols: []string{"id", "name"}}, nil
 	}})
@@ -346,7 +346,7 @@ type nestPostWithAuthor struct {
 	Author *nestUser `dropRel:"author"`
 }
 
-func mkNestSchema() (users, posts, comments *pg.Table) {
+func mkNestSchema() (users, posts *pg.Table) {
 	usersT := pg.NewTable("users")
 	uID := pg.Add(usersT, pg.BigSerial("id").PrimaryKey())
 	pg.Add(usersT, pg.Text("name").NotNull())
@@ -367,11 +367,11 @@ func mkNestSchema() (users, posts, comments *pg.Table) {
 		HasMany("comments", commentsT, pID, cPID).
 		BelongsTo("author", usersT, pUID, uID)
 
-	return usersT, postsT, commentsT
+	return usersT, postsT
 }
 
 func TestFindNestedHasManyHasMany(t *testing.T) {
-	usersT, _, _ := mkNestSchema()
+	usersT, _ := mkNestSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -436,7 +436,7 @@ func TestFindNestedHasManyHasMany(t *testing.T) {
 }
 
 func TestFindNestedBelongsToHasMany(t *testing.T) {
-	_, postsT, _ := mkNestSchema()
+	_, postsT := mkNestSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -489,7 +489,7 @@ func TestFindNestedBelongsToHasMany(t *testing.T) {
 }
 
 func TestFindNestedSharedPrefixMergedIntoOneQuery(t *testing.T) {
-	usersT, _, _ := mkNestSchema()
+	usersT, _ := mkNestSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -526,7 +526,7 @@ func TestFindNestedSharedPrefixMergedIntoOneQuery(t *testing.T) {
 }
 
 func TestFindNestedUnknownRelationFailsFast(t *testing.T) {
-	usersT, _, _ := mkNestSchema()
+	usersT, _ := mkNestSchema()
 	// Handler would error if any query ran; validation must short-circuit.
 	db := pg.New(&fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		return nil, fmt.Errorf("no query should run: %s", sql)
@@ -540,7 +540,7 @@ func TestFindNestedUnknownRelationFailsFast(t *testing.T) {
 }
 
 func TestFindInvalidRelationPath(t *testing.T) {
-	usersT, _, _ := mkNestSchema()
+	usersT, _ := mkNestSchema()
 	db := pg.New(&fakeDriver{})
 	var users []nestUser
 	err := db.Find(usersT).With("posts..comments").All(context.Background(), &users)
@@ -680,7 +680,7 @@ func TestFindWithRelOrderByEmitsClauseAndPreservesOrder(t *testing.T) {
 }
 
 func TestFindWithRelNestedFilterAndDepth(t *testing.T) {
-	usersT, postsT, _ := mkNestSchema()
+	usersT, postsT := mkNestSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -782,7 +782,7 @@ func TestFindManyToManyOrderByUsesTargetOrder(t *testing.T) {
 }
 
 func TestFindWithRelInvalidPathFailsFast(t *testing.T) {
-	usersT, _, _ := mkNestSchema()
+	usersT, _ := mkNestSchema()
 	db := pg.New(&fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		return nil, fmt.Errorf("no query should run: %s", sql)
 	}})

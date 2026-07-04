@@ -11,7 +11,7 @@ import (
 
 // jsonbSchema returns a table with a single jsonb column ready for
 // the path tests.
-func jsonbSchema() (*pg.Table, *pg.Col[int64], *pg.Col[any]) {
+func jsonbSchema() (table *pg.Table, idCol *pg.Col[int64], metaCol *pg.Col[any]) {
 	tbl := pg.NewTable("users")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	meta := pg.Add(tbl, pg.Custom[any]("meta", "jsonb"))

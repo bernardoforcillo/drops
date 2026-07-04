@@ -84,7 +84,7 @@ func TestSagaCompensatesInReverseOnFailure(t *testing.T) {
 			},
 			func(ctx context.Context, tx *pg.DB, st *pg.SagaState) error {
 				pid, _ := pg.SagaStateGet[int64](st, "paymentId")
-				called = append(called, "refund:" + strFromInt(pid))
+				called = append(called, "refund:"+strFromInt(pid))
 				return nil
 			}).
 		Step("ship",

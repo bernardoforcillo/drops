@@ -73,7 +73,7 @@ func readIntrospectTables(ctx context.Context, db *DB, schemas []string) ([]*Tab
 		FROM information_schema.tables
 		WHERE table_type = 'BASE TABLE' AND table_schema IN (%s)
 		ORDER BY table_schema, table_name`,
-		placeholderList(len(schemas), 1)), anySlice(schemas)...)
+		placeholderList(len(schemas))), anySlice(schemas)...)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +116,7 @@ func readIntrospectColumns(ctx context.Context, db *DB, schemas []string, tables
 		FROM information_schema.columns
 		WHERE table_schema IN (%s)
 		ORDER BY table_schema, table_name, ordinal_position`,
-		placeholderList(len(schemas), 1)), anySlice(schemas)...)
+		placeholderList(len(schemas))), anySlice(schemas)...)
 	if err != nil {
 		return err
 	}
@@ -229,7 +229,7 @@ func readIntrospectPrimaryKeys(ctx context.Context, db *DB, schemas []string, ta
 		WHERE tc.constraint_type = 'PRIMARY KEY'
 			AND tc.table_schema IN (%s)
 		ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position`,
-		placeholderList(len(schemas), 1)), anySlice(schemas)...)
+		placeholderList(len(schemas))), anySlice(schemas)...)
 	if err != nil {
 		return err
 	}
@@ -264,7 +264,7 @@ func readIntrospectUniques(ctx context.Context, db *DB, schemas []string, tables
 		WHERE tc.constraint_type = 'UNIQUE'
 			AND tc.table_schema IN (%s)
 		ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position`,
-		placeholderList(len(schemas), 1)), anySlice(schemas)...)
+		placeholderList(len(schemas))), anySlice(schemas)...)
 	if err != nil {
 		return err
 	}
@@ -329,7 +329,7 @@ func readIntrospectForeignKeys(ctx context.Context, db *DB, schemas []string, ta
 		WHERE tc.constraint_type = 'FOREIGN KEY'
 			AND tc.table_schema IN (%s)
 		ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position`,
-		placeholderList(len(schemas), 1)), anySlice(schemas)...)
+		placeholderList(len(schemas))), anySlice(schemas)...)
 	if err != nil {
 		return err
 	}
@@ -383,14 +383,14 @@ func readIntrospectForeignKeys(ctx context.Context, db *DB, schemas []string, ta
 	return nil
 }
 
-// placeholderList returns "$start, $start+1, ..., $start+count-1".
-func placeholderList(count, start int) string {
+// placeholderList returns "$1, $2, ..., $count".
+func placeholderList(count int) string {
 	var b strings.Builder
 	for i := 0; i < count; i++ {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		fmt.Fprintf(&b, "$%d", start+i)
+		fmt.Fprintf(&b, "$%d", 1+i)
 	}
 	return b.String()
 }

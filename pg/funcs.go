@@ -23,7 +23,7 @@ func AvgDistinct(e drops.Expression) drops.Expression { return distinctAgg("avg"
 // Filter wraps an aggregate with a FILTER (WHERE ...) clause:
 //
 //	pg.Filter(pg.Count(UserID), pg.Eq(UserStatus, "active"))
-func Filter(agg drops.Expression, pred drops.Expression) drops.Expression {
+func Filter(agg, pred drops.Expression) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.Append(agg)
 		b.WriteString(" FILTER (WHERE ")

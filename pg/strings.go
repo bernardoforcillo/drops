@@ -26,7 +26,7 @@ func CharLength(e any) drops.Expression { return funcCall("char_length", []any{e
 
 // Substring renders substring(<e> FROM <from> FOR <count>). count may be
 // nil to omit the FOR clause.
-func Substring(e any, from any, count any) drops.Expression {
+func Substring(e, from, count any) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("substring(")
 		writeOperand(b, e)

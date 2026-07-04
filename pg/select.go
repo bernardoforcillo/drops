@@ -132,9 +132,9 @@ func (s *SelectBuilder) Limit(n int64) *SelectBuilder { s.limit = &n; return s }
 // has already been set to something tighter. Used by Entity.Budget
 // to bound result sets without overriding the caller's narrower
 // LIMIT.
-func (s *SelectBuilder) applyLimitCap(cap int64) {
-	if s.limit == nil || *s.limit > cap {
-		v := cap
+func (s *SelectBuilder) applyLimitCap(capt int64) {
+	if s.limit == nil || *s.limit > capt {
+		v := capt
 		s.limit = &v
 	}
 }
@@ -264,7 +264,7 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 }
 
 // ToSQL renders the statement to a SQL string and arg list.
-func (s *SelectBuilder) ToSQL() (string, []any) {
+func (s *SelectBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder()
 	s.WriteSQL(b)
 	return b.SQL()

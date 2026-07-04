@@ -24,7 +24,7 @@ type relUserFixture struct {
 	Posts []relPostFixture `dropRel:"posts"`
 }
 
-func mkRelLimitedSchema() (*pg.Table, *pg.Table) {
+func mkRelLimitedSchema() (usersTbl, postsTbl *pg.Table) {
 	users := pg.NewTable("users")
 	uID := pg.Add(users, pg.BigSerial("id").PrimaryKey())
 	pg.Add(users, pg.Text("name").NotNull())

@@ -1,7 +1,6 @@
 package pg
 
 import (
-	"fmt"
 	"reflect"
 	"time"
 
@@ -209,7 +208,7 @@ func JSONContains(col ColRef, value any) drops.Expression {
 		// which is almost certainly not what the caller intended.
 		// Surface the mistake via an explicit message rather than
 		// silently emitting AND NULL.
-		return drops.Raw(fmt.Sprintf("/* drops/pg: JSONContains called with nil value */ FALSE"))
+		return drops.Raw("/* drops/pg: JSONContains called with nil value */ FALSE")
 	}
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteByte('(')

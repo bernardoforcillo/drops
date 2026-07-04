@@ -88,7 +88,7 @@ func (r N1Report) IsClean() bool { return len(r.Patterns) == 0 }
 // statement issued through pg.DB. Call the returned finisher with a
 // threshold to produce the report; typically wired up in a `defer`
 // so it runs once at the end of the request / job.
-func WithN1Detector(ctx context.Context) (context.Context, func(threshold int) N1Report) {
+func WithN1Detector(ctx context.Context) (derived context.Context, finish func(threshold int) N1Report) {
 	t := &n1Tracker{counts: map[string]int{}}
 	ctx2 := context.WithValue(ctx, n1TrackerKey, t)
 	return ctx2, func(threshold int) N1Report {

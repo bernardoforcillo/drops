@@ -18,7 +18,7 @@ type counterRow struct {
 
 // patchSchema declares the columns explicitly so the test owns
 // typed *Col[T] handles for Inc / SetIfGreater / etc.
-func patchSchema(t *testing.T) (*pg.Entity[counterRow], *pg.Col[int64], *pg.Col[int64], *pg.Col[int64], *pg.Col[string]) {
+func patchSchema(t *testing.T) (ent *pg.Entity[counterRow], likesCol, viewsCol, scoreCol *pg.Col[int64], nameCol *pg.Col[string]) {
 	t.Helper()
 	tbl := pg.NewTable("posts")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())

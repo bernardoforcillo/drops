@@ -11,14 +11,14 @@ import (
 
 // pageUsersSchema returns an entity bound to a table whose PK column
 // type matches entUser's ID field.
-func pageUsersSchema(t *testing.T) (*pg.Table, *pg.Entity[entUser], *pg.Column) {
+func pageUsersSchema(t *testing.T) (*pg.Table, *pg.Entity[entUser]) {
 	t.Helper()
 	tbl, ent := entUsersSchema()
-	return tbl, ent, tbl.Col("id")
+	return tbl, ent
 }
 
 func TestPageFirstPageReturnsCursor(t *testing.T) {
-	tbl, ent, _ := pageUsersSchema(t)
+	tbl, ent := pageUsersSchema(t)
 
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		// LIMIT 3 (page=2 + 1) returns 3 rows → HasMore true.
@@ -53,7 +53,7 @@ func TestPageFirstPageReturnsCursor(t *testing.T) {
 }
 
 func TestPageLastPageHasNoCursor(t *testing.T) {
-	tbl, ent, _ := pageUsersSchema(t)
+	tbl, ent := pageUsersSchema(t)
 
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		// LIMIT 3 returns 2 rows → HasMore false.
@@ -80,7 +80,7 @@ func TestPageLastPageHasNoCursor(t *testing.T) {
 }
 
 func TestPageAfterAppliesCursorGuard(t *testing.T) {
-	tbl, ent, _ := pageUsersSchema(t)
+	tbl, ent := pageUsersSchema(t)
 
 	calls := 0
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
@@ -126,7 +126,7 @@ func TestPageAfterAppliesCursorGuard(t *testing.T) {
 }
 
 func TestPageInvalidCursorErrors(t *testing.T) {
-	tbl, ent, _ := pageUsersSchema(t)
+	tbl, ent := pageUsersSchema(t)
 	db := pg.New(&fakeDriver{})
 	_, err := ent.Page(db).
 		OrderBy(pg.Asc(tbl.Col("id"))).
@@ -138,7 +138,7 @@ func TestPageInvalidCursorErrors(t *testing.T) {
 }
 
 func TestPageRequiresOrderBy(t *testing.T) {
-	_, ent, _ := pageUsersSchema(t)
+	_, ent := pageUsersSchema(t)
 	db := pg.New(&fakeDriver{})
 	_, err := ent.Page(db).All(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "OrderBy") {

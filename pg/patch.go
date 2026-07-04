@@ -145,7 +145,7 @@ type setValOp[T any] struct {
 	val T
 }
 
-func (o *setValOp[T]) column() *Column            { return o.col }
+func (o *setValOp[T]) column() *Column             { return o.col }
 func (o *setValOp[T]) writeValue(b *drops.Builder) { b.AddArg(o.val) }
 
 // SetIfGreater emits "col = GREATEST(col, $1)" — only raises the

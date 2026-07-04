@@ -254,7 +254,6 @@ func (t *Table) Policies() map[string]*Policy { return t.policies }
 // nothing is wired up.
 func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
 func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
-func (t *Table) hasDeleteHooks() bool { return len(t.deleteHooks) > 0 }
 
 // writeName writes only the (schema-qualified) table name, with no alias.
 // Used by DDL where AS clauses are not permitted.

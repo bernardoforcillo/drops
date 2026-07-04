@@ -116,10 +116,8 @@ func TestListenClosesWhenCtxCancelled(t *testing.T) {
 	cancel()
 	// The goroutine should drain and close ch.
 	select {
-	case _, open := <-ch:
-		if open {
-			// drain
-		}
+	case <-ch:
+		// drain any pending notification (or the close)
 	case <-time.After(200 * time.Millisecond):
 	}
 	// Reading again should not block forever.

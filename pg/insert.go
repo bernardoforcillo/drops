@@ -255,7 +255,7 @@ func writeConflict(b *drops.Builder, c *conflictClause) {
 }
 
 // ToSQL renders the statement.
-func (i *InsertBuilder) ToSQL() (string, []any) {
+func (i *InsertBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder()
 	i.WriteSQL(b)
 	return b.SQL()

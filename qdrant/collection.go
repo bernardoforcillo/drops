@@ -29,10 +29,10 @@ type VectorParams struct {
 // HNSWConfig is the HNSW-index tuning bag. Pointer fields let zero-
 // valued integers reach Qdrant as "not set" rather than 0.
 type HNSWConfig struct {
-	M                *int  `json:"m,omitempty"`
-	EFConstruct      *int  `json:"ef_construct,omitempty"`
-	FullScanThreshold *int `json:"full_scan_threshold,omitempty"`
-	OnDisk           *bool `json:"on_disk,omitempty"`
+	M                 *int  `json:"m,omitempty"`
+	EFConstruct       *int  `json:"ef_construct,omitempty"`
+	FullScanThreshold *int  `json:"full_scan_threshold,omitempty"`
+	OnDisk            *bool `json:"on_disk,omitempty"`
 }
 
 // CollectionConfig is the payload for CreateCollection.

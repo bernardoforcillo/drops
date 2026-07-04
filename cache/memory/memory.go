@@ -51,8 +51,8 @@ type Cache struct {
 }
 
 type entry struct {
-	value     []byte
-	expiresAt time.Time // zero = no expiry
+	value      []byte
+	expiresAt  time.Time // zero = no expiry
 	insertedAt time.Time
 }
 
@@ -354,7 +354,7 @@ func (c *Cache) evictIfNeeded() {
 	}
 }
 
-func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) {
+func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) { //nolint:gocritic // errp is read at defer time to observe the final error value
 	drops.CallHook(c.opts.Hook, ctx, drops.QueryEvent{
 		Kind:     kind,
 		Duration: c.opts.Clock().Sub(start),

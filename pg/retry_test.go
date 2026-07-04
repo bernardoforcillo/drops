@@ -11,11 +11,10 @@ import (
 	"github.com/bernardoforcillo/drops/pg"
 )
 
-// flakyDriver fails the first N transactions with err, then
-// succeeds. Used to verify the retry loop re-runs the callback.
+// flakyDriver counts begins/commits/rollbacks so tests can verify the
+// retry loop re-runs the callback.
 type flakyDriver struct {
 	failuresLeft atomic.Int32
-	err          error
 	begins       atomic.Int32
 	commits      atomic.Int32
 	rollbacks    atomic.Int32

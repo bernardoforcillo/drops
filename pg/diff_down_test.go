@@ -152,4 +152,3 @@ func TestDiffDownOnEmptyDiffEmitsNothing(t *testing.T) {
 		t.Errorf("identical snapshots should produce empty down: %v", got)
 	}
 }
-

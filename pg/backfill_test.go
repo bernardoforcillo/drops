@@ -17,10 +17,10 @@ import (
 // SELECT used by Status. The Fetch/Process callbacks are supplied
 // per-test via the API.
 type backfillDriver struct {
-	mu       sync.Mutex
-	rows     map[string]backfillRow // status table data
-	calls    []string               // sql prefixes for ordering assertions
-	execs    atomic.Int32
+	mu    sync.Mutex
+	rows  map[string]backfillRow // status table data
+	calls []string               // sql prefixes for ordering assertions
+	execs atomic.Int32
 }
 
 type backfillRow struct {

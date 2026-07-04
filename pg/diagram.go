@@ -64,7 +64,6 @@ func writeMermaidTable(b *strings.Builder, t *Table) {
 // duplicating the inverse direction by only rendering from the
 // owning side (HasMany / HasOne / ManyToMany / MorphMany).
 func writeMermaidRelations(b *strings.Builder, tables []*Table) {
-	type edge struct{ line string }
 	var lines []string
 	seen := map[string]bool{}
 	emit := func(s string) {

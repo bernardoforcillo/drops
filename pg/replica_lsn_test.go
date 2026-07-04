@@ -39,7 +39,7 @@ func TestParseLSNRejectsMalformed(t *testing.T) {
 // lsnDriver simulates a primary or replica returning canned LSN values
 // to pg_current_wal_lsn / pg_last_wal_replay_lsn queries.
 type lsnDriver struct {
-	name      string
+	name       string
 	currentLSN atomic.Value // string
 	replayLSN  atomic.Value // string
 	execs      atomic.Int32
@@ -89,9 +89,11 @@ func TestLSNTrackingRoutesToCaughtUpReplica(t *testing.T) {
 	caughtUp.reads.Store(0)
 	lagging.reads.Store(0)
 
-	if _, err := db.Query(ctx, "SELECT 1"); err != nil {
+	rows, err := db.Query(ctx, "SELECT 1")
+	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
+	_ = rows.Close()
 
 	// The lagging replica may be probed for its LSN, but the
 	// actual user query must land on the caught-up one.
@@ -115,7 +117,10 @@ func TestLSNTrackingFallsBackToPrimaryWhenNoReplicaCaughtUp(t *testing.T) {
 	// All replicas behind the write LSN (0x9000 > 0x2000). Reset
 	// primary reads so we can prove the follow-up read went there.
 	primary.reads.Store(0)
-	_, _ = db.Query(ctx, "SELECT 1")
+	rows, _ := db.Query(ctx, "SELECT 1")
+	if rows != nil {
+		_ = rows.Close()
+	}
 	if primary.reads.Load() != 1 {
 		t.Errorf("expected fallback to primary, got primary reads=%d", primary.reads.Load())
 	}
@@ -133,7 +138,10 @@ func TestLSNTrackingCachesReplayLSN(t *testing.T) {
 	r1.reads.Store(0)
 
 	for i := 0; i < 5; i++ {
-		_, _ = db.Query(ctx, "SELECT 1")
+		rows, _ := db.Query(ctx, "SELECT 1")
+		if rows != nil {
+			_ = rows.Close()
+		}
 	}
 	// Within TTL: one LSN probe + N user queries → r1.reads counts
 	// every Query that touched the driver. Cache should suppress the
@@ -157,7 +165,10 @@ func TestLSNTrackingDisabledKeepsTimeBasedStickiness(t *testing.T) {
 	primary.reads.Store(0)
 	r1.reads.Store(0)
 
-	_, _ = db.Query(ctx, "SELECT 1")
+	rows, _ := db.Query(ctx, "SELECT 1")
+	if rows != nil {
+		_ = rows.Close()
+	}
 	if primary.reads.Load() != 1 {
 		t.Errorf("without LSN tracking, read must pin to primary; got primary reads=%d", primary.reads.Load())
 	}
@@ -175,7 +186,10 @@ func TestLSNTrackingNoRYWWindowGoesToReplica(t *testing.T) {
 
 	primary.reads.Store(0)
 	r1.reads.Store(0)
-	_, _ = db.Query(context.Background(), "SELECT 1")
+	rows, _ := db.Query(context.Background(), "SELECT 1")
+	if rows != nil {
+		_ = rows.Close()
+	}
 	if r1.reads.Load() == 0 {
 		t.Error("without RYW window, read should still go to replica")
 	}

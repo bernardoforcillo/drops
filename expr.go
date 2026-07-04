@@ -51,8 +51,12 @@ func NewBuilder(opts ...BuilderOption) *Builder {
 // unsanitised user input).
 func (b *Builder) WriteString(s string) { b.sb.WriteString(s) }
 
-// WriteByte appends a single raw byte of SQL. The error returned is
-// always nil; the signature satisfies io.ByteWriter.
+// WriteByte appends a single raw byte of SQL. The returned error is
+// always nil (strings.Builder.WriteByte never fails); the signature
+// matches io.ByteWriter, which go vet's stdmethods check requires for a
+// method named WriteByte. Callers ignore the error — errcheck is
+// configured to skip this method, mirroring how it skips the identical
+// (*strings.Builder).WriteByte by default.
 func (b *Builder) WriteByte(c byte) error { return b.sb.WriteByte(c) }
 
 // WriteIdent appends a quoted identifier. Embedded double quotes are
@@ -112,13 +116,13 @@ func (b *Builder) AppendList(sep string, exprs []Expression) {
 }
 
 // SQL returns the accumulated SQL text and bound arguments.
-func (b *Builder) SQL() (string, []any) {
+func (b *Builder) SQL() (sql string, args []any) {
 	return b.sb.String(), b.args
 }
 
 // String renders an Expression to its SQL text and bound argument list.
 // Useful in tests and for logging.
-func String(e Expression) (string, []any) {
+func String(e Expression) (sql string, args []any) {
 	b := NewBuilder()
 	b.Append(e)
 	return b.SQL()

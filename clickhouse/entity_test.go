@@ -73,17 +73,17 @@ type entEvent struct {
 	Kind   string `drop:"kind"`
 }
 
-func entEventsSchema() (*clickhouse.Table, *clickhouse.Entity[entEvent]) {
+func entEventsSchema() *clickhouse.Entity[entEvent] {
 	tbl := clickhouse.NewTable("events").Engine(clickhouse.MergeTree())
 	id := clickhouse.Add(tbl, clickhouse.UUID("id"))
 	clickhouse.Add(tbl, clickhouse.UInt64("userId"))
 	clickhouse.Add(tbl, clickhouse.String("kind"))
 	tbl.OrderBy(id)
-	return tbl, clickhouse.NewEntity[entEvent](tbl)
+	return clickhouse.NewEntity[entEvent](tbl)
 }
 
 func TestClickhouseEntityCreate(t *testing.T) {
-	_, ent := entEventsSchema()
+	ent := entEventsSchema()
 	fd := &entFakeDriver{}
 	db := clickhouse.New(fd)
 	ev := entEvent{ID: "u1", UserID: 7, Kind: "click"}
@@ -102,7 +102,7 @@ func TestClickhouseEntityCreate(t *testing.T) {
 }
 
 func TestClickhouseEntityCreateMany(t *testing.T) {
-	_, ent := entEventsSchema()
+	ent := entEventsSchema()
 	fd := &entFakeDriver{}
 	db := clickhouse.New(fd)
 	evs := []entEvent{
@@ -118,7 +118,7 @@ func TestClickhouseEntityCreateMany(t *testing.T) {
 }
 
 func TestClickhouseEntityQueryAll(t *testing.T) {
-	_, ent := entEventsSchema()
+	ent := entEventsSchema()
 	fd := &entFakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &entFakeRows{
 			cols: []string{"id", "userId", "kind"},
@@ -139,7 +139,7 @@ func TestClickhouseEntityQueryAll(t *testing.T) {
 }
 
 func TestClickhouseEntityValidatorBlocksCreate(t *testing.T) {
-	_, ent := entEventsSchema()
+	ent := entEventsSchema()
 	errBad := errors.New("kind required")
 	ent.Validate(func(e *entEvent) error {
 		if e.Kind == "" {
@@ -159,7 +159,7 @@ func TestClickhouseEntityValidatorBlocksCreate(t *testing.T) {
 }
 
 func TestClickhouseEntityValidatorAbortsBatch(t *testing.T) {
-	_, ent := entEventsSchema()
+	ent := entEventsSchema()
 	errBad := errors.New("invalid")
 	ent.Validate(func(e *entEvent) error {
 		if e.Kind == "bad" {

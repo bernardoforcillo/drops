@@ -35,14 +35,14 @@ type EnumSnapshot struct {
 
 // SequenceSnapshot is one entry in Snapshot.Sequences.
 type SequenceSnapshot struct {
-	Name      string  `json:"name"`
-	Schema    string  `json:"schema"`
-	Start     *int64  `json:"startWith,omitempty"`
-	Increment *int64  `json:"incrementBy,omitempty"`
-	MinValue  *int64  `json:"minValue,omitempty"`
-	MaxValue  *int64  `json:"maxValue,omitempty"`
-	Cache     *int64  `json:"cacheSize,omitempty"`
-	Cycle     bool    `json:"cycle"`
+	Name      string `json:"name"`
+	Schema    string `json:"schema"`
+	Start     *int64 `json:"startWith,omitempty"`
+	Increment *int64 `json:"incrementBy,omitempty"`
+	MinValue  *int64 `json:"minValue,omitempty"`
+	MaxValue  *int64 `json:"maxValue,omitempty"`
+	Cache     *int64 `json:"cacheSize,omitempty"`
+	Cycle     bool   `json:"cycle"`
 }
 
 // ViewSnapshot is one entry in Snapshot.Views.
@@ -73,29 +73,29 @@ type SnapshotMeta struct {
 
 // TableSnapshot is one entry in Snapshot.Tables.
 type TableSnapshot struct {
-	Name                 string                              `json:"name"`
-	Schema               string                              `json:"schema"`
-	Columns              map[string]*ColumnSnapshot          `json:"columns"`
-	Indexes              map[string]*IndexSnapshot           `json:"indexes"`
-	ForeignKeys          map[string]*ForeignKeySnapshot      `json:"foreignKeys"`
-	CompositePrimaryKeys map[string]*CompositePKSnapshot     `json:"compositePrimaryKeys"`
-	UniqueConstraints    map[string]*UniqueSnapshot          `json:"uniqueConstraints"`
-	Policies             map[string]*PolicySnapshot          `json:"policies"`
-	CheckConstraints     map[string]*CheckSnapshot           `json:"checkConstraints"`
-	IsRLSEnabled         bool                                `json:"isRLSEnabled"`
+	Name                 string                          `json:"name"`
+	Schema               string                          `json:"schema"`
+	Columns              map[string]*ColumnSnapshot      `json:"columns"`
+	Indexes              map[string]*IndexSnapshot       `json:"indexes"`
+	ForeignKeys          map[string]*ForeignKeySnapshot  `json:"foreignKeys"`
+	CompositePrimaryKeys map[string]*CompositePKSnapshot `json:"compositePrimaryKeys"`
+	UniqueConstraints    map[string]*UniqueSnapshot      `json:"uniqueConstraints"`
+	Policies             map[string]*PolicySnapshot      `json:"policies"`
+	CheckConstraints     map[string]*CheckSnapshot       `json:"checkConstraints"`
+	IsRLSEnabled         bool                            `json:"isRLSEnabled"`
 }
 
 // IndexSnapshot is one entry in TableSnapshot.Indexes. JSON keys
 // follow drizzle-kit's v7 PostgreSQL schema.
 type IndexSnapshot struct {
-	Name             string   `json:"name"`
-	Columns          []string `json:"columns"`
-	IsUnique         bool     `json:"isUnique"`
-	Where            string   `json:"where"`
+	Name             string         `json:"name"`
+	Columns          []string       `json:"columns"`
+	IsUnique         bool           `json:"isUnique"`
+	Where            string         `json:"where"`
 	With             map[string]any `json:"with"`
-	Method           string   `json:"method"`
-	Concurrently     bool     `json:"concurrently"`
-	NullsNotDistinct bool     `json:"nullsNotDistinct"`
+	Method           string         `json:"method"`
+	Concurrently     bool           `json:"concurrently"`
+	NullsNotDistinct bool           `json:"nullsNotDistinct"`
 }
 
 // CompositePKSnapshot is one entry in TableSnapshot.CompositePrimaryKeys.

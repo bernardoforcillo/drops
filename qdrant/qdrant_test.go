@@ -342,7 +342,7 @@ func TestScrollAndRecommend(t *testing.T) {
 	defer m.close()
 	m.handle("POST /collections/v/points/scroll", func(w http.ResponseWriter, _ *http.Request) {
 		envelope(w, map[string]any{
-			"points": []map[string]any{{"id": "a"}, {"id": "b"}},
+			"points":           []map[string]any{{"id": "a"}, {"id": "b"}},
 			"next_page_offset": "c",
 		})
 	})

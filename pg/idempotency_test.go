@@ -17,10 +17,9 @@ import (
 // SELECTs, and applies UPDATEs in-memory so the test can verify the
 // completed flag flips correctly.
 type idemDriver struct {
-	mu        sync.Mutex
-	rows      map[string]*idemRow
-	queries   []string
-	completed atomic.Bool
+	mu      sync.Mutex
+	rows    map[string]*idemRow
+	queries []string
 }
 
 type idemRow struct {

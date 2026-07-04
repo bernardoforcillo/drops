@@ -280,7 +280,7 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 		if guardPred != nil {
 			sel.Where(guardPred)
 		}
-		err := e.scanOneFast(db, ctx, sel, &out)
+		err := e.scanOneFast(ctx, sel, &out)
 		return out, err
 	}
 	fb := db.Find(e.table).Where(Eq(e.pk, id))
@@ -313,7 +313,7 @@ func (e *Entity[T]) getCached(db *DB, ctx context.Context, id any) (T, error) {
 		}
 		var err error
 		if e.fastScan != nil {
-			err = e.scanOneFast(db, ctx, db.Select().From(e.table).Where(Eq(e.pk, id)), &t)
+			err = e.scanOneFast(ctx, db.Select().From(e.table).Where(Eq(e.pk, id)), &t)
 		} else {
 			err = db.Find(e.table).Where(Eq(e.pk, id)).One(ctx, &t)
 		}
@@ -331,7 +331,7 @@ func (e *Entity[T]) getCached(db *DB, ctx context.Context, id any) (T, error) {
 
 // scanOneFast runs sel and decodes the first row via fastScan.
 // Returns ErrNoRows when sel produces no rows.
-func (e *Entity[T]) scanOneFast(db *DB, ctx context.Context, sel *SelectBuilder, dest *T) error {
+func (e *Entity[T]) scanOneFast(ctx context.Context, sel *SelectBuilder, dest *T) error {
 	rows, err := sel.Rows(ctx)
 	if err != nil {
 		return err
@@ -418,6 +418,13 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		cu = cu.Set(&exprBinding{col: cf.col, expr: Excluded(cf.col)})
 	}
 	return cu.Done().Exec(ctx)
+}
+
+// EntityQuery is the typed counterpart of FindBuilder — same shape,
+// but its executors return ([]T, error) and (T, error) directly.
+type EntityQuery[T any] struct {
+	e  *Entity[T]
+	fb *FindBuilder
 }
 
 // Stream iterates the matching rows one at a time, invoking fn for
@@ -731,13 +738,6 @@ func (q *EntityQuery[T]) applyGuardOnFB(ctx context.Context) error {
 	return nil
 }
 
-// EntityQuery is the typed counterpart of FindBuilder — same shape,
-// but its executors return ([]T, error) and (T, error) directly.
-type EntityQuery[T any] struct {
-	e  *Entity[T]
-	fb *FindBuilder
-}
-
 // Where appends predicates joined by AND.
 func (q *EntityQuery[T]) Where(preds ...drops.Expression) *EntityQuery[T] {
 	q.fb.Where(preds...)
@@ -829,7 +829,7 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	}
 	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
 		var out T
-		err := q.e.scanOneFast(q.fb.db, ctx, q.fb.Select(), &out)
+		err := q.e.scanOneFast(ctx, q.fb.Select(), &out)
 		return out, err
 	}
 	var out T
@@ -890,7 +890,7 @@ func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
 		}
 		var rerr error
 		if q.e.fastScan != nil {
-			rerr = q.e.scanOneFast(q.fb.db, ctx, q.fb.Select(), &t)
+			rerr = q.e.scanOneFast(ctx, q.fb.Select(), &t)
 		} else {
 			rerr = q.fb.One(ctx, &t)
 		}

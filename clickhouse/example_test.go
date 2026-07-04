@@ -18,6 +18,10 @@ var (
 	exEventDur = clickhouse.Add(exEvents, clickhouse.Float64("duration_ms"))
 )
 
+// exEventID rounds out the fixture schema but isn't used by every
+// example; keep it declared without tripping unused.
+var _ = exEventID
+
 func init() {
 	exEvents.
 		Engine(clickhouse.MergeTree()).

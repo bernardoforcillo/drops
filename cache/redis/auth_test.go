@@ -102,9 +102,9 @@ func TestCredentialsProviderTakesPrecedenceOverStaticFields(t *testing.T) {
 	fr := newFakeRedis(t)
 	fr.authPass = "real-token"
 	c := redis.New(redis.Options{
-		Addr:     fr.addr(),
-		Username: "wrong-user",
-		Password: "wrong-password", // these would fail
+		Addr:        fr.addr(),
+		Username:    "wrong-user",
+		Password:    "wrong-password", // these would fail
 		Credentials: redis.StaticCredentials("right-user", "real-token"),
 	})
 	defer c.Close()

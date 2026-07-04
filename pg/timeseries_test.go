@@ -14,11 +14,11 @@ import (
 // tsDriver records every Exec and returns canned discovery rows
 // for the pg_inherits query DropExpired issues.
 type tsDriver struct {
-	mu          sync.Mutex
-	queries     []string
-	args        [][]any
-	listPartFn  func() []string // returns child relnames for discovery
-	dropped     []string
+	mu         sync.Mutex
+	queries    []string
+	args       [][]any
+	listPartFn func() []string // returns child relnames for discovery
+	dropped    []string
 }
 
 func (d *tsDriver) Exec(_ context.Context, sql string, args ...any) (drops.Result, error) {

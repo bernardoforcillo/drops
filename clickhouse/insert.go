@@ -160,7 +160,7 @@ func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]drops.Expression) {
 }
 
 // ToSQL renders the statement.
-func (i *InsertBuilder) ToSQL() (string, []any) {
+func (i *InsertBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder(Placeholder)
 	i.WriteSQL(b)
 	return b.SQL()

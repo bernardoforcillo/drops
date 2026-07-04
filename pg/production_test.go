@@ -78,9 +78,11 @@ func TestHookFiresOnExecQueryBeginCommitRollback(t *testing.T) {
 	}
 
 	// Plain raw Query.
-	if _, err := db.Query(ctx, "SELECT 1"); err != nil {
+	rows, err := db.Query(ctx, "SELECT 1")
+	if err != nil {
 		t.Fatal(err)
 	}
+	_ = rows.Close()
 
 	// Transaction lifecycle.
 	if err := db.InTx(ctx, func(tx *pg.DB) error {

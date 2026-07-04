@@ -167,7 +167,7 @@ func diffEnumsCreate(prev, cur *Snapshot, safe bool) []string {
 		add := newEnumValues(prevE.Values, curE.Values)
 		for _, v := range add {
 			out = append(out, fmt.Sprintf(
-				`ALTER TYPE "%s" ADD VALUE IF NOT EXISTS '%s';`, curE.Name, escapeLit(v)))
+				`ALTER TYPE %s ADD VALUE IF NOT EXISTS '%s';`, quoteIdent(curE.Name), escapeLit(v)))
 		}
 	}
 	return out
@@ -224,9 +224,9 @@ func diffRLS(prev, cur *TableSnapshot) []string {
 		return nil
 	}
 	if cur.IsRLSEnabled {
-		return []string{fmt.Sprintf(`ALTER TABLE "%s" ENABLE ROW LEVEL SECURITY;`, cur.Name)}
+		return []string{fmt.Sprintf(`ALTER TABLE %s ENABLE ROW LEVEL SECURITY;`, quoteIdent(cur.Name))}
 	}
-	return []string{fmt.Sprintf(`ALTER TABLE "%s" DISABLE ROW LEVEL SECURITY;`, cur.Name)}
+	return []string{fmt.Sprintf(`ALTER TABLE %s DISABLE ROW LEVEL SECURITY;`, quoteIdent(cur.Name))}
 }
 
 func diffPolicies(prev, cur *TableSnapshot, safe bool) []string {
@@ -278,9 +278,9 @@ func createEnumSQL(e *EnumSnapshot, safe bool) string {
 
 func dropEnumSQL(name string, safe bool) string {
 	if safe {
-		return fmt.Sprintf(`DROP TYPE IF EXISTS "%s";`, name)
+		return fmt.Sprintf(`DROP TYPE IF EXISTS %s;`, quoteIdent(name))
 	}
-	return fmt.Sprintf(`DROP TYPE "%s";`, name)
+	return fmt.Sprintf(`DROP TYPE %s;`, quoteIdent(name))
 }
 
 // newEnumValues returns the labels present in cur but not prev,
@@ -333,9 +333,9 @@ func createSequenceSQL(s *SequenceSnapshot, safe bool) string {
 
 func dropSequenceSQL(name string, safe bool) string {
 	if safe {
-		return fmt.Sprintf(`DROP SEQUENCE IF EXISTS "%s";`, name)
+		return fmt.Sprintf(`DROP SEQUENCE IF EXISTS %s;`, quoteIdent(name))
 	}
-	return fmt.Sprintf(`DROP SEQUENCE "%s";`, name)
+	return fmt.Sprintf(`DROP SEQUENCE %s;`, quoteIdent(name))
 }
 
 func createViewSQL(v *ViewSnapshot, replace bool) string {
@@ -357,9 +357,9 @@ func dropViewSQL(v *ViewSnapshot, safe bool) string {
 		kind = "MATERIALIZED VIEW"
 	}
 	if safe {
-		return fmt.Sprintf(`DROP %s IF EXISTS "%s";`, kind, v.Name)
+		return fmt.Sprintf(`DROP %s IF EXISTS %s;`, kind, quoteIdent(v.Name))
 	}
-	return fmt.Sprintf(`DROP %s "%s";`, kind, v.Name)
+	return fmt.Sprintf(`DROP %s %s;`, kind, quoteIdent(v.Name))
 }
 
 func createPolicySQL(table string, p *PolicySnapshot) string {
@@ -389,9 +389,9 @@ func createPolicySQL(table string, p *PolicySnapshot) string {
 
 func dropPolicySQL(table, name string, safe bool) string {
 	if safe {
-		return fmt.Sprintf(`DROP POLICY IF EXISTS "%s" ON "%s";`, name, table)
+		return fmt.Sprintf(`DROP POLICY IF EXISTS %s ON %s;`, quoteIdent(name), quoteIdent(table))
 	}
-	return fmt.Sprintf(`DROP POLICY "%s" ON "%s";`, name, table)
+	return fmt.Sprintf(`DROP POLICY %s ON %s;`, quoteIdent(name), quoteIdent(table))
 }
 
 func policyEqual(a, b *PolicySnapshot) bool {
@@ -445,9 +445,9 @@ func createTableSQL(t *TableSnapshot, safe bool) string {
 
 func dropTableSQL(t *TableSnapshot, safe bool) string {
 	if safe {
-		return fmt.Sprintf(`DROP TABLE IF EXISTS "%s" CASCADE;`, t.Name)
+		return fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE;`, quoteIdent(t.Name))
 	}
-	return fmt.Sprintf(`DROP TABLE "%s" CASCADE;`, t.Name)
+	return fmt.Sprintf(`DROP TABLE %s CASCADE;`, quoteIdent(t.Name))
 }
 
 func columnDefSQL(c *ColumnSnapshot) string {
@@ -474,9 +474,9 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 	for _, k := range sortedKeys(prev.Columns) {
 		if _, ok := cur.Columns[k]; !ok {
 			if safe {
-				out = append(out, fmt.Sprintf(`ALTER TABLE "%s" DROP COLUMN IF EXISTS "%s";`, cur.Name, k))
+				out = append(out, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN IF EXISTS %s;`, quoteIdent(cur.Name), quoteIdent(k)))
 			} else {
-				out = append(out, fmt.Sprintf(`ALTER TABLE "%s" DROP COLUMN "%s";`, cur.Name, k))
+				out = append(out, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s;`, quoteIdent(cur.Name), quoteIdent(k)))
 			}
 		}
 	}
@@ -485,9 +485,9 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 			continue
 		}
 		if safe {
-			out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ADD COLUMN IF NOT EXISTS %s;`, cur.Name, columnDefSQL(cur.Columns[k])))
+			out = append(out, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s;`, quoteIdent(cur.Name), columnDefSQL(cur.Columns[k])))
 		} else {
-			out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ADD COLUMN %s;`, cur.Name, columnDefSQL(cur.Columns[k])))
+			out = append(out, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s;`, quoteIdent(cur.Name), columnDefSQL(cur.Columns[k])))
 		}
 	}
 	for _, k := range sortedKeys(cur.Columns) {
@@ -497,22 +497,22 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 		}
 		curC := cur.Columns[k]
 		if prevC.Type != curC.Type {
-			out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ALTER COLUMN "%s" SET DATA TYPE %s;`,
-				cur.Name, k, curC.Type))
+			out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s SET DATA TYPE %s;`,
+				quoteIdent(cur.Name), quoteIdent(k), curC.Type))
 		}
 		if prevC.NotNull != curC.NotNull {
 			if curC.NotNull {
-				out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ALTER COLUMN "%s" SET NOT NULL;`, cur.Name, k))
+				out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;`, quoteIdent(cur.Name), quoteIdent(k)))
 			} else {
-				out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ALTER COLUMN "%s" DROP NOT NULL;`, cur.Name, k))
+				out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;`, quoteIdent(cur.Name), quoteIdent(k)))
 			}
 		}
 		if !sameStringPtr(prevC.Default, curC.Default) {
 			if curC.Default == nil {
-				out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ALTER COLUMN "%s" DROP DEFAULT;`, cur.Name, k))
+				out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;`, quoteIdent(cur.Name), quoteIdent(k)))
 			} else {
-				out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ALTER COLUMN "%s" SET DEFAULT %s;`,
-					cur.Name, k, *curC.Default))
+				out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;`,
+					quoteIdent(cur.Name), quoteIdent(k), *curC.Default))
 			}
 		}
 	}
@@ -532,7 +532,7 @@ func diffUniques(prev, cur *TableSnapshot, safe bool) []string {
 		}
 		u := cur.UniqueConstraints[k]
 		cols := strings.Join(quoteIdents(u.Columns), ", ")
-		out = append(out, fmt.Sprintf(`ALTER TABLE "%s" ADD CONSTRAINT "%s" UNIQUE(%s);`, cur.Name, u.Name, cols))
+		out = append(out, fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s UNIQUE(%s);`, quoteIdent(cur.Name), quoteIdent(u.Name), cols))
 	}
 	return out
 }
@@ -556,16 +556,16 @@ func diffForeignKeys(prev, cur *TableSnapshot, safe bool) []string {
 // dropConstraintSQL emits DROP CONSTRAINT [IF EXISTS] "name".
 func dropConstraintSQL(table, name string, safe bool) string {
 	if safe {
-		return fmt.Sprintf(`ALTER TABLE "%s" DROP CONSTRAINT IF EXISTS "%s";`, table, name)
+		return fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s;`, quoteIdent(table), quoteIdent(name))
 	}
-	return fmt.Sprintf(`ALTER TABLE "%s" DROP CONSTRAINT "%s";`, table, name)
+	return fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT %s;`, quoteIdent(table), quoteIdent(name))
 }
 
 func fkAddSQL(tableFrom string, fk *ForeignKeySnapshot) string {
 	cols := strings.Join(quoteIdents(fk.ColumnsFrom), ", ")
 	targetCols := strings.Join(quoteIdents(fk.ColumnsTo), ", ")
-	return fmt.Sprintf(`ALTER TABLE "%s" ADD CONSTRAINT "%s" FOREIGN KEY (%s) REFERENCES "%s"(%s) ON DELETE %s ON UPDATE %s;`,
-		tableFrom, fk.Name, cols, fk.TableTo, targetCols, fk.OnDelete, fk.OnUpdate)
+	return fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE %s ON UPDATE %s;`,
+		quoteIdent(tableFrom), quoteIdent(fk.Name), cols, quoteIdent(fk.TableTo), targetCols, fk.OnDelete, fk.OnUpdate)
 }
 
 func quoteIdents(names []string) []string {
@@ -625,8 +625,8 @@ func diffCompositePKs(prev, cur *TableSnapshot, safe bool) []string {
 		pk := cur.CompositePrimaryKeys[k]
 		cols := strings.Join(quoteIdents(pk.Columns), ", ")
 		out = append(out, fmt.Sprintf(
-			`ALTER TABLE "%s" ADD CONSTRAINT "%s" PRIMARY KEY (%s);`,
-			cur.Name, pk.Name, cols))
+			`ALTER TABLE %s ADD CONSTRAINT %s PRIMARY KEY (%s);`,
+			quoteIdent(cur.Name), quoteIdent(pk.Name), cols))
 	}
 	return out
 }
@@ -646,8 +646,8 @@ func diffChecks(prev, cur *TableSnapshot, safe bool) []string {
 		}
 		c := cur.CheckConstraints[k]
 		out = append(out, fmt.Sprintf(
-			`ALTER TABLE "%s" ADD CONSTRAINT "%s" CHECK (%s);`,
-			cur.Name, c.Name, c.Value))
+			`ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);`,
+			quoteIdent(cur.Name), quoteIdent(c.Name), c.Value))
 	}
 	return out
 }
@@ -683,9 +683,9 @@ func createIndexSQL(table string, idx *IndexSnapshot, safe bool) string {
 // dropIndexSQL renders DROP INDEX [IF EXISTS] "name".
 func dropIndexSQL(name string, safe bool) string {
 	if safe {
-		return fmt.Sprintf(`DROP INDEX IF EXISTS "%s";`, name)
+		return fmt.Sprintf(`DROP INDEX IF EXISTS %s;`, quoteIdent(name))
 	}
-	return fmt.Sprintf(`DROP INDEX "%s";`, name)
+	return fmt.Sprintf(`DROP INDEX %s;`, quoteIdent(name))
 }
 
 // indexEqual reports whether two index snapshots describe the

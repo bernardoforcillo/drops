@@ -102,7 +102,7 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 }
 
 // ToSQL renders the statement.
-func (d *DeleteBuilder) ToSQL() (string, []any) {
+func (d *DeleteBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder()
 	d.WriteSQL(b)
 	return b.SQL()

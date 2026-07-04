@@ -9,6 +9,20 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Migration data hooks** (`drops/pg`) — both migrators now expose
+  `BeforeEach` / `AfterEach` hooks that run inside each migration's
+  transaction, the seam for data migrations that must run between
+  schema migrations (backfilling a new column, copying rows into a
+  split-out table, rewriting a value before an old column is dropped).
+  On the native `Migrator`, `MigrationHook` receives the tx-scoped
+  `*DB`, the `Migration`, and a `MigrationDirection` (`DirectionUp` /
+  `DirectionDown`) so a data step can be scoped to a specific version
+  and direction; hooks fire around both `Up` and `Down`. On
+  `DrizzleMigrator` — where migration files are pure SQL and there is
+  otherwise no place for Go logic — `DrizzleHook` receives the
+  tx-scoped `*DB` and the `DrizzleEntry`, letting a backfill run
+  atomically with the file's statements. A hook that returns an error
+  aborts the migration and the whole transaction rolls back.
 - **Nested (deep) relation eager-loading** (`drops/pg`) — `Find().With`
   now accepts dot paths such as `With("posts.comments")` to load
   relations of relations to arbitrary depth. Each relation edge still
@@ -193,6 +207,15 @@ once a 1.0 is cut.
 - MIT license (`license.md`).
 
 ### Changed
+- **Migration diff generator never inlines constraints into `CREATE
+  TABLE`** (`drops/pg`) — `Diff` now emits every composite primary
+  key, UNIQUE, FOREIGN KEY and CHECK constraint as its own raw SQL
+  `ALTER TABLE … ADD CONSTRAINT` statement, and enums as a separate
+  `CREATE TYPE`. Previously UNIQUE constraints were rendered inline
+  in the `CREATE TABLE` body; new tables now produce a bare column-only
+  `CREATE TABLE` followed by the constraint statements (matching how
+  composite PKs, FKs and CHECKs were already handled). This keeps each
+  constraint independently diffable and re-orderable across migrations.
 - `InTx` (both the root `drops.InTx` helper and `pg.DB.InTx`) now uses a
   detached context with a 5-second timeout for the deferred `Rollback`,
   so a cancelled or expired caller-ctx no longer prevents the cleanup
@@ -208,6 +231,18 @@ once a 1.0 is cut.
 - Empty `In(col)` / `NotIn(col)` no longer emits the invalid
   `(col IN ())`. `In` returns `(false)`, `NotIn` returns `(true)` —
   matching set-theoretic semantics.
+
+### Fixed
+- **`CREATE INDEX` rendered table-qualified column names, producing
+  invalid DDL** (`drops/pg`) — `NewIndex(...)` built from column handles
+  emitted its column list as `("table"."column")`, which PostgreSQL
+  rejects inside an index column list with `syntax error at or near
+  ")"` (SQLSTATE 42601). Column references in the index column list now
+  render as bare identifiers (`("column")`); functional/expression
+  indexes are unaffected, and `WHERE` predicates (ordinary expressions)
+  stay qualified. This also corrects pgvector `USING hnsw/ivfflat`
+  index DDL. The bug was latent because the builder's tests only
+  string-compared the rendered SQL and never executed it.
 
 ### Removed
 - `drops.MustString` and `drops.Errorf` re-exports (unused).

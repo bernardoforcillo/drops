@@ -79,7 +79,10 @@ func TestHNSWIndexWithOpClass(t *testing.T) {
 		OpClass(pg.VectorCosineOps).
 		With("m = 16, ef_construction = 64")
 	got, _ := drops.String(pg.CreateIndex(idx))
-	want := `CREATE INDEX "items_embedding_hnsw" ON "items" USING hnsw ("items"."embedding" vector_cosine_ops) WITH (m = 16, ef_construction = 64)`
+	// The index column is a bare identifier ("embedding"), not the
+	// table-qualified form — PostgreSQL rejects a qualified name in a
+	// CREATE INDEX column list (SQLSTATE 42601).
+	want := `CREATE INDEX "items_embedding_hnsw" ON "items" USING hnsw ("embedding" vector_cosine_ops) WITH (m = 16, ef_construction = 64)`
 	if got != want {
 		t.Errorf("hnsw\n  got:  %s\n  want: %s", got, want)
 	}
@@ -91,7 +94,7 @@ func TestIVFFlatIndex(t *testing.T) {
 		OpClass(pg.VectorL2Ops).
 		With("lists = 100")
 	got, _ := drops.String(pg.CreateIndex(idx))
-	if !strings.Contains(got, `USING ivfflat ("items"."embedding" vector_l2_ops)`) ||
+	if !strings.Contains(got, `USING ivfflat ("embedding" vector_l2_ops)`) ||
 		!strings.Contains(got, `WITH (lists = 100)`) {
 		t.Errorf("ivfflat: %s", got)
 	}

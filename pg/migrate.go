@@ -33,11 +33,59 @@ type Status struct {
 	AppliedAt time.Time // zero if not applied
 }
 
+// MigrationDirection tells a MigrationHook whether the migrator is
+// applying a migration (DirectionUp) or rolling one back
+// (DirectionDown).
+type MigrationDirection int
+
+const (
+	// DirectionUp is passed to hooks firing during Up.
+	DirectionUp MigrationDirection = iota
+	// DirectionDown is passed to hooks firing during Down.
+	DirectionDown
+)
+
+// String renders the direction as "up" or "down".
+func (d MigrationDirection) String() string {
+	if d == DirectionDown {
+		return "down"
+	}
+	return "up"
+}
+
+// MigrationHook runs around a migration's Up/Down body, inside the
+// same transaction, so any data it reads or writes commits atomically
+// with the schema change (or rolls back with it on error). This is the
+// seam for data migrations that must run between schema migrations —
+// backfilling a new column, copying rows into a split-out table,
+// rewriting a value before an old column is dropped.
+//
+// Register hooks with Migrator.BeforeEach / Migrator.AfterEach. A
+// "before" hook runs just before the migration body; an "after" hook
+// runs just after it — in both directions. Use mig.Version / mig.Name
+// to scope a data migration to a specific step, and dir to run it only
+// on the way up (or only on the way down):
+//
+//	m.AfterEach(func(ctx context.Context, tx *pg.DB, mig pg.Migration, dir pg.MigrationDirection) error {
+//		if dir == pg.DirectionUp && mig.Version == "0003" {
+//			_, err := tx.Exec(ctx, `UPDATE users SET full_name = first_name || ' ' || last_name`)
+//			return err
+//		}
+//		return nil
+//	})
+//
+// A hook that returns an error aborts the migration: the whole
+// transaction (schema change plus every hook) rolls back and Up/Down
+// return the error.
+type MigrationHook func(ctx context.Context, tx *DB, mig Migration, dir MigrationDirection) error
+
 // Migrator runs database migrations and tracks their history in a table.
 type Migrator struct {
 	db         *DB
 	table      string
 	migrations []Migration
+	before     []MigrationHook
+	after      []MigrationHook
 }
 
 // NewMigrator returns a migrator bound to db. Add migrations with Add /
@@ -54,6 +102,38 @@ func (m *Migrator) WithTable(name string) *Migrator { m.table = name; return m }
 func (m *Migrator) Add(mig Migration) *Migrator {
 	m.migrations = append(m.migrations, mig)
 	return m
+}
+
+// BeforeEach registers a hook that runs immediately before every
+// migration body, within the migration's transaction. Hooks fire in
+// registration order; the first one to error aborts the migration.
+// See MigrationHook.
+func (m *Migrator) BeforeEach(h MigrationHook) *Migrator {
+	m.before = append(m.before, h)
+	return m
+}
+
+// AfterEach registers a hook that runs immediately after every
+// migration body, within the migration's transaction. Hooks fire in
+// registration order; the first one to error aborts the migration.
+// This is the usual home for a data migration that depends on the
+// schema change having just landed. See MigrationHook.
+func (m *Migrator) AfterEach(h MigrationHook) *Migrator {
+	m.after = append(m.after, h)
+	return m
+}
+
+// runHooks invokes each hook in order, stopping at the first error.
+func (m *Migrator) runHooks(ctx context.Context, tx *DB, hooks []MigrationHook, mig Migration, dir MigrationDirection) error {
+	for _, h := range hooks {
+		if h == nil {
+			continue
+		}
+		if err := h(ctx, tx, mig, dir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AddSQL registers a migration whose Up and Down are raw SQL. downSQL may
@@ -224,8 +304,14 @@ func (m *Migrator) Up(ctx context.Context) error {
 			return fmt.Errorf("drops/pg: migration %s has no Up", mig.Version)
 		}
 		if err := m.db.InTx(ctx, func(tx *DB) error {
+			if err := m.runHooks(ctx, tx, m.before, mig, DirectionUp); err != nil {
+				return fmt.Errorf("drops/pg: before-hook for %s_%s: %w", mig.Version, mig.Name, err)
+			}
 			if err := mig.Up(ctx, tx); err != nil {
 				return fmt.Errorf("drops/pg: applying %s_%s: %w", mig.Version, mig.Name, err)
+			}
+			if err := m.runHooks(ctx, tx, m.after, mig, DirectionUp); err != nil {
+				return fmt.Errorf("drops/pg: after-hook for %s_%s: %w", mig.Version, mig.Name, err)
 			}
 			_, err := tx.Exec(ctx,
 				fmt.Sprintf("INSERT INTO %s (version, name) VALUES ($1, $2)", quoteIdent(m.table)),
@@ -268,8 +354,14 @@ func (m *Migrator) Down(ctx context.Context) error {
 		return fmt.Errorf("drops/pg: migration %s_%s is irreversible (no Down)", target.Version, target.Name)
 	}
 	return m.db.InTx(ctx, func(tx *DB) error {
+		if err := m.runHooks(ctx, tx, m.before, *target, DirectionDown); err != nil {
+			return fmt.Errorf("drops/pg: before-hook for %s_%s: %w", target.Version, target.Name, err)
+		}
 		if err := target.Down(ctx, tx); err != nil {
 			return fmt.Errorf("drops/pg: rolling back %s_%s: %w", target.Version, target.Name, err)
+		}
+		if err := m.runHooks(ctx, tx, m.after, *target, DirectionDown); err != nil {
+			return fmt.Errorf("drops/pg: after-hook for %s_%s: %w", target.Version, target.Name, err)
 		}
 		_, err := tx.Exec(ctx,
 			fmt.Sprintf("DELETE FROM %s WHERE version = $1", quoteIdent(m.table)),

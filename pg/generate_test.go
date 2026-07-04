@@ -115,6 +115,35 @@ func TestDiffFromEmptyEmitsCreateTable(t *testing.T) {
 	}
 }
 
+// TestDiffFromEmptyEmitsUniqueAsSeparateAlter locks in the contract
+// that constraints are never inlined into CREATE TABLE: a brand-new
+// table carrying a UNIQUE column must render a bare CREATE TABLE plus
+// a separate ALTER TABLE ... ADD CONSTRAINT ... UNIQUE statement.
+func TestDiffFromEmptyEmitsUniqueAsSeparateAlter(t *testing.T) {
+	users := pg.NewTable("users")
+	pg.Add(users, pg.BigSerial("id").PrimaryKey())
+	pg.Add(users, pg.Text("email").NotNull().Unique())
+
+	cur := pg.BuildSnapshot(pg.NewSchema(users))
+	stmts := pg.Diff(pg.EmptySnapshot(), cur)
+
+	if len(stmts) != 2 {
+		t.Fatalf("got %d statements, want 2 (CREATE TABLE + ALTER TABLE):\n%s",
+			len(stmts), strings.Join(stmts, "\n"))
+	}
+	create := stmts[0]
+	if !strings.HasPrefix(create, `CREATE TABLE "users"`) {
+		t.Errorf("first statement should be CREATE TABLE, got: %s", create)
+	}
+	if strings.Contains(create, "UNIQUE") || strings.Contains(create, "CONSTRAINT") {
+		t.Errorf("CREATE TABLE must not inline the UNIQUE constraint:\n%s", create)
+	}
+	want := `ALTER TABLE "users" ADD CONSTRAINT "usersEmailUnique" UNIQUE("email");`
+	if stmts[1] != want {
+		t.Errorf("second statement mismatch:\n  got: %s\n want: %s", stmts[1], want)
+	}
+}
+
 func TestDiffAddColumn(t *testing.T) {
 	beforeSchema := pg.NewTable("users")
 	pg.Add(beforeSchema, pg.BigSerial("id").PrimaryKey())

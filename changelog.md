@@ -232,5 +232,17 @@ once a 1.0 is cut.
   `(col IN ())`. `In` returns `(false)`, `NotIn` returns `(true)` —
   matching set-theoretic semantics.
 
+### Fixed
+- **`CREATE INDEX` rendered table-qualified column names, producing
+  invalid DDL** (`drops/pg`) — `NewIndex(...)` built from column handles
+  emitted its column list as `("table"."column")`, which PostgreSQL
+  rejects inside an index column list with `syntax error at or near
+  ")"` (SQLSTATE 42601). Column references in the index column list now
+  render as bare identifiers (`("column")`); functional/expression
+  indexes are unaffected, and `WHERE` predicates (ordinary expressions)
+  stay qualified. This also corrects pgvector `USING hnsw/ivfflat`
+  index DDL. The bug was latent because the builder's tests only
+  string-compared the rendered SQL and never executed it.
+
 ### Removed
 - `drops.MustString` and `drops.Errorf` re-exports (unused).

@@ -85,7 +85,7 @@ func writeIndexCreate(b *drops.Builder, idx *Index, ifNotExists bool) {
 		if j > 0 {
 			b.WriteString(", ")
 		}
-		b.Append(c)
+		writeIndexColumn(b, c)
 		if idx.opClass != "" {
 			b.WriteByte(' ')
 			b.WriteString(idx.opClass)
@@ -111,6 +111,28 @@ func writeIndexCreate(b *drops.Builder, idx *Index, ifNotExists bool) {
 		b.WriteString(" WHERE ")
 		b.Append(idx.where)
 	}
+}
+
+// writeIndexColumn renders one entry of a CREATE INDEX column list.
+//
+// Column references are written as BARE, unqualified identifiers.
+// PostgreSQL rejects a table-qualified name inside an index column
+// list — an index element must be a bare column name or a
+// parenthesised expression, so `("t"."c")` fails with
+// `syntax error at or near ")"` (SQLSTATE 42601). A column handle's
+// default WriteSQL qualifies the reference (correct for SELECT/WHERE,
+// invalid here), so we source the name from the handle and emit it
+// unqualified instead.
+//
+// Anything that is not a column reference — a functional index such as
+// Lower(c), or a raw expression — is rendered as-is; the caller is
+// responsible for any parentheses PostgreSQL requires around it.
+func writeIndexColumn(b *drops.Builder, c drops.Expression) {
+	if cr, ok := c.(ColRef); ok {
+		b.WriteIdent(cr.col().Name())
+		return
+	}
+	b.Append(c)
 }
 
 // DropIndex returns DROP INDEX "name".

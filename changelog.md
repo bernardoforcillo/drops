@@ -8,6 +8,8 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-04
+
 ### Added
 - **Migration data hooks** (`drops/pg`) — both migrators now expose
   `BeforeEach` / `AfterEach` hooks that run inside each migration's

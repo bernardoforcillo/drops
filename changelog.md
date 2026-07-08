@@ -8,6 +8,58 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-08
+
+### Added
+- **Swappable SQL dialect abstraction** (`drops`) — a new `drops.Dialect`
+  interface (`Name`, `Placeholder`, `QuoteIdent`, `SupportsReturning`)
+  that a `Builder` carries. `drops.WithDialect(d)` reroutes placeholder
+  rendering and identifier quoting through the dialect, so the same
+  builder chain targets any SQL-like backend by swapping the dialect and
+  driver. A Builder with no dialect keeps the previous PostgreSQL
+  behaviour byte-for-byte (`$N` placeholders, `"…"` identifiers), so this
+  is fully backward compatible. `pg.Dialect` and `sqlite.Dialect` are the
+  two implementations; `drops.StringWithDialect` renders an expression a
+  dialect's way.
+- **SQLite dialect** (`drops/sqlite`) — a new package mirroring
+  `drops/pg`'s API surface (Table / Column / DB / DDL / Select / Insert /
+  Update / Delete) over the shared `drops.Driver`, emitting SQLite SQL:
+  `?` placeholders, SQLite type affinities, `INSERT OR IGNORE/REPLACE`,
+  and — the key dialect difference — **all constraints rendered inline in
+  `CREATE TABLE`** (SQLite has no `ALTER TABLE ADD CONSTRAINT`). Type
+  constructors share pg's names (`Text`, `BigInt`, `Timestamp`, …) so a
+  schema ports with a package swap.
+- **Composite (N-column) foreign keys** (`drops/pg`, `drops/sqlite`) —
+  `Table.ForeignKeyN(cols, target, targetCols, opts…)` declares a
+  multi-column FK (`FOREIGN KEY (a,b) REFERENCES t (x,y)`). In pg it is
+  wired through the snapshot/diff generator and emitted as a separate
+  `ALTER TABLE ADD CONSTRAINT`; in sqlite it is emitted inline. Column
+  counts must match (panics at declaration otherwise).
+- **Shared reflection row-scanner** (`drops`) — `drops.ScanOne` /
+  `drops.ScanAll` moved the dialect-agnostic struct↔column mapping into
+  the root package so every dialect scans rows identically. `drops.StructFields`
+  exposes the column→field map for entity binding. `drops/sqlite` uses
+  both; `drops/pg` keeps its own wrappers.
+- **SQLite full ORM parity** (`drops/sqlite`) — the dialect now covers:
+  - **Entities** — `Entity[T]` typed CRUD (`Get` / `Create` / `Update` /
+    `Delete`) and a fluent `Query` (`Where` / `OrderBy` / `Limit` /
+    `Offset` / `All` / `One`).
+  - **Relations & eager loading** — `NewRelations(t).HasMany / HasOne /
+    BelongsTo / ManyToMany`, loaded via `db.Find(t).With(names…)` with one
+    batched query per edge (no N+1) stitched into `dropRel` struct fields.
+  - **Migrations** — a versioned `Migrator` (`Add` / `AddSQL` / `AddFS` /
+    `Up` / `Down` / `Status`) with `BeforeEach` / `AfterEach` in-transaction
+    data hooks, mirroring `pg.Migrator`.
+  - **Snapshot & diff** — `BuildSnapshot` / `Diff` generate SQLite
+    migration SQL, honouring SQLite semantics: `ALTER TABLE ADD COLUMN`
+    where possible, and the standard **table-rebuild sequence**
+    (`CREATE t_new` → `INSERT … SELECT` → `DROP` → `RENAME`) for column
+    type changes, drops, and constraint changes that SQLite cannot alter
+    in place.
+  - **Introspection** — `Introspect(ctx, db)` reconstructs a `Snapshot`
+    from a live database via `sqlite_master` and the `table_info` /
+    `foreign_key_list` / `index_list` PRAGMAs.
+
 ## [0.3.0] - 2026-07-04
 
 ### Added

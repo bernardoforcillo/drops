@@ -216,6 +216,31 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 		for name, expr := range t.Checks() {
 			ts.CheckConstraints[name] = &CheckSnapshot{Name: name, Value: expr}
 		}
+		// Composite (multi-column) foreign keys declared via ForeignKeyN.
+		for _, cfk := range t.CompositeForeignKeys() {
+			from := make([]string, len(cfk.Columns))
+			for i, c := range cfk.Columns {
+				from[i] = c.Name()
+			}
+			to := make([]string, len(cfk.TargetColumns))
+			for i, c := range cfk.TargetColumns {
+				to[i] = c.Name()
+			}
+			targetSchema := ""
+			if cfk.Target != nil {
+				targetSchema = cfk.Target.Schema()
+			}
+			ts.ForeignKeys[cfk.Name] = &ForeignKeySnapshot{
+				Name:        cfk.Name,
+				TableFrom:   t.Name(),
+				ColumnsFrom: from,
+				TableTo:     cfk.Target.Name(),
+				SchemaTo:    targetSchema,
+				ColumnsTo:   to,
+				OnDelete:    normaliseAction(cfk.OnDelete),
+				OnUpdate:    normaliseAction(cfk.OnUpdate),
+			}
+		}
 		// Indexes.
 		for _, idx := range t.Indexes() {
 			ts.Indexes[idx.Name()] = indexSnapshotOf(idx)

@@ -93,6 +93,14 @@ func ScanAll(rows Rows, dest any) error {
 	return rows.Err()
 }
 
+// StructFields returns the column-name → field-index-path map the
+// scanner uses: `drop:"col"` tags win (`drop:"-"` skips), otherwise the
+// exported field name and its camelCase form both map, and embedded
+// structs are walked. Dialect entity layers use it to bind struct
+// fields to columns without re-implementing the reflection walk. The
+// result is cached per type and must not be mutated.
+func StructFields(t reflect.Type) map[string][]int { return fieldMap(t) }
+
 func scanRowInto(rows Rows, structVal reflect.Value, cols []string, fields map[string][]int) error {
 	targets := make([]any, len(cols))
 	var discard any

@@ -19,6 +19,19 @@ type Table struct {
 	compositeUniques map[string][]*Column
 	checks           map[string]string
 	compositeFKs     []*CompositeFK
+
+	relations map[string]*Relation
+}
+
+// Relation returns the named relation declared on t, or nil.
+func (t *Table) Relation(name string) *Relation { return t.relations[name] }
+
+// setRelation registers r under name (used by NewRelations).
+func (t *Table) setRelation(name string, r *Relation) {
+	if t.relations == nil {
+		t.relations = map[string]*Relation{}
+	}
+	t.relations[name] = r
 }
 
 // NewTable creates a table. The name is validated; a bad identifier

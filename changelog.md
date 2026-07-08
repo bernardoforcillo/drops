@@ -8,6 +8,8 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-08
+
 ### Added
 - **Swappable SQL dialect abstraction** (`drops`) — a new `drops.Dialect`
   interface (`Name`, `Placeholder`, `QuoteIdent`, `SupportsReturning`)

@@ -31,6 +31,12 @@ type Table struct {
 	// the raw SQL expression (e.g. "age >= 0").
 	checks map[string]string
 
+	// compositeFKs are multi-column (N-column) foreign keys declared
+	// at the table level via ForeignKeyN. Single-column FKs continue
+	// to live on the column (via *Col[T].References / Table.ForeignKey).
+	// Emitted as separate ALTER TABLE ADD CONSTRAINT statements.
+	compositeFKs []*CompositeFK
+
 	// policies are RLS policies declared on the table.
 	policies map[string]*Policy
 
@@ -112,6 +118,86 @@ func (t *Table) ForeignKey(col, target *Column, opts ...func(*FK)) *Table {
 	col.ref = fk
 	return t
 }
+
+// CompositeFK is a multi-column foreign key declared at the table
+// level: FOREIGN KEY (Columns...) REFERENCES Target (TargetColumns...).
+// Columns and TargetColumns are positionally paired and must be the
+// same length. OnDelete / OnUpdate carry the referential actions.
+type CompositeFK struct {
+	Name          string
+	Columns       []*Column
+	Target        *Table
+	TargetColumns []*Column
+	OnDelete      string
+	OnUpdate      string
+}
+
+// ForeignKeyN declares a composite (N-column) foreign key from cols on
+// this table to targetCols on target, paired positionally. It is the
+// multi-column counterpart to ForeignKey; use it for keys that
+// reference a composite primary key or a multi-column unique
+// constraint.
+//
+//	orders.ForeignKeyN(
+//	    []pg.ColRef{oTenantID, oUserID}, users,
+//	    []pg.ColRef{uTenantID, uID}, pg.OnDelete("CASCADE"))
+//
+// len(cols) must equal len(targetCols) and both must be non-empty;
+// violations panic at declaration time. Referential actions are set
+// with the same OnDelete / OnUpdate options as ForeignKey. The
+// constraint is emitted as a separate ALTER TABLE ADD CONSTRAINT (never
+// inlined into CREATE TABLE), matching how every other table-level
+// constraint is rendered.
+func (t *Table) ForeignKeyN(cols []ColRef, target *Table, targetCols []ColRef, opts ...func(*FK)) *Table {
+	if target == nil {
+		panic("drops/pg: ForeignKeyN requires a non-nil target table")
+	}
+	if len(cols) == 0 || len(targetCols) == 0 {
+		panic("drops/pg: ForeignKeyN requires at least one column on each side")
+	}
+	if len(cols) != len(targetCols) {
+		panic("drops/pg: ForeignKeyN local and target column counts must match")
+	}
+	from := make([]*Column, len(cols))
+	for i, c := range cols {
+		if c == nil {
+			panic("drops/pg: ForeignKeyN got a nil local column")
+		}
+		from[i] = c.col()
+	}
+	to := make([]*Column, len(targetCols))
+	for i, c := range targetCols {
+		if c == nil {
+			panic("drops/pg: ForeignKeyN got a nil target column")
+		}
+		to[i] = c.col()
+	}
+	var f FK
+	for _, o := range opts {
+		o(&f)
+	}
+	names := make([]string, len(from))
+	for i, c := range from {
+		names[i] = c.Name()
+	}
+	targetNames := make([]string, len(to))
+	for i, c := range to {
+		targetNames[i] = c.Name()
+	}
+	t.compositeFKs = append(t.compositeFKs, &CompositeFK{
+		Name:          fkName(t.name, names, target.Name(), targetNames),
+		Columns:       from,
+		Target:        target,
+		TargetColumns: to,
+		OnDelete:      f.OnDelete,
+		OnUpdate:      f.OnUpdate,
+	})
+	return t
+}
+
+// CompositeForeignKeys returns the table's multi-column foreign keys in
+// declaration order.
+func (t *Table) CompositeForeignKeys() []*CompositeFK { return t.compositeFKs }
 
 // add is the internal registration step used by Add. It does not return
 // anything because callers (the Add helper) need to preserve the typed

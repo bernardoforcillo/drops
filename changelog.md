@@ -8,6 +8,40 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+### Added
+- **Swappable SQL dialect abstraction** (`drops`) — a new `drops.Dialect`
+  interface (`Name`, `Placeholder`, `QuoteIdent`, `SupportsReturning`)
+  that a `Builder` carries. `drops.WithDialect(d)` reroutes placeholder
+  rendering and identifier quoting through the dialect, so the same
+  builder chain targets any SQL-like backend by swapping the dialect and
+  driver. A Builder with no dialect keeps the previous PostgreSQL
+  behaviour byte-for-byte (`$N` placeholders, `"…"` identifiers), so this
+  is fully backward compatible. `pg.Dialect` and `sqlite.Dialect` are the
+  two implementations; `drops.StringWithDialect` renders an expression a
+  dialect's way.
+- **SQLite dialect** (`drops/sqlite`) — a new package mirroring
+  `drops/pg`'s API surface (Table / Column / DB / DDL / Select / Insert /
+  Update / Delete) over the shared `drops.Driver`, emitting SQLite SQL:
+  `?` placeholders, SQLite type affinities, `INSERT OR IGNORE/REPLACE`,
+  and — the key dialect difference — **all constraints rendered inline in
+  `CREATE TABLE`** (SQLite has no `ALTER TABLE ADD CONSTRAINT`). Type
+  constructors share pg's names (`Text`, `BigInt`, `Timestamp`, …) so a
+  schema ports with a package swap.
+- **Composite (N-column) foreign keys** (`drops/pg`, `drops/sqlite`) —
+  `Table.ForeignKeyN(cols, target, targetCols, opts…)` declares a
+  multi-column FK (`FOREIGN KEY (a,b) REFERENCES t (x,y)`). In pg it is
+  wired through the snapshot/diff generator and emitted as a separate
+  `ALTER TABLE ADD CONSTRAINT`; in sqlite it is emitted inline. Column
+  counts must match (panics at declaration otherwise).
+- **Shared reflection row-scanner** (`drops`) — `drops.ScanOne` /
+  `drops.ScanAll` moved the dialect-agnostic struct↔column mapping into
+  the root package so every dialect scans rows identically. `drops/sqlite`
+  uses it; `drops/pg` keeps its own wrappers.
+
+  Note: the SQLite dialect currently covers schema, DDL, migrations-free
+  CRUD and composite keys; full pg parity (entities, relations,
+  migrations/diff, introspection) is planned as follow-on work.
+
 ## [0.3.0] - 2026-07-04
 
 ### Added

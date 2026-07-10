@@ -28,6 +28,19 @@ Early. Two dialects ship today:
   + bounded connection pool. Zero deps. Supports AUTH (legacy and ACL
   forms), SELECT db, key prefix, and the same `drops.Hook` contract
   used elsewhere.
+- **`drops/cache/memcached`** — Memcached backend speaking the classic
+  ASCII protocol (get / set / delete, native multi-key get) over a
+  bounded connection pool, with `TTL` via the meta-get command
+  (`mg`, Memcached 1.6+). Zero deps; `MultiCache`, `KeyPrefix`, `Hook`.
+- **`drops/cache/tiered`** — two-level L1 + L2 read-through /
+  write-through cache composing any two `cache.Cache` backends (e.g.
+  memory in front of redis). Backfills L1 on L2 hits, caps local
+  staleness with `L1TTL`, and offers `GetOrLoad` with singleflight
+  stampede protection. Zero deps; nests (an L2 can be another tiered).
+- **`drops/otel`** — OpenTelemetry spans + RED metrics built from the
+  `drops.Hook` stream via small OTel-shaped interfaces (no OTel import;
+  a ~10-line adapter bridges the real SDK). One instrumentation covers
+  every dialect and every cache backend.
 - **`drops/qdrant`** — Qdrant vector database. Focused HTTP client
   (stdlib only): collections, upsert/delete/retrieve, search /
   recommend / scroll, and a Must/Should/MustNot filter DSL with
@@ -968,12 +981,17 @@ commands.
 drops/                       driver interface + SQL primitives + Hook
 drops/pg/                    Postgres schema, query builders, relations,
                              migrations, snapshot/diff/generate
+drops/sqlite/                SQLite schema, query builders, entities,
+                             relations, migrations, pagination, soft delete
 drops/clickhouse/            ClickHouse schema, engines, query builder,
                              analytical aggregates
 drops/qdrant/                Qdrant vector-database HTTP client
 drops/cache/                 Cache interface + sentinels
 drops/cache/memory/          in-process cache backend
 drops/cache/redis/           Redis cache backend (own RESP2 client)
+drops/cache/memcached/       Memcached cache backend (own ASCII client)
+drops/cache/tiered/          two-level L1+L2 read-through cache
+drops/otel/                  OpenTelemetry spans + metrics from Hook
 drops/stdlib/                database/sql adapter
 drops/examples/sqlgen/       no-deps SQL-generation demo (pg)
 drops/examples/generate/     drizzle-kit-style migration generation demo
@@ -982,7 +1000,7 @@ drops/_examples/postgres/    full DB demo via pgx (excluded from build)
 
 ## What's not here
 
-- Other dialects (MySQL, SQLite, MSSQL)
+- Other dialects (MySQL, MSSQL)
 - Indexes, composite primary keys, composite uniques, check constraints, enums, sequences, views, RLS in the snapshot/diff generator
 - Per-parent `LIMIT`/`OFFSET` on eager loads (drizzle's `with: { posts: { limit } }`) — `WithRel` supports per-relation `Where`/`OrderBy` and dot-path nesting, but a per-parent row cap needs a window-function rewrite
 - Down-migration generation from the diff (only Go-native `pg.Migrator` supports `Down`, and only when the user writes the down SQL themselves)

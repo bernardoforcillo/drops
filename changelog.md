@@ -8,6 +8,49 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+### Added
+- **Two-level tiered cache** (`drops/cache/tiered`) — composes two
+  `cache.Cache` backends into one read-through / write-through cache: a
+  fast near tier (L1, typically `cache/memory`) in front of a shared
+  network tier (L2, typically `cache/redis` or `cache/memcached`). Reads
+  check L1, fall through to L2, and backfill L1 on an L2 hit; writes and
+  deletes fan out to both tiers with an `L1TTL` cap that bounds local
+  staleness. `GetOrLoad` adds read-through population from an origin
+  function with built-in **singleflight** stampede protection (a burst of
+  concurrent misses for a cold key triggers exactly one load). Implements
+  `cache.Cache` and `cache.MultiCache`, so tiers nest. Zero deps.
+- **Memcached backend** (`drops/cache/memcached`) — a `cache.Cache`
+  implementation speaking the classic Memcached ASCII protocol (get /
+  set / delete, native multi-key get) over a small bounded connection
+  pool, with `TTL` served by the meta-get command (`mg`, Memcached 1.6+).
+  Satisfies `cache.MultiCache`, honours `KeyPrefix`, and fires the shared
+  `drops.Hook` contract. Standard library only.
+- **OpenTelemetry instrumentation** (`drops/otel`) — turns the
+  `drops.Hook` / `drops.QueryEvent` stream into OpenTelemetry spans and
+  RED metrics (call counter, error counter, duration histogram) without
+  importing OpenTelemetry: it talks to small OTel-shaped interfaces
+  (`Tracer`, `Span`, `Meter`, `Int64Counter`, `Float64Histogram`) that a
+  ~10-line adapter bridges to the real SDK — the same zero-dependency
+  approach as `pg.Tracer`. Because it is driven purely by the Hook, one
+  `Instrumentation` covers every dialect (pg / sqlite / clickhouse) and
+  every cache backend. Spans are created retroactively with explicit
+  start/end timestamps; `db.statement` recording is opt-in.
+- **Keyset (cursor) pagination for SQLite** (`drops/sqlite`) — ports
+  drops/pg's `Entity[T].Page` down to `drops/sqlite`: `Page` /
+  `PageBuilder` with opaque URL-safe cursors, `Asc` / `Desc` ordering
+  columns, and `HasMore` / `NextCursor`. Uses SQLite row-value comparison
+  (`(a, b) > (?, ?)`) for homogeneous orderings and a tie-break
+  disjunction for mixed asc/desc directions — O(limit) regardless of page
+  depth, unlike OFFSET. `(*Column).Asc` / `.Desc` were added for parity.
+- **Default filters + soft delete for SQLite** (`drops/sqlite`) — a new
+  `Table.DefaultFilter` mechanism auto-applies predicates to every
+  Select / Update / Delete (also handy for tenant scoping), with
+  `Unscoped()` on each builder to opt out. `SoftDelete(t)` registers a
+  nullable `deletedAt` column plus a `deletedAt IS NULL` default filter,
+  and `Entity[T].SoftDeleteByID` / `Restore` mark and un-mark rows.
+  Mirrors drops/pg's `SoftDeleteMixin` semantics. `UpdateBuilder.SetExpr`
+  was added to assign raw SQL expressions (e.g. `CURRENT_TIMESTAMP`).
+
 ## [0.4.0] - 2026-07-08
 
 ### Added

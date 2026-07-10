@@ -8,9 +8,10 @@ import (
 
 // DeleteBuilder builds a DELETE statement. Create one via DB.Delete.
 type DeleteBuilder struct {
-	db     *DB
-	table  *Table
-	wheres []drops.Expression
+	db       *DB
+	table    *Table
+	wheres   []drops.Expression
+	unscoped bool
 }
 
 // Where AND-s the given predicates onto the statement. A DELETE with no
@@ -20,13 +21,22 @@ func (d *DeleteBuilder) Where(preds ...drops.Expression) *DeleteBuilder {
 	return d
 }
 
+// Unscoped opts out of the table's DefaultFilter predicates for this
+// statement (e.g. to hard-delete rows already hidden by a soft-delete
+// guard).
+func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.unscoped = true; return d }
+
 // WriteSQL implements drops.Expression.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 	b.WriteString("DELETE FROM ")
 	d.table.writeName(b)
-	if len(d.wheres) > 0 {
+	wheres := d.wheres
+	if !d.unscoped && len(d.table.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), d.table.defaultFilters...), d.wheres...)
+	}
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		b.AppendList(" AND ", d.wheres)
+		b.AppendList(" AND ", wheres)
 	}
 }
 

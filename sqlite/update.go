@@ -8,17 +8,29 @@ import (
 
 // UpdateBuilder builds an UPDATE statement. Create one via DB.Update.
 type UpdateBuilder struct {
-	db     *DB
-	table  *Table
-	sets   []ColumnValue
-	wheres []drops.Expression
+	db       *DB
+	table    *Table
+	sets     []ColumnValue
+	wheres   []drops.Expression
+	unscoped bool
 }
 
-// Set adds a column assignment.
+// Set adds a column assignment binding a value.
 func (u *UpdateBuilder) Set(vals ...ColumnValue) *UpdateBuilder {
 	u.sets = append(u.sets, vals...)
 	return u
 }
+
+// SetExpr assigns a raw SQL expression to col (e.g. CURRENT_TIMESTAMP,
+// NULL, or "count + 1") rather than a bound value.
+func (u *UpdateBuilder) SetExpr(col *Column, expr drops.Expression) *UpdateBuilder {
+	u.sets = append(u.sets, exprValue{col: col, expr: expr})
+	return u
+}
+
+// Unscoped opts out of the table's DefaultFilter predicates for this
+// statement.
+func (u *UpdateBuilder) Unscoped() *UpdateBuilder { u.unscoped = true; return u }
 
 // Where AND-s the given predicates onto the statement.
 func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
@@ -39,9 +51,13 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" = ")
 		cv.writeValue(b)
 	}
-	if len(u.wheres) > 0 {
+	wheres := u.wheres
+	if !u.unscoped && len(u.table.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), u.wheres...)
+	}
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		b.AppendList(" AND ", u.wheres)
+		b.AppendList(" AND ", wheres)
 	}
 }
 

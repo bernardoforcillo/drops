@@ -20,8 +20,25 @@ type Table struct {
 	checks           map[string]string
 	compositeFKs     []*CompositeFK
 
+	// defaultFilters are predicates applied automatically to every
+	// Select / Update / Delete against this table unless the builder opts
+	// out with Unscoped. SoftDelete registers "deletedAt IS NULL" here;
+	// they are equally useful for tenant scoping.
+	defaultFilters []drops.Expression
+
 	relations map[string]*Relation
 }
+
+// DefaultFilter appends a predicate applied to every Select / Update /
+// Delete against t unless the builder calls Unscoped. Mirrors
+// drops/pg's Table.DefaultFilter.
+func (t *Table) DefaultFilter(e drops.Expression) *Table {
+	t.defaultFilters = append(t.defaultFilters, e)
+	return t
+}
+
+// DefaultFilters returns the registered default-filter predicates.
+func (t *Table) DefaultFilters() []drops.Expression { return t.defaultFilters }
 
 // Relation returns the named relation declared on t, or nil.
 func (t *Table) Relation(name string) *Relation { return t.relations[name] }

@@ -67,6 +67,21 @@ func (c *Column) WriteSQL(b *drops.Builder) {
 	b.WriteIdent(c.name)
 }
 
+// Asc / Desc produce ORDER BY direction expressions, mirroring drops/pg.
+func (c *Column) Asc() drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(" ASC")
+	})
+}
+
+func (c *Column) Desc() drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(" DESC")
+	})
+}
+
 // Col is the typed column handle whose Go value type is T.
 type Col[T any] struct{ *Column }
 
@@ -213,3 +228,13 @@ type columnValue struct {
 
 func (v columnValue) column() *Column             { return v.col }
 func (v columnValue) writeValue(b *drops.Builder) { b.AddArg(v.val) }
+
+// exprValue assigns a raw SQL expression (not a bound value) to a column,
+// backing UpdateBuilder.SetExpr — e.g. deletedAt = CURRENT_TIMESTAMP.
+type exprValue struct {
+	col  *Column
+	expr drops.Expression
+}
+
+func (v exprValue) column() *Column             { return v.col }
+func (v exprValue) writeValue(b *drops.Builder) { b.Append(v.expr) }

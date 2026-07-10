@@ -16,9 +16,14 @@ type SelectBuilder struct {
 	wheres   []drops.Expression
 	orderBy  []drops.Expression
 	distinct bool
+	unscoped bool
 	limit    *int64
 	offset   *int64
 }
+
+// Unscoped opts out of the FROM table's DefaultFilter predicates for this
+// query — e.g. to include soft-deleted rows. Mirrors drops/pg.
+func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
 
 type joinClause struct {
 	kind  string // "JOIN", "LEFT JOIN", ...
@@ -86,9 +91,10 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" ON ")
 		b.Append(j.on)
 	}
-	if len(s.wheres) > 0 {
+	wheres := s.effectiveWheres()
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		b.AppendList(" AND ", s.wheres)
+		b.AppendList(" AND ", wheres)
 	}
 	if len(s.orderBy) > 0 {
 		b.WriteString(" ORDER BY ")
@@ -102,6 +108,15 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" OFFSET ")
 		b.AddArg(*s.offset)
 	}
+}
+
+// effectiveWheres prepends the FROM table's default filters (unless
+// unscoped) to the explicit predicates.
+func (s *SelectBuilder) effectiveWheres() []drops.Expression {
+	if s.unscoped || s.table == nil || len(s.table.defaultFilters) == 0 {
+		return s.wheres
+	}
+	return append(append([]drops.Expression(nil), s.table.defaultFilters...), s.wheres...)
 }
 
 // ToSQL renders the statement with SQLite placeholders.

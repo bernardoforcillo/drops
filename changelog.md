@@ -8,6 +8,22 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-14
+
+### Fixed
+- **Qdrant missing-collection 404 classification** (`drops/qdrant`) — the
+  `Client.Do` 404 check used a case-sensitive substring match on
+  `"not found"`, which does not match real Qdrant's response body
+  (``Not found: Collection `x` doesn't exist!`` — capital "Not found",
+  "doesn't exist"). A missing collection therefore surfaced as a plain
+  `HTTPError` instead of `ErrCollectionMissing`, so `CollectionExists`
+  returned an error rather than `(false, nil)` and callers never reached
+  their auto-create branch — collections were silently never created.
+  The 404 is now classified case-insensitively and also accepts
+  `"doesn't exist"` / `"does not exist"`. The test mock, which previously
+  matched a lowercase body no live server emits, now uses Qdrant's real
+  format, and a table-driven test pins the variants.
+
 ## [0.4.0] - 2026-07-08
 
 ### Added

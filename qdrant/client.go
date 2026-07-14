@@ -36,6 +36,30 @@ func (e *HTTPError) Error() string {
 // collection. Use errors.Is to branch on it.
 var ErrCollectionMissing = errors.New("qdrant: collection not found")
 
+// missingCollectionPhrases are the case-insensitive substrings Qdrant uses
+// to signal a missing collection on a 404. The phrasing is not stable across
+// versions: real Qdrant returns bodies like
+//
+//	Not found: Collection `tenders` doesn't exist!
+//
+// (capital "Not found", "doesn't exist"), while other paths return
+// "... not found". Matching any of these — after lower-casing — keeps
+// CollectionExists returning (false, nil) so callers can auto-create,
+// instead of surfacing a raw HTTPError.
+var missingCollectionPhrases = []string{"not found", "doesn't exist", "does not exist"}
+
+// isMissingCollectionBody reports whether a 404 response body indicates a
+// missing collection, tolerant of Qdrant's inconsistent casing and wording.
+func isMissingCollectionBody(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	for _, phrase := range missingCollectionPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 // Client wraps Qdrant's HTTP API.
 //
 // Safe for concurrent use by multiple goroutines. The optional Hook
@@ -222,7 +246,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body, out any) (er
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		herr := &HTTPError{Status: resp.StatusCode, StatusText: resp.Status, Body: respBody}
-		if resp.StatusCode == http.StatusNotFound && strings.Contains(string(respBody), "not found") {
+		if resp.StatusCode == http.StatusNotFound && isMissingCollectionBody(respBody) {
 			err = fmt.Errorf("%w: %w", ErrCollectionMissing, herr)
 			return err
 		}

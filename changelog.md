@@ -9,6 +9,18 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Transactional store patterns for SQLite** (`drops/sqlite`) —
+  - **Idempotency keys** (`idempotency.go`) — `IdempotencyStore` /
+    `NewIdempotencyTable` / `Run` / `RunJSON` / `Cleanup` / `SweepEvery`.
+    SQLite has no `SELECT ... FOR UPDATE`; concurrent `Run` calls
+    serialise on the write-transaction lock instead. Time comparisons
+    bind Go times (not `CURRENT_TIMESTAMP`) to avoid datetime-format
+    mismatch.
+  - **Chunked backfill** (`backfill.go`) — `NewBackfill` with
+    `ChunkSize`/`Throttle`/`Fetch`/`Process`/`OnProgress`, resumable via a
+    persisted state table (`NewBackfillStateTable`, timestamps stored as
+    INTEGER Unix seconds), upserting through `ON CONFLICT DO UPDATE`. The
+    pg replica-lag gate is omitted (SQLite has no replication).
 - **Lifecycle hooks, templates and mixins for SQLite** (`drops/sqlite`) —
   the pg hook/mixin subsystem, adapted to SQLite:
   - **Hooks** (`hooks.go` + builder wiring) — `Table.OnInsert` /
@@ -25,9 +37,6 @@ once a 1.0 is cut.
     (bumps `updatedAt` on UPDATE), `SoftDeleteMixin` (default-scopes
     queries and rewrites DELETE into UPDATE `deletedAt`), `AuditMixin`,
     `UUIDPrimaryKeyMixin`.
-
-
-### Added
 - **Higher-level pg feature parity for SQLite** (`drops/sqlite`) — the
   portable feature patterns that previously lived only in `drops/pg` are
   now available on SQLite, adapted to SQLite semantics:

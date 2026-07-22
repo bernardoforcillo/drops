@@ -9,6 +9,10 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Query-plan capture for SQLite** (`drops/sqlite`, `explain.go`) —
+  `Explain` runs `EXPLAIN QUERY PLAN`, parsing it into `PlanStep`s with
+  `SeqScans` (full-table scans), `UsedIndexes`, a stable `Fingerprint`
+  for regression detection, and a tree `String`.
 - **Audit, authorization and caching for SQLite** (`drops/sqlite`) — the
   cross-cutting Entity concerns from pg, wired into SQLite's Entity CRUD:
   - **Audit** (`audit.go`) — `NewAuditLog`/`NewAuditTable`/`WithAudit`,

@@ -9,6 +9,25 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Lifecycle hooks, templates and mixins for SQLite** (`drops/sqlite`) —
+  the pg hook/mixin subsystem, adapted to SQLite:
+  - **Hooks** (`hooks.go` + builder wiring) — `Table.OnInsert` /
+    `OnUpdate` / `OnDelete` and `DefaultFilter`, applied by the INSERT /
+    UPDATE / DELETE / SELECT builders; `Unscoped()` on Select/Update/
+    Delete bypasses default scopes. User-supplied values always win over
+    hook-supplied ones.
+  - **Templates** (`template.go`) — `Timestamps`, `SoftDelete`, `Audit`,
+    `UUIDPrimaryKey` column groups returning typed handles. SQLite
+    adaptations: `CURRENT_TIMESTAMP` defaults, and a `randomblob()`-based
+    RFC-4122 v4 UUID default for `UUIDPrimaryKey` (SQLite has no
+    `gen_random_uuid()`).
+  - **Mixins** (`mixin.go`) — `ApplyMixins` + `TimestampsMixin`
+    (bumps `updatedAt` on UPDATE), `SoftDeleteMixin` (default-scopes
+    queries and rewrites DELETE into UPDATE `deletedAt`), `AuditMixin`,
+    `UUIDPrimaryKeyMixin`.
+
+
+### Added
 - **Higher-level pg feature parity for SQLite** (`drops/sqlite`) — the
   portable feature patterns that previously lived only in `drops/pg` are
   now available on SQLite, adapted to SQLite semantics:

@@ -46,12 +46,16 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 	}
 	b.WriteString("INTO ")
 	i.table.writeName(b)
-	if len(i.rows) == 0 {
+	rows := i.rows
+	if i.table.hasInsertHooks() {
+		rows = i.applyInsertHooks()
+	}
+	if len(rows) == 0 {
 		// Degenerate: nothing to insert. DEFAULT VALUES keeps it valid.
 		b.WriteString(" DEFAULT VALUES")
 		return
 	}
-	cols := i.rows[0]
+	cols := rows[0]
 	b.WriteString(" (")
 	for j, cv := range cols {
 		if j > 0 {
@@ -60,7 +64,7 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteIdent(cv.column().Name())
 	}
 	b.WriteString(") VALUES ")
-	for r, row := range i.rows {
+	for r, row := range rows {
 		if r > 0 {
 			b.WriteString(", ")
 		}
@@ -82,6 +86,33 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 			b.WriteIdent(c.col().Name())
 		}
 	}
+}
+
+// applyInsertHooks runs every InsertHook on the table and returns the
+// rows with hook-supplied bindings appended to each (uniformly, so the
+// column list derived from the first row stays aligned).
+func (i *InsertBuilder) applyInsertHooks() [][]ColumnValue {
+	if len(i.rows) == 0 {
+		return i.rows
+	}
+	ctx := &InsertHookCtx{bound: make(map[*Column]bool, len(i.rows[0]))}
+	for _, cv := range i.rows[0] {
+		ctx.bound[cv.column()] = true
+	}
+	for _, h := range i.table.insertHooks {
+		h.BeforeInsert(ctx)
+	}
+	if len(ctx.adds) == 0 {
+		return i.rows
+	}
+	out := make([][]ColumnValue, len(i.rows))
+	for r, row := range i.rows {
+		nr := make([]ColumnValue, 0, len(row)+len(ctx.adds))
+		nr = append(nr, row...)
+		nr = append(nr, ctx.adds...)
+		out[r] = nr
+	}
+	return out
 }
 
 // ToSQL renders the statement with SQLite placeholders.

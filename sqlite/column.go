@@ -23,6 +23,7 @@ type Column struct {
 	defaultSQL string
 	hasDefault bool
 	ref        *FK
+	pii        bool
 }
 
 // FK describes a single-column foreign-key reference.
@@ -211,5 +212,13 @@ type columnValue struct {
 	val any
 }
 
-func (v columnValue) column() *Column             { return v.col }
-func (v columnValue) writeValue(b *drops.Builder) { b.AddArg(v.val) }
+func (v columnValue) column() *Column { return v.col }
+func (v columnValue) writeValue(b *drops.Builder) {
+	// PII columns bind a redaction marker so loggers/hooks see
+	// "<redacted>"; db.Exec/Query unwrap it before the driver call.
+	if v.col != nil && v.col.pii {
+		b.AddArg(piiArg{Value: v.val})
+		return
+	}
+	b.AddArg(v.val)
+}

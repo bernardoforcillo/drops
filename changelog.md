@@ -9,6 +9,17 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Reflection, PII and drift for SQLite** (`drops/sqlite`) —
+  - **AutoTable** (`autotable.go`) — `AutoTable[T]` / `NewAutoEntity[T]`
+    derive a Table from `drop` struct tags (primaryKey, autoIncrement,
+    notNull, unique, pii, default), mapping Go types to SQLite affinities
+    (`sqlite.Money` → INTEGER).
+  - **PII redaction** (`pii.go`) — `PII`/`IsPII`/`(*Col).AsPII`; Exec and
+    Query unwrap the marker for the driver while hooks/loggers see
+    `<redacted>`, and entity bindings wrap PII columns automatically.
+  - **Drift detection** (`drift.go`) — `DetectDrift` computes the two-way
+    Snapshot diff into a `DriftReport` (`PendingMigrations`,
+    `UnauthorizedChanges`, `InSync`).
 - **Dev & schema tooling for SQLite** (`drops/sqlite`) —
   - **Factory** (`factory.go`) — `NewFactory`/`Build`/`BuildN`/`Create`/
     `CreateN`/`With`/`Reset` test-data factories (backed by the new

@@ -163,7 +163,11 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 	defer span.End()
 	db.annotateSpan(span, "exec", sql, args)
 	start := time.Now()
-	res, err := db.drv.Exec(ctx, sql, args...)
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	res, err := db.drv.Exec(ctx, sql, drvArgs...)
 	if err != nil {
 		span.RecordError(err)
 	}
@@ -177,7 +181,11 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 	defer span.End()
 	db.annotateSpan(span, "query", sql, args)
 	start := time.Now()
-	rows, err := db.drv.Query(ctx, sql, args...)
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	rows, err := db.drv.Query(ctx, sql, drvArgs...)
 	if err != nil {
 		span.RecordError(err)
 	}

@@ -9,6 +9,14 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Transactional outbox for SQLite** (`drops/sqlite`, `outbox.go`) —
+  `Outbox` / `NewOutboxTable` / `Emit` / `EmitWith`, `Drain`,
+  `MarkPublished`, `MarkFailed`, `Cleanup`, and `OutboxWorker`
+  (`OnEvent`/`OnBatch`, `WithInterval`/`WithBatch`/`WithMaxAttempts`/
+  `WithBackoff`, `Run`/`Tick`). SQLite has no LISTEN/NOTIFY, SKIP LOCKED
+  or advisory locks, so it is a poll-based single-worker outbox with
+  INTEGER Unix-second timestamps; the pg per-aggregate advisory-lock
+  ordering mode is omitted. Delivery is at-least-once.
 - **Event sourcing & saga for SQLite** (`drops/sqlite`) —
   - **Event store** (`eventstore.go`) — `EventStore` / `NewEventStoreTable`
     with `Append` (optimistic concurrency via the UNIQUE

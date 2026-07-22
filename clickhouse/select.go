@@ -26,6 +26,8 @@ type SelectBuilder struct {
 	distinct  bool
 	settings  []string // raw "key = value"
 	unscoped  bool
+
+	ctes []*CTE
 }
 
 type joinKind string
@@ -139,6 +141,7 @@ func (s *SelectBuilder) Setting(key, value string) *SelectBuilder {
 
 // WriteSQL renders the SELECT.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
+	writeCTEs(b, s.ctes)
 	b.WriteString("SELECT ")
 	if s.distinct {
 		b.WriteString("DISTINCT ")

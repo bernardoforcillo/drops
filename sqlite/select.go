@@ -18,6 +18,9 @@ type SelectBuilder struct {
 	distinct bool
 	limit    *int64
 	offset   *int64
+
+	ctes         []*CTE
+	recursiveCTE bool
 }
 
 type joinClause struct {
@@ -65,6 +68,7 @@ func (s *SelectBuilder) Offset(n int64) *SelectBuilder { s.offset = &n; return s
 
 // WriteSQL implements drops.Expression.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
+	writeCTEs(b, s.ctes, s.recursiveCTE)
 	b.WriteString("SELECT ")
 	if s.distinct {
 		b.WriteString("DISTINCT ")

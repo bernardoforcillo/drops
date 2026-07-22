@@ -9,6 +9,16 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Event sourcing & saga for SQLite** (`drops/sqlite`) —
+  - **Event store** (`eventstore.go`) — `EventStore` / `NewEventStoreTable`
+    with `Append` (optimistic concurrency via the UNIQUE
+    aggregate/version constraint → `ErrConcurrencyConflict`, detected
+    from SQLite's "UNIQUE constraint failed" message), `Load`, `Stream`,
+    `LatestVersion`, plus snapshots (`NewSnapshotTable`, `SaveSnapshot`
+    via `ON CONFLICT DO UPDATE`, `LoadSnapshot`).
+  - **Saga** (`saga.go`) — `NewSaga`/`Step`/`Run` orchestration with
+    reverse-order compensation, typed `SagaState` (`SagaStateGet[T]`),
+    and `SagaError`/`IsSagaError`.
 - **Transactional store patterns for SQLite** (`drops/sqlite`) —
   - **Idempotency keys** (`idempotency.go`) — `IdempotencyStore` /
     `NewIdempotencyTable` / `Run` / `RunJSON` / `Cleanup` / `SweepEvery`.

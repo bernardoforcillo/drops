@@ -15,4 +15,13 @@ var (
 	// ErrInvalidIdentifier is returned (or panicked, at declaration
 	// time) for an identifier that cannot be safely quoted.
 	ErrInvalidIdentifier = errors.New("drops/sqlite: invalid identifier")
+
+	// ErrBusy / ErrLocked are the retryable-contention sentinels
+	// matching SQLITE_BUSY and SQLITE_LOCKED. A RetryPolicy listing
+	// them (as DefaultRetryPolicy does) retries a transaction when the
+	// underlying driver reports either — matched by errors.Is or by the
+	// driver error's message (drivers rarely wrap a comparable
+	// sentinel).
+	ErrBusy   = errors.New("drops/sqlite: database is busy (SQLITE_BUSY)")
+	ErrLocked = errors.New("drops/sqlite: database is locked (SQLITE_LOCKED)")
 )

@@ -19,6 +19,11 @@ type Entity[T any] struct {
 	pk        *Column
 	pkField   []int
 	colFields []entityColField
+
+	// Tenant scoping (see tenant.go). tenantCol is nil unless
+	// ScopeByTenant was called.
+	tenantCol   *Column
+	tenantField []int
 }
 
 type entityColField struct {
@@ -83,34 +88,63 @@ func (e *Entity[T]) selectCols() []drops.Expression {
 }
 
 // Get fetches the row whose primary key equals id, returning ErrNoRows
-// if absent.
+// if absent. When the entity is tenant-scoped the ctx tenant is AND-ed
+// into the predicate (see ScopeByTenant).
 func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 	var out T
-	err := db.Select(e.selectCols()...).From(e.table).
-		Where(cmp(e.pk, "=", id)).
-		One(ctx, &out)
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return out, err
+	}
+	sel := db.Select(e.selectCols()...).From(e.table).Where(cmp(e.pk, "=", id))
+	if tenantPred != nil {
+		sel.Where(tenantPred)
+	}
+	err = sel.One(ctx, &out)
 	return out, err
 }
 
-// Create inserts r.
+// Create inserts r. When the entity is tenant-scoped the ctx tenant is
+// stamped onto r first (rejecting a row that carries a different one).
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	vals := e.bindings(reflect.ValueOf(r).Elem(), false)
 	_, err := db.Insert(e.table).Values(vals...).Exec(ctx)
 	return err
 }
 
-// Update writes every non-PK column of r, matched by primary key.
+// Update writes every non-PK column of r, matched by primary key (and
+// the ctx tenant when the entity is tenant-scoped).
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	rv := reflect.ValueOf(r).Elem()
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return err
+	}
 	sets := e.bindings(rv, true)
 	pkVal := rv.FieldByIndex(e.pkField).Interface()
-	_, err := db.Update(e.table).Set(sets...).Where(cmp(e.pk, "=", pkVal)).Exec(ctx)
+	upd := db.Update(e.table).Set(sets...).Where(cmp(e.pk, "=", pkVal))
+	if tenantPred != nil {
+		upd.Where(tenantPred)
+	}
+	_, err = upd.Exec(ctx)
 	return err
 }
 
-// Delete removes the row whose primary key equals id.
+// Delete removes the row whose primary key equals id (scoped to the ctx
+// tenant when the entity is tenant-scoped).
 func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, error) {
-	return db.Delete(e.table).Where(cmp(e.pk, "=", id)).Exec(ctx)
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	del := db.Delete(e.table).Where(cmp(e.pk, "=", id))
+	if tenantPred != nil {
+		del.Where(tenantPred)
+	}
+	return del.Exec(ctx)
 }
 
 // bindings builds the column bindings from r. When skipPK is true the
@@ -126,15 +160,36 @@ func (e *Entity[T]) bindings(rv reflect.Value, skipPK bool) []ColumnValue {
 	return out
 }
 
-// Query begins a fluent, entity-typed query.
+// Query begins a fluent, entity-typed query. When the entity is
+// tenant-scoped the caller must pass a tenant-carrying ctx to All/One
+// (via WithTenant); the tenant predicate is applied at execution time.
 func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 	return &EntityQuery[T]{e: e, sb: db.Select(e.selectCols()...).From(e.table)}
 }
 
 // EntityQuery is a typed wrapper over SelectBuilder that returns []T / T.
 type EntityQuery[T any] struct {
-	e  *Entity[T]
-	sb *SelectBuilder
+	e             *Entity[T]
+	sb            *SelectBuilder
+	tenantApplied bool
+}
+
+// applyTenant AND-s the ctx tenant predicate onto the query the first
+// time it runs. Returns ErrTenantMissing when the entity is scoped but
+// ctx carries no tenant.
+func (q *EntityQuery[T]) applyTenant(ctx context.Context) error {
+	if q.tenantApplied || q.e.tenantCol == nil {
+		return nil
+	}
+	pred, err := q.e.tenantPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if pred != nil {
+		q.sb.Where(pred)
+	}
+	q.tenantApplied = true
+	return nil
 }
 
 // Where AND-s predicates onto the query.
@@ -155,6 +210,9 @@ func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); retur
 
 // All executes and returns every matching row.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
+	if err := q.applyTenant(ctx); err != nil {
+		return nil, err
+	}
 	var out []T
 	if err := q.sb.All(ctx, &out); err != nil {
 		return nil, err
@@ -165,6 +223,9 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 // One executes and returns the first row, or ErrNoRows.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	var out T
+	if err := q.applyTenant(ctx); err != nil {
+		return out, err
+	}
 	err := q.sb.Limit(1).One(ctx, &out)
 	return out, err
 }

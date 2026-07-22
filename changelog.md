@@ -9,6 +9,45 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Higher-level pg feature parity for SQLite** (`drops/sqlite`) — the
+  portable feature patterns that previously lived only in `drops/pg` are
+  now available on SQLite, adapted to SQLite semantics:
+  - **Money** (`money.go`) — precision-safe integer-cents monetary type
+    (`Money`, `MoneyFromString`/`MoneyFromCents`/`MoneyFromUnits`, `Add`,
+    `Sub`, `MulRate` with banker's rounding, JSON string round-trip,
+    `driver.Valuer`/`sql.Scanner`).
+  - **Cursor pagination** (`page.go`) — `Entity.Page` with opaque
+    keyset cursors (`Asc`/`Desc`, `Page[T]`, `HasMore`/`NextCursor`),
+    using SQLite row-value comparison for the keyset guard.
+  - **Patch** (`patch.go`) — `Entity.Patch` with SQL-side ops `Inc`,
+    `Dec`, `Set`, `SetIfGreater`/`SetIfLess` (via `max`/`min`) and
+    `SetIfChanged` (via NULL-safe `IS NOT`).
+  - **Tenant scoping** (`tenant.go`) — `Entity.ScopeByTenant` +
+    `WithTenant`/`TenantFrom`; Get/Query/Update/Delete auto-apply the
+    tenant predicate and Create stamps it, failing closed with
+    `ErrTenantMissing` / `ErrTenantMismatch`.
+  - **Typed JSON path** (`jsonpath.go`) — `JSONField[T]` typed accessor
+    over `json_extract` with comparison/`In`/`IsNull`/`Like` operators,
+    plus `JSONHasKey` via `json_type`.
+  - **Retry** (`retry.go`) — `RetryPolicy` + `DB.WithRetry`;
+    transaction-level retry on `SQLITE_BUSY`/`SQLITE_LOCKED`
+    (`ErrBusy`/`ErrLocked`, matched by `errors.Is` or driver message),
+    `ExponentialJitter`, `DefaultRetryPolicy`.
+  - **Tracing** (`tracing.go`) — `Tracer`/`Span` contract + `WithTracer`
+    wired into every Exec/Query span (dependency-free OTel-shaped API).
+  - **Existence checks** (`exists.go`) — `TableExists`, `ColumnExists`,
+    `IndexExists`, `TriggerExists` over `sqlite_master` / `pragma_table_info`.
+  - **Migration safety analyzer** (`safety.go`) — `AnalyzeMigration`
+    with SQLite-tuned rules (drop-table, drop/rename-column,
+    add-NOT-NULL-without-default, non-constant ADD COLUMN default,
+    DELETE/UPDATE without WHERE).
+  - **Logger hook alias** (`hook_logger.go`) — `sqlite.LoggerHook` for
+    symmetry with the pg/clickhouse dialects.
+
+  Postgres-specific features remain pg-only where SQL cannot express
+  them (LISTEN/NOTIFY, pgvector, materialized views, COPY, PostGIS,
+  advisory locks, streaming replication, `CREATE INDEX CONCURRENTLY`,
+  table-partitioned time series).
 - **Portable SQL expression layer for SQLite** (`drops/sqlite`) — the
   SQLite dialect gains the full set of standard-SQL expression builders
   that previously lived only in `drops/pg`, so anything expressible in

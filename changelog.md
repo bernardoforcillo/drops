@@ -9,6 +9,19 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Audit, authorization and caching for SQLite** (`drops/sqlite`) — the
+  cross-cutting Entity concerns from pg, wired into SQLite's Entity CRUD:
+  - **Audit** (`audit.go`) — `NewAuditLog`/`NewAuditTable`/`WithAudit`,
+    `WithActor`/`ActorFrom`; Create/Update/Delete write an audit row in
+    the same transaction as the mutation.
+  - **Authorization** (`authz.go`) — `Guard` + `OwnerGuard`/
+    `MembershipGuard`/`CustomGuard` + `AnyOf`/`AllOf`, `WithSubject`/
+    `SubjectFrom`, `(*Entity).AuthorizeWith`; the guard predicate is
+    AND-ed into Get/Query/Update/Delete and fails closed with
+    `ErrSubjectMissing`.
+  - **Cache** (`cache.go`) — `(*Entity).WithCache` read-through cache
+    over the `drops/cache` backend, with a single-flight group,
+    PK-entry invalidation on write/delete, and gob-encoded entries.
 - **Schema push & diagram for SQLite** (`drops/sqlite`) —
   - **Push** (`push.go`) — `Push` introspects the live DB, diffs it
     against a Go `Schema`, and applies (or `DryRun`-previews) the diff in

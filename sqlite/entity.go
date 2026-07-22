@@ -24,6 +24,11 @@ type Entity[T any] struct {
 	// ScopeByTenant was called.
 	tenantCol   *Column
 	tenantField []int
+
+	// Optional cross-cutting wiring; nil unless opted into.
+	audit *auditWiring // WithAudit (audit.go)
+	guard Guard        // AuthorizeWith (authz.go)
+	cache *EntityCache // WithCache (cache.go)
 }
 
 type entityColField struct {
@@ -88,30 +93,81 @@ func (e *Entity[T]) selectCols() []drops.Expression {
 }
 
 // Get fetches the row whose primary key equals id, returning ErrNoRows
-// if absent. When the entity is tenant-scoped the ctx tenant is AND-ed
-// into the predicate (see ScopeByTenant).
+// if absent. Applies the tenant scope and the authorization guard when
+// configured, and reads through the cache when one is attached and no
+// scope/guard narrows the query.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 	var out T
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
 		return out, err
 	}
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return out, err
+	}
+	if e.cache != nil && tenantPred == nil && guardPred == nil {
+		return e.getCached(db, ctx, id)
+	}
 	sel := db.Select(e.selectCols()...).From(e.table).Where(cmp(e.pk, "=", id))
 	if tenantPred != nil {
 		sel.Where(tenantPred)
+	}
+	if guardPred != nil {
+		sel.Where(guardPred)
 	}
 	err = sel.One(ctx, &out)
 	return out, err
 }
 
-// Create inserts r. When the entity is tenant-scoped the ctx tenant is
-// stamped onto r first (rejecting a row that carries a different one).
+// getCached is the cache-aware implementation of Get. Concurrent misses
+// for the same key collapse to one DB read via the single-flight group.
+func (e *Entity[T]) getCached(db *DB, ctx context.Context, id any) (T, error) {
+	var out T
+	key := e.pkKey(id)
+	if hit, err := e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := e.cache.sf.do(key, func() (any, error) {
+		var t T
+		if hit, err := e.cache.readPK(ctx, key, &t); err == nil && hit {
+			return t, nil
+		}
+		sel := db.Select(e.selectCols()...).From(e.table).Where(cmp(e.pk, "=", id))
+		if serr := sel.One(ctx, &t); serr != nil {
+			return nil, serr
+		}
+		_ = e.cache.writeKey(ctx, key, t)
+		return t, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.(T), nil
+}
+
+// Create inserts r. Stamps the tenant (when scoped), writes an audit row
+// in the same transaction (when audited), and populates the cache.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if err := e.stampTenant(ctx, r); err != nil {
 		return err
 	}
-	vals := e.bindings(reflect.ValueOf(r).Elem(), false)
-	_, err := db.Insert(e.table).Values(vals...).Exec(ctx)
+	do := func(tx *DB) error {
+		vals := e.bindings(reflect.ValueOf(r).Elem(), false)
+		if _, err := tx.Insert(e.table).Values(vals...).Exec(ctx); err != nil {
+			return err
+		}
+		return e.recordAudit(tx, ctx, "create", r, e.pkValue(r))
+	}
+	var err error
+	if e.audit != nil {
+		err = db.InTx(ctx, do)
+	} else {
+		err = do(db)
+	}
+	if err == nil && e.cache != nil {
+		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValue(r)), *r)
+	}
 	return err
 }
 
@@ -133,36 +189,82 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	return ins.Exec(ctx)
 }
 
-// Update writes every non-PK column of r, matched by primary key (and
-// the ctx tenant when the entity is tenant-scoped).
+// Update writes every non-PK column of r, matched by primary key. Applies
+// the tenant scope and authorization guard, records an audit row in the
+// same transaction (when audited), and refreshes the cache.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	rv := reflect.ValueOf(r).Elem()
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
 		return err
 	}
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return err
+	}
 	sets := e.bindings(rv, true)
 	pkVal := rv.FieldByIndex(e.pkField).Interface()
-	upd := db.Update(e.table).Set(sets...).Where(cmp(e.pk, "=", pkVal))
-	if tenantPred != nil {
-		upd.Where(tenantPred)
+	do := func(tx *DB) error {
+		upd := tx.Update(e.table).Set(sets...).Where(cmp(e.pk, "=", pkVal))
+		if tenantPred != nil {
+			upd.Where(tenantPred)
+		}
+		if guardPred != nil {
+			upd.Where(guardPred)
+		}
+		if _, err := upd.Exec(ctx); err != nil {
+			return err
+		}
+		return e.recordAudit(tx, ctx, "update", r, pkVal)
 	}
-	_, err = upd.Exec(ctx)
+	if e.audit != nil {
+		err = db.InTx(ctx, do)
+	} else {
+		err = do(db)
+	}
+	if err == nil && e.cache != nil {
+		_ = e.cache.writeKey(ctx, e.pkKey(pkVal), *r)
+	}
 	return err
 }
 
-// Delete removes the row whose primary key equals id (scoped to the ctx
-// tenant when the entity is tenant-scoped).
+// Delete removes the row whose primary key equals id. Applies the tenant
+// scope and authorization guard, records an audit row in the same
+// transaction (when audited), and invalidates the cache entry.
 func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, error) {
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
 		return nil, err
 	}
-	del := db.Delete(e.table).Where(cmp(e.pk, "=", id))
-	if tenantPred != nil {
-		del.Where(tenantPred)
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return del.Exec(ctx)
+	var res drops.Result
+	do := func(tx *DB) error {
+		del := tx.Delete(e.table).Where(cmp(e.pk, "=", id))
+		if tenantPred != nil {
+			del.Where(tenantPred)
+		}
+		if guardPred != nil {
+			del.Where(guardPred)
+		}
+		r, derr := del.Exec(ctx)
+		if derr != nil {
+			return derr
+		}
+		res = r
+		return e.recordAudit(tx, ctx, "delete", nil, id)
+	}
+	if e.audit != nil {
+		err = db.InTx(ctx, do)
+	} else {
+		err = do(db)
+	}
+	if err == nil {
+		e.invalidatePK(ctx, id)
+	}
+	return res, err
 }
 
 // bindings builds the column bindings from r. When skipPK is true the
@@ -189,24 +291,32 @@ func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 type EntityQuery[T any] struct {
 	e             *Entity[T]
 	sb            *SelectBuilder
-	tenantApplied bool
+	scopesApplied bool
 }
 
-// applyTenant AND-s the ctx tenant predicate onto the query the first
-// time it runs. Returns ErrTenantMissing when the entity is scoped but
-// ctx carries no tenant.
-func (q *EntityQuery[T]) applyTenant(ctx context.Context) error {
-	if q.tenantApplied || q.e.tenantCol == nil {
+// applyScopes AND-s the ctx tenant predicate and authorization guard onto
+// the query the first time it runs. Returns ErrTenantMissing /
+// ErrSubjectMissing when a scope/guard is configured but ctx lacks the
+// needed value.
+func (q *EntityQuery[T]) applyScopes(ctx context.Context) error {
+	if q.scopesApplied {
 		return nil
 	}
-	pred, err := q.e.tenantPredicate(ctx)
+	tenantPred, err := q.e.tenantPredicate(ctx)
 	if err != nil {
 		return err
 	}
-	if pred != nil {
-		q.sb.Where(pred)
+	if tenantPred != nil {
+		q.sb.Where(tenantPred)
 	}
-	q.tenantApplied = true
+	guardPred, err := q.e.guardPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if guardPred != nil {
+		q.sb.Where(guardPred)
+	}
+	q.scopesApplied = true
 	return nil
 }
 
@@ -228,7 +338,7 @@ func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); retur
 
 // All executes and returns every matching row.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
-	if err := q.applyTenant(ctx); err != nil {
+	if err := q.applyScopes(ctx); err != nil {
 		return nil, err
 	}
 	var out []T
@@ -241,7 +351,7 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 // One executes and returns the first row, or ErrNoRows.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	var out T
-	if err := q.applyTenant(ctx); err != nil {
+	if err := q.applyScopes(ctx); err != nil {
 		return out, err
 	}
 	err := q.sb.Limit(1).One(ctx, &out)

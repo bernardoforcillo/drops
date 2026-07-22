@@ -9,6 +9,15 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Schema push & diagram for SQLite** (`drops/sqlite`) —
+  - **Push** (`push.go`) — `Push` introspects the live DB, diffs it
+    against a Go `Schema`, and applies (or `DryRun`-previews) the diff in
+    one transaction; `PushResult`/`PushOptions`/`ErrSchemaRequired`.
+  - **Mermaid ER diagram** (`diagram.go`) — `MermaidDiagram` renders a
+    schema (tables + relations) as a Mermaid `erDiagram`.
+
+  `objects.go` (sequences, RLS policies, materialized views) is not
+  ported — those are Postgres-specific.
 - **Reflection, PII and drift for SQLite** (`drops/sqlite`) —
   - **AutoTable** (`autotable.go`) — `AutoTable[T]` / `NewAutoEntity[T]`
     derive a Table from `drop` struct tags (primaryKey, autoIncrement,

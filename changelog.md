@@ -8,6 +8,53 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+### Added
+- **Portable SQL expression layer for SQLite** (`drops/sqlite`) — the
+  SQLite dialect gains the full set of standard-SQL expression builders
+  that previously lived only in `drops/pg`, so anything expressible in
+  portable SQL is now available on SQLite too. New helpers:
+  - **Operators / predicates** (`op.go`): free-standing `Eq`, `Ne`, `Gt`,
+    `Gte`, `Lt`, `Lte`, `Not`, `In`, `NotIn`, `IsNull`, `IsNotNull`,
+    `Between`, `NotBetween`, `Like`, `NotLike`, `LikeEscape`, plus the
+    SQLite-native `Glob`, `Regexp`, and the NULL-safe `IsDistinctFrom` /
+    `IsNotDistinctFrom` (rendered via SQLite `IS` / `IS NOT`).
+  - **Aggregates / scalars** (`funcs.go`): `Count`, `CountAll`,
+    `CountDistinct`, `Sum`, `Avg`, `Min`, `Max`, `SumDistinct`,
+    `AvgDistinct`, `Filter`, plus SQLite's `Total`, `GroupConcat`,
+    `Coalesce`, `IfNull`, `NullIf`, `Lower`, `Upper`, `As`, `Func`.
+  - **Math** (`math.go`): `Abs`, `Round`, `Ceil`, `Floor`, `Trunc`,
+    `Mod` (via `%`), `Power` (`pow`), `Sqrt`, `Sign`, `Exp`, `Ln`, `Log`,
+    `Greatest`/`Least` (via multi-arg `max`/`min`), trig functions,
+    `Random`, and the `Plus`/`Minus`/`Mul`/`Div` operators.
+  - **Strings** (`strings.go`): `ConcatOp` (`||`), `Concat`, `ConcatWS`,
+    `Length`, `OctetLength`, `Substr`, `Trim`/`LTrim`/`RTrim`, `Replace`,
+    `Instr`, `Hex`/`Unhex`, `Quote`, `Chr`, `Unicode`, `Format`/`Printf`.
+  - **Cast / Case** (`cast.go`): `CastAs`/`Cast` (SQLite has only the
+    `CAST(x AS T)` form) and the `Case`/`CaseOn` builder.
+  - **Subqueries** (`subquery.go`): `Exists`, `NotExists`, `Subquery`,
+    `InSub`, `NotInSub`.
+  - **CTEs** (`cte.go`): `With` / `WithRecursive` on the SELECT builder
+    plus `CTEDef` (WITH / WITH RECURSIVE, supported since SQLite 3.8.3).
+  - **Window functions** (`window.go`): `Over`, `WindowSpec`,
+    `RowNumber`, `Rank`, `DenseRank`, `PercentRank`, `CumeDist`, `Ntile`,
+    `Lag`, `Lead`, `FirstValue`, `LastValue`, `NthValue`.
+  - **JSON1** (`json.go`): `JSONExtract`, `JSONGet` (`->`),
+    `JSONGetText` (`->>`), `JSONArrayLength`, `JSONType`, `JSONValid`,
+    `JSONQuote`, `JSONObject`, `JSONArray`, `JSONSet`/`JSONInsert`/
+    `JSONReplace`, `JSONRemove`, `JSONPatch`, `JSONGroupArray`,
+    `JSONGroupObject`.
+  - **Date/time** (`datetime.go`): `Now`, `CurrentDate`, `CurrentTime`,
+    `CurrentTimestamp`, `DateOf`, `TimeOf`, `DateTime`, `JulianDay`,
+    `UnixEpoch`, `StrfTime`.
+- **Portable SQL expression layer for ClickHouse** (`drops/clickhouse`)
+  — the standard-SQL structural helpers ClickHouse supports with
+  identical syntax, mirroring the SQLite/pg surface: `CastAs`/`Cast` and
+  `Case`/`CaseOn` (`cast.go`); `Exists`, `NotExists`, `Subquery`,
+  `InSub`, `NotInSub` (`subquery.go`); `With` / `CTEDef` (`cte.go`); and
+  window functions `Over`, `WindowSpec`, `RowNumber`, `Rank`,
+  `DenseRank`, `FirstValue`, `LastValue`, `NthValue`, plus `Lag`/`Lead`
+  emitting ClickHouse's `lagInFrame`/`leadInFrame` (`window.go`).
+
 ## [0.4.1] - 2026-07-14
 
 ### Fixed

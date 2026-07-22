@@ -9,6 +9,17 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **drizzle-kit interop for SQLite** (`drops/sqlite`) —
+  - **DrizzleMigrator** (`drizzle.go`) — applies a drizzle-kit migration
+    directory (journal + hashed `.sql` files, statement-breakpoint
+    splitting, `BeforeEach`/`AfterEach` hooks). Adapted to SQLite: the
+    `__drizzle_migrations` history table is unqualified (no schema), and
+    the journal dialect must be `sqlite`.
+  - **GenerateMigration** (`generate.go`) — diffs the Go schema against
+    the latest snapshot and writes a new drizzle-kit migration set
+    (`<tag>.sql`, `meta/<idx>_snapshot.json`, updated `_journal.json`),
+    with optional `WithDown` rollback SQL. No-op when the schema is
+    unchanged.
 - **Query-plan capture for SQLite** (`drops/sqlite`, `explain.go`) —
   `Explain` runs `EXPLAIN QUERY PLAN`, parsing it into `PlanStep`s with
   `SeqScans` (full-table scans), `UsedIndexes`, a stable `Fingerprint`

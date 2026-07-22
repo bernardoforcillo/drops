@@ -9,6 +9,23 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Dev & schema tooling for SQLite** (`drops/sqlite`) —
+  - **Factory** (`factory.go`) — `NewFactory`/`Build`/`BuildN`/`Create`/
+    `CreateN`/`With`/`Reset` test-data factories (backed by the new
+    `Entity.CreateMany` batch insert).
+  - **Seeder** (`seed.go`) — `NewSeeder` + `SeedAdd`/`SeedAddCreate`/
+    `SeedDo` + transactional `Apply`.
+  - **Test transaction** (`testing.go`) — `TestTx` runs a test body in a
+    rolled-back transaction via the `TB` interface.
+  - **N+1 detector** (`n1.go`) — `WithN1Detector` + `N1Hook` +
+    `N1Report`/`N1Pattern` to flag repeated query skeletons.
+  - **Keyset cursor** (`cursor.go`) — `CursorSpec`/`OrderKey`,
+    `EncodeCursor`/`Cursor.Decode`, and `SelectBuilder.OrderByCursor`/
+    `AfterCursor`/`BeforeCursor` (NULLS defaults documented for SQLite).
+  - **Enum** (`enum.go`) — `NewEnum`/`AddTo`/`EnumCol` emulate a
+    PostgreSQL enum as a `TEXT` column plus an `IN (...)` CHECK
+    constraint (SQLite has no enum type).
+  - `Entity.CreateMany` — multi-row batch insert with tenant stamping.
 - **Transactional outbox for SQLite** (`drops/sqlite`, `outbox.go`) —
   `Outbox` / `NewOutboxTable` / `Emit` / `EmitWith`, `Drain`,
   `MarkPublished`, `MarkFailed`, `Cleanup`, and `OutboxWorker`

@@ -20,8 +20,10 @@ import (
 // Safe for concurrent use by multiple goroutines provided the
 // underlying Driver is; builders are not — create one per query.
 type DB struct {
-	drv  drops.Driver
-	hook drops.Hook
+	drv    drops.Driver
+	hook   drops.Hook
+	retry  *RetryPolicy
+	tracer Tracer
 }
 
 // New wraps a drops.Driver as a SQLite DB.
@@ -66,21 +68,48 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return &DB{drv: tx, hook: db.hook}, tx, nil
+	return &DB{drv: tx, hook: db.hook, retry: db.retry, tracer: db.tracer}, tx, nil
 }
 
 // InTx runs fn inside a transaction, committing on nil and rolling back
 // otherwise (including on panic, which is re-raised). Rollback uses a
 // detached, short-timeout context so a cancelled caller-ctx can't block
 // cleanup.
-func (db *DB) InTx(ctx context.Context, fn func(*DB) error) (err error) {
+//
+// When a RetryPolicy is installed via WithRetry, the whole callback is
+// re-run inside a fresh transaction on a retryable error (SQLITE_BUSY /
+// SQLITE_LOCKED by default), up to MaxAttempts times, sleeping Backoff
+// between attempts. Callbacks must be idempotent across retries.
+func (db *DB) InTx(ctx context.Context, fn func(*DB) error) error {
+	if db.retry == nil {
+		return db.inTxOnce(ctx, fn)
+	}
+	policy := *db.retry
+	attempts := policy.attempts()
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = db.inTxOnce(ctx, fn)
+		if err == nil || attempt == attempts || !policy.shouldRetry(err) {
+			return err
+		}
+		if policy.Backoff != nil {
+			if serr := retrySleep(ctx, policy.Backoff(attempt)); serr != nil {
+				return serr
+			}
+		}
+	}
+	return err
+}
+
+// inTxOnce runs fn inside exactly one transaction.
+func (db *DB) inTxOnce(ctx context.Context, fn func(*DB) error) (err error) {
 	bstart := time.Now()
 	tx, berr := db.drv.Begin(ctx)
 	db.emit(ctx, drops.QueryEvent{Kind: "begin", Duration: time.Since(bstart), Err: berr})
 	if berr != nil {
 		return berr
 	}
-	inner := &DB{drv: tx, hook: db.hook}
+	inner := &DB{drv: tx, hook: db.hook, retry: db.retry, tracer: db.tracer}
 	rollback := func() {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
@@ -130,16 +159,36 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 
 // Exec runs a raw SQL statement. Placeholders are SQLite "?" markers.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	ctx, span := db.startSpan(ctx, "sqlite.exec")
+	defer span.End()
+	db.annotateSpan(span, "exec", sql, args)
 	start := time.Now()
-	res, err := db.drv.Exec(ctx, sql, args...)
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	res, err := db.drv.Exec(ctx, sql, drvArgs...)
+	if err != nil {
+		span.RecordError(err)
+	}
 	db.emit(ctx, drops.QueryEvent{Kind: "exec", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return res, err
 }
 
 // Query runs a raw SQL query.
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	ctx, span := db.startSpan(ctx, "sqlite.query")
+	defer span.End()
+	db.annotateSpan(span, "query", sql, args)
 	start := time.Now()
-	rows, err := db.drv.Query(ctx, sql, args...)
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	rows, err := db.drv.Query(ctx, sql, drvArgs...)
+	if err != nil {
+		span.RecordError(err)
+	}
 	db.emit(ctx, drops.QueryEvent{Kind: "query", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return rows, err
 }

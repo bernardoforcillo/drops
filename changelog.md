@@ -9,6 +9,156 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **drizzle-kit interop for SQLite** (`drops/sqlite`) —
+  - **DrizzleMigrator** (`drizzle.go`) — applies a drizzle-kit migration
+    directory (journal + hashed `.sql` files, statement-breakpoint
+    splitting, `BeforeEach`/`AfterEach` hooks). Adapted to SQLite: the
+    `__drizzle_migrations` history table is unqualified (no schema), and
+    the journal dialect must be `sqlite`.
+  - **GenerateMigration** (`generate.go`) — diffs the Go schema against
+    the latest snapshot and writes a new drizzle-kit migration set
+    (`<tag>.sql`, `meta/<idx>_snapshot.json`, updated `_journal.json`),
+    with optional `WithDown` rollback SQL. No-op when the schema is
+    unchanged.
+- **Query-plan capture for SQLite** (`drops/sqlite`, `explain.go`) —
+  `Explain` runs `EXPLAIN QUERY PLAN`, parsing it into `PlanStep`s with
+  `SeqScans` (full-table scans), `UsedIndexes`, a stable `Fingerprint`
+  for regression detection, and a tree `String`.
+- **Audit, authorization and caching for SQLite** (`drops/sqlite`) — the
+  cross-cutting Entity concerns from pg, wired into SQLite's Entity CRUD:
+  - **Audit** (`audit.go`) — `NewAuditLog`/`NewAuditTable`/`WithAudit`,
+    `WithActor`/`ActorFrom`; Create/Update/Delete write an audit row in
+    the same transaction as the mutation.
+  - **Authorization** (`authz.go`) — `Guard` + `OwnerGuard`/
+    `MembershipGuard`/`CustomGuard` + `AnyOf`/`AllOf`, `WithSubject`/
+    `SubjectFrom`, `(*Entity).AuthorizeWith`; the guard predicate is
+    AND-ed into Get/Query/Update/Delete and fails closed with
+    `ErrSubjectMissing`.
+  - **Cache** (`cache.go`) — `(*Entity).WithCache` read-through cache
+    over the `drops/cache` backend, with a single-flight group,
+    PK-entry invalidation on write/delete, and gob-encoded entries.
+- **Schema push & diagram for SQLite** (`drops/sqlite`) —
+  - **Push** (`push.go`) — `Push` introspects the live DB, diffs it
+    against a Go `Schema`, and applies (or `DryRun`-previews) the diff in
+    one transaction; `PushResult`/`PushOptions`/`ErrSchemaRequired`.
+  - **Mermaid ER diagram** (`diagram.go`) — `MermaidDiagram` renders a
+    schema (tables + relations) as a Mermaid `erDiagram`.
+
+  `objects.go` (sequences, RLS policies, materialized views) is not
+  ported — those are Postgres-specific.
+- **Reflection, PII and drift for SQLite** (`drops/sqlite`) —
+  - **AutoTable** (`autotable.go`) — `AutoTable[T]` / `NewAutoEntity[T]`
+    derive a Table from `drop` struct tags (primaryKey, autoIncrement,
+    notNull, unique, pii, default), mapping Go types to SQLite affinities
+    (`sqlite.Money` → INTEGER).
+  - **PII redaction** (`pii.go`) — `PII`/`IsPII`/`(*Col).AsPII`; Exec and
+    Query unwrap the marker for the driver while hooks/loggers see
+    `<redacted>`, and entity bindings wrap PII columns automatically.
+  - **Drift detection** (`drift.go`) — `DetectDrift` computes the two-way
+    Snapshot diff into a `DriftReport` (`PendingMigrations`,
+    `UnauthorizedChanges`, `InSync`).
+- **Dev & schema tooling for SQLite** (`drops/sqlite`) —
+  - **Factory** (`factory.go`) — `NewFactory`/`Build`/`BuildN`/`Create`/
+    `CreateN`/`With`/`Reset` test-data factories (backed by the new
+    `Entity.CreateMany` batch insert).
+  - **Seeder** (`seed.go`) — `NewSeeder` + `SeedAdd`/`SeedAddCreate`/
+    `SeedDo` + transactional `Apply`.
+  - **Test transaction** (`testing.go`) — `TestTx` runs a test body in a
+    rolled-back transaction via the `TB` interface.
+  - **N+1 detector** (`n1.go`) — `WithN1Detector` + `N1Hook` +
+    `N1Report`/`N1Pattern` to flag repeated query skeletons.
+  - **Keyset cursor** (`cursor.go`) — `CursorSpec`/`OrderKey`,
+    `EncodeCursor`/`Cursor.Decode`, and `SelectBuilder.OrderByCursor`/
+    `AfterCursor`/`BeforeCursor` (NULLS defaults documented for SQLite).
+  - **Enum** (`enum.go`) — `NewEnum`/`AddTo`/`EnumCol` emulate a
+    PostgreSQL enum as a `TEXT` column plus an `IN (...)` CHECK
+    constraint (SQLite has no enum type).
+  - `Entity.CreateMany` — multi-row batch insert with tenant stamping.
+- **Transactional outbox for SQLite** (`drops/sqlite`, `outbox.go`) —
+  `Outbox` / `NewOutboxTable` / `Emit` / `EmitWith`, `Drain`,
+  `MarkPublished`, `MarkFailed`, `Cleanup`, and `OutboxWorker`
+  (`OnEvent`/`OnBatch`, `WithInterval`/`WithBatch`/`WithMaxAttempts`/
+  `WithBackoff`, `Run`/`Tick`). SQLite has no LISTEN/NOTIFY, SKIP LOCKED
+  or advisory locks, so it is a poll-based single-worker outbox with
+  INTEGER Unix-second timestamps; the pg per-aggregate advisory-lock
+  ordering mode is omitted. Delivery is at-least-once.
+- **Event sourcing & saga for SQLite** (`drops/sqlite`) —
+  - **Event store** (`eventstore.go`) — `EventStore` / `NewEventStoreTable`
+    with `Append` (optimistic concurrency via the UNIQUE
+    aggregate/version constraint → `ErrConcurrencyConflict`, detected
+    from SQLite's "UNIQUE constraint failed" message), `Load`, `Stream`,
+    `LatestVersion`, plus snapshots (`NewSnapshotTable`, `SaveSnapshot`
+    via `ON CONFLICT DO UPDATE`, `LoadSnapshot`).
+  - **Saga** (`saga.go`) — `NewSaga`/`Step`/`Run` orchestration with
+    reverse-order compensation, typed `SagaState` (`SagaStateGet[T]`),
+    and `SagaError`/`IsSagaError`.
+- **Transactional store patterns for SQLite** (`drops/sqlite`) —
+  - **Idempotency keys** (`idempotency.go`) — `IdempotencyStore` /
+    `NewIdempotencyTable` / `Run` / `RunJSON` / `Cleanup` / `SweepEvery`.
+    SQLite has no `SELECT ... FOR UPDATE`; concurrent `Run` calls
+    serialise on the write-transaction lock instead. Time comparisons
+    bind Go times (not `CURRENT_TIMESTAMP`) to avoid datetime-format
+    mismatch.
+  - **Chunked backfill** (`backfill.go`) — `NewBackfill` with
+    `ChunkSize`/`Throttle`/`Fetch`/`Process`/`OnProgress`, resumable via a
+    persisted state table (`NewBackfillStateTable`, timestamps stored as
+    INTEGER Unix seconds), upserting through `ON CONFLICT DO UPDATE`. The
+    pg replica-lag gate is omitted (SQLite has no replication).
+- **Lifecycle hooks, templates and mixins for SQLite** (`drops/sqlite`) —
+  the pg hook/mixin subsystem, adapted to SQLite:
+  - **Hooks** (`hooks.go` + builder wiring) — `Table.OnInsert` /
+    `OnUpdate` / `OnDelete` and `DefaultFilter`, applied by the INSERT /
+    UPDATE / DELETE / SELECT builders; `Unscoped()` on Select/Update/
+    Delete bypasses default scopes. User-supplied values always win over
+    hook-supplied ones.
+  - **Templates** (`template.go`) — `Timestamps`, `SoftDelete`, `Audit`,
+    `UUIDPrimaryKey` column groups returning typed handles. SQLite
+    adaptations: `CURRENT_TIMESTAMP` defaults, and a `randomblob()`-based
+    RFC-4122 v4 UUID default for `UUIDPrimaryKey` (SQLite has no
+    `gen_random_uuid()`).
+  - **Mixins** (`mixin.go`) — `ApplyMixins` + `TimestampsMixin`
+    (bumps `updatedAt` on UPDATE), `SoftDeleteMixin` (default-scopes
+    queries and rewrites DELETE into UPDATE `deletedAt`), `AuditMixin`,
+    `UUIDPrimaryKeyMixin`.
+- **Higher-level pg feature parity for SQLite** (`drops/sqlite`) — the
+  portable feature patterns that previously lived only in `drops/pg` are
+  now available on SQLite, adapted to SQLite semantics:
+  - **Money** (`money.go`) — precision-safe integer-cents monetary type
+    (`Money`, `MoneyFromString`/`MoneyFromCents`/`MoneyFromUnits`, `Add`,
+    `Sub`, `MulRate` with banker's rounding, JSON string round-trip,
+    `driver.Valuer`/`sql.Scanner`).
+  - **Cursor pagination** (`page.go`) — `Entity.Page` with opaque
+    keyset cursors (`Asc`/`Desc`, `Page[T]`, `HasMore`/`NextCursor`),
+    using SQLite row-value comparison for the keyset guard.
+  - **Patch** (`patch.go`) — `Entity.Patch` with SQL-side ops `Inc`,
+    `Dec`, `Set`, `SetIfGreater`/`SetIfLess` (via `max`/`min`) and
+    `SetIfChanged` (via NULL-safe `IS NOT`).
+  - **Tenant scoping** (`tenant.go`) — `Entity.ScopeByTenant` +
+    `WithTenant`/`TenantFrom`; Get/Query/Update/Delete auto-apply the
+    tenant predicate and Create stamps it, failing closed with
+    `ErrTenantMissing` / `ErrTenantMismatch`.
+  - **Typed JSON path** (`jsonpath.go`) — `JSONField[T]` typed accessor
+    over `json_extract` with comparison/`In`/`IsNull`/`Like` operators,
+    plus `JSONHasKey` via `json_type`.
+  - **Retry** (`retry.go`) — `RetryPolicy` + `DB.WithRetry`;
+    transaction-level retry on `SQLITE_BUSY`/`SQLITE_LOCKED`
+    (`ErrBusy`/`ErrLocked`, matched by `errors.Is` or driver message),
+    `ExponentialJitter`, `DefaultRetryPolicy`.
+  - **Tracing** (`tracing.go`) — `Tracer`/`Span` contract + `WithTracer`
+    wired into every Exec/Query span (dependency-free OTel-shaped API).
+  - **Existence checks** (`exists.go`) — `TableExists`, `ColumnExists`,
+    `IndexExists`, `TriggerExists` over `sqlite_master` / `pragma_table_info`.
+  - **Migration safety analyzer** (`safety.go`) — `AnalyzeMigration`
+    with SQLite-tuned rules (drop-table, drop/rename-column,
+    add-NOT-NULL-without-default, non-constant ADD COLUMN default,
+    DELETE/UPDATE without WHERE).
+  - **Logger hook alias** (`hook_logger.go`) — `sqlite.LoggerHook` for
+    symmetry with the pg/clickhouse dialects.
+
+  Postgres-specific features remain pg-only where SQL cannot express
+  them (LISTEN/NOTIFY, pgvector, materialized views, COPY, PostGIS,
+  advisory locks, streaming replication, `CREATE INDEX CONCURRENTLY`,
+  table-partitioned time series).
 - **Portable SQL expression layer for SQLite** (`drops/sqlite`) — the
   SQLite dialect gains the full set of standard-SQL expression builders
   that previously lived only in `drops/pg`, so anything expressible in

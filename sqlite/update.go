@@ -8,10 +8,11 @@ import (
 
 // UpdateBuilder builds an UPDATE statement. Create one via DB.Update.
 type UpdateBuilder struct {
-	db     *DB
-	table  *Table
-	sets   []ColumnValue
-	wheres []drops.Expression
+	db       *DB
+	table    *Table
+	sets     []ColumnValue
+	wheres   []drops.Expression
+	unscoped bool
 }
 
 // Set adds a column assignment.
@@ -26,12 +27,27 @@ func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
 	return u
 }
 
+// Unscoped opts out of the table's DefaultFilter predicates for this
+// UPDATE (e.g. an admin job bypassing a soft-delete or tenant guard).
+func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
+	u.unscoped = true
+	return u
+}
+
 // WriteSQL implements drops.Expression.
 func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
+	sets := u.sets
+	if u.table.hasUpdateHooks() {
+		sets = u.applyUpdateHooks()
+	}
+	wheres := u.wheres
+	if !u.unscoped && len(u.table.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), wheres...)
+	}
 	b.WriteString("UPDATE ")
 	u.table.writeName(b)
 	b.WriteString(" SET ")
-	for i, cv := range u.sets {
+	for i, cv := range sets {
 		if i > 0 {
 			b.WriteString(", ")
 		}
@@ -39,10 +55,28 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" = ")
 		cv.writeValue(b)
 	}
-	if len(u.wheres) > 0 {
+	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
-		b.AppendList(" AND ", u.wheres)
+		b.AppendList(" AND ", wheres)
 	}
+}
+
+// applyUpdateHooks runs every UpdateHook on the table and returns the
+// (possibly extended) SET list.
+func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
+	ctx := &UpdateHookCtx{bound: make(map[*Column]bool, len(u.sets))}
+	for _, s := range u.sets {
+		ctx.bound[s.column()] = true
+	}
+	for _, h := range u.table.updateHooks {
+		h.BeforeUpdate(ctx)
+	}
+	if len(ctx.add) == 0 {
+		return u.sets
+	}
+	out := append([]ColumnValue(nil), u.sets...)
+	out = append(out, ctx.add...)
+	return out
 }
 
 // ToSQL renders the statement with SQLite placeholders.

@@ -21,6 +21,13 @@ func (u *UpdateBuilder) Set(vals ...ColumnValue) *UpdateBuilder {
 	return u
 }
 
+// SetExpr assigns a raw SQL expression to col (e.g. CURRENT_TIMESTAMP,
+// NULL, or "count + 1") rather than a bound value.
+func (u *UpdateBuilder) SetExpr(col *Column, expr drops.Expression) *UpdateBuilder {
+	u.sets = append(u.sets, exprValue{col: col, expr: expr})
+	return u
+}
+
 // Where AND-s the given predicates onto the statement.
 func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
 	u.wheres = append(u.wheres, preds...)

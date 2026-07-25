@@ -9,6 +9,15 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Tiered cache** (`drops/cache/tiered`) — two-level L1+L2 read-through /
+  write-through cache with `GetOrLoad` singleflight stampede protection.
+- **Memcached cache backend** (`drops/cache/memcached`) — stdlib-only
+  backend implementing `cache.Cache` / `cache.MultiCache`.
+- **OpenTelemetry hook instrumentation** (`drops/otel`) — spans + RED
+  metrics adapter for all backends without importing OTel in core packages.
+- **SQLite keyset pagination and soft delete parity** (`drops/sqlite`) —
+  `Entity.Page`, `Table.DefaultFilter`, `SoftDelete` helpers, and
+  `UpdateBuilder.SetExpr`.
 - **drizzle-kit interop for SQLite** (`drops/sqlite`) —
   - **DrizzleMigrator** (`drizzle.go`) — applies a drizzle-kit migration
     directory (journal + hashed `.sql` files, statement-breakpoint

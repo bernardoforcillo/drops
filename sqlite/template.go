@@ -30,19 +30,6 @@ func Timestamps(t *Table) TimestampsCols {
 	}
 }
 
-// SoftDeleteCols holds the typed handle created by SoftDelete.
-type SoftDeleteCols struct {
-	DeletedAt *Col[time.Time]
-}
-
-// SoftDelete appends a nullable "deletedAt" DATETIME column. A record is
-// treated as live while deletedAt IS NULL.
-func SoftDelete(t *Table) SoftDeleteCols {
-	return SoftDeleteCols{
-		DeletedAt: Add(t, Timestamp("deletedAt", false)),
-	}
-}
-
 // AuditCols holds the typed handles created by Audit.
 type AuditCols[T any] struct {
 	CreatedBy *Col[T]

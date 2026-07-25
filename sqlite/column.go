@@ -222,3 +222,12 @@ func (v columnValue) writeValue(b *drops.Builder) {
 	}
 	b.AddArg(v.val)
 }
+
+// exprValue assigns a raw SQL expression (not a bound value) to a column.
+type exprValue struct {
+	col  *Column
+	expr drops.Expression
+}
+
+func (v exprValue) column() *Column             { return v.col }
+func (v exprValue) writeValue(b *drops.Builder) { b.Append(v.expr) }

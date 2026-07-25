@@ -1,4 +1,4 @@
-package pg
+package clickhouse
 
 import (
 	"encoding/base64"
@@ -18,26 +18,26 @@ import (
 // the same regardless of depth.
 //
 //	// Declare the cursor shape once — typically per page-able endpoint.
-//	spec := pg.NewCursorSpec(
-//	    pg.OrderKey{Col: Posts.CreatedAt, Desc: true},
-//	    pg.OrderKey{Col: Posts.ID,        Desc: true}, // tiebreaker
+//	spec := clickhouse.NewCursorSpec(
+//	    clickhouse.OrderKey{Col: Events.Ts, Desc: true},
+//	    clickhouse.OrderKey{Col: Events.ID, Desc: true}, // tiebreaker
 //	)
 //
 //	// First page — no cursor.
-//	var rows []Post
-//	err := db.Select(/* cols */).From(Posts).
+//	var rows []Event
+//	err := db.Select(/* cols */).From(Events).
 //	    OrderByCursor(spec).
 //	    Limit(50).
-//	    Iter(ctx, /* scan into &rows */ )
+//	    All(ctx, &rows)
 //
 //	// Build the cursor from the last row and pass it to the next page.
 //	last := rows[len(rows)-1]
-//	cur, _ := pg.EncodeCursor(spec, last.CreatedAt, last.ID)
-//	err = db.Select(/* cols */).From(Posts).
+//	cur, _ := clickhouse.EncodeCursor(spec, last.Ts, last.ID)
+//	err = db.Select(/* cols */).From(Events).
 //	    OrderByCursor(spec).
 //	    AfterCursor(spec, cur).
 //	    Limit(50).
-//	    Iter(ctx, /* scan into &rows */)
+//	    All(ctx, &rows)
 //
 // The cursor is opaque — base64 URL-safe encoding of a typed JSON
 // payload — so it can be passed through query strings without
@@ -60,12 +60,7 @@ type OrderKey struct {
 	// Desc selects descending order. Defaults to ascending.
 	Desc bool
 
-	// Nulls picks the NULLS FIRST / NULLS LAST clause. Leaving
-	// it empty inherits PG's default ("NULLS LAST" for ASC,
-	// "NULLS FIRST" for DESC). Cursor columns are typically
-	// non-null (timestamps, IDs) so the default is fine — but
-	// when you cursor on nullable columns set this explicitly
-	// so the WHERE clause and ORDER BY agree.
+	// Nulls picks the NULLS FIRST / NULLS LAST clause.
 	Nulls NullsOrdering
 }
 
@@ -74,7 +69,7 @@ type OrderKey struct {
 type NullsOrdering string
 
 const (
-	// NullsDefault inherits PostgreSQL's per-direction default.
+	// NullsDefault inherits ClickHouse's per-direction default.
 	NullsDefault NullsOrdering = ""
 	// NullsFirst pushes NULL values to the start of the order.
 	NullsFirst NullsOrdering = "FIRST"
@@ -102,7 +97,7 @@ func NewCursorSpec(keys ...OrderKey) CursorSpec {
 // wrong length or contains an unsupported type.
 func EncodeCursor(spec CursorSpec, values ...any) (Cursor, error) {
 	if len(values) != len(spec.Keys) {
-		return "", fmt.Errorf("drops/pg: EncodeCursor: %d values for %d keys", len(values), len(spec.Keys))
+		return "", fmt.Errorf("drops/clickhouse: EncodeCursor: %d values for %d keys", len(values), len(spec.Keys))
 	}
 	w := cursorWire{V: make([]cursorVal, len(values))}
 	for i, v := range values {
@@ -124,15 +119,15 @@ func EncodeCursor(spec CursorSpec, values ...any) (Cursor, error) {
 // the request as "first page" (or reject the input outright).
 func (c Cursor) Decode() ([]any, error) {
 	if c == "" {
-		return nil, errors.New("drops/pg: empty cursor")
+		return nil, errors.New("drops/clickhouse: empty cursor")
 	}
 	body, err := base64.RawURLEncoding.DecodeString(string(c))
 	if err != nil {
-		return nil, fmt.Errorf("drops/pg: cursor base64: %w", err)
+		return nil, fmt.Errorf("drops/clickhouse: cursor base64: %w", err)
 	}
 	var w cursorWire
 	if err := json.Unmarshal(body, &w); err != nil {
-		return nil, fmt.Errorf("drops/pg: cursor JSON: %w", err)
+		return nil, fmt.Errorf("drops/clickhouse: cursor JSON: %w", err)
 	}
 	out := make([]any, len(w.V))
 	for i, cv := range w.V {
@@ -221,7 +216,7 @@ func encodeCursorValue(v any) (cursorVal, error) {
 	case []byte:
 		return cursorVal{T: cTypeBytes, V: json.RawMessage(`"` + base64.RawURLEncoding.EncodeToString(x) + `"`)}, nil
 	default:
-		return cursorVal{}, fmt.Errorf("drops/pg: cursor value type %T not supported", v)
+		return cursorVal{}, fmt.Errorf("drops/clickhouse: cursor value type %T not supported", v)
 	}
 }
 
@@ -276,7 +271,7 @@ func decodeCursorValue(cv cursorVal) (any, error) {
 		}
 		return base64.RawURLEncoding.DecodeString(s)
 	default:
-		return nil, fmt.Errorf("drops/pg: cursor value type %q unknown", cv.T)
+		return nil, fmt.Errorf("drops/clickhouse: cursor value type %q unknown", cv.T)
 	}
 }
 
@@ -285,7 +280,7 @@ func decodeCursorValue(cv cursorVal) (any, error) {
 // the keyset WHERE matches.
 func (s *SelectBuilder) OrderByCursor(spec CursorSpec) *SelectBuilder {
 	for _, k := range spec.Keys {
-		s.orderBys = append(s.orderBys, orderKeyExpr(k))
+		s.orderBys = append(s.orderBys, cursorOrderKeyExpr(k))
 	}
 	return s
 }
@@ -305,7 +300,7 @@ func (s *SelectBuilder) AfterCursor(spec CursorSpec, c Cursor) *SelectBuilder {
 		return s
 	}
 	if len(values) != len(spec.Keys) {
-		s.err = fmt.Errorf("drops/pg: cursor has %d values, spec wants %d", len(values), len(spec.Keys))
+		s.err = fmt.Errorf("drops/clickhouse: cursor has %d values, spec wants %d", len(values), len(spec.Keys))
 		s.wheres = append(s.wheres, falseExpr)
 		return s
 	}
@@ -328,7 +323,7 @@ func (s *SelectBuilder) BeforeCursor(spec CursorSpec, c Cursor) *SelectBuilder {
 		return s
 	}
 	if len(values) != len(spec.Keys) {
-		s.err = fmt.Errorf("drops/pg: cursor has %d values, spec wants %d", len(values), len(spec.Keys))
+		s.err = fmt.Errorf("drops/clickhouse: cursor has %d values, spec wants %d", len(values), len(spec.Keys))
 		s.wheres = append(s.wheres, falseExpr)
 		return s
 	}
@@ -336,9 +331,9 @@ func (s *SelectBuilder) BeforeCursor(spec CursorSpec, c Cursor) *SelectBuilder {
 	return s
 }
 
-// orderKeyExpr renders one ORDER BY fragment honouring direction
+// cursorOrderKeyExpr renders one ORDER BY fragment honouring direction
 // and NULLS placement.
-func orderKeyExpr(k OrderKey) drops.Expression {
+func cursorOrderKeyExpr(k OrderKey) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		k.Col.WriteSQL(b)
 		if k.Desc {
@@ -362,10 +357,6 @@ func orderKeyExpr(k OrderKey) drops.Expression {
 //	OR (k1 = v1 AND k2 > v2)
 //	OR (k1 = v1 AND k2 = v2 AND k3 > v3)
 //	...
-//
-// The strict comparator on the i-th key flips per OrderKey.Desc and
-// per forward / backward paging direction. Equality on leading keys
-// uses Eq so it works for any comparable PG type.
 func keysetWhere(spec CursorSpec, values []any, forward bool) drops.Expression {
 	ors := make([]drops.Expression, 0, len(spec.Keys))
 	for i := range spec.Keys {

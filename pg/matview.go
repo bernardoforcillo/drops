@@ -73,11 +73,11 @@ type MatView struct {
 // MatViewManager tracks the registered views and coordinates
 // refresh across dependents.
 type MatViewManager struct {
-	db       *DB
-	mu       sync.RWMutex
-	views    map[string]MatView
-	last     map[string]time.Time // last successful refresh per view
-	now      func() time.Time
+	db        *DB
+	mu        sync.RWMutex
+	views     map[string]MatView
+	last      map[string]time.Time // last successful refresh per view
+	now       func() time.Time
 	pollEvery time.Duration
 }
 
@@ -179,9 +179,9 @@ func (m *MatViewManager) RefreshAll(ctx context.Context) error {
 
 // refreshOne issues the SQL for v and records the success time.
 func (m *MatViewManager) refreshOne(ctx context.Context, v MatView) error {
-	sql := fmt.Sprintf(`REFRESH MATERIALIZED VIEW "%s"`, v.Name)
+	sql := fmt.Sprintf(`REFRESH MATERIALIZED VIEW %s`, quoteIdent(v.Name))
 	if v.Mode == RefreshConcurrently {
-		sql = fmt.Sprintf(`REFRESH MATERIALIZED VIEW CONCURRENTLY "%s"`, v.Name)
+		sql = fmt.Sprintf(`REFRESH MATERIALIZED VIEW CONCURRENTLY %s`, quoteIdent(v.Name))
 	}
 	if _, err := m.db.Exec(ctx, sql); err != nil {
 		return err
@@ -244,10 +244,7 @@ func (m *MatViewManager) downstreamOrder(upstream string) []string {
 	}
 	// Collect reachable from upstream.
 	visited := map[string]bool{}
-	var stack []string
-	for _, n := range dependents[upstream] {
-		stack = append(stack, n)
-	}
+	stack := append([]string(nil), dependents[upstream]...)
 	var collected []string
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]

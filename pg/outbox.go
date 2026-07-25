@@ -173,7 +173,7 @@ func (o *Outbox) EmitWith(tx *DB, ctx context.Context, kind string, payload any,
 		}
 		headers = json.RawMessage(h)
 	}
-	sql := fmt.Sprintf(`INSERT INTO "%s" ("kind", "aggregateType", "aggregateID", "payload", "headers") VALUES ($1, $2, $3, $4, $5)`, o.table)
+	sql := fmt.Sprintf(`INSERT INTO %s ("kind", "aggregateType", "aggregateID", "payload", "headers") VALUES ($1, $2, $3, $4, $5)`, quoteIdent(o.table))
 	if _, err := tx.Exec(ctx, sql, kind,
 		outboxNullableString(opts.AggregateType),
 		outboxNullableString(opts.AggregateID),
@@ -212,13 +212,13 @@ func (o *Outbox) Drain(ctx context.Context, limit int) ([]OutboxEvent, error) {
 	}
 	sql := fmt.Sprintf(`
 		SELECT "id", "kind", "aggregateType", "aggregateID", "payload", "headers", "attempts", "lastError", "createdAt"
-		FROM "%s"
+		FROM %s
 		WHERE "publishedAt" IS NULL
 		  AND "failedAt" IS NULL
 		  AND "availableAt" <= now()
 		ORDER BY "id"
 		LIMIT $1
-		FOR UPDATE SKIP LOCKED`, o.table)
+		FOR UPDATE SKIP LOCKED`, quoteIdent(o.table))
 	rows, err := o.db.Query(ctx, sql, limit)
 	if err != nil {
 		return nil, err
@@ -269,14 +269,14 @@ func (o *Outbox) DrainAggregate(ctx context.Context, aggregateType, aggregateID 
 		}
 		sql := fmt.Sprintf(`
 			SELECT "id", "kind", "aggregateType", "aggregateID", "payload", "headers", "attempts", "lastError", "createdAt"
-			FROM "%s"
+			FROM %s
 			WHERE "publishedAt" IS NULL
 			  AND "failedAt" IS NULL
 			  AND "availableAt" <= now()
 			  AND "aggregateType" IS NOT DISTINCT FROM $1
 			  AND "aggregateID" = $2
 			ORDER BY "id"
-			LIMIT $3`, o.table)
+			LIMIT $3`, quoteIdent(o.table))
 		eventRows, err := tx.Query(ctx, sql, outboxNullableString(aggregateType), aggregateID, limit)
 		if err != nil {
 			return err
@@ -302,12 +302,12 @@ func (o *Outbox) PendingAggregates(ctx context.Context, limit int) ([]AggregateR
 	}
 	sql := fmt.Sprintf(`
 		SELECT DISTINCT "aggregateType", "aggregateID"
-		FROM "%s"
+		FROM %s
 		WHERE "publishedAt" IS NULL
 		  AND "failedAt" IS NULL
 		  AND "availableAt" <= now()
 		  AND "aggregateID" IS NOT NULL
-		LIMIT $1`, o.table)
+		LIMIT $1`, quoteIdent(o.table))
 	rows, err := o.db.Query(ctx, sql, limit)
 	if err != nil {
 		return nil, err
@@ -391,7 +391,7 @@ func markPublishedOn(ctx context.Context, exec interface {
 	if len(ids) == 0 {
 		return nil
 	}
-	sql := fmt.Sprintf(`UPDATE "%s" SET "publishedAt" = now() WHERE "id" = ANY($1)`, table)
+	sql := fmt.Sprintf(`UPDATE %s SET "publishedAt" = now() WHERE "id" = ANY($1)`, quoteIdent(table))
 	_, err := exec.Exec(ctx, sql, ids)
 	return err
 }
@@ -403,11 +403,11 @@ func markPublishedOn(ctx context.Context, exec interface {
 // and the error message stored in lastError.
 func (o *Outbox) MarkFailed(ctx context.Context, id int64, attempts int, nextRetryAt time.Time, lastErr string) error {
 	if nextRetryAt.IsZero() {
-		sql := fmt.Sprintf(`UPDATE "%s" SET "attempts" = $2, "lastError" = $3, "failedAt" = now() WHERE "id" = $1`, o.table)
+		sql := fmt.Sprintf(`UPDATE %s SET "attempts" = $2, "lastError" = $3, "failedAt" = now() WHERE "id" = $1`, quoteIdent(o.table))
 		_, err := o.db.Exec(ctx, sql, id, attempts, lastErr)
 		return err
 	}
-	sql := fmt.Sprintf(`UPDATE "%s" SET "attempts" = $2, "lastError" = $3, "availableAt" = $4 WHERE "id" = $1`, o.table)
+	sql := fmt.Sprintf(`UPDATE %s SET "attempts" = $2, "lastError" = $3, "availableAt" = $4 WHERE "id" = $1`, quoteIdent(o.table))
 	_, err := o.db.Exec(ctx, sql, id, attempts, lastErr, nextRetryAt)
 	return err
 }
@@ -424,7 +424,7 @@ func (o *Outbox) Cleanup(ctx context.Context, retainAfter time.Duration) (int64,
 	if retainAfter < 0 {
 		retainAfter = 0
 	}
-	sql := fmt.Sprintf(`DELETE FROM "%s" WHERE "publishedAt" IS NOT NULL AND "publishedAt" < now() - make_interval(secs => $1)`, o.table)
+	sql := fmt.Sprintf(`DELETE FROM %s WHERE "publishedAt" IS NOT NULL AND "publishedAt" < now() - make_interval(secs => $1)`, quoteIdent(o.table))
 	res, err := o.db.Exec(ctx, sql, retainAfter.Seconds())
 	if err != nil {
 		return 0, err

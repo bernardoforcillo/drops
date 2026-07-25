@@ -163,7 +163,7 @@ func (db *DB) emit(ctx context.Context, e drops.QueryEvent) {
 // ToSQL renders an Expression with the ClickHouse placeholder style.
 // Use it when you need to inspect generated SQL outside of the
 // builders (logging, snapshotting, tests).
-func ToSQL(e drops.Expression) (string, []any) {
+func ToSQL(e drops.Expression) (sql string, args []any) {
 	b := drops.NewBuilder(Placeholder)
 	b.Append(e)
 	return b.SQL()

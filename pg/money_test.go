@@ -61,11 +61,11 @@ func TestMoneyMulRateBankersRounding(t *testing.T) {
 		rate  float64
 		want  int64
 	}{
-		{1000, 0.10, 100},  // 100.0 exact
-		{1234, 0.5, 617},   // 617.0 exact
-		{125, 0.5, 62},     // 62.5 → 62 (even)
-		{375, 0.5, 188},    // 187.5 → 188 (even)
-		{1000, 1.0, 1000},  // identity
+		{1000, 0.10, 100}, // 100.0 exact
+		{1234, 0.5, 617},  // 617.0 exact
+		{125, 0.5, 62},    // 62.5 → 62 (even)
+		{375, 0.5, 188},   // 187.5 → 188 (even)
+		{1000, 1.0, 1000}, // identity
 	}
 	for _, tc := range cases {
 		got := pg.MoneyFromCents(tc.cents).MulRate(tc.rate)
@@ -84,7 +84,8 @@ func TestMoneyCompare(t *testing.T) {
 	if b.Compare(a) <= 0 {
 		t.Errorf("b should be greater than a")
 	}
-	if a.Compare(a) != 0 {
+	aEqual := pg.MoneyFromCents(100)
+	if a.Compare(aEqual) != 0 {
 		t.Errorf("equal compare should be 0")
 	}
 }

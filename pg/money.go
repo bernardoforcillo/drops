@@ -93,7 +93,7 @@ func MoneyFromString(s string) (Money, error) {
 		if len(fracPart) > int(exp) {
 			fracPart = fracPart[:exp]
 		} else if len(fracPart) < int(exp) {
-			fracPart = fracPart + strings.Repeat("0", int(exp)-len(fracPart))
+			fracPart += strings.Repeat("0", int(exp)-len(fracPart))
 		}
 		frac, err = strconv.ParseInt(fracPart, 10, 64)
 		if err != nil {

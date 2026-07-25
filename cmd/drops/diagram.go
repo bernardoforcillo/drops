@@ -41,10 +41,10 @@ type diagSnapshot struct {
 }
 
 type diagTable struct {
-	Name        string                       `json:"name"`
-	Schema      string                       `json:"schema"`
-	Columns     map[string]*diagColumn       `json:"columns"`
-	ForeignKeys map[string]*diagForeignKey   `json:"foreignKeys"`
+	Name        string                     `json:"name"`
+	Schema      string                     `json:"schema"`
+	Columns     map[string]*diagColumn     `json:"columns"`
+	ForeignKeys map[string]*diagForeignKey `json:"foreignKeys"`
 }
 
 type diagColumn struct {
@@ -89,7 +89,6 @@ func writeTable(b *strings.Builder, t *diagTable) {
 // kept simple — Mermaid renders the same shape regardless of
 // composite vs single-column keys.
 func writeRelations(b *strings.Builder, tables []*diagTable) {
-	type edge struct{ line string }
 	var lines []string
 	seen := map[string]bool{}
 	for _, t := range tables {

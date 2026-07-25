@@ -12,19 +12,19 @@ import (
 
 // Invoice schema fixture used across guard tests:
 //
-//   invoices    (id, organizationId, createdBy, total)
-//   org_members (userId, organizationId)
+//	invoices    (id, organizationId, createdBy, total)
+//	org_members (userId, organizationId)
 //
 // A user can read / mutate an invoice if EITHER they created it
 // OR they're a member of its organization.
 type guardInvoice struct {
-	ID             int64  `drop:"id,primaryKey,autoIncrement"`
-	OrganizationID int64  `drop:"organizationId,notNull"`
-	CreatedBy      int64  `drop:"createdBy,notNull"`
-	Total          int64  `drop:"total,notNull"`
+	ID             int64 `drop:"id,primaryKey,autoIncrement"`
+	OrganizationID int64 `drop:"organizationId,notNull"`
+	CreatedBy      int64 `drop:"createdBy,notNull"`
+	Total          int64 `drop:"total,notNull"`
 }
 
-func guardSchema(t *testing.T) (*pg.Entity[guardInvoice], *pg.Table, *pg.Table) {
+func guardSchema(t *testing.T) (entity *pg.Entity[guardInvoice], invoiceTbl, memberTbl *pg.Table) {
 	t.Helper()
 	invoices := pg.AutoTable[guardInvoice]("invoices")
 

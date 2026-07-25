@@ -177,8 +177,8 @@ func (s *EventStore) Append(tx *DB, ctx context.Context, aggregateType, aggregat
 			base+1, base+2, base+3, base+4, base+5, base+6)
 		args = append(args, aggregateType, aggregateID, version, ev.Type, payload, headers)
 	}
-	sql := fmt.Sprintf(`INSERT INTO "%s" ("aggregateType", "aggregateID", "version", "eventType", "payload", "headers") VALUES %s`,
-		s.table, strings.Join(rows, ", "))
+	sql := fmt.Sprintf(`INSERT INTO %s ("aggregateType", "aggregateID", "version", "eventType", "payload", "headers") VALUES %s`,
+		quoteIdent(s.table), strings.Join(rows, ", "))
 	if _, err := tx.Exec(ctx, sql, args...); err != nil {
 		if isUniqueViolation(err) {
 			return ErrConcurrencyConflict
@@ -207,11 +207,11 @@ func isUniqueViolation(err error) bool {
 func (s *EventStore) Load(ctx context.Context, aggregateType, aggregateID string, fromVersion int64) ([]Event, error) {
 	sql := fmt.Sprintf(`
 		SELECT "id", "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
-		FROM "%s"
+		FROM %s
 		WHERE "aggregateType" = $1
 		  AND "aggregateID" = $2
 		  AND "version" > $3
-		ORDER BY "version"`, s.table)
+		ORDER BY "version"`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID, fromVersion)
 	if err != nil {
 		return nil, err
@@ -230,10 +230,10 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 	}
 	sql := fmt.Sprintf(`
 		SELECT "id", "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
-		FROM "%s"
+		FROM %s
 		WHERE "id" > $1
 		ORDER BY "id"
-		LIMIT $2`, s.table)
+		LIMIT $2`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, fromOffset, limit)
 	if err != nil {
 		return nil, err
@@ -246,7 +246,7 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 // stream, or -1 when the stream is empty. Use this before Append
 // to compute the expectedVersion for a fresh write.
 func (s *EventStore) LatestVersion(ctx context.Context, aggregateType, aggregateID string) (int64, error) {
-	sql := fmt.Sprintf(`SELECT COALESCE(MAX("version"), -1) FROM "%s" WHERE "aggregateType" = $1 AND "aggregateID" = $2`, s.table)
+	sql := fmt.Sprintf(`SELECT COALESCE(MAX("version"), -1) FROM %s WHERE "aggregateType" = $1 AND "aggregateID" = $2`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
 	if err != nil {
 		return -1, err
@@ -329,12 +329,12 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 		state = json.RawMessage("null")
 	}
 	sql := fmt.Sprintf(`
-		INSERT INTO "%s" ("aggregateType", "aggregateID", "version", "state", "createdAt")
+		INSERT INTO %s ("aggregateType", "aggregateID", "version", "state", "createdAt")
 		VALUES ($1, $2, $3, $4, now())
 		ON CONFLICT ("aggregateType", "aggregateID") DO UPDATE
 		SET "version" = EXCLUDED."version",
 		    "state" = EXCLUDED."state",
-		    "createdAt" = EXCLUDED."createdAt"`, table)
+		    "createdAt" = EXCLUDED."createdAt"`, quoteIdent(table))
 	_, err := s.db.Exec(ctx, sql, snap.AggregateType, snap.AggregateID, snap.Version, state)
 	return err
 }
@@ -343,7 +343,7 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 // Returns ok=false when no snapshot exists; callers should fall
 // back to replaying from version 0.
 func (s *EventStore) LoadSnapshot(ctx context.Context, table, aggregateType, aggregateID string) (AggregateSnapshot, bool, error) {
-	sql := fmt.Sprintf(`SELECT "aggregateType", "aggregateID", "version", "state", "createdAt" FROM "%s" WHERE "aggregateType" = $1 AND "aggregateID" = $2`, table)
+	sql := fmt.Sprintf(`SELECT "aggregateType", "aggregateID", "version", "state", "createdAt" FROM %s WHERE "aggregateType" = $1 AND "aggregateID" = $2`, quoteIdent(table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
 	if err != nil {
 		return AggregateSnapshot{}, false, err

@@ -81,7 +81,7 @@ func (k *aesGCMKeyring) Decrypt(ciphertext []byte) ([]byte, error) {
 // ----------------------------------------------------------------------
 
 var (
-	keyringMu sync.RWMutex
+	keyringMu  sync.RWMutex
 	activeRing Keyring
 )
 

@@ -109,7 +109,7 @@ func TestEntityCreateWithExplicitPK(t *testing.T) {
 	}
 	sql := fd.queries[0]
 	// Find the column list section: between "(" and ") VALUES"
-	header := sql[:strings.Index(sql, " VALUES")]
+	header, _, _ := strings.Cut(sql, " VALUES")
 	if !strings.Contains(header, `"id"`) {
 		t.Errorf("explicit PK should be in INSERT cols: %s", sql)
 	}
@@ -164,7 +164,8 @@ func TestEntityUpdate(t *testing.T) {
 	if !strings.Contains(sql, `WHERE ("users"."id" = $`) {
 		t.Errorf("UPDATE must filter by PK: %s", sql)
 	}
-	if strings.Contains(sql[:strings.Index(sql, " WHERE")], `"id" =`) {
+	setList, _, _ := strings.Cut(sql, " WHERE")
+	if strings.Contains(setList, `"id" =`) {
 		t.Errorf("PK must not be in SET list: %s", sql)
 	}
 }

@@ -109,7 +109,7 @@ func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
 }
 
 // ToSQL renders the statement.
-func (u *UpdateBuilder) ToSQL() (string, []any) {
+func (u *UpdateBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder()
 	u.WriteSQL(b)
 	return b.SQL()

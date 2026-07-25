@@ -82,7 +82,7 @@ func TestN1DetectorPatternsAreSortedByCount(t *testing.T) {
 		_, _ = ent.Get(db, ctx, i)
 	}
 	for i := int64(1); i <= 5; i++ {
-		_, _ = ent.Query(db).Limit(int64(i)).All(ctx)
+		_, _ = ent.Query(db).Limit(i).All(ctx)
 	}
 	r := finish(5)
 	if len(r.Patterns) < 2 {

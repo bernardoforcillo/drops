@@ -37,10 +37,7 @@ func runIntrospect(snapshotPath, outDir, pkg string) error {
 	sort.Strings(names)
 	for _, key := range names {
 		tbl := snap.Tables[key]
-		src, err := emitIntrospectFile(pkg, tbl)
-		if err != nil {
-			return fmt.Errorf("emit %s: %w", tbl.Name, err)
-		}
+		src := emitIntrospectFile(pkg, tbl)
 		file := filepath.Join(outDir, snakeForFile(tbl.Name)+"_drops.go")
 		if err := os.WriteFile(file, src, 0o644); err != nil {
 			return err
@@ -50,10 +47,10 @@ func runIntrospect(snapshotPath, outDir, pkg string) error {
 }
 
 type introspectTable struct {
-	Name              string                          `json:"name"`
-	Schema            string                          `json:"schema"`
-	Columns           map[string]*introspectColumn    `json:"columns"`
-	UniqueConstraints map[string]*introspectUnique    `json:"uniqueConstraints"`
+	Name              string                       `json:"name"`
+	Schema            string                       `json:"schema"`
+	Columns           map[string]*introspectColumn `json:"columns"`
+	UniqueConstraints map[string]*introspectUnique `json:"uniqueConstraints"`
 }
 
 type introspectColumn struct {
@@ -70,7 +67,7 @@ type introspectUnique struct {
 }
 
 // emitIntrospectFile renders the Go source for a single table.
-func emitIntrospectFile(pkg string, tbl *introspectTable) ([]byte, error) {
+func emitIntrospectFile(pkg string, tbl *introspectTable) []byte {
 	structName := goIdentFor(tbl.Name)
 	cols := orderedColumns(tbl.Columns)
 	singleUniqs := singleColumnUniqueSet(tbl.UniqueConstraints)
@@ -119,7 +116,7 @@ func emitIntrospectFile(pkg string, tbl *introspectTable) ([]byte, error) {
 		b.WriteByte('\n')
 	}
 	b.WriteString("}\n")
-	return []byte(b.String()), nil
+	return []byte(b.String())
 }
 
 // orderedColumns returns the columns sorted by name so output is

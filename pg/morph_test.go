@@ -42,12 +42,12 @@ type morphUserWithComments struct {
 	Comments []morphComment `dropRel:"comments"`
 }
 
-func morphSchema() (users, posts, comments *pg.Table, morphs *pg.MorphMap) {
+func morphSchema() (users, comments *pg.Table) {
 	users = pg.NewTable("users")
 	userID := pg.Add(users, pg.BigSerial("id").PrimaryKey())
 	pg.Add(users, pg.Text("name").NotNull())
 
-	posts = pg.NewTable("posts")
+	posts := pg.NewTable("posts")
 	postID := pg.Add(posts, pg.BigSerial("id").PrimaryKey())
 	pg.Add(posts, pg.Text("title").NotNull())
 
@@ -57,7 +57,7 @@ func morphSchema() (users, posts, comments *pg.Table, morphs *pg.MorphMap) {
 	cType := pg.Add(comments, pg.Text("commentableType").NotNull())
 	cID := pg.Add(comments, pg.BigInt("commentableId").NotNull())
 
-	morphs = pg.NewMorphMap()
+	morphs := pg.NewMorphMap()
 	pg.RegisterMorph[morphUser](morphs, "users", users)
 	pg.RegisterMorph[morphPost](morphs, "posts", posts)
 
@@ -72,7 +72,7 @@ func morphSchema() (users, posts, comments *pg.Table, morphs *pg.MorphMap) {
 // commentableType/commentableId pair points at a User receives a
 // *morphUser, and one pointing at a Post receives a *morphPost.
 func TestMorphToLoadsPolymorphicParent(t *testing.T) {
-	_, _, comments, _ := morphSchema()
+	_, comments := morphSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -127,7 +127,7 @@ func TestMorphToLoadsPolymorphicParent(t *testing.T) {
 // TestMorphToBatchesByType verifies that one query is issued per
 // distinct morph type (plus the root query for the children).
 func TestMorphToBatchesByType(t *testing.T) {
-	_, _, comments, _ := morphSchema()
+	_, comments := morphSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {
@@ -172,7 +172,7 @@ func TestMorphToBatchesByType(t *testing.T) {
 // TestMorphToUnknownTypeReturnsError verifies that an unregistered
 // morph type is reported.
 func TestMorphToUnknownTypeReturnsError(t *testing.T) {
-	_, _, comments, _ := morphSchema()
+	_, comments := morphSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		return &fakeRows{
@@ -193,7 +193,7 @@ func TestMorphToUnknownTypeReturnsError(t *testing.T) {
 
 // TestMorphToRejectsNestedWith verifies the validation guard.
 func TestMorphToRejectsNestedWith(t *testing.T) {
-	_, _, comments, _ := morphSchema()
+	_, comments := morphSchema()
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		return &fakeRows{
 			cols: []string{"id", "body", "commentableType", "commentableId"},
@@ -212,7 +212,7 @@ func TestMorphToRejectsNestedWith(t *testing.T) {
 // a User's "comments" collects only comments whose commentableType
 // is "users" and commentableId is the user's id.
 func TestMorphManyLoadsTypedSlice(t *testing.T) {
-	users, _, _, _ := morphSchema()
+	users, _ := morphSchema()
 
 	fd := &fakeDriver{handler: func(sql string, _ []any) (drops.Rows, error) {
 		switch {

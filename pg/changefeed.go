@@ -118,16 +118,16 @@ BEGIN
         '%s',
         json_build_object(
             'op', TG_OP,
-            'id', COALESCE(NEW."%s"::text, OLD."%s"::text)
+            'id', COALESCE(NEW.%s::text, OLD.%s::text)
         )::text
     );
     RETURN COALESCE(NEW, OLD);
 END;
-$$ LANGUAGE plpgsql`, fn, channel, pkName, pkName)
-	dropTrg := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON "%s"`, trg, tableName)
+$$ LANGUAGE plpgsql`, fn, channel, quoteIdent(pkName), quoteIdent(pkName))
+	dropTrg := fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, trg, quoteIdent(tableName))
 	createTrg := fmt.Sprintf(`CREATE TRIGGER %s
-AFTER INSERT OR UPDATE OR DELETE ON "%s"
-FOR EACH ROW EXECUTE FUNCTION %s()`, trg, tableName, fn)
+AFTER INSERT OR UPDATE OR DELETE ON %s
+FOR EACH ROW EXECUTE FUNCTION %s()`, trg, quoteIdent(tableName), fn)
 	return []string{createFunc, dropTrg, createTrg}, nil
 }
 
@@ -136,7 +136,7 @@ FOR EACH ROW EXECUTE FUNCTION %s()`, trg, tableName, fn)
 func UninstallChangeFeed(t *Table) []string {
 	tableName := t.Name()
 	return []string{
-		fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON "%s"`, changeFeedTrgName(t), tableName),
+		fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s`, changeFeedTrgName(t), quoteIdent(tableName)),
 		fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, changeFeedFuncName(t)),
 	}
 }

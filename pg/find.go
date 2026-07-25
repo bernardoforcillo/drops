@@ -813,7 +813,7 @@ func coerceSlice(src reflect.Value, dstType reflect.Type) reflect.Value {
 // no struct field matches the name.
 func (f *FindBuilder) buildPerParentLimitedSQL(
 	rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
-) (string, []any) {
+) (sql string, args []any) {
 	b := drops.NewBuilder()
 	b.WriteString("SELECT * FROM (SELECT ")
 	cols := rel.To.Columns()
@@ -954,9 +954,9 @@ func (f *FindBuilder) loadMorphTo(
 	// back at the parentSlice rows that have to receive the loaded
 	// parent.
 	type bucket struct {
-		ids       []any
-		rowIdxs   []int
-		entry     morphEntry
+		ids        []any
+		rowIdxs    []int
+		entry      morphEntry
 		idToParent map[any]reflect.Value
 	}
 	buckets := map[string]*bucket{}

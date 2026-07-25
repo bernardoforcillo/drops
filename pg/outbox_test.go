@@ -140,7 +140,7 @@ func outboxDrainCols() []string {
 	}
 }
 
-func drainRow(id int64, kind string, payload string, attempts int) []any {
+func drainRow(id int64, kind, payload string, attempts int) []any {
 	return []any{
 		id, kind, any(nil), any(nil),
 		json.RawMessage(payload), []byte(nil), attempts, any(nil), time.Now(),

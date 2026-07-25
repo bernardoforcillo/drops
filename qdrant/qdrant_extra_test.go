@@ -148,14 +148,14 @@ func TestCollectionNameValidation(t *testing.T) {
 	cases := []struct {
 		name string
 	}{
-		{""},                  // empty
-		{"with space"},        // space
-		{"slash/here"},        // path separator would break URL
-		{"question?mark"},     // query separator
-		{"hash#fragment"},     // fragment
-		{".dotleader"},        // leading dot
-		{"-hyphenleader"},     // leading hyphen
-		{"null\x00inside"},    // NUL
+		{""},               // empty
+		{"with space"},     // space
+		{"slash/here"},     // path separator would break URL
+		{"question?mark"},  // query separator
+		{"hash#fragment"},  // fragment
+		{".dotleader"},     // leading dot
+		{"-hyphenleader"},  // leading hyphen
+		{"null\x00inside"}, // NUL
 	}
 	cfg := qdrant.CollectionConfig{
 		Vectors: qdrant.VectorParams{Size: 4, Distance: qdrant.DistanceCosine},

@@ -35,7 +35,7 @@ func TestGeneratorMatchesGolden(t *testing.T) {
 	if string(got) != string(want) {
 		// Drop the actual generated output next to the test for
 		// easier diffing on failure.
-		_ = os.WriteFile(filepath.Join(t.TempDir(), "got.go"), got, 0644)
+		_ = os.WriteFile(filepath.Join(t.TempDir(), "got.go"), got, 0o644)
 		t.Errorf("generated source does not match golden\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
@@ -50,7 +50,7 @@ type Bad struct {
 }
 `
 	path := filepath.Join(tmp, "bad.go")
-	if err := os.WriteFile(path, []byte(src), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := parseFile(path); err == nil {
@@ -71,7 +71,7 @@ type Foo struct {
 }
 `
 	path := filepath.Join(tmp, "foo.go")
-	if err := os.WriteFile(path, []byte(src), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	entities, _, err := parseFile(path)
@@ -108,7 +108,7 @@ func TestRunFailsOnNoEntities(t *testing.T) {
 type Plain struct { ID int }
 `
 	in := filepath.Join(tmp, "plain.go")
-	if err := os.WriteFile(in, []byte(src), 0644); err != nil {
+	if err := os.WriteFile(in, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := run(in, ""); err == nil {

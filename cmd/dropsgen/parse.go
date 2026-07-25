@@ -65,10 +65,7 @@ func parseFile(path string) ([]entity, string, error) {
 			if err != nil {
 				return nil, "", fmt.Errorf("%s: %s: %w", path, ts.Name.Name, err)
 			}
-			fields, err := collectFields(st)
-			if err != nil {
-				return nil, "", fmt.Errorf("%s: %s: %w", path, ts.Name.Name, err)
-			}
+			fields := collectFields(st)
 			out = append(out, entity{
 				StructName: ts.Name.Name,
 				TableVar:   tableVar,
@@ -113,7 +110,7 @@ func tableFromDirective(directive string) (string, error) {
 // (primaryKey, autoIncrement, notNull, …) are ignored here because dropsgen
 // itself does not generate the schema declaration, only the
 // bind/scan helpers.
-func collectFields(st *ast.StructType) ([]field, error) {
+func collectFields(st *ast.StructType) []field {
 	var out []field
 	for _, f := range st.Fields.List {
 		if f.Tag == nil {
@@ -139,7 +136,7 @@ func collectFields(st *ast.StructType) ([]field, error) {
 			})
 		}
 	}
-	return out, nil
+	return out
 }
 
 // typeString renders an ast.Expr back to its source form — sufficient

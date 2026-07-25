@@ -100,12 +100,12 @@ func (db *DB) RetryPolicyValue() RetryPolicy {
 //	attempt 3: 4*base + jitter
 //	...
 //	clipped at max + jitter
-func ExponentialJitter(base, max time.Duration) func(attempt int) time.Duration {
+func ExponentialJitter(base, maxN time.Duration) func(attempt int) time.Duration {
 	if base <= 0 {
 		base = 10 * time.Millisecond
 	}
-	if max <= 0 || max < base {
-		max = base * 256
+	if maxN <= 0 || maxN < base {
+		maxN = base * 256
 	}
 	return func(attempt int) time.Duration {
 		if attempt < 1 {
@@ -116,8 +116,8 @@ func ExponentialJitter(base, max time.Duration) func(attempt int) time.Duration 
 			shift = 30
 		}
 		d := base * time.Duration(1<<shift)
-		if d > max {
-			d = max
+		if d > maxN {
+			d = maxN
 		}
 		// Deterministic-enough jitter source — we don't need
 		// cryptographic randomness here, just decorrelation.

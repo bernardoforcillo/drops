@@ -37,6 +37,20 @@ const DrizzleTable = "__drizzle_migrations"
 // statements when breakpoints are enabled.
 const StatementBreakpoint = "--> statement-breakpoint"
 
+// DrizzleHook runs around a drizzle migration file, inside the same
+// transaction as the file's SQL, so a data migration it performs
+// commits atomically with the schema change (or rolls back with it on
+// error). Because drizzle files are pure SQL, this is the only seam
+// for Go-based data migrations — backfills, cross-table copies — that
+// must run between the generated schema statements.
+//
+// Register hooks with DrizzleMigrator.BeforeEach / AfterEach: "before"
+// runs before the file's statements, "after" runs after them. Use
+// entry.Tag to scope a data migration to a specific file. A hook that
+// returns an error aborts that migration; the whole transaction rolls
+// back and Up returns the error.
+type DrizzleHook func(ctx context.Context, tx *DB, entry DrizzleEntry) error
+
 // DrizzleMigrator runs migrations from a drizzle-kit-formatted directory.
 type DrizzleMigrator struct {
 	db     *DB
@@ -44,6 +58,8 @@ type DrizzleMigrator struct {
 	dir    string
 	schema string
 	table  string
+	before []DrizzleHook
+	after  []DrizzleHook
 }
 
 // NewDrizzleMigrator wraps db with a migrator that reads from dir within
@@ -73,6 +89,38 @@ func (d *DrizzleMigrator) WithSchema(schema string) *DrizzleMigrator {
 func (d *DrizzleMigrator) WithTable(table string) *DrizzleMigrator {
 	d.table = table
 	return d
+}
+
+// BeforeEach registers a hook that runs immediately before each
+// migration file's statements, within that migration's transaction.
+// Hooks fire in registration order; the first to error aborts the
+// migration. See DrizzleHook.
+func (d *DrizzleMigrator) BeforeEach(h DrizzleHook) *DrizzleMigrator {
+	d.before = append(d.before, h)
+	return d
+}
+
+// AfterEach registers a hook that runs immediately after each
+// migration file's statements, within that migration's transaction.
+// Hooks fire in registration order; the first to error aborts the
+// migration. This is the usual home for a data migration that depends
+// on the file's schema change having just landed. See DrizzleHook.
+func (d *DrizzleMigrator) AfterEach(h DrizzleHook) *DrizzleMigrator {
+	d.after = append(d.after, h)
+	return d
+}
+
+// runHooks invokes each hook in order, stopping at the first error.
+func (d *DrizzleMigrator) runHooks(ctx context.Context, tx *DB, hooks []DrizzleHook, e DrizzleEntry) error {
+	for _, h := range hooks {
+		if h == nil {
+			continue
+		}
+		if err := h(ctx, tx, e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // drizzleJournal mirrors meta/_journal.json.
@@ -206,6 +254,9 @@ func (d *DrizzleMigrator) Up(ctx context.Context) error {
 // applyOne runs one migration plus the bookkeeping insert in a single tx.
 func (d *DrizzleMigrator) applyOne(ctx context.Context, e DrizzleEntry) error {
 	return d.db.InTx(ctx, func(tx *DB) error {
+		if err := d.runHooks(ctx, tx, d.before, e); err != nil {
+			return fmt.Errorf("before-hook: %w", err)
+		}
 		for _, stmt := range splitDrizzleStatements(e.SQL, e.Breakpoints) {
 			if strings.TrimSpace(stmt) == "" {
 				continue
@@ -213,6 +264,9 @@ func (d *DrizzleMigrator) applyOne(ctx context.Context, e DrizzleEntry) error {
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("statement %q: %w", excerptSQL(stmt), err)
 			}
+		}
+		if err := d.runHooks(ctx, tx, d.after, e); err != nil {
+			return fmt.Errorf("after-hook: %w", err)
 		}
 		_, err := tx.Exec(ctx,
 			fmt.Sprintf(`INSERT INTO %s.%s (hash, created_at) VALUES ($1, $2)`,

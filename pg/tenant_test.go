@@ -16,16 +16,15 @@ type tenantUser struct {
 	Name     string `drop:"name,notNull"`
 }
 
-func tenantSchema(t *testing.T) (*pg.Table, *pg.Entity[tenantUser]) {
+func tenantSchema(t *testing.T) *pg.Entity[tenantUser] {
 	t.Helper()
 	tbl := pg.AutoTable[tenantUser]("users")
 	ent := pg.NewEntity[tenantUser](tbl).ScopeByTenant(tbl.Col("tenantId"))
-	return tbl, ent
+	return ent
 }
 
 func TestScopeByTenantInjectsPredicateOnGet(t *testing.T) {
-	tbl, ent := tenantSchema(t)
-	_ = tbl
+	ent := tenantSchema(t)
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{cols: []string{"id", "tenantId", "name"}, data: [][]any{{int64(1), int64(99), "Alice"}}}, nil
 	}}
@@ -41,7 +40,7 @@ func TestScopeByTenantInjectsPredicateOnGet(t *testing.T) {
 }
 
 func TestScopeByTenantRequiresCtxTenant(t *testing.T) {
-	_, ent := tenantSchema(t)
+	ent := tenantSchema(t)
 	db := pg.New(&fakeDriver{})
 	_, err := ent.Get(db, context.Background(), int64(1))
 	if !errors.Is(err, pg.ErrTenantMissing) {
@@ -50,8 +49,7 @@ func TestScopeByTenantRequiresCtxTenant(t *testing.T) {
 }
 
 func TestScopeByTenantOnQueryAll(t *testing.T) {
-	tbl, ent := tenantSchema(t)
-	_ = tbl
+	ent := tenantSchema(t)
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{cols: []string{"id", "tenantId", "name"}}, nil
 	}}
@@ -71,7 +69,7 @@ func TestScopeByTenantOnQueryAll(t *testing.T) {
 }
 
 func TestScopeByTenantOnUpdate(t *testing.T) {
-	_, ent := tenantSchema(t)
+	ent := tenantSchema(t)
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{cols: []string{"id", "tenantId", "name"}, data: [][]any{{int64(1), int64(7), "Alice"}}}, nil
 	}}
@@ -88,7 +86,7 @@ func TestScopeByTenantOnUpdate(t *testing.T) {
 }
 
 func TestScopeByTenantOnDelete(t *testing.T) {
-	_, ent := tenantSchema(t)
+	ent := tenantSchema(t)
 	fd := &fakeDriver{}
 	db := pg.New(fd)
 	ctx := pg.WithTenant(context.Background(), int64(7))
@@ -105,7 +103,7 @@ func TestScopeByTenantOnDelete(t *testing.T) {
 }
 
 func TestScopeByTenantCreateStampsTenant(t *testing.T) {
-	_, ent := tenantSchema(t)
+	ent := tenantSchema(t)
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{cols: []string{"id", "tenantId", "name"}, data: [][]any{{int64(7), int64(42), "Alice"}}}, nil
 	}}
@@ -121,7 +119,7 @@ func TestScopeByTenantCreateStampsTenant(t *testing.T) {
 }
 
 func TestScopeByTenantCreateRejectsMismatch(t *testing.T) {
-	_, ent := tenantSchema(t)
+	ent := tenantSchema(t)
 	db := pg.New(&fakeDriver{})
 	ctx := pg.WithTenant(context.Background(), int64(42))
 	u := tenantUser{Name: "Alice", TenantID: 99} // wrong tenant

@@ -23,6 +23,10 @@ var (
 	eventDur  = clickhouse.Add(events, clickhouse.Float64("durationMs"))
 )
 
+// eventTags is part of the representative fixture schema but not
+// referenced by every test; keep it declared without tripping unused.
+var _ = eventTags
+
 func init() {
 	events.
 		Engine(clickhouse.MergeTree()).
@@ -32,24 +36,6 @@ func init() {
 }
 
 // --- Helpers ---------------------------------------------------------
-
-type sqlable interface {
-	ToSQL() (string, []any)
-}
-
-func check(t *testing.T, q sqlable, wantSQL string, wantArgs ...any) {
-	t.Helper()
-	gotSQL, gotArgs := q.ToSQL()
-	if gotSQL != wantSQL {
-		t.Errorf("sql mismatch\n  got:  %s\n  want: %s", gotSQL, wantSQL)
-	}
-	if len(wantArgs) == 0 && len(gotArgs) == 0 {
-		return
-	}
-	if !reflect.DeepEqual(gotArgs, wantArgs) {
-		t.Errorf("args mismatch\n  got:  %v\n  want: %v", gotArgs, wantArgs)
-	}
-}
 
 func checkExpr(t *testing.T, e drops.Expression, wantSQL string, wantArgs ...any) {
 	t.Helper()

@@ -11,14 +11,14 @@ type Filter struct {
 // Condition is a single filter clause — either a key/value test, a
 // range, an ID membership test, or a nested Filter.
 type Condition struct {
-	Key    string          `json:"key,omitempty"`
-	Match  *MatchCondition `json:"match,omitempty"`
-	Range  *RangeCondition `json:"range,omitempty"`
-	HasID  []any           `json:"has_id,omitempty"`
+	Key     string            `json:"key,omitempty"`
+	Match   *MatchCondition   `json:"match,omitempty"`
+	Range   *RangeCondition   `json:"range,omitempty"`
+	HasID   []any             `json:"has_id,omitempty"`
 	IsEmpty *IsEmptyCondition `json:"is_empty,omitempty"`
-	IsNull *IsNullCondition `json:"is_null,omitempty"`
-	Geo    *GeoBoundingBox `json:"geo_bounding_box,omitempty"`
-	Nested *Filter         `json:"filter,omitempty"`
+	IsNull  *IsNullCondition  `json:"is_null,omitempty"`
+	Geo     *GeoBoundingBox   `json:"geo_bounding_box,omitempty"`
+	Nested  *Filter           `json:"filter,omitempty"`
 }
 
 // MatchCondition expresses payload value equality / set membership /

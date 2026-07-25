@@ -21,10 +21,10 @@ func (t *recordingTracer) Start(ctx context.Context, name string) (context.Conte
 }
 
 type recordingSpan struct {
-	name   string
-	attrs  map[string]any
-	err    error
-	ended  bool
+	name  string
+	attrs map[string]any
+	err   error
+	ended bool
 }
 
 func (s *recordingSpan) SetAttribute(k string, v any) { s.attrs[k] = v }
@@ -58,9 +58,11 @@ func TestTracerStartsSpanPerExec(t *testing.T) {
 func TestTracerStartsSpanPerQuery(t *testing.T) {
 	tracer := &recordingTracer{}
 	db := pg.New(&fakeDriver{}).WithTracer(tracer)
-	if _, err := db.Query(context.Background(), "SELECT 1"); err != nil {
+	rows, err := db.Query(context.Background(), "SELECT 1")
+	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
+	_ = rows.Close()
 	if len(tracer.spans) != 1 || tracer.spans[0].name != "drops.query" {
 		t.Errorf("expected drops.query span, got %v", tracer.spans)
 	}

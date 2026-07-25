@@ -71,7 +71,7 @@ func run(in, out string) error {
 		base := strings.TrimSuffix(filepath.Base(in), ".go")
 		out = filepath.Join(dir, base+"_drops_gen.go")
 	}
-	if err := os.WriteFile(out, src, 0644); err != nil {
+	if err := os.WriteFile(out, src, 0o644); err != nil {
 		return err
 	}
 	return nil

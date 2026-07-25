@@ -127,11 +127,11 @@ func (s *Saga) Step(name string, forward, compensate SagaStepFn) *Saga {
 // errors that surfaced during compensation. Use errors.As to
 // reach it.
 type SagaError struct {
-	SagaName       string
-	FailedStep     string
-	FailedStepIdx  int
-	Cause          error
-	CompFailures   []SagaCompensationFailure
+	SagaName      string
+	FailedStep    string
+	FailedStepIdx int
+	Cause         error
+	CompFailures  []SagaCompensationFailure
 }
 
 // SagaCompensationFailure is one compensation that itself errored.

@@ -66,7 +66,7 @@ func DropEnumIfExists(name string) drops.Expression {
 // AlterEnumAddValue appends a new label to an existing enum (PG 9.1+).
 // before/after are optional anchors; if both are empty the value is
 // appended at the end.
-func AlterEnumAddValue(enumName, value string, before, after string) drops.Expression {
+func AlterEnumAddValue(enumName, value, before, after string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("ALTER TYPE ")
 		b.WriteIdent(enumName)

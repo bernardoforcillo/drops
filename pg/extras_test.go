@@ -1,6 +1,7 @@
 package pg_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bernardoforcillo/drops"
@@ -88,14 +89,51 @@ func TestCreateIndexUniqueWhereInclude(t *testing.T) {
 		Using("btree").
 		Include(userID.Column).
 		Where(userAge.Gte(18))
+	// The index column list must use a BARE column name ("name"), not
+	// the table-qualified form ("users"."name") — PostgreSQL rejects a
+	// qualified name inside a CREATE INDEX column list (SQLSTATE 42601).
+	// The WHERE predicate, by contrast, is an ordinary expression and
+	// stays qualified.
 	checkExpr(t, pg.CreateIndex(idx),
-		`CREATE UNIQUE INDEX "usersActiveEmailIdx" ON "users" USING btree ("users"."name") INCLUDE ("id") WHERE ("users"."age" >= $1)`,
+		`CREATE UNIQUE INDEX "usersActiveEmailIdx" ON "users" USING btree ("name") INCLUDE ("id") WHERE ("users"."age" >= $1)`,
 		int32(18),
 	)
 }
 
 func TestDropIndex(t *testing.T) {
 	checkExpr(t, pg.DropIndexIfExists("usersEmailIdx"), `DROP INDEX IF EXISTS "usersEmailIdx"`)
+}
+
+// TestIndexColumnsAreUnqualified is the regression guard for the 0002
+// workspaces migration failure: a CREATE INDEX built from column
+// handles rendered its column list table-qualified ("users"."name"),
+// which PostgreSQL rejects with `syntax error at or near ")"`
+// (SQLSTATE 42601). The column list must be bare identifiers. This
+// test is DB-free so it runs in CI without a live Postgres.
+func TestIndexColumnsAreUnqualified(t *testing.T) {
+	single := pg.NewIndex("idxUsersName", users, userName)
+	checkExpr(t, pg.CreateIndexIfNotExists(single),
+		`CREATE INDEX IF NOT EXISTS "idxUsersName" ON "users" ("name")`)
+
+	multi := pg.NewIndex("idxUsersNameAge", users, userName, userAge)
+	checkExpr(t, pg.CreateIndex(multi),
+		`CREATE INDEX "idxUsersNameAge" ON "users" ("name", "age")`)
+
+	// Belt-and-braces: no rendered index column list may contain a
+	// dotted, table-qualified reference. Guards every index-building
+	// entry point at once.
+	for _, idx := range []*pg.Index{single, multi} {
+		sql, _ := drops.String(pg.CreateIndex(idx))
+		open := strings.IndexByte(sql, '(')
+		closeParen := strings.IndexByte(sql, ')')
+		if open < 0 || closeParen < 0 {
+			t.Fatalf("no column list in: %s", sql)
+		}
+		cols := sql[open : closeParen+1]
+		if strings.Contains(cols, `"."`) {
+			t.Errorf("index column list is table-qualified (invalid DDL): %s", cols)
+		}
+	}
 }
 
 // --- Enums -----------------------------------------------------------

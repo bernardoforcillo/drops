@@ -27,6 +27,7 @@ type SelectBuilder struct {
 	settings  []string // raw "key = value"
 	unscoped  bool
 	err       error // deferred error (e.g. cursor decode failure) surfaced at Rows()
+	ctes []*CTE
 }
 
 type joinKind string
@@ -140,6 +141,7 @@ func (s *SelectBuilder) Setting(key, value string) *SelectBuilder {
 
 // WriteSQL renders the SELECT.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
+	writeCTEs(b, s.ctes)
 	b.WriteString("SELECT ")
 	if s.distinct {
 		b.WriteString("DISTINCT ")
@@ -214,7 +216,7 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 }
 
 // ToSQL renders the statement using the ClickHouse placeholder style.
-func (s *SelectBuilder) ToSQL() (string, []any) {
+func (s *SelectBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder(Placeholder)
 	s.WriteSQL(b)
 	return b.SQL()

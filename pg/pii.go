@@ -64,7 +64,7 @@ func IsPII(v any) bool {
 type PIIParam struct{ Value any }
 
 // WriteSQL implements drops.Expression.
-func (p PIIParam) WriteSQL(b *drops.Builder) { b.AddArg(piiArg{Value: p.Value}) }
+func (p PIIParam) WriteSQL(b *drops.Builder) { b.AddArg(piiArg(p)) }
 
 // AsPII flags the column as carrying PII. Entity binders wrap
 // values for this column so any logger / tracer formatting them

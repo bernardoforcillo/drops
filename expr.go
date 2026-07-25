@@ -25,6 +25,7 @@ type Builder struct {
 	sb          strings.Builder
 	args        []any
 	placeholder func(n int) string
+	dialect     Dialect
 }
 
 // BuilderOption configures a Builder at construction time.
@@ -37,6 +38,26 @@ type BuilderOption func(*Builder)
 func WithPlaceholder(fn func(n int) string) BuilderOption {
 	return func(b *Builder) { b.placeholder = fn }
 }
+
+// WithDialect installs d so the Builder renders placeholders and quotes
+// identifiers the dialect's way. It is the swap point for targeting a
+// different SQL-like backend: the query builders are otherwise
+// dialect-agnostic. Passing nil is a no-op (PostgreSQL defaults stay in
+// force). WithDialect also sets the placeholder function from
+// d.Placeholder unless a later WithPlaceholder overrides it.
+func WithDialect(d Dialect) BuilderOption {
+	return func(b *Builder) {
+		if d == nil {
+			return
+		}
+		b.dialect = d
+		b.placeholder = d.Placeholder
+	}
+}
+
+// Dialect returns the Builder's installed dialect, or nil when it is
+// using the default PostgreSQL syntax.
+func (b *Builder) Dialect() Dialect { return b.dialect }
 
 // NewBuilder returns an empty Builder.
 func NewBuilder(opts ...BuilderOption) *Builder {
@@ -51,13 +72,22 @@ func NewBuilder(opts ...BuilderOption) *Builder {
 // unsanitised user input).
 func (b *Builder) WriteString(s string) { b.sb.WriteString(s) }
 
-// WriteByte appends a single raw byte of SQL. The error returned is
-// always nil; the signature satisfies io.ByteWriter.
+// WriteByte appends a single raw byte of SQL. The returned error is
+// always nil (strings.Builder.WriteByte never fails); the signature
+// matches io.ByteWriter, which go vet's stdmethods check requires for a
+// method named WriteByte. Callers ignore the error — errcheck is
+// configured to skip this method, mirroring how it skips the identical
+// (*strings.Builder).WriteByte by default.
 func (b *Builder) WriteByte(c byte) error { return b.sb.WriteByte(c) }
 
-// WriteIdent appends a quoted identifier. Embedded double quotes are
-// doubled per the SQL standard.
+// WriteIdent appends a quoted identifier. With no dialect installed it
+// uses standard double quotes with "" doubling; a dialect can override
+// the quoting (e.g. MySQL backticks) via QuoteIdent.
 func (b *Builder) WriteIdent(name string) {
+	if b.dialect != nil {
+		b.sb.WriteString(b.dialect.QuoteIdent(name))
+		return
+	}
 	b.sb.WriteByte('"')
 	b.sb.WriteString(strings.ReplaceAll(name, `"`, `""`))
 	b.sb.WriteByte('"')
@@ -112,14 +142,24 @@ func (b *Builder) AppendList(sep string, exprs []Expression) {
 }
 
 // SQL returns the accumulated SQL text and bound arguments.
-func (b *Builder) SQL() (string, []any) {
+func (b *Builder) SQL() (sql string, args []any) {
 	return b.sb.String(), b.args
 }
 
-// String renders an Expression to its SQL text and bound argument list.
-// Useful in tests and for logging.
-func String(e Expression) (string, []any) {
+// String renders an Expression to its SQL text and bound argument list
+// using the default PostgreSQL syntax. Useful in tests and for logging.
+func String(e Expression) (sql string, args []any) {
 	b := NewBuilder()
+	b.Append(e)
+	return b.SQL()
+}
+
+// StringWithDialect renders an Expression using d's placeholder and
+// identifier-quoting rules. It is the dialect-aware counterpart to
+// String — dialect packages and their tests use it to render SQL the
+// backend's way.
+func StringWithDialect(d Dialect, e Expression) (sql string, args []any) {
+	b := NewBuilder(WithDialect(d))
 	b.Append(e)
 	return b.SQL()
 }

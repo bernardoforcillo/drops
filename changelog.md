@@ -9,6 +9,137 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Portable SQL expression layer for SQLite** (`drops/sqlite`) — the
+  SQLite dialect gains the full set of standard-SQL expression builders
+  that previously lived only in `drops/pg`, so anything expressible in
+  portable SQL is now available on SQLite too. New helpers:
+  - **Operators / predicates** (`op.go`): free-standing `Eq`, `Ne`, `Gt`,
+    `Gte`, `Lt`, `Lte`, `Not`, `In`, `NotIn`, `IsNull`, `IsNotNull`,
+    `Between`, `NotBetween`, `Like`, `NotLike`, `LikeEscape`, plus the
+    SQLite-native `Glob`, `Regexp`, and the NULL-safe `IsDistinctFrom` /
+    `IsNotDistinctFrom` (rendered via SQLite `IS` / `IS NOT`).
+  - **Aggregates / scalars** (`funcs.go`): `Count`, `CountAll`,
+    `CountDistinct`, `Sum`, `Avg`, `Min`, `Max`, `SumDistinct`,
+    `AvgDistinct`, `Filter`, plus SQLite's `Total`, `GroupConcat`,
+    `Coalesce`, `IfNull`, `NullIf`, `Lower`, `Upper`, `As`, `Func`.
+  - **Math** (`math.go`): `Abs`, `Round`, `Ceil`, `Floor`, `Trunc`,
+    `Mod` (via `%`), `Power` (`pow`), `Sqrt`, `Sign`, `Exp`, `Ln`, `Log`,
+    `Greatest`/`Least` (via multi-arg `max`/`min`), trig functions,
+    `Random`, and the `Plus`/`Minus`/`Mul`/`Div` operators.
+  - **Strings** (`strings.go`): `ConcatOp` (`||`), `Concat`, `ConcatWS`,
+    `Length`, `OctetLength`, `Substr`, `Trim`/`LTrim`/`RTrim`, `Replace`,
+    `Instr`, `Hex`/`Unhex`, `Quote`, `Chr`, `Unicode`, `Format`/`Printf`.
+  - **Cast / Case** (`cast.go`): `CastAs`/`Cast` (SQLite has only the
+    `CAST(x AS T)` form) and the `Case`/`CaseOn` builder.
+  - **Subqueries** (`subquery.go`): `Exists`, `NotExists`, `Subquery`,
+    `InSub`, `NotInSub`.
+  - **CTEs** (`cte.go`): `With` / `WithRecursive` on the SELECT builder
+    plus `CTEDef` (WITH / WITH RECURSIVE, supported since SQLite 3.8.3).
+  - **Window functions** (`window.go`): `Over`, `WindowSpec`,
+    `RowNumber`, `Rank`, `DenseRank`, `PercentRank`, `CumeDist`, `Ntile`,
+    `Lag`, `Lead`, `FirstValue`, `LastValue`, `NthValue`.
+  - **JSON1** (`json.go`): `JSONExtract`, `JSONGet` (`->`),
+    `JSONGetText` (`->>`), `JSONArrayLength`, `JSONType`, `JSONValid`,
+    `JSONQuote`, `JSONObject`, `JSONArray`, `JSONSet`/`JSONInsert`/
+    `JSONReplace`, `JSONRemove`, `JSONPatch`, `JSONGroupArray`,
+    `JSONGroupObject`.
+  - **Date/time** (`datetime.go`): `Now`, `CurrentDate`, `CurrentTime`,
+    `CurrentTimestamp`, `DateOf`, `TimeOf`, `DateTime`, `JulianDay`,
+    `UnixEpoch`, `StrfTime`.
+- **Portable SQL expression layer for ClickHouse** (`drops/clickhouse`)
+  — the standard-SQL structural helpers ClickHouse supports with
+  identical syntax, mirroring the SQLite/pg surface: `CastAs`/`Cast` and
+  `Case`/`CaseOn` (`cast.go`); `Exists`, `NotExists`, `Subquery`,
+  `InSub`, `NotInSub` (`subquery.go`); `With` / `CTEDef` (`cte.go`); and
+  window functions `Over`, `WindowSpec`, `RowNumber`, `Rank`,
+  `DenseRank`, `FirstValue`, `LastValue`, `NthValue`, plus `Lag`/`Lead`
+  emitting ClickHouse's `lagInFrame`/`leadInFrame` (`window.go`).
+
+## [0.4.1] - 2026-07-14
+
+### Fixed
+- **Qdrant missing-collection 404 classification** (`drops/qdrant`) — the
+  `Client.Do` 404 check used a case-sensitive substring match on
+  `"not found"`, which does not match real Qdrant's response body
+  (``Not found: Collection `x` doesn't exist!`` — capital "Not found",
+  "doesn't exist"). A missing collection therefore surfaced as a plain
+  `HTTPError` instead of `ErrCollectionMissing`, so `CollectionExists`
+  returned an error rather than `(false, nil)` and callers never reached
+  their auto-create branch — collections were silently never created.
+  The 404 is now classified case-insensitively and also accepts
+  `"doesn't exist"` / `"does not exist"`. The test mock, which previously
+  matched a lowercase body no live server emits, now uses Qdrant's real
+  format, and a table-driven test pins the variants.
+
+## [0.4.0] - 2026-07-08
+
+### Added
+- **Swappable SQL dialect abstraction** (`drops`) — a new `drops.Dialect`
+  interface (`Name`, `Placeholder`, `QuoteIdent`, `SupportsReturning`)
+  that a `Builder` carries. `drops.WithDialect(d)` reroutes placeholder
+  rendering and identifier quoting through the dialect, so the same
+  builder chain targets any SQL-like backend by swapping the dialect and
+  driver. A Builder with no dialect keeps the previous PostgreSQL
+  behaviour byte-for-byte (`$N` placeholders, `"…"` identifiers), so this
+  is fully backward compatible. `pg.Dialect` and `sqlite.Dialect` are the
+  two implementations; `drops.StringWithDialect` renders an expression a
+  dialect's way.
+- **SQLite dialect** (`drops/sqlite`) — a new package mirroring
+  `drops/pg`'s API surface (Table / Column / DB / DDL / Select / Insert /
+  Update / Delete) over the shared `drops.Driver`, emitting SQLite SQL:
+  `?` placeholders, SQLite type affinities, `INSERT OR IGNORE/REPLACE`,
+  and — the key dialect difference — **all constraints rendered inline in
+  `CREATE TABLE`** (SQLite has no `ALTER TABLE ADD CONSTRAINT`). Type
+  constructors share pg's names (`Text`, `BigInt`, `Timestamp`, …) so a
+  schema ports with a package swap.
+- **Composite (N-column) foreign keys** (`drops/pg`, `drops/sqlite`) —
+  `Table.ForeignKeyN(cols, target, targetCols, opts…)` declares a
+  multi-column FK (`FOREIGN KEY (a,b) REFERENCES t (x,y)`). In pg it is
+  wired through the snapshot/diff generator and emitted as a separate
+  `ALTER TABLE ADD CONSTRAINT`; in sqlite it is emitted inline. Column
+  counts must match (panics at declaration otherwise).
+- **Shared reflection row-scanner** (`drops`) — `drops.ScanOne` /
+  `drops.ScanAll` moved the dialect-agnostic struct↔column mapping into
+  the root package so every dialect scans rows identically. `drops.StructFields`
+  exposes the column→field map for entity binding. `drops/sqlite` uses
+  both; `drops/pg` keeps its own wrappers.
+- **SQLite full ORM parity** (`drops/sqlite`) — the dialect now covers:
+  - **Entities** — `Entity[T]` typed CRUD (`Get` / `Create` / `Update` /
+    `Delete`) and a fluent `Query` (`Where` / `OrderBy` / `Limit` /
+    `Offset` / `All` / `One`).
+  - **Relations & eager loading** — `NewRelations(t).HasMany / HasOne /
+    BelongsTo / ManyToMany`, loaded via `db.Find(t).With(names…)` with one
+    batched query per edge (no N+1) stitched into `dropRel` struct fields.
+  - **Migrations** — a versioned `Migrator` (`Add` / `AddSQL` / `AddFS` /
+    `Up` / `Down` / `Status`) with `BeforeEach` / `AfterEach` in-transaction
+    data hooks, mirroring `pg.Migrator`.
+  - **Snapshot & diff** — `BuildSnapshot` / `Diff` generate SQLite
+    migration SQL, honouring SQLite semantics: `ALTER TABLE ADD COLUMN`
+    where possible, and the standard **table-rebuild sequence**
+    (`CREATE t_new` → `INSERT … SELECT` → `DROP` → `RENAME`) for column
+    type changes, drops, and constraint changes that SQLite cannot alter
+    in place.
+  - **Introspection** — `Introspect(ctx, db)` reconstructs a `Snapshot`
+    from a live database via `sqlite_master` and the `table_info` /
+    `foreign_key_list` / `index_list` PRAGMAs.
+
+## [0.3.0] - 2026-07-04
+
+### Added
+- **Migration data hooks** (`drops/pg`) — both migrators now expose
+  `BeforeEach` / `AfterEach` hooks that run inside each migration's
+  transaction, the seam for data migrations that must run between
+  schema migrations (backfilling a new column, copying rows into a
+  split-out table, rewriting a value before an old column is dropped).
+  On the native `Migrator`, `MigrationHook` receives the tx-scoped
+  `*DB`, the `Migration`, and a `MigrationDirection` (`DirectionUp` /
+  `DirectionDown`) so a data step can be scoped to a specific version
+  and direction; hooks fire around both `Up` and `Down`. On
+  `DrizzleMigrator` — where migration files are pure SQL and there is
+  otherwise no place for Go logic — `DrizzleHook` receives the
+  tx-scoped `*DB` and the `DrizzleEntry`, letting a backfill run
+  atomically with the file's statements. A hook that returns an error
+  aborts the migration and the whole transaction rolls back.
 - **Nested (deep) relation eager-loading** (`drops/pg`) — `Find().With`
   now accepts dot paths such as `With("posts.comments")` to load
   relations of relations to arbitrary depth. Each relation edge still
@@ -193,6 +324,15 @@ once a 1.0 is cut.
 - MIT license (`license.md`).
 
 ### Changed
+- **Migration diff generator never inlines constraints into `CREATE
+  TABLE`** (`drops/pg`) — `Diff` now emits every composite primary
+  key, UNIQUE, FOREIGN KEY and CHECK constraint as its own raw SQL
+  `ALTER TABLE … ADD CONSTRAINT` statement, and enums as a separate
+  `CREATE TYPE`. Previously UNIQUE constraints were rendered inline
+  in the `CREATE TABLE` body; new tables now produce a bare column-only
+  `CREATE TABLE` followed by the constraint statements (matching how
+  composite PKs, FKs and CHECKs were already handled). This keeps each
+  constraint independently diffable and re-orderable across migrations.
 - `InTx` (both the root `drops.InTx` helper and `pg.DB.InTx`) now uses a
   detached context with a 5-second timeout for the deferred `Rollback`,
   so a cancelled or expired caller-ctx no longer prevents the cleanup
@@ -208,6 +348,18 @@ once a 1.0 is cut.
 - Empty `In(col)` / `NotIn(col)` no longer emits the invalid
   `(col IN ())`. `In` returns `(false)`, `NotIn` returns `(true)` —
   matching set-theoretic semantics.
+
+### Fixed
+- **`CREATE INDEX` rendered table-qualified column names, producing
+  invalid DDL** (`drops/pg`) — `NewIndex(...)` built from column handles
+  emitted its column list as `("table"."column")`, which PostgreSQL
+  rejects inside an index column list with `syntax error at or near
+  ")"` (SQLSTATE 42601). Column references in the index column list now
+  render as bare identifiers (`("column")`); functional/expression
+  indexes are unaffected, and `WHERE` predicates (ordinary expressions)
+  stay qualified. This also corrects pgvector `USING hnsw/ivfflat`
+  index DDL. The bug was latent because the builder's tests only
+  string-compared the rendered SQL and never executed it.
 
 ### Removed
 - `drops.MustString` and `drops.Errorf` re-exports (unused).

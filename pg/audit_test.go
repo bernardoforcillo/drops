@@ -80,9 +80,9 @@ func (tx *auditTx) Exec(ctx context.Context, sql string, args ...any) (drops.Res
 func (tx *auditTx) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
 	return tx.drv.Query(ctx, sql, args...)
 }
-func (tx *auditTx) Begin(ctx context.Context) (drops.Tx, error)  { return tx.drv.Begin(ctx) }
-func (tx *auditTx) Commit(_ context.Context) error               { return nil }
-func (tx *auditTx) Rollback(_ context.Context) error             { return nil }
+func (tx *auditTx) Begin(ctx context.Context) (drops.Tx, error) { return tx.drv.Begin(ctx) }
+func (tx *auditTx) Commit(_ context.Context) error              { return nil }
+func (tx *auditTx) Rollback(_ context.Context) error            { return nil }
 
 func TestAuditOnCreate(t *testing.T) {
 	_, ent := entUsersSchema()

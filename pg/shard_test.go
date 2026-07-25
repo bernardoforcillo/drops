@@ -64,7 +64,10 @@ func TestShardedRoutesByKey(t *testing.T) {
 
 	// userID=10 → shard 2
 	ctx10 := pg.WithShardKey(context.Background(), int64(10))
-	_, _ = db.Query(ctx10, "SELECT ...")
+	rows, _ := db.Query(ctx10, "SELECT ...")
+	if rows != nil {
+		_ = rows.Close()
+	}
 	if shards[2].reads.Load() != 1 {
 		t.Errorf("expected shard 2 to handle the read")
 	}

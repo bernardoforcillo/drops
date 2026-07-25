@@ -1,5 +1,3 @@
-version: "2"
-
 linters:
   enable:
     - bodyclose
@@ -17,6 +15,13 @@ linters:
     - unused
 
 linters-settings:
+  errcheck:
+    # Builder.WriteByte returns error only to satisfy io.ByteWriter (go
+    # vet's stdmethods check requires the signature); the error is always
+    # nil. Skip it, exactly as errcheck skips (*strings.Builder).WriteByte
+    # by default.
+    exclude-functions:
+      - (*github.com/bernardoforcillo/drops.Builder).WriteByte
   goimports:
     local-prefixes: github.com/bernardoforcillo/drops
   gocritic:

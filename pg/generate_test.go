@@ -115,6 +115,35 @@ func TestDiffFromEmptyEmitsCreateTable(t *testing.T) {
 	}
 }
 
+// TestDiffFromEmptyEmitsUniqueAsSeparateAlter locks in the contract
+// that constraints are never inlined into CREATE TABLE: a brand-new
+// table carrying a UNIQUE column must render a bare CREATE TABLE plus
+// a separate ALTER TABLE ... ADD CONSTRAINT ... UNIQUE statement.
+func TestDiffFromEmptyEmitsUniqueAsSeparateAlter(t *testing.T) {
+	users := pg.NewTable("users")
+	pg.Add(users, pg.BigSerial("id").PrimaryKey())
+	pg.Add(users, pg.Text("email").NotNull().Unique())
+
+	cur := pg.BuildSnapshot(pg.NewSchema(users))
+	stmts := pg.Diff(pg.EmptySnapshot(), cur)
+
+	if len(stmts) != 2 {
+		t.Fatalf("got %d statements, want 2 (CREATE TABLE + ALTER TABLE):\n%s",
+			len(stmts), strings.Join(stmts, "\n"))
+	}
+	create := stmts[0]
+	if !strings.HasPrefix(create, `CREATE TABLE "users"`) {
+		t.Errorf("first statement should be CREATE TABLE, got: %s", create)
+	}
+	if strings.Contains(create, "UNIQUE") || strings.Contains(create, "CONSTRAINT") {
+		t.Errorf("CREATE TABLE must not inline the UNIQUE constraint:\n%s", create)
+	}
+	want := `ALTER TABLE "users" ADD CONSTRAINT "usersEmailUnique" UNIQUE("email");`
+	if stmts[1] != want {
+		t.Errorf("second statement mismatch:\n  got: %s\n want: %s", stmts[1], want)
+	}
+}
+
 func TestDiffAddColumn(t *testing.T) {
 	beforeSchema := pg.NewTable("users")
 	pg.Add(beforeSchema, pg.BigSerial("id").PrimaryKey())
@@ -281,13 +310,13 @@ func TestGenerateFirstMigration(t *testing.T) {
 	pg.Add(users, pg.BigSerial("id").PrimaryKey())
 	pg.Add(users, pg.Text("name").NotNull())
 
-	cap := newCaptureFS(fstest.MapFS{})
+	capt := newCaptureFS(fstest.MapFS{})
 	res, err := pg.GenerateMigration(pg.GenerateOptions{
 		Schema: pg.NewSchema(users),
 		Dir:    "drizzle",
 		Name:   "init",
-		FS:     cap.read,
-		Write:  cap.write,
+		FS:     capt.read,
+		Write:  capt.write,
 		Now:    func() int64 { return 1700000000000 },
 	})
 	if err != nil {
@@ -299,14 +328,14 @@ func TestGenerateFirstMigration(t *testing.T) {
 	if res.Tag != "0000_init" {
 		t.Errorf("tag: %s", res.Tag)
 	}
-	if _, ok := cap.written["0000_init.sql"]; !ok {
-		t.Errorf("missing 0000_init.sql; wrote: %v", keysOf(cap.written))
+	if _, ok := capt.written["0000_init.sql"]; !ok {
+		t.Errorf("missing 0000_init.sql; wrote: %v", keysOf(capt.written))
 	}
-	if _, ok := cap.written["meta/0000_snapshot.json"]; !ok {
-		t.Errorf("missing meta/0000_snapshot.json; wrote: %v", keysOf(cap.written))
+	if _, ok := capt.written["meta/0000_snapshot.json"]; !ok {
+		t.Errorf("missing meta/0000_snapshot.json; wrote: %v", keysOf(capt.written))
 	}
-	if _, ok := cap.written["meta/_journal.json"]; !ok {
-		t.Errorf("missing meta/_journal.json; wrote: %v", keysOf(cap.written))
+	if _, ok := capt.written["meta/_journal.json"]; !ok {
+		t.Errorf("missing meta/_journal.json; wrote: %v", keysOf(capt.written))
 	}
 
 	// Journal should have one entry pointing at our tag.
@@ -319,7 +348,7 @@ func TestGenerateFirstMigration(t *testing.T) {
 			When int64  `json:"when"`
 		} `json:"entries"`
 	}
-	if err := json.Unmarshal(cap.written["meta/_journal.json"], &j); err != nil {
+	if err := json.Unmarshal(capt.written["meta/_journal.json"], &j); err != nil {
 		t.Fatal(err)
 	}
 	if j.Dialect != "postgresql" || j.Version != "7" {
@@ -358,13 +387,13 @@ func TestGenerateSecondMigrationDiff(t *testing.T) {
 	pg.Add(after, pg.Text("name").NotNull())
 	pg.Add(after, pg.Integer("age"))
 
-	cap := newCaptureFS(initial)
+	capt := newCaptureFS(initial)
 	res, err := pg.GenerateMigration(pg.GenerateOptions{
 		Schema: pg.NewSchema(after),
 		Dir:    "drizzle",
 		Name:   "add_age",
-		FS:     cap.read,
-		Write:  cap.write,
+		FS:     capt.read,
+		Write:  capt.write,
 		Now:    func() int64 { return 1700000100000 },
 	})
 	if err != nil {
@@ -373,7 +402,7 @@ func TestGenerateSecondMigrationDiff(t *testing.T) {
 	if res.Tag != "0001_add_age" {
 		t.Errorf("tag: %s", res.Tag)
 	}
-	sql := string(cap.written["0001_add_age.sql"])
+	sql := string(capt.written["0001_add_age.sql"])
 	if !strings.Contains(sql, `ADD COLUMN "age" integer`) {
 		t.Errorf("expected ADD COLUMN in SQL, got:\n%s", sql)
 	}
@@ -385,7 +414,7 @@ func TestGenerateSecondMigrationDiff(t *testing.T) {
 			Tag string `json:"tag"`
 		} `json:"entries"`
 	}
-	if err := json.Unmarshal(cap.written["meta/_journal.json"], &j); err != nil {
+	if err := json.Unmarshal(capt.written["meta/_journal.json"], &j); err != nil {
 		t.Fatal(err)
 	}
 	if len(j.Entries) != 2 ||
@@ -413,13 +442,13 @@ func TestGenerateNoOpWhenSchemaUnchanged(t *testing.T) {
 	}
 
 	// Same schema as before.
-	cap := newCaptureFS(initial)
+	capt := newCaptureFS(initial)
 	res, err := pg.GenerateMigration(pg.GenerateOptions{
 		Schema: pg.NewSchema(users),
 		Dir:    "drizzle",
 		Name:   "noop",
-		FS:     cap.read,
-		Write:  cap.write,
+		FS:     capt.read,
+		Write:  capt.write,
 	})
 	if err != nil {
 		t.Fatalf("GenerateMigration: %v", err)
@@ -427,8 +456,8 @@ func TestGenerateNoOpWhenSchemaUnchanged(t *testing.T) {
 	if !res.NoOp {
 		t.Errorf("expected NoOp = true, got %+v", res)
 	}
-	if len(cap.written) != 0 {
-		t.Errorf("NoOp should not write files; got: %v", keysOf(cap.written))
+	if len(capt.written) != 0 {
+		t.Errorf("NoOp should not write files; got: %v", keysOf(capt.written))
 	}
 }
 

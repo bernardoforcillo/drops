@@ -658,6 +658,47 @@ m.Add(pg.Migration{
 })
 ```
 
+#### Data hooks (migrating data between schema migrations)
+
+When a schema change needs a data migration alongside it — backfill a new
+column, copy rows into a split-out table, rewrite a value before an old
+column is dropped — register a `BeforeEach` / `AfterEach` hook. Hooks run
+**inside the same transaction** as the migration, so the data change
+commits atomically with the schema change (or rolls back with it on error).
+
+On the Go-native `Migrator`, the hook receives the tx-scoped `*pg.DB`, the
+`Migration`, and the direction, so a step can be scoped to one version and
+one direction:
+
+```go
+m.AfterEach(func(ctx context.Context, tx *pg.DB, mig pg.Migration, dir pg.MigrationDirection) error {
+    if dir == pg.DirectionUp && mig.Version == "0004" {
+        // 0004 added full_name; backfill it from the split columns.
+        _, err := tx.Exec(ctx, `UPDATE users SET full_name = first_name || ' ' || last_name`)
+        return err
+    }
+    return nil
+})
+```
+
+The `DrizzleMigrator` gets the same seam. Since drizzle files are pure SQL
+with no place for Go logic, a `DrizzleHook` lets a backfill run atomically
+with a file's statements, keyed by tag:
+
+```go
+m := pg.NewDrizzleMigrator(db, migrations, "drizzle")
+m.AfterEach(func(ctx context.Context, tx *pg.DB, e pg.DrizzleEntry) error {
+    if e.Tag == "0001_add_full_name" {
+        _, err := tx.Exec(ctx, `UPDATE users SET full_name = first_name || ' ' || last_name`)
+        return err
+    }
+    return nil
+})
+```
+
+A hook that returns an error aborts that migration; the whole transaction
+rolls back.
+
 ## PostgreSQL feature surface
 
 In addition to the schema/query/migration story above, the `pg` package

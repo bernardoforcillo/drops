@@ -20,25 +20,49 @@ type Table struct {
 	checks           map[string]string
 	compositeFKs     []*CompositeFK
 
-	// defaultFilters are predicates applied automatically to every
-	// Select / Update / Delete against this table unless the builder opts
-	// out with Unscoped. SoftDelete registers "deletedAt IS NULL" here;
-	// they are equally useful for tenant scoping.
-	defaultFilters []drops.Expression
-
 	relations map[string]*Relation
+
+	// Lifecycle hooks (see hooks.go) and default filters. All are
+	// optional; a table with none renders SQL unchanged.
+	insertHooks    []InsertHook
+	updateHooks    []UpdateHook
+	deleteHooks    []DeleteHook
+	defaultFilters []drops.Expression
 }
 
-// DefaultFilter appends a predicate applied to every Select / Update /
-// Delete against t unless the builder calls Unscoped. Mirrors
-// drops/pg's Table.DefaultFilter.
+// OnInsert registers an INSERT hook, run before every INSERT renders.
+func (t *Table) OnInsert(h InsertHook) *Table {
+	t.insertHooks = append(t.insertHooks, h)
+	return t
+}
+
+// OnUpdate registers an UPDATE hook, run before every UPDATE renders.
+func (t *Table) OnUpdate(h UpdateHook) *Table {
+	t.updateHooks = append(t.updateHooks, h)
+	return t
+}
+
+// OnDelete registers a DELETE hook, run before every DELETE renders. A
+// hook may replace the DELETE with another statement (soft delete).
+func (t *Table) OnDelete(h DeleteHook) *Table {
+	t.deleteHooks = append(t.deleteHooks, h)
+	return t
+}
+
+// DefaultFilter appends a predicate applied automatically to every
+// Select / Update / Delete against the table, unless the builder opts
+// out with Unscoped(). Used to implement default scopes (soft-delete
+// hiding, tenant guards).
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
 	t.defaultFilters = append(t.defaultFilters, e)
 	return t
 }
 
-// DefaultFilters returns the registered default-filter predicates.
+// DefaultFilters returns the table's default-scope predicates.
 func (t *Table) DefaultFilters() []drops.Expression { return t.defaultFilters }
+
+func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
+func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
 
 // Relation returns the named relation declared on t, or nil.
 func (t *Table) Relation(name string) *Relation { return t.relations[name] }

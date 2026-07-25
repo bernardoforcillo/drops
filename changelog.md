@@ -9,47 +9,226 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
-- **Two-level tiered cache** (`drops/cache/tiered`) — composes two
-  `cache.Cache` backends into one read-through / write-through cache: a
-  fast near tier (L1, typically `cache/memory`) in front of a shared
-  network tier (L2, typically `cache/redis` or `cache/memcached`). Reads
-  check L1, fall through to L2, and backfill L1 on an L2 hit; writes and
-  deletes fan out to both tiers with an `L1TTL` cap that bounds local
-  staleness. `GetOrLoad` adds read-through population from an origin
-  function with built-in **singleflight** stampede protection (a burst of
-  concurrent misses for a cold key triggers exactly one load). Implements
-  `cache.Cache` and `cache.MultiCache`, so tiers nest. Zero deps.
-- **Memcached backend** (`drops/cache/memcached`) — a `cache.Cache`
-  implementation speaking the classic Memcached ASCII protocol (get /
-  set / delete, native multi-key get) over a small bounded connection
-  pool, with `TTL` served by the meta-get command (`mg`, Memcached 1.6+).
-  Satisfies `cache.MultiCache`, honours `KeyPrefix`, and fires the shared
-  `drops.Hook` contract. Standard library only.
-- **OpenTelemetry instrumentation** (`drops/otel`) — turns the
-  `drops.Hook` / `drops.QueryEvent` stream into OpenTelemetry spans and
-  RED metrics (call counter, error counter, duration histogram) without
-  importing OpenTelemetry: it talks to small OTel-shaped interfaces
-  (`Tracer`, `Span`, `Meter`, `Int64Counter`, `Float64Histogram`) that a
-  ~10-line adapter bridges to the real SDK — the same zero-dependency
-  approach as `pg.Tracer`. Because it is driven purely by the Hook, one
-  `Instrumentation` covers every dialect (pg / sqlite / clickhouse) and
-  every cache backend. Spans are created retroactively with explicit
-  start/end timestamps; `db.statement` recording is opt-in.
-- **Keyset (cursor) pagination for SQLite** (`drops/sqlite`) — ports
-  drops/pg's `Entity[T].Page` down to `drops/sqlite`: `Page` /
-  `PageBuilder` with opaque URL-safe cursors, `Asc` / `Desc` ordering
-  columns, and `HasMore` / `NextCursor`. Uses SQLite row-value comparison
-  (`(a, b) > (?, ?)`) for homogeneous orderings and a tie-break
-  disjunction for mixed asc/desc directions — O(limit) regardless of page
-  depth, unlike OFFSET. `(*Column).Asc` / `.Desc` were added for parity.
-- **Default filters + soft delete for SQLite** (`drops/sqlite`) — a new
-  `Table.DefaultFilter` mechanism auto-applies predicates to every
-  Select / Update / Delete (also handy for tenant scoping), with
-  `Unscoped()` on each builder to opt out. `SoftDelete(t)` registers a
-  nullable `deletedAt` column plus a `deletedAt IS NULL` default filter,
-  and `Entity[T].SoftDeleteByID` / `Restore` mark and un-mark rows.
-  Mirrors drops/pg's `SoftDeleteMixin` semantics. `UpdateBuilder.SetExpr`
-  was added to assign raw SQL expressions (e.g. `CURRENT_TIMESTAMP`).
+- **Tiered cache** (`drops/cache/tiered`) — two-level L1+L2 read-through /
+  write-through cache with `GetOrLoad` singleflight stampede protection.
+- **Memcached cache backend** (`drops/cache/memcached`) — stdlib-only
+  backend implementing `cache.Cache` / `cache.MultiCache`.
+- **OpenTelemetry hook instrumentation** (`drops/otel`) — spans + RED
+  metrics adapter for all backends without importing OTel in core packages.
+- **SQLite keyset pagination and soft delete parity** (`drops/sqlite`) —
+  `Entity.Page`, `Table.DefaultFilter`, `SoftDelete` helpers, and
+  `UpdateBuilder.SetExpr`.
+- **drizzle-kit interop for SQLite** (`drops/sqlite`) —
+  - **DrizzleMigrator** (`drizzle.go`) — applies a drizzle-kit migration
+    directory (journal + hashed `.sql` files, statement-breakpoint
+    splitting, `BeforeEach`/`AfterEach` hooks). Adapted to SQLite: the
+    `__drizzle_migrations` history table is unqualified (no schema), and
+    the journal dialect must be `sqlite`.
+  - **GenerateMigration** (`generate.go`) — diffs the Go schema against
+    the latest snapshot and writes a new drizzle-kit migration set
+    (`<tag>.sql`, `meta/<idx>_snapshot.json`, updated `_journal.json`),
+    with optional `WithDown` rollback SQL. No-op when the schema is
+    unchanged.
+- **Query-plan capture for SQLite** (`drops/sqlite`, `explain.go`) —
+  `Explain` runs `EXPLAIN QUERY PLAN`, parsing it into `PlanStep`s with
+  `SeqScans` (full-table scans), `UsedIndexes`, a stable `Fingerprint`
+  for regression detection, and a tree `String`.
+- **Audit, authorization and caching for SQLite** (`drops/sqlite`) — the
+  cross-cutting Entity concerns from pg, wired into SQLite's Entity CRUD:
+  - **Audit** (`audit.go`) — `NewAuditLog`/`NewAuditTable`/`WithAudit`,
+    `WithActor`/`ActorFrom`; Create/Update/Delete write an audit row in
+    the same transaction as the mutation.
+  - **Authorization** (`authz.go`) — `Guard` + `OwnerGuard`/
+    `MembershipGuard`/`CustomGuard` + `AnyOf`/`AllOf`, `WithSubject`/
+    `SubjectFrom`, `(*Entity).AuthorizeWith`; the guard predicate is
+    AND-ed into Get/Query/Update/Delete and fails closed with
+    `ErrSubjectMissing`.
+  - **Cache** (`cache.go`) — `(*Entity).WithCache` read-through cache
+    over the `drops/cache` backend, with a single-flight group,
+    PK-entry invalidation on write/delete, and gob-encoded entries.
+- **Schema push & diagram for SQLite** (`drops/sqlite`) —
+  - **Push** (`push.go`) — `Push` introspects the live DB, diffs it
+    against a Go `Schema`, and applies (or `DryRun`-previews) the diff in
+    one transaction; `PushResult`/`PushOptions`/`ErrSchemaRequired`.
+  - **Mermaid ER diagram** (`diagram.go`) — `MermaidDiagram` renders a
+    schema (tables + relations) as a Mermaid `erDiagram`.
+
+  `objects.go` (sequences, RLS policies, materialized views) is not
+  ported — those are Postgres-specific.
+- **Reflection, PII and drift for SQLite** (`drops/sqlite`) —
+  - **AutoTable** (`autotable.go`) — `AutoTable[T]` / `NewAutoEntity[T]`
+    derive a Table from `drop` struct tags (primaryKey, autoIncrement,
+    notNull, unique, pii, default), mapping Go types to SQLite affinities
+    (`sqlite.Money` → INTEGER).
+  - **PII redaction** (`pii.go`) — `PII`/`IsPII`/`(*Col).AsPII`; Exec and
+    Query unwrap the marker for the driver while hooks/loggers see
+    `<redacted>`, and entity bindings wrap PII columns automatically.
+  - **Drift detection** (`drift.go`) — `DetectDrift` computes the two-way
+    Snapshot diff into a `DriftReport` (`PendingMigrations`,
+    `UnauthorizedChanges`, `InSync`).
+- **Dev & schema tooling for SQLite** (`drops/sqlite`) —
+  - **Factory** (`factory.go`) — `NewFactory`/`Build`/`BuildN`/`Create`/
+    `CreateN`/`With`/`Reset` test-data factories (backed by the new
+    `Entity.CreateMany` batch insert).
+  - **Seeder** (`seed.go`) — `NewSeeder` + `SeedAdd`/`SeedAddCreate`/
+    `SeedDo` + transactional `Apply`.
+  - **Test transaction** (`testing.go`) — `TestTx` runs a test body in a
+    rolled-back transaction via the `TB` interface.
+  - **N+1 detector** (`n1.go`) — `WithN1Detector` + `N1Hook` +
+    `N1Report`/`N1Pattern` to flag repeated query skeletons.
+  - **Keyset cursor** (`cursor.go`) — `CursorSpec`/`OrderKey`,
+    `EncodeCursor`/`Cursor.Decode`, and `SelectBuilder.OrderByCursor`/
+    `AfterCursor`/`BeforeCursor` (NULLS defaults documented for SQLite).
+  - **Enum** (`enum.go`) — `NewEnum`/`AddTo`/`EnumCol` emulate a
+    PostgreSQL enum as a `TEXT` column plus an `IN (...)` CHECK
+    constraint (SQLite has no enum type).
+  - `Entity.CreateMany` — multi-row batch insert with tenant stamping.
+- **Transactional outbox for SQLite** (`drops/sqlite`, `outbox.go`) —
+  `Outbox` / `NewOutboxTable` / `Emit` / `EmitWith`, `Drain`,
+  `MarkPublished`, `MarkFailed`, `Cleanup`, and `OutboxWorker`
+  (`OnEvent`/`OnBatch`, `WithInterval`/`WithBatch`/`WithMaxAttempts`/
+  `WithBackoff`, `Run`/`Tick`). SQLite has no LISTEN/NOTIFY, SKIP LOCKED
+  or advisory locks, so it is a poll-based single-worker outbox with
+  INTEGER Unix-second timestamps; the pg per-aggregate advisory-lock
+  ordering mode is omitted. Delivery is at-least-once.
+- **Event sourcing & saga for SQLite** (`drops/sqlite`) —
+  - **Event store** (`eventstore.go`) — `EventStore` / `NewEventStoreTable`
+    with `Append` (optimistic concurrency via the UNIQUE
+    aggregate/version constraint → `ErrConcurrencyConflict`, detected
+    from SQLite's "UNIQUE constraint failed" message), `Load`, `Stream`,
+    `LatestVersion`, plus snapshots (`NewSnapshotTable`, `SaveSnapshot`
+    via `ON CONFLICT DO UPDATE`, `LoadSnapshot`).
+  - **Saga** (`saga.go`) — `NewSaga`/`Step`/`Run` orchestration with
+    reverse-order compensation, typed `SagaState` (`SagaStateGet[T]`),
+    and `SagaError`/`IsSagaError`.
+- **Transactional store patterns for SQLite** (`drops/sqlite`) —
+  - **Idempotency keys** (`idempotency.go`) — `IdempotencyStore` /
+    `NewIdempotencyTable` / `Run` / `RunJSON` / `Cleanup` / `SweepEvery`.
+    SQLite has no `SELECT ... FOR UPDATE`; concurrent `Run` calls
+    serialise on the write-transaction lock instead. Time comparisons
+    bind Go times (not `CURRENT_TIMESTAMP`) to avoid datetime-format
+    mismatch.
+  - **Chunked backfill** (`backfill.go`) — `NewBackfill` with
+    `ChunkSize`/`Throttle`/`Fetch`/`Process`/`OnProgress`, resumable via a
+    persisted state table (`NewBackfillStateTable`, timestamps stored as
+    INTEGER Unix seconds), upserting through `ON CONFLICT DO UPDATE`. The
+    pg replica-lag gate is omitted (SQLite has no replication).
+- **Lifecycle hooks, templates and mixins for SQLite** (`drops/sqlite`) —
+  the pg hook/mixin subsystem, adapted to SQLite:
+  - **Hooks** (`hooks.go` + builder wiring) — `Table.OnInsert` /
+    `OnUpdate` / `OnDelete` and `DefaultFilter`, applied by the INSERT /
+    UPDATE / DELETE / SELECT builders; `Unscoped()` on Select/Update/
+    Delete bypasses default scopes. User-supplied values always win over
+    hook-supplied ones.
+  - **Templates** (`template.go`) — `Timestamps`, `SoftDelete`, `Audit`,
+    `UUIDPrimaryKey` column groups returning typed handles. SQLite
+    adaptations: `CURRENT_TIMESTAMP` defaults, and a `randomblob()`-based
+    RFC-4122 v4 UUID default for `UUIDPrimaryKey` (SQLite has no
+    `gen_random_uuid()`).
+  - **Mixins** (`mixin.go`) — `ApplyMixins` + `TimestampsMixin`
+    (bumps `updatedAt` on UPDATE), `SoftDeleteMixin` (default-scopes
+    queries and rewrites DELETE into UPDATE `deletedAt`), `AuditMixin`,
+    `UUIDPrimaryKeyMixin`.
+- **Higher-level pg feature parity for SQLite** (`drops/sqlite`) — the
+  portable feature patterns that previously lived only in `drops/pg` are
+  now available on SQLite, adapted to SQLite semantics:
+  - **Money** (`money.go`) — precision-safe integer-cents monetary type
+    (`Money`, `MoneyFromString`/`MoneyFromCents`/`MoneyFromUnits`, `Add`,
+    `Sub`, `MulRate` with banker's rounding, JSON string round-trip,
+    `driver.Valuer`/`sql.Scanner`).
+  - **Cursor pagination** (`page.go`) — `Entity.Page` with opaque
+    keyset cursors (`Asc`/`Desc`, `Page[T]`, `HasMore`/`NextCursor`),
+    using SQLite row-value comparison for the keyset guard.
+  - **Patch** (`patch.go`) — `Entity.Patch` with SQL-side ops `Inc`,
+    `Dec`, `Set`, `SetIfGreater`/`SetIfLess` (via `max`/`min`) and
+    `SetIfChanged` (via NULL-safe `IS NOT`).
+  - **Tenant scoping** (`tenant.go`) — `Entity.ScopeByTenant` +
+    `WithTenant`/`TenantFrom`; Get/Query/Update/Delete auto-apply the
+    tenant predicate and Create stamps it, failing closed with
+    `ErrTenantMissing` / `ErrTenantMismatch`.
+  - **Typed JSON path** (`jsonpath.go`) — `JSONField[T]` typed accessor
+    over `json_extract` with comparison/`In`/`IsNull`/`Like` operators,
+    plus `JSONHasKey` via `json_type`.
+  - **Retry** (`retry.go`) — `RetryPolicy` + `DB.WithRetry`;
+    transaction-level retry on `SQLITE_BUSY`/`SQLITE_LOCKED`
+    (`ErrBusy`/`ErrLocked`, matched by `errors.Is` or driver message),
+    `ExponentialJitter`, `DefaultRetryPolicy`.
+  - **Tracing** (`tracing.go`) — `Tracer`/`Span` contract + `WithTracer`
+    wired into every Exec/Query span (dependency-free OTel-shaped API).
+  - **Existence checks** (`exists.go`) — `TableExists`, `ColumnExists`,
+    `IndexExists`, `TriggerExists` over `sqlite_master` / `pragma_table_info`.
+  - **Migration safety analyzer** (`safety.go`) — `AnalyzeMigration`
+    with SQLite-tuned rules (drop-table, drop/rename-column,
+    add-NOT-NULL-without-default, non-constant ADD COLUMN default,
+    DELETE/UPDATE without WHERE).
+  - **Logger hook alias** (`hook_logger.go`) — `sqlite.LoggerHook` for
+    symmetry with the pg/clickhouse dialects.
+
+  Postgres-specific features remain pg-only where SQL cannot express
+  them (LISTEN/NOTIFY, pgvector, materialized views, COPY, PostGIS,
+  advisory locks, streaming replication, `CREATE INDEX CONCURRENTLY`,
+  table-partitioned time series).
+- **Portable SQL expression layer for SQLite** (`drops/sqlite`) — the
+  SQLite dialect gains the full set of standard-SQL expression builders
+  that previously lived only in `drops/pg`, so anything expressible in
+  portable SQL is now available on SQLite too. New helpers:
+  - **Operators / predicates** (`op.go`): free-standing `Eq`, `Ne`, `Gt`,
+    `Gte`, `Lt`, `Lte`, `Not`, `In`, `NotIn`, `IsNull`, `IsNotNull`,
+    `Between`, `NotBetween`, `Like`, `NotLike`, `LikeEscape`, plus the
+    SQLite-native `Glob`, `Regexp`, and the NULL-safe `IsDistinctFrom` /
+    `IsNotDistinctFrom` (rendered via SQLite `IS` / `IS NOT`).
+  - **Aggregates / scalars** (`funcs.go`): `Count`, `CountAll`,
+    `CountDistinct`, `Sum`, `Avg`, `Min`, `Max`, `SumDistinct`,
+    `AvgDistinct`, `Filter`, plus SQLite's `Total`, `GroupConcat`,
+    `Coalesce`, `IfNull`, `NullIf`, `Lower`, `Upper`, `As`, `Func`.
+  - **Math** (`math.go`): `Abs`, `Round`, `Ceil`, `Floor`, `Trunc`,
+    `Mod` (via `%`), `Power` (`pow`), `Sqrt`, `Sign`, `Exp`, `Ln`, `Log`,
+    `Greatest`/`Least` (via multi-arg `max`/`min`), trig functions,
+    `Random`, and the `Plus`/`Minus`/`Mul`/`Div` operators.
+  - **Strings** (`strings.go`): `ConcatOp` (`||`), `Concat`, `ConcatWS`,
+    `Length`, `OctetLength`, `Substr`, `Trim`/`LTrim`/`RTrim`, `Replace`,
+    `Instr`, `Hex`/`Unhex`, `Quote`, `Chr`, `Unicode`, `Format`/`Printf`.
+  - **Cast / Case** (`cast.go`): `CastAs`/`Cast` (SQLite has only the
+    `CAST(x AS T)` form) and the `Case`/`CaseOn` builder.
+  - **Subqueries** (`subquery.go`): `Exists`, `NotExists`, `Subquery`,
+    `InSub`, `NotInSub`.
+  - **CTEs** (`cte.go`): `With` / `WithRecursive` on the SELECT builder
+    plus `CTEDef` (WITH / WITH RECURSIVE, supported since SQLite 3.8.3).
+  - **Window functions** (`window.go`): `Over`, `WindowSpec`,
+    `RowNumber`, `Rank`, `DenseRank`, `PercentRank`, `CumeDist`, `Ntile`,
+    `Lag`, `Lead`, `FirstValue`, `LastValue`, `NthValue`.
+  - **JSON1** (`json.go`): `JSONExtract`, `JSONGet` (`->`),
+    `JSONGetText` (`->>`), `JSONArrayLength`, `JSONType`, `JSONValid`,
+    `JSONQuote`, `JSONObject`, `JSONArray`, `JSONSet`/`JSONInsert`/
+    `JSONReplace`, `JSONRemove`, `JSONPatch`, `JSONGroupArray`,
+    `JSONGroupObject`.
+  - **Date/time** (`datetime.go`): `Now`, `CurrentDate`, `CurrentTime`,
+    `CurrentTimestamp`, `DateOf`, `TimeOf`, `DateTime`, `JulianDay`,
+    `UnixEpoch`, `StrfTime`.
+- **Portable SQL expression layer for ClickHouse** (`drops/clickhouse`)
+  — the standard-SQL structural helpers ClickHouse supports with
+  identical syntax, mirroring the SQLite/pg surface: `CastAs`/`Cast` and
+  `Case`/`CaseOn` (`cast.go`); `Exists`, `NotExists`, `Subquery`,
+  `InSub`, `NotInSub` (`subquery.go`); `With` / `CTEDef` (`cte.go`); and
+  window functions `Over`, `WindowSpec`, `RowNumber`, `Rank`,
+  `DenseRank`, `FirstValue`, `LastValue`, `NthValue`, plus `Lag`/`Lead`
+  emitting ClickHouse's `lagInFrame`/`leadInFrame` (`window.go`).
+
+## [0.4.1] - 2026-07-14
+
+### Fixed
+- **Qdrant missing-collection 404 classification** (`drops/qdrant`) — the
+  `Client.Do` 404 check used a case-sensitive substring match on
+  `"not found"`, which does not match real Qdrant's response body
+  (``Not found: Collection `x` doesn't exist!`` — capital "Not found",
+  "doesn't exist"). A missing collection therefore surfaced as a plain
+  `HTTPError` instead of `ErrCollectionMissing`, so `CollectionExists`
+  returned an error rather than `(false, nil)` and callers never reached
+  their auto-create branch — collections were silently never created.
+  The 404 is now classified case-insensitively and also accepts
+  `"doesn't exist"` / `"does not exist"`. The test mock, which previously
+  matched a lowercase body no live server emits, now uses Qdrant's real
+  format, and a table-driven test pins the variants.
 
 ## [0.4.0] - 2026-07-08
 

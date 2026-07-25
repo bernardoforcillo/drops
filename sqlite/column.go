@@ -23,6 +23,7 @@ type Column struct {
 	defaultSQL string
 	hasDefault bool
 	ref        *FK
+	pii        bool
 }
 
 // FK describes a single-column foreign-key reference.
@@ -65,21 +66,6 @@ func (c *Column) WriteSQL(b *drops.Builder) {
 		b.WriteByte('.')
 	}
 	b.WriteIdent(c.name)
-}
-
-// Asc / Desc produce ORDER BY direction expressions, mirroring drops/pg.
-func (c *Column) Asc() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(" ASC")
-	})
-}
-
-func (c *Column) Desc() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(" DESC")
-	})
 }
 
 // Col is the typed column handle whose Go value type is T.
@@ -226,11 +212,18 @@ type columnValue struct {
 	val any
 }
 
-func (v columnValue) column() *Column             { return v.col }
-func (v columnValue) writeValue(b *drops.Builder) { b.AddArg(v.val) }
+func (v columnValue) column() *Column { return v.col }
+func (v columnValue) writeValue(b *drops.Builder) {
+	// PII columns bind a redaction marker so loggers/hooks see
+	// "<redacted>"; db.Exec/Query unwrap it before the driver call.
+	if v.col != nil && v.col.pii {
+		b.AddArg(piiArg{Value: v.val})
+		return
+	}
+	b.AddArg(v.val)
+}
 
-// exprValue assigns a raw SQL expression (not a bound value) to a column,
-// backing UpdateBuilder.SetExpr — e.g. deletedAt = CURRENT_TIMESTAMP.
+// exprValue assigns a raw SQL expression (not a bound value) to a column.
 type exprValue struct {
 	col  *Column
 	expr drops.Expression

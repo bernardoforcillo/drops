@@ -15,7 +15,7 @@ type UpdateBuilder struct {
 	unscoped bool
 }
 
-// Set adds a column assignment binding a value.
+// Set adds a column assignment.
 func (u *UpdateBuilder) Set(vals ...ColumnValue) *UpdateBuilder {
 	u.sets = append(u.sets, vals...)
 	return u
@@ -28,22 +28,33 @@ func (u *UpdateBuilder) SetExpr(col *Column, expr drops.Expression) *UpdateBuild
 	return u
 }
 
-// Unscoped opts out of the table's DefaultFilter predicates for this
-// statement.
-func (u *UpdateBuilder) Unscoped() *UpdateBuilder { u.unscoped = true; return u }
-
 // Where AND-s the given predicates onto the statement.
 func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
 	u.wheres = append(u.wheres, preds...)
 	return u
 }
 
+// Unscoped opts out of the table's DefaultFilter predicates for this
+// UPDATE (e.g. an admin job bypassing a soft-delete or tenant guard).
+func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
+	u.unscoped = true
+	return u
+}
+
 // WriteSQL implements drops.Expression.
 func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
+	sets := u.sets
+	if u.table.hasUpdateHooks() {
+		sets = u.applyUpdateHooks()
+	}
+	wheres := u.wheres
+	if !u.unscoped && len(u.table.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), wheres...)
+	}
 	b.WriteString("UPDATE ")
 	u.table.writeName(b)
 	b.WriteString(" SET ")
-	for i, cv := range u.sets {
+	for i, cv := range sets {
 		if i > 0 {
 			b.WriteString(", ")
 		}
@@ -51,14 +62,28 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" = ")
 		cv.writeValue(b)
 	}
-	wheres := u.wheres
-	if !u.unscoped && len(u.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), u.wheres...)
-	}
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		b.AppendList(" AND ", wheres)
 	}
+}
+
+// applyUpdateHooks runs every UpdateHook on the table and returns the
+// (possibly extended) SET list.
+func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
+	ctx := &UpdateHookCtx{bound: make(map[*Column]bool, len(u.sets))}
+	for _, s := range u.sets {
+		ctx.bound[s.column()] = true
+	}
+	for _, h := range u.table.updateHooks {
+		h.BeforeUpdate(ctx)
+	}
+	if len(ctx.add) == 0 {
+		return u.sets
+	}
+	out := append([]ColumnValue(nil), u.sets...)
+	out = append(out, ctx.add...)
+	return out
 }
 
 // ToSQL renders the statement with SQLite placeholders.

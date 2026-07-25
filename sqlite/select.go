@@ -16,13 +16,16 @@ type SelectBuilder struct {
 	wheres   []drops.Expression
 	orderBy  []drops.Expression
 	distinct bool
-	unscoped bool
 	limit    *int64
 	offset   *int64
+
+	ctes         []*CTE
+	recursiveCTE bool
+	unscoped     bool
 }
 
-// Unscoped opts out of the FROM table's DefaultFilter predicates for this
-// query — e.g. to include soft-deleted rows. Mirrors drops/pg.
+// Unscoped opts out of the FROM table's DefaultFilter predicates for
+// this SELECT (e.g. to read soft-deleted rows).
 func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
 
 type joinClause struct {
@@ -70,6 +73,7 @@ func (s *SelectBuilder) Offset(n int64) *SelectBuilder { s.offset = &n; return s
 
 // WriteSQL implements drops.Expression.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
+	writeCTEs(b, s.ctes, s.recursiveCTE)
 	b.WriteString("SELECT ")
 	if s.distinct {
 		b.WriteString("DISTINCT ")
@@ -91,7 +95,10 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" ON ")
 		b.Append(j.on)
 	}
-	wheres := s.effectiveWheres()
+	wheres := s.wheres
+	if !s.unscoped && s.table != nil && len(s.table.defaultFilters) > 0 {
+		wheres = append(append([]drops.Expression(nil), s.table.defaultFilters...), wheres...)
+	}
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		b.AppendList(" AND ", wheres)
@@ -108,15 +115,6 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" OFFSET ")
 		b.AddArg(*s.offset)
 	}
-}
-
-// effectiveWheres prepends the FROM table's default filters (unless
-// unscoped) to the explicit predicates.
-func (s *SelectBuilder) effectiveWheres() []drops.Expression {
-	if s.unscoped || s.table == nil || len(s.table.defaultFilters) == 0 {
-		return s.wheres
-	}
-	return append(append([]drops.Expression(nil), s.table.defaultFilters...), s.wheres...)
 }
 
 // ToSQL renders the statement with SQLite placeholders.

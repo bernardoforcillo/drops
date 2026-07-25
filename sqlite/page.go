@@ -14,26 +14,18 @@ import (
 
 // Page is the typed result of a cursor-based pagination. NextCursor is
 // empty when no further rows exist; HasMore short-circuits the presence
-// check. It mirrors drops/pg's Page[T] so pagination code ports across
-// dialects with a package swap.
+// check.
 type Page[T any] struct {
 	Items      []T
 	NextCursor string
 	HasMore    bool
 }
 
-// PageBuilder composes a cursor-paginated query. It keeps cursor
-// encoding/decoding internal — callers never construct or inspect cursors
-// directly.
-//
-// Cursors are opaque, URL-safe base64 strings whose payload is a
-// gob-encoded slice of the ordering columns' values. A cursor stays valid
-// as long as the OrderBy spec doesn't change between calls.
-//
-// Keyset (a.k.a. seek) pagination is O(limit) regardless of how deep the
-// caller has paged — unlike OFFSET, which SQLite must still walk past. Use
-// EntityQuery.Offset for small offsets; use Page for deep, stable
-// iteration.
+// PageBuilder composes a cursor-paginated query, keeping the cursor
+// encoding/decoding internal — callers never construct or inspect
+// cursors directly. Cursors are opaque, URL-safe base64 strings whose
+// payload is a gob-encoded slice of the ordering columns' values,
+// stable as long as the OrderBy spec doesn't change between calls.
 type PageBuilder[T any] struct {
 	e        *Entity[T]
 	db       *DB
@@ -50,51 +42,41 @@ type OrderingColumn struct {
 	asc bool
 }
 
-// Asc returns an OrderingColumn for c sorted ascending. Accepts either
-// *Column or *Col[T] via ColRef.
+// Asc returns an OrderingColumn for c sorted ascending.
 func Asc(c ColRef) OrderingColumn { return OrderingColumn{col: c.col(), asc: true} }
 
 // Desc returns an OrderingColumn for c sorted descending.
 func Desc(c ColRef) OrderingColumn { return OrderingColumn{col: c.col(), asc: false} }
 
-// Page returns a cursor-paginated builder for this entity. The default
-// limit is 50; override with Limit.
-//
-//	p, err := UserEntity.Page(db).
-//	    OrderBy(sqlite.Asc(UserID)).
-//	    Limit(20).
-//	    After(prevCursor).
-//	    All(ctx)
-//	if p.HasMore {
-//	    // request next page with p.NextCursor
-//	}
+// Page returns a cursor-paginated builder for this entity. Default limit
+// is 50; override with Limit.
 func (e *Entity[T]) Page(db *DB) *PageBuilder[T] {
 	return &PageBuilder[T]{e: e, db: db, limit: 50}
 }
 
 // OrderBy fixes the cursor's stability axis. At least one column is
-// required; the last column should be unique (typically the PK) so every
-// row has a distinct cursor.
+// required; the last should be unique (typically the PK) so every row
+// has a distinct cursor.
 func (p *PageBuilder[T]) OrderBy(cols ...OrderingColumn) *PageBuilder[T] {
 	p.orderBys = append(p.orderBys, cols...)
 	return p
 }
 
-// Where appends predicates joined by AND. Composes with the cursor guard
-// so additional filters narrow the page set.
+// Where appends predicates joined by AND, composing with the cursor
+// guard so filters narrow the page set.
 func (p *PageBuilder[T]) Where(preds ...drops.Expression) *PageBuilder[T] {
 	p.wheres = append(p.wheres, preds...)
 	return p
 }
 
-// After resumes iteration after the supplied cursor. Pass the empty string
-// for the first page.
+// After resumes iteration after the supplied cursor. Pass "" for the
+// first page.
 func (p *PageBuilder[T]) After(cursor string) *PageBuilder[T] {
 	p.after = cursor
 	return p
 }
 
-// Limit caps the page size. Defaults to 50.
+// Limit caps the page size (default 50).
 func (p *PageBuilder[T]) Limit(n int) *PageBuilder[T] {
 	if n > 0 {
 		p.limit = n
@@ -102,17 +84,24 @@ func (p *PageBuilder[T]) Limit(n int) *PageBuilder[T] {
 	return p
 }
 
-// All runs the query and returns the page.
+// All runs the query and returns the page. Honours the entity's tenant
+// scope when one is configured.
 func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	if len(p.orderBys) == 0 {
 		return nil, errors.New("drops/sqlite: Page requires OrderBy(...)")
+	}
+	tenantPred, err := p.e.tenantPredicate(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	sel := p.db.Select(p.e.selectCols()...).From(p.e.table)
 	for _, w := range p.wheres {
 		sel.Where(w)
 	}
-	// Apply the cursor guard, if any.
+	if tenantPred != nil {
+		sel.Where(tenantPred)
+	}
 	if p.after != "" {
 		guard, err := cursorGuard(p.orderBys, p.after)
 		if err != nil {
@@ -120,7 +109,6 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 		}
 		sel.Where(guard)
 	}
-	// Stable ordering — every OrderingColumn renders into the ORDER BY.
 	for _, o := range p.orderBys {
 		sel.OrderBy(orderingExpr(o))
 	}
@@ -136,11 +124,9 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	if hasMore {
 		rows = rows[:p.limit]
 	}
-
 	out := &Page[T]{Items: rows, HasMore: hasMore}
 	if hasMore && len(rows) > 0 {
-		last := rows[len(rows)-1]
-		cur, err := encodeCursor(p.e, p.orderBys, last)
+		cur, err := encodeCursor(p.e, p.orderBys, rows[len(rows)-1])
 		if err != nil {
 			return nil, err
 		}
@@ -149,21 +135,22 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	return out, nil
 }
 
-// orderingExpr renders an OrderingColumn into the ORDER BY form.
+// orderingExpr renders "<col> ASC" / "<col> DESC".
 func orderingExpr(o OrderingColumn) drops.Expression {
-	if o.asc {
-		return o.col.Asc()
-	}
-	return o.col.Desc()
+	return drops.ExprFunc(func(b *drops.Builder) {
+		o.col.WriteSQL(b)
+		if o.asc {
+			b.WriteString(" ASC")
+		} else {
+			b.WriteString(" DESC")
+		}
+	})
 }
 
-// cursorGuard builds the WHERE predicate that moves past the supplied
-// cursor.
-//
-// Single/homogeneous form: WHERE (c1, c2) > (?, ?) — SQLite supports
-// row-value comparison (>= 3.15, 2016) and evaluates it lexicographically.
-// Mixed asc/desc directions fall back to the explicit tie-break
-// disjunction so the comparison stays well-defined.
+// cursorGuard builds the WHERE predicate that moves past the cursor.
+// Homogeneous directions use the row-comparison form (SQLite supports
+// row values since 3.15); mixed directions fall back to the tie-break
+// disjunction.
 func cursorGuard(orderBys []OrderingColumn, cursor string) (drops.Expression, error) {
 	vals, err := decodeCursor(cursor)
 	if err != nil {
@@ -181,7 +168,6 @@ func cursorGuard(orderBys []OrderingColumn, cursor string) (drops.Expression, er
 		}
 	}
 	if allAsc || allDesc {
-		// Row-comparison form.
 		op := ">"
 		if allDesc {
 			op = "<"
@@ -206,11 +192,7 @@ func cursorGuard(orderBys []OrderingColumn, cursor string) (drops.Expression, er
 			b.WriteByte(')')
 		}), nil
 	}
-	// Mixed-direction fallback: tie-break disjunction. For c1 ASC, c2 DESC:
-	//
-	//   c1 > v1 OR (c1 = v1 AND c2 < v2)
-	//
-	// Generalises N-wise via cumulative-equality prefixes.
+	// Mixed-direction fallback: cumulative-equality-prefix disjunction.
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteByte('(')
 		for i := range orderBys {
@@ -242,7 +224,7 @@ func cursorGuard(orderBys []OrderingColumn, cursor string) (drops.Expression, er
 	}), nil
 }
 
-// encodeCursor extracts the ordering-column values from the last row and
+// encodeCursor extracts the ordering-column values from row and
 // gob-encodes them inside a URL-safe base64 string.
 func encodeCursor[T any](e *Entity[T], orderBys []OrderingColumn, row T) (string, error) {
 	v := reflect.ValueOf(&row).Elem()

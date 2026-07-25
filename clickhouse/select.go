@@ -26,6 +26,8 @@ type SelectBuilder struct {
 	distinct  bool
 	settings  []string // raw "key = value"
 	unscoped  bool
+	err       error // deferred error (e.g. cursor decode failure) surfaced at Rows()
+	ctes []*CTE
 }
 
 type joinKind string
@@ -139,6 +141,7 @@ func (s *SelectBuilder) Setting(key, value string) *SelectBuilder {
 
 // WriteSQL renders the SELECT.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
+	writeCTEs(b, s.ctes)
 	b.WriteString("SELECT ")
 	if s.distinct {
 		b.WriteString("DISTINCT ")
@@ -221,6 +224,9 @@ func (s *SelectBuilder) ToSQL() (sql string, args []any) {
 
 // Rows runs the SELECT and returns the raw cursor.
 func (s *SelectBuilder) Rows(ctx context.Context) (drops.Rows, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	sql, args := s.ToSQL()
 	return s.db.Query(ctx, sql, args...)
 }

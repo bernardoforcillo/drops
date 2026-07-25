@@ -167,8 +167,12 @@ func TestCreateCollectionValidates(t *testing.T) {
 func TestCollectionExistsHandlesNotFound(t *testing.T) {
 	m := newMock()
 	defer m.close()
+	// Body mirrors real Qdrant's 404 for a missing collection: capital
+	// "Not found" and "doesn't exist" (not lowercase "not found"). See
+	// https://github.com/qdrant/qdrant response format.
 	m.handle("GET /collections/missing", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, `{"status":{"error":"Collection 'missing' not found"}}`,
+		http.Error(w,
+			"{\"status\":{\"error\":\"Not found: Collection `missing` doesn't exist!\"},\"time\":0.0}",
 			http.StatusNotFound)
 	})
 	m.handle("GET /collections/present", func(w http.ResponseWriter, _ *http.Request) {
@@ -203,6 +207,50 @@ func TestErrCollectionMissingIsWrapped(t *testing.T) {
 	_, err := cli.CollectionInfo(context.Background(), "missing")
 	if !errors.Is(err, qdrant.ErrCollectionMissing) {
 		t.Errorf("expected ErrCollectionMissing, got %v", err)
+	}
+}
+
+// TestMissingCollectionBodyVariants pins down the 404 classification against
+// the range of bodies Qdrant emits across versions. The real-Qdrant form
+// ("Not found: Collection ... doesn't exist!") regressed silently before —
+// case-sensitive matching on lowercase "not found" missed it, so a missing
+// collection surfaced as a raw HTTPError and callers never hit their
+// auto-create branch.
+func TestMissingCollectionBodyVariants(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		missing bool // true => should map to ErrCollectionMissing
+	}{
+		{"real qdrant doesn't exist", "Not found: Collection `tenders` doesn't exist!", true},
+		{"lowercase not found", `{"status":{"error":"collection not found"}}`, true},
+		{"does not exist spelled out", `{"status":{"error":"Collection does not exist"}}`, true},
+		{"unrelated 404", `{"status":{"error":"page missing"}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMock()
+			defer m.close()
+			m.handle("GET /collections/c", func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, tc.body, http.StatusNotFound)
+			})
+			cli, _ := qdrant.NewClient(m.server.URL)
+			_, err := cli.CollectionInfo(context.Background(), "c")
+			if err == nil {
+				t.Fatal("expected an error for a 404")
+			}
+			if got := errors.Is(err, qdrant.ErrCollectionMissing); got != tc.missing {
+				t.Errorf("errors.Is(ErrCollectionMissing) = %v, want %v (body %q)",
+					got, tc.missing, tc.body)
+			}
+			// A non-missing 404 must still be reachable as an HTTPError.
+			if !tc.missing {
+				var httpErr *qdrant.HTTPError
+				if !errors.As(err, &httpErr) {
+					t.Errorf("expected *qdrant.HTTPError, got %T", err)
+				}
+			}
+		})
 	}
 }
 

@@ -9,6 +9,47 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Portable vector search** (`drops/vector`) — one search vocabulary
+  shared by pgvector, ClickHouse and Qdrant, replacing three
+  backend-specific ones:
+  - **`Filter`** — a portable predicate tree (`And`/`Or`/`Not` over
+    `Eq`, `Ne`, `In`, `NotIn`, `Lt`/`Lte`/`Gt`/`Gte`, `Between`,
+    `IsNull`, `MatchText`, `HasID`, `GeoWithin`), compiled to each
+    backend's own representation through a generic `Compile`/`Visitor`
+    pair so the traversal exists once.
+  - **`Query` / `QueryBuilder`** — query vector, `TopK`, `Metric`,
+    filter, `MaxDistance` (always in the metric's units), payload and
+    vector inclusion, cursor, and a `Params` bag for backend-specific
+    tuning that other backends ignore.
+  - **`Hit` / `Results`** — every hit carries both `Distance` (lower is
+    closer) and `Score` (higher is better), converted in one place;
+    `HasMore` is decided by a `TopK+1` probe, never a second query.
+  - **`Cursor`** — one opaque, URL-safe cursor across backends, stamped
+    with the issuing backend so a cross-store replay is
+    `ErrCursorMismatch` rather than a wrong page. IDs travel as text
+    plus a kind tag, so an `int64` past 2^53 round-trips exactly.
+  - **`Store`** — the one-method interface the three adapters implement.
+- **Vector-store adapters** for the three backends:
+  - **`pg.NewVectorStore`** — pgvector distance operators for all six
+    metrics, filter fields resolved to mapped columns or a jsonb
+    payload accessor, keyset pagination on `(distance, id)`, PostGIS
+    `ST_Within` for geo filters via `WithGeoColumn`. `FormatVector` /
+    `ParseVector` / `FormatBitVector` are exported for hand-written
+    statements.
+  - **`clickhouse.NewVectorStore`** — `cosineDistance` / `L2Distance` /
+    `L1Distance` / negated `dotProduct` over `Array(Float32)` (no
+    extension required), `JSONExtract*` payload accessors with
+    `JSONHas` null tests, SETTINGS forwarded from `Params`, and the
+    same keyset pagination. The query vector is rendered once and
+    referenced by alias in `WHERE` and `ORDER BY`.
+  - **`(*qdrant.Client).Store`** — portable filters compiled to Qdrant's
+    Must/Should/MustNot tree (negations routed through `must_not`,
+    `IsNull` covering both `is_null` and `is_empty`), offset
+    pagination, and score-to-distance normalisation that accounts for
+    Qdrant's per-metric score semantics. `qdrant.CompileFilter` is
+    exported so portable filters can also drive `Scroll`,
+    `Recommend` and `DeleteByFilter`.
+
 - **Tiered cache** (`drops/cache/tiered`) — two-level L1+L2 read-through /
   write-through cache with `GetOrLoad` singleflight stampede protection.
 - **Memcached cache backend** (`drops/cache/memcached`) — stdlib-only
@@ -213,6 +254,14 @@ once a 1.0 is cut.
   window functions `Over`, `WindowSpec`, `RowNumber`, `Rank`,
   `DenseRank`, `FirstValue`, `LastValue`, `NthValue`, plus `Lag`/`Lead`
   emitting ClickHouse's `lagInFrame`/`leadInFrame` (`window.go`).
+
+### Fixed
+- **`pg.Within` bound the wrong parameters** (`drops/pg`, `geo.go`) — it
+  wrote `$1, $2, $3, $4` literally while appending its four arguments at
+  the Builder's own indexes, so any `Within` that was not the first
+  expression in a statement compared against whatever parameters
+  happened to occupy those slots. It now renders each placeholder
+  through `AddArg`.
 
 ## [0.4.1] - 2026-07-14
 

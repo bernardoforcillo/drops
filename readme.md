@@ -41,10 +41,15 @@ Early. Two dialects ship today:
   `drops.Hook` stream via small OTel-shaped interfaces (no OTel import;
   a ~10-line adapter bridges the real SDK). One instrumentation covers
   every dialect and every cache backend.
+- **`drops/vector`** — one portable vector-search vocabulary shared by
+  pgvector, ClickHouse and Qdrant: a `Filter` predicate tree, a `Query`
+  builder, `Hit`/`Results` with both distance and score, opaque
+  cursors, and the `Store` interface all three backends implement.
 - **`drops/qdrant`** — Qdrant vector database. Focused HTTP client
   (stdlib only): collections, upsert/delete/retrieve, search /
   recommend / scroll, and a Must/Should/MustNot filter DSL with
-  Eq/In/Range/HasID/Geo conditions.
+  Eq/In/Range/HasID/Geo conditions. `(*Client).Store` exposes a
+  collection as a `vector.Store`.
 - **`drops/pg`** with **pgvector** — `Vector(name, dim)`,
   `HalfVec(name, dim)`, `SparseVec`, `BitVec` column types plus
   the distance operators (`<->` L2, `<#>` inner product, `<=>` cosine,
@@ -278,6 +283,99 @@ Surface: `CreateCollection` / `DeleteCollection` / `CollectionInfo` /
 `MatchText` / `Range` / `HasID` / `IsEmpty` / `IsNull` / `GeoIn` /
 `Nest` conditions. `HTTPError` (with `Status`/`Body`) and
 `ErrCollectionMissing` are exported for `errors.As` / `errors.Is`.
+
+### One search, three backends: `drops/vector`
+
+pgvector, ClickHouse and Qdrant all do similarity search, and until now
+each wanted the query written its own way: a `drops.Expression`
+predicate and a distance operator for pgvector, a JSON
+Must/Should/MustNot tree for Qdrant, nothing at all for ClickHouse.
+Moving a collection between them — or querying two at once — meant
+rewriting the search.
+
+`drops/vector` is that query written once. It has no SQL and no HTTP in
+it: a portable `Filter` tree, a `Query`, a `Store` interface, and the
+score/distance conventions the three backends are normalised onto.
+
+```go
+import "github.com/bernardoforcillo/drops/vector"
+
+q := vector.Search(embedding).
+    TopK(20).
+    Metric(vector.Cosine).
+    Where(vector.And(
+        vector.Eq("lang", "it"),
+        vector.Gte("published_at", 1700000000),
+        vector.Not(vector.In("status", "draft", "archived")),
+    )).
+    WithPayload().
+    Build()
+
+res, err := store.Search(ctx, q)   // store is any vector.Store
+```
+
+`store` is whichever backend holds the vectors:
+
+```go
+// pgvector — a table with a vector(N) column
+store := pg.NewVectorStore(db, Docs, DocID, DocEmbedding,
+    pg.WithPayloadColumn(DocMeta),   // jsonb
+    pg.WithField("lang", DocLang))   // a real column beats jsonb
+
+// ClickHouse — an Array(Float32) column, no extension needed
+store := clickhouse.NewVectorStore(chdb, Docs, DocID, DocEmbedding,
+    clickhouse.WithPayloadColumn(DocMeta))
+
+// Qdrant — a collection
+store := cli.Store("embeddings", qdrant.WithMetric(vector.Cosine))
+```
+
+Filter fields are strings because Qdrant payloads have no schema. The
+SQL stores resolve them in two steps: a `WithField` mapping compiles to
+that column, otherwise the name becomes a JSON accessor into the
+payload column (dotted names walk nested objects). A field that matches
+neither is `vector.ErrUnknownField` rather than a predicate that
+silently matches nothing.
+
+**Distance and score.** Every `Hit` carries both. `Distance` is in the
+metric's own units and smaller is closer; `Score` is a ranking value
+where larger is better. The conversion lives in one place, so a
+`MaxDistance(0.25)` means the same thing whether it becomes a `<=` on a
+pgvector expression or Qdrant's `score_threshold` — Qdrant's score,
+which is a similarity for Cosine/Dot but the raw distance for
+Euclid/Manhattan, is normalised on the way out.
+
+**Pagination.** One opaque cursor, whatever is underneath:
+
+```go
+for cursor := ""; ; {
+    res, err := store.Search(ctx, vector.Search(v).TopK(50).After(cursor).Build())
+    if err != nil {
+        return err
+    }
+    handle(res.Hits)
+    if !res.HasMore {
+        break
+    }
+    cursor = res.NextCursor
+}
+```
+
+The two SQL stores paginate by keyset on `(distance, id)` — the next
+page is guarded by `(distance, id) > (lastDistance, lastID)`, so
+concurrent inserts cannot shift a row across a page boundary the way
+`OFFSET` does. Qdrant's search API has no keyset, so its cursor carries
+an offset instead. Both encode to the same opaque string, and each is
+stamped with the backend that issued it: replaying a Qdrant cursor
+against a pgvector store returns `vector.ErrCursorMismatch` rather than
+quietly serving the wrong page. `HasMore` costs no extra round trip —
+every backend asks for `TopK+1` and trims.
+
+Two honest caveats. pgvector's HNSW/IVFFlat indexes are approximate and
+apply `WHERE` on top of what the index returned, so a selective filter
+or a deep page can return fewer than `TopK` rows; widen the search with
+`.Param("hnsw.ef_search", 200)`. ClickHouse without a vector index is
+an exact brute-force scan — never lossy, but linear.
 
 ## Design
 
@@ -986,6 +1084,7 @@ drops/sqlite/                SQLite schema, query builders, entities,
 drops/clickhouse/            ClickHouse schema, engines, query builder,
                              analytical aggregates
 drops/qdrant/                Qdrant vector-database HTTP client
+drops/vector/                portable vector search shared by pg/CH/Qdrant
 drops/cache/                 Cache interface + sentinels
 drops/cache/memory/          in-process cache backend
 drops/cache/redis/           Redis cache backend (own RESP2 client)

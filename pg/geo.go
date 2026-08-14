@@ -191,11 +191,19 @@ func Within(col ColRef, box Box) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("ST_Within(")
 		col.col().WriteSQL(b)
-		b.WriteString("::geometry, ST_MakeEnvelope($1, $2, $3, $4, 4326))")
+		b.WriteString("::geometry, ST_MakeEnvelope(")
+		// AddArg renders the placeholder at the Builder's own index —
+		// writing "$1, $2, ..." literally would bind the wrong
+		// parameters for any Within() that is not the first
+		// expression in the statement.
 		b.AddArg(box.SW.Lon)
+		b.WriteString(", ")
 		b.AddArg(box.SW.Lat)
+		b.WriteString(", ")
 		b.AddArg(box.NE.Lon)
+		b.WriteString(", ")
 		b.AddArg(box.NE.Lat)
+		b.WriteString(", 4326))")
 	})
 }
 

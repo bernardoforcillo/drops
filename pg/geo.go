@@ -181,6 +181,12 @@ type Box struct {
 
 // ----------------------------------------------------------------------
 // SQL helpers
+//
+// Every helper below binds its coordinates through Builder.AddArg,
+// which both appends the argument and writes its placeholder at the
+// Builder's own index. Writing "$1" into the SQL text by hand and
+// calling AddArg alongside it emits the placeholder twice — once in
+// the wrong place — and is what these helpers used to do.
 // ----------------------------------------------------------------------
 
 // Within renders ST_Within(col, ST_MakeEnvelope(...)::geography),
@@ -191,11 +197,15 @@ func Within(col ColRef, box Box) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("ST_Within(")
 		col.col().WriteSQL(b)
-		b.WriteString("::geometry, ST_MakeEnvelope($1, $2, $3, $4, 4326))")
+		b.WriteString("::geometry, ST_MakeEnvelope(")
 		b.AddArg(box.SW.Lon)
+		b.WriteString(", ")
 		b.AddArg(box.SW.Lat)
+		b.WriteString(", ")
 		b.AddArg(box.NE.Lon)
+		b.WriteString(", ")
 		b.AddArg(box.NE.Lat)
+		b.WriteString(", 4326))")
 	})
 }
 
@@ -211,8 +221,9 @@ func DistanceFrom(col ColRef, p Point) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("ST_Distance(")
 		col.col().WriteSQL(b)
-		b.WriteString(", $1::geography)")
+		b.WriteString(", ")
 		b.AddArg(p.String())
+		b.WriteString("::geography)")
 	})
 }
 
@@ -223,8 +234,9 @@ func DistanceFrom(col ColRef, p Point) drops.Expression {
 func NearestFrom(col ColRef, p Point) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		col.col().WriteSQL(b)
-		b.WriteString(" <-> $1::geography")
+		b.WriteString(" <-> ")
 		b.AddArg(p.String())
+		b.WriteString("::geography")
 	})
 }
 
@@ -236,8 +248,10 @@ func WithinRadius(col ColRef, p Point, metres float64) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("ST_DWithin(")
 		col.col().WriteSQL(b)
-		b.WriteString(", $1::geography, $2)")
+		b.WriteString(", ")
 		b.AddArg(p.String())
+		b.WriteString("::geography, ")
 		b.AddArg(metres)
+		b.WriteByte(')')
 	})
 }

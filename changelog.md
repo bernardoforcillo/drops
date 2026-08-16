@@ -53,12 +53,22 @@ once a 1.0 is cut.
     `Recommend` and `DeleteByFilter`.
 
 ### Fixed
-- **`pg.Within` bound the wrong parameters** (`drops/pg`, `geo.go`) — it
-  wrote `$1, $2, $3, $4` literally while appending its four arguments at
-  the Builder's own indexes, so any `Within` that was not the first
-  expression in a statement compared against whatever parameters
-  happened to occupy those slots. It now renders each placeholder
-  through `AddArg`.
+- **Every PostGIS helper emitted invalid SQL** (`drops/pg`, `geo.go`) —
+  `Within`, `DistanceFrom`, `NearestFrom` and `WithinRadius` each wrote
+  `$1`, `$2`, … into the SQL text by hand *and* called `AddArg`, which
+  writes the placeholder itself. Each helper therefore emitted its
+  placeholders twice, the second set dangling after the closing
+  parenthesis:
+
+      ST_Within(…, ST_MakeEnvelope($1, $2, $3, $4, 4326))$1$2$3$4
+
+  That is a syntax error unconditionally, not merely mis-numbered
+  parameters, so PostGIS support has never worked. All four now bind
+  through `AddArg` alone, which also makes their numbering follow the
+  Builder — a geo predicate that is not first in a statement now binds
+  `$2`, `$3`, … correctly. The existing tests missed this because they
+  asserted on substrings and argument counts, which the broken output
+  satisfied; the new regression test pins the whole rendered string.
 
 ## [0.5.0] - 2026-07-25
 

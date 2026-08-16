@@ -147,3 +147,97 @@ func TestPointStringIsCanonical(t *testing.T) {
 		t.Errorf("String: %q", p.String())
 	}
 }
+
+// Every geo helper binds its coordinates through Builder.AddArg, which
+// writes the placeholder itself. These helpers used to also write "$1"
+// into the SQL text by hand, so each one emitted its placeholders
+// twice — the hand-written set inside the call, and AddArg's own set
+// dangling after the closing parenthesis:
+//
+//	ST_Within(…, ST_MakeEnvelope($1, $2, $3, $4, 4326))$1$2$3$4
+//
+// That is invalid SQL unconditionally, not merely mis-numbered, which
+// means PostGIS support never worked. The existing tests missed it
+// because they asserted on substrings and argument counts, both of
+// which the broken output satisfied — so this one pins the whole
+// rendered string.
+func TestGeoHelpersRenderExactSQL(t *testing.T) {
+	tbl := pg.NewTable("drivers")
+	pos := pg.Add(tbl, pg.Custom[pg.Point]("position", "geography(Point,4326)"))
+	p := pg.Point{Lat: 41.9, Lon: 12.5}
+	wkt := p.String()
+
+	cases := []struct {
+		name string
+		expr drops.Expression
+		sql  string
+		args []any
+	}{
+		{
+			"Within",
+			pg.Within(pos, pg.Box{SW: pg.Point{Lat: 41.85, Lon: 12.40}, NE: pg.Point{Lat: 41.95, Lon: 12.55}}),
+			`ST_Within("drivers"."position"::geometry, ST_MakeEnvelope($1, $2, $3, $4, 4326))`,
+			[]any{12.40, 41.85, 12.55, 41.95},
+		},
+		{
+			"DistanceFrom",
+			pg.DistanceFrom(pos, p),
+			`ST_Distance("drivers"."position", $1::geography)`,
+			[]any{wkt},
+		},
+		{
+			"NearestFrom",
+			pg.NearestFrom(pos, p),
+			`"drivers"."position" <-> $1::geography`,
+			[]any{wkt},
+		},
+		{
+			"WithinRadius",
+			pg.WithinRadius(pos, p, 1500),
+			`ST_DWithin("drivers"."position", $1::geography, $2)`,
+			[]any{wkt, 1500.0},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sql, args := drops.String(c.expr)
+			if sql != c.sql {
+				t.Errorf("SQL\n got %s\nwant %s", sql, c.sql)
+			}
+			if len(args) != len(c.args) {
+				t.Fatalf("args = %v, want %v", args, c.args)
+			}
+			for i := range c.args {
+				if args[i] != c.args[i] {
+					t.Errorf("args[%d] = %v want %v", i, args[i], c.args[i])
+				}
+			}
+		})
+	}
+}
+
+// The placeholder numbering has to follow the Builder, not the helper:
+// a geo predicate that is not the first expression in a statement must
+// bind $2, $3, … and not restart at $1.
+func TestGeoHelpersNumberPlaceholdersFromTheBuilder(t *testing.T) {
+	tbl := pg.NewTable("drivers")
+	pos := pg.Add(tbl, pg.Custom[pg.Point]("position", "geography(Point,4326)"))
+	name := pg.Add(tbl, pg.Text("name"))
+
+	pred := pg.And(
+		pg.Eq(name, "ada"),
+		pg.WithinRadius(pos, pg.Point{Lat: 41.9, Lon: 12.5}, 1500),
+	)
+	sql, args := drops.String(pred)
+
+	if len(args) != 3 {
+		t.Fatalf("args = %v, want 3", args)
+	}
+	if !strings.Contains(sql, "$2::geography, $3") {
+		t.Errorf("geo placeholders did not continue the Builder's numbering: %s", sql)
+	}
+	if strings.Count(sql, "$1") != 1 {
+		t.Errorf("$1 should appear once (the name predicate): %s", sql)
+	}
+}

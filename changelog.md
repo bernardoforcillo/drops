@@ -8,6 +8,8 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-16
+
 ### Added
 - **Portable vector search** (`drops/vector`) — one search vocabulary
   shared by pgvector, ClickHouse and Qdrant, replacing three
@@ -50,6 +52,17 @@ once a 1.0 is cut.
     exported so portable filters can also drive `Scroll`,
     `Recommend` and `DeleteByFilter`.
 
+### Fixed
+- **`pg.Within` bound the wrong parameters** (`drops/pg`, `geo.go`) — it
+  wrote `$1, $2, $3, $4` literally while appending its four arguments at
+  the Builder's own indexes, so any `Within` that was not the first
+  expression in a statement compared against whatever parameters
+  happened to occupy those slots. It now renders each placeholder
+  through `AddArg`.
+
+## [0.5.0] - 2026-07-25
+
+### Added
 - **Tiered cache** (`drops/cache/tiered`) — two-level L1+L2 read-through /
   write-through cache with `GetOrLoad` singleflight stampede protection.
 - **Memcached cache backend** (`drops/cache/memcached`) — stdlib-only
@@ -254,14 +267,6 @@ once a 1.0 is cut.
   window functions `Over`, `WindowSpec`, `RowNumber`, `Rank`,
   `DenseRank`, `FirstValue`, `LastValue`, `NthValue`, plus `Lag`/`Lead`
   emitting ClickHouse's `lagInFrame`/`leadInFrame` (`window.go`).
-
-### Fixed
-- **`pg.Within` bound the wrong parameters** (`drops/pg`, `geo.go`) — it
-  wrote `$1, $2, $3, $4` literally while appending its four arguments at
-  the Builder's own indexes, so any `Within` that was not the first
-  expression in a statement compared against whatever parameters
-  happened to occupy those slots. It now renders each placeholder
-  through `AddArg`.
 
 ## [0.4.1] - 2026-07-14
 

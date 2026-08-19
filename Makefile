@@ -57,6 +57,14 @@ integration-up: ## Start the servers the integration suite talks to
 integration-down: ## Stop them and discard their data
 	docker compose -f integration/docker-compose.yml down -v
 
+.PHONY: servers-up
+servers-up: ## Start Postgres and MySQL from distribution packages, no Docker
+	./scripts/local-servers.sh
+
+.PHONY: servers-down
+servers-down: ## Stop the packaged servers
+	./scripts/local-servers.sh stop
+
 .PHONY: integration-all
 integration-all: ## Run every backend against the compose servers
 	DROPS_PG_DSN='postgres://drops:drops@localhost:5433/drops?sslmode=disable' \
@@ -88,13 +96,18 @@ lint: vet staticcheck golangci-lint ## Run all linters (vet + staticcheck + gola
 
 # ── module hygiene ────────────────────────────────────────────────────
 .PHONY: tidy
-tidy: ## Run go mod tidy
+tidy: ## Run go mod tidy in both modules
 	$(GO) mod tidy
+	$(GO) mod tidy -C integration
 
+# The diff is whole-tree rather than naming go.mod and go.sum: the root
+# module has no dependencies, so it has no go.sum, and naming a file
+# that does not exist is itself an error.
 .PHONY: tidy-check
-tidy-check: ## Verify go.mod / go.sum are up to date (fails if tidy would change anything)
+tidy-check: ## Verify both modules' go.mod / go.sum are up to date
 	$(GO) mod tidy
-	git diff --exit-code go.mod go.sum
+	$(GO) mod tidy -C integration
+	git diff --exit-code
 
 # ── full CI equivalent ────────────────────────────────────────────────
 .PHONY: check

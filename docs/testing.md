@@ -60,6 +60,39 @@ DROPS_QDRANT_URL='http://localhost:6334' \
 go test -C integration ./...
 ```
 
+### Without Docker
+
+A container with no Docker daemon is a normal place to work, and the
+alternative there is running no integration tests at all. `make
+servers-up` starts PostgreSQL and MySQL from distribution packages
+instead, on the same offset ports, and prints the two DSNs:
+
+```sh
+. scripts/local-servers.sh
+go test -C integration ./...
+make servers-down
+```
+
+It needs `postgresql-16`, `postgresql-16-pgvector`,
+`postgresql-16-postgis-3` and `mariadb-server`. Two things differ from
+the compose services and both are worth knowing:
+
+- It gives you **MariaDB**, not MySQL 8.4. Where the two disagree —
+  `FOR SHARE` against `LOCK IN SHARE MODE`, CHECK enforcement, the
+  rules for indexing a `TEXT` column — a test that passes here can
+  still fail in CI. That is not a flaw in the setup; drops claims to
+  serve both, so a difference between them is a thing to pin rather
+  than to smooth over.
+- pgvector's version is whatever the distribution ships. The `<+>`,
+  `<~>` and `<%>` operators arrived in 0.7.0, so on an older package
+  the tests that need them skip.
+
+ClickHouse and Qdrant are not covered — neither ships a distribution
+package worth depending on. Leave their DSNs unset and those tests
+skip.
+
+### Skipping
+
 A test whose DSN is unset **skips**, with a message saying how to start
 the servers. That is deliberate: a contributor without Docker should
 still get real signal from the SQLite half rather than a wall of

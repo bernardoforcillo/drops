@@ -17,7 +17,7 @@ var ErrInvalidIdentifier = errors.New("qdrant: invalid identifier")
 // embedded path separators or query markers. Qdrant itself has
 // stricter rules; this layer catches the cases that would corrupt the
 // request URL before the server gets a chance to.
-func validateName(kind, name string) error {
+func validateName(kind, name string) error { //nolint:unparam // kind is the error-message noun; only collections are named today, points and aliases come next
 	if name == "" {
 		return fmt.Errorf("%w: %s name is empty", ErrInvalidIdentifier, kind)
 	}

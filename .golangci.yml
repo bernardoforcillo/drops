@@ -1,52 +1,89 @@
+version: "2"
+run:
+  tests: true
 linters:
   enable:
     - bodyclose
-    - errcheck
     - gocritic
-    - goimports
-    - gosimple
-    - govet
-    - ineffassign
     - noctx
     - nolintlint
-    - staticcheck
     - unconvert
     - unparam
-    - unused
-
-linters-settings:
-  errcheck:
-    # Builder.WriteByte returns error only to satisfy io.ByteWriter (go
-    # vet's stdmethods check requires the signature); the error is always
-    # nil. Skip it, exactly as errcheck skips (*strings.Builder).WriteByte
-    # by default.
-    exclude-functions:
-      - (*github.com/bernardoforcillo/drops.Builder).WriteByte
-  goimports:
-    local-prefixes: github.com/bernardoforcillo/drops
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-    disabled-checks:
-      - commentFormatting  # not enforced here
-      - ifElseChain
-  unparam:
-    check-exported: false  # exported API params are intentional
-
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*github.com/bernardoforcillo/drops.Builder).WriteByte
+    gocritic:
+      disabled-checks:
+        - commentFormatting
+        - ifElseChain
+        # sloppyReassign wants `err := f()` where this codebase writes
+        # `err = f()` against a *named* return that a deferred hook
+        # reads (`defer c.emit(ctx, kind, start, &err)`). Taking the
+        # suggestion would shadow the named return, so every hook would
+        # observe nil instead of the error that actually escaped. The
+        # check is wrong for this pattern, and the pattern is
+        # deliberate and pervasive.
+        - sloppyReassign
+      # diagnostic only. The style tag flags naming and shadowing
+      # preferences (unnamedResult, importShadow) that this codebase
+      # deliberately does not follow; keeping it on meant the job was
+      # never green, which is worse than not running it.
+      enabled-tags:
+        - diagnostic
+    staticcheck:
+      # SA (correctness) + S (simplification) + ST (style), i.e. what
+      # the v1 config ran as staticcheck + gosimple. QF is the
+      # quickfix category v2 folded in — auto-fix suggestions such as
+      # "drop the embedded field from this selector", which are
+      # editor hints rather than defects.
+      checks:
+        - all
+        - -QF*
+    unparam:
+      check-exported: false
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - govet
+        path: _test\.go
+        text: shadow
+      - linters:
+          - unparam
+          - unused
+        path: example_test\.go
+      # Test helpers legitimately return more than a given test uses,
+      # and a discarded Query() against a fake driver leaks nothing.
+      - linters:
+          - unparam
+        path: _test\.go
+      - linters:
+          - gocritic
+        path: _test\.go
+        text: sqlQuery
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 issues:
-  # Don't report shadowing in test files — common Go test pattern.
-  exclude-rules:
-    - path: "_test\\.go"
-      linters: [govet]
-      text: "shadow"
-    # Example test files may have unused exported symbols.
-    - path: "example_test\\.go"
-      linters: [unused, unparam]
-  # Raise the line limit a bit for table-driven tests.
   max-issues-per-linter: 0
   max-same-issues: 0
-
-run:
-  timeout: 5m
-  tests: true
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/bernardoforcillo/drops
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

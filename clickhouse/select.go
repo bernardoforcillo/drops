@@ -27,7 +27,7 @@ type SelectBuilder struct {
 	settings  []string // raw "key = value"
 	unscoped  bool
 	err       error // deferred error (e.g. cursor decode failure) surfaced at Rows()
-	ctes []*CTE
+	ctes      []*CTE
 }
 
 type joinKind string

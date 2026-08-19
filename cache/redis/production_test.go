@@ -188,7 +188,7 @@ func TestReadTimeoutCapsHangingServer(t *testing.T) {
 	// the read. Without a default ReadTimeout the client would hang
 	// forever; with one (default 3s, overridden here to be short),
 	// the call should return a timeout-class error promptly.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

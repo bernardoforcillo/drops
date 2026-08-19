@@ -178,8 +178,8 @@ func (s *EventStore) Append(ctx context.Context, aggregateType, aggregateID stri
 		rows[i] = "(?, ?, ?, ?, ?, ?)"
 		args = append(args, aggregateType, aggregateID, version, ev.Type, string(payload), headers)
 	}
-	sql := fmt.Sprintf(`INSERT INTO "%s" ("aggregateType", "aggregateID", "version", "eventType", "payload", "headers") VALUES %s`,
-		s.table, strings.Join(rows, ", "))
+	sql := fmt.Sprintf(`INSERT INTO %s ("aggregateType", "aggregateID", "version", "eventType", "payload", "headers") VALUES %s`,
+		quoteIdent(s.table), strings.Join(rows, ", "))
 	_, err = s.db.Exec(ctx, sql, args...)
 	return err
 }
@@ -248,7 +248,7 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 // or -1 when the stream is empty. Use this before Append to compute
 // the expectedVersion for a fresh write.
 func (s *EventStore) LatestVersion(ctx context.Context, aggregateType, aggregateID string) (int64, error) {
-	sql := fmt.Sprintf(`SELECT coalesce(max("version"), -1) FROM "%s" WHERE "aggregateType" = ? AND "aggregateID" = ?`, s.table)
+	sql := fmt.Sprintf(`SELECT coalesce(max("version"), -1) FROM %s WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
 	if err != nil {
 		return -1, err
@@ -337,7 +337,7 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 	if state == nil {
 		state = json.RawMessage("null")
 	}
-	sql := fmt.Sprintf(`INSERT INTO "%s" ("aggregateType", "aggregateID", "version", "state", "createdAt") VALUES (?, ?, ?, ?, now64(9))`, table)
+	sql := fmt.Sprintf(`INSERT INTO %s ("aggregateType", "aggregateID", "version", "state", "createdAt") VALUES (?, ?, ?, ?, now64(9))`, quoteIdent(table))
 	_, err := s.db.Exec(ctx, sql, snap.AggregateType, snap.AggregateID, snap.Version, string(state))
 	return err
 }

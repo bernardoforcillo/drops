@@ -38,7 +38,7 @@ type fakeEntry struct {
 
 func newFakeRedis(t *testing.T) *fakeRedis {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}

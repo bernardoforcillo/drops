@@ -21,8 +21,8 @@ type fakeSpan struct {
 }
 
 func (s *fakeSpan) SetAttributes(a ...otel.Attr) { s.attrs = append(s.attrs, a...) }
-func (s *fakeSpan) RecordError(err error)         { s.err = err }
-func (s *fakeSpan) End(t time.Time)               { s.ended = t }
+func (s *fakeSpan) RecordError(err error)        { s.err = err }
+func (s *fakeSpan) End(t time.Time)              { s.ended = t }
 
 type fakeTracer struct{ spans []*fakeSpan }
 

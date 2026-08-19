@@ -336,10 +336,15 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 
-// All executes and returns every matching row.
+// All executes and returns every matching row. When the entity has a
+// cache attached, the result is read through it under a key derived
+// from the rendered SQL and its arguments, matching drops/pg.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	if err := q.applyScopes(ctx); err != nil {
 		return nil, err
+	}
+	if q.e.cache != nil {
+		return q.allCached(ctx)
 	}
 	var out []T
 	if err := q.sb.All(ctx, &out); err != nil {
@@ -348,12 +353,70 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	return out, nil
 }
 
-// One executes and returns the first row, or ErrNoRows.
+// One executes and returns the first row, or ErrNoRows. Cached the
+// same way as All when the entity has a cache attached.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	var out T
 	if err := q.applyScopes(ctx); err != nil {
 		return out, err
 	}
-	err := q.sb.Limit(1).One(ctx, &out)
+	q.sb.Limit(1)
+	if q.e.cache != nil {
+		return q.oneCached(ctx)
+	}
+	err := q.sb.One(ctx, &out)
 	return out, err
+}
+
+// allCached and oneCached read the rendered query through the entity
+// cache. Both go through the single-flight group so a cold key under
+// concurrent load issues one query rather than one per caller — the
+// stampede protection the PK path already had.
+func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
+	sql, args := q.sb.ToSQL()
+	key := queryKey(q.e.table.Name(), sql, args)
+	var out []T
+	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := q.e.cache.sf.do(key, func() (any, error) {
+		var hits []T
+		if hit, rErr := q.e.cache.readPK(ctx, key, &hits); rErr == nil && hit {
+			return hits, nil
+		}
+		var rs []T
+		if qErr := q.sb.All(ctx, &rs); qErr != nil {
+			return rs, qErr
+		}
+		_ = q.e.cache.writeKey(ctx, key, rs)
+		return rs, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.([]T), nil
+}
+
+func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
+	sql, args := q.sb.ToSQL()
+	key := queryKey(q.e.table.Name(), sql, args) + ":one"
+	var out T
+	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := q.e.cache.sf.do(key, func() (any, error) {
+		var t T
+		if hit, rErr := q.e.cache.readPK(ctx, key, &t); rErr == nil && hit {
+			return t, nil
+		}
+		if qErr := q.sb.One(ctx, &t); qErr != nil {
+			return t, qErr
+		}
+		_ = q.e.cache.writeKey(ctx, key, t)
+		return t, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.(T), nil
 }

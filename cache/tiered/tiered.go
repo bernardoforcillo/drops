@@ -366,7 +366,7 @@ func (c *Cache) setMulti(ctx context.Context, tier cache.Cache, items map[string
 	return nil
 }
 
-func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) { //nolint:gocritic // errp is read at defer time to observe the final error
+func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) {
 	drops.CallHook(c.hook, ctx, drops.QueryEvent{
 		Kind:     kind,
 		Duration: c.clock().Sub(start),

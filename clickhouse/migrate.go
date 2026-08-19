@@ -67,10 +67,10 @@ type TreeStatus struct {
 	Description string
 	Applied     bool
 	AppliedAt   time.Time
-	IsHead      bool  // applied with no applied successors
-	IsReady     bool  // unapplied, all parents applied
+	IsHead      bool // applied with no applied successors
+	IsReady     bool // unapplied, all parents applied
 	Checksum    string
-	Tampered    bool  // stored checksum differs from current SQL
+	Tampered    bool // stored checksum differs from current SQL
 }
 
 // PlanStep is one action in the dry-run output of Plan().
@@ -179,7 +179,7 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 
 	type fileEntry struct {
 		id, name, branch, upSQL, downSQL, description string
-		parents                                        []string
+		parents                                       []string
 	}
 	all := map[string]*fileEntry{}
 

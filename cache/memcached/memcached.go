@@ -65,10 +65,10 @@ type Options struct {
 type Cache struct {
 	opts Options
 
-	mu     sync.Mutex
-	idle   []*conn
+	mu      sync.Mutex
+	idle    []*conn
 	numOpen int
-	closed bool
+	closed  bool
 }
 
 type conn struct {
@@ -563,7 +563,7 @@ func (c *Cache) prefixed(key string) string {
 	return c.opts.KeyPrefix + key
 }
 
-func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) { //nolint:gocritic // errp read at defer to observe final error
+func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) {
 	drops.CallHook(c.opts.Hook, ctx, drops.QueryEvent{
 		Kind:     kind,
 		Duration: time.Since(start),

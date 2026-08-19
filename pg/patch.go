@@ -54,8 +54,22 @@ type PatchOp interface {
 // Returns the result so callers can detect "no row matched"
 // without an additional SELECT.
 func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (drops.Result, error) {
+	return e.PatchKey(db, ctx, []any{id}, ops...)
+}
+
+// PatchKey is [Entity.Patch] for a composite primary key. Patch
+// cannot take a variadic key because its operations already are
+// variadic, so the multi-column form spells the key as a slice:
+//
+//	MembershipEntity.PatchKey(db, ctx, []any{orgID, userID},
+//	    pg.Increment(SeatCount, 1))
+func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...PatchOp) (drops.Result, error) {
 	if len(ops) == 0 {
 		return nil, errors.New("drops/pg: Patch requires at least one operation")
+	}
+	pred, err := e.pkPredicate(key)
+	if err != nil {
+		return nil, err
 	}
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
@@ -71,7 +85,7 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 		for _, op := range ops {
 			upd.Set(op)
 		}
-		upd.Where(Eq(e.pk, id))
+		upd.Where(pred)
 		if tenantPred != nil {
 			upd.Where(tenantPred)
 		}
@@ -83,7 +97,7 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 			return err
 		}
 		res = r
-		return e.recordAudit(tx, ctx, "patch", nil, id)
+		return e.recordAudit(tx, ctx, "patch", nil, auditKey(key))
 	}
 	if e.audit != nil {
 		err = db.InTx(ctx, doPatch)
@@ -93,7 +107,7 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 	if err == nil {
 		// Invalidate the cached entry — the patched value is
 		// computed server-side and we don't have it locally.
-		e.invalidatePK(ctx, id)
+		e.invalidatePK(ctx, key)
 	}
 	return res, err
 }

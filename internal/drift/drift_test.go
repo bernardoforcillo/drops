@@ -14,7 +14,13 @@ type row struct {
 	Skipped  string   `drop:"-"`
 	Children []string `dropRel:"children"`
 	Stray    string
-	private  string //nolint:unused // present to prove unexported fields are ignored
+}
+
+// unexported holds an unexported field, which SpareFields must skip:
+// nothing can bind a column to it, so reporting it would be noise.
+type unexported struct {
+	ID     int64
+	hidden string
 }
 
 func TestSpareFieldsIgnoresOptedOutAndRelations(t *testing.T) {
@@ -26,6 +32,16 @@ func TestSpareFieldsIgnoresOptedOutAndRelations(t *testing.T) {
 	if len(got) != 1 || got[0] != "Stray" {
 		t.Errorf("SpareFields = %v, want only [Stray]", got)
 	}
+}
+
+func TestSpareFieldsSkipsUnexported(t *testing.T) {
+	got := drift.SpareFields(reflect.TypeOf(unexported{}), map[string]bool{
+		drift.FieldKey([]int{0}): true,
+	})
+	if len(got) != 0 {
+		t.Errorf("SpareFields = %v, want none — an unexported field cannot hold a column", got)
+	}
+	_ = unexported{}.hidden
 }
 
 func TestFieldKeyDistinguishesPaths(t *testing.T) {

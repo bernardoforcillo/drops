@@ -32,14 +32,25 @@ type PatchOp = ColumnValue
 
 // Patch applies ops to the row identified by id.
 func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (drops.Result, error) {
+	return e.PatchKey(db, ctx, []any{id}, ops...)
+}
+
+// PatchKey is [Entity.Patch] for a composite primary key. Patch
+// cannot take a variadic key because its operations already are, so
+// the multi-column form spells the key as a slice.
+func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...PatchOp) (drops.Result, error) {
 	if len(ops) == 0 {
 		return nil, errors.New("drops/sqlite: Patch requires at least one operation")
+	}
+	pred, err := e.pkPredicate(key)
+	if err != nil {
+		return nil, err
 	}
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
 		return nil, err
 	}
-	upd := db.Update(e.table).Set(ops...).Where(cmp(e.pk, "=", id))
+	upd := db.Update(e.table).Set(ops...).Where(pred)
 	if tenantPred != nil {
 		upd.Where(tenantPred)
 	}

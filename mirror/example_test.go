@@ -116,3 +116,37 @@ func ExamplePump() {
 func clickhouseDDL(t *clickhouse.Table) (string, []any) {
 	return dropsString(clickhouse.CreateTable(t))
 }
+
+// The source gained a column; the mirror lost one to somebody's ALTER.
+// A plan says what it will run and what it will not touch without being
+// told.
+func ExampleEvolver_PlanAgainst() {
+	ev, err := mirror.NewEvolver(clickhouse.New(&recDriver{}), Docs)
+	if err != nil {
+		panic(err)
+	}
+
+	// What ClickHouse actually holds, read back with InspectMirror in
+	// anything but an example: no "views", and a "legacy" column the
+	// source has never had.
+	live := []mirror.MirrorColumn{
+		{Name: "id", Type: "Int64", InKey: true},
+		{Name: "title", Type: "String"},
+		{Name: "lang", Type: "Nullable(String)"},
+		{Name: "created_at", Type: "DateTime64(6, 'UTC')"},
+		{Name: "legacy", Type: "String"},
+		{Name: "_drops_version", Type: "UInt64"},
+		{Name: "_drops_deleted", Type: "UInt8"},
+	}
+
+	plan := ev.PlanAgainst(live)
+	for _, s := range plan.Steps {
+		fmt.Println(s.SQL)
+	}
+	for _, r := range plan.Refusals {
+		fmt.Println("refused:", r)
+	}
+	// Output:
+	// ALTER TABLE "docs" ADD COLUMN IF NOT EXISTS "views" Int32 AFTER "lang"
+	// refused: drop_column "legacy" (needs_opt_in): the source no longer has this column, and dropping it discards the data ClickHouse still holds; pass "legacy" to AllowDrop to accept that
+}

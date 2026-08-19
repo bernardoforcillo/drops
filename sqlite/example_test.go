@@ -21,7 +21,7 @@ func ExampleCreateTable() {
 	fmt.Println(sql)
 	// Output:
 	// CREATE TABLE "notes" (
-	//   "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+	//   "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
 	//   "title" TEXT NOT NULL,
 	//   "archived" BOOLEAN NOT NULL DEFAULT 0
 	// )

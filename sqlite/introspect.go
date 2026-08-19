@@ -38,6 +38,11 @@ func Introspect(ctx context.Context, db *DB) (*Snapshot, error) {
 			ForeignKeys:          map[string]*ForeignKeySnapshot{},
 			CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
+			// Initialised even though SQLite's catalogue is not read
+			// for CHECK constraints, so an introspected snapshot
+			// serialises the same shape a declared one does. drops/pg
+			// does the same.
+			CheckConstraints: map[string]*CheckSnapshot{},
 		}
 		if err := introspectColumns(ctx, db, ts); err != nil {
 			return nil, err
@@ -109,6 +114,11 @@ func introspectColumns(ctx context.Context, db *DB, ts *TableSnapshot) error {
 	case 1:
 		if c, ok := ts.Columns[pks[0].name]; ok {
 			c.PrimaryKey = true
+			auto, err := tableIsAutoIncrement(ctx, db, ts.Name)
+			if err != nil {
+				return err
+			}
+			c.AutoIncrement = auto
 		}
 	default:
 		sort.Slice(pks, func(i, j int) bool { return pks[i].pos < pks[j].pos })
@@ -123,6 +133,33 @@ func introspectColumns(ctx context.Context, db *DB, ts *TableSnapshot) error {
 		}
 	}
 	return nil
+}
+
+// tableIsAutoIncrement reports whether the table's key was declared
+// AUTOINCREMENT.
+//
+// PRAGMA table_info does not say — AUTOINCREMENT is not a column
+// attribute SQLite tracks there, it is a rowid-allocation strategy. The
+// stored DDL is the only reliable source: sqlite_sequence would also
+// reveal it, but only once a row has been inserted, so a freshly
+// created table would read as not auto-incrementing and diff against
+// its own declaration forever.
+//
+// SQLite permits AUTOINCREMENT only on an INTEGER PRIMARY KEY, so
+// finding the keyword anywhere in the table's DDL identifies the one
+// column it can belong to.
+func tableIsAutoIncrement(ctx context.Context, db *DB, table string) (bool, error) {
+	rows, err := queryRows(ctx, db,
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name=`+quoteLiteral(table))
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if strings.Contains(strings.ToUpper(asString(r["sql"])), "AUTOINCREMENT") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // introspectForeignKeys assembles single- and multi-column foreign keys

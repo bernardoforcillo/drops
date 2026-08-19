@@ -106,10 +106,10 @@ func diffTable(prev, cur *TableSnapshot) []string {
 		}
 	}
 
-	constraintsDiffer := !reflect.DeepEqual(prev.CompositePrimaryKeys, cur.CompositePrimaryKeys) ||
-		!reflect.DeepEqual(prev.UniqueConstraints, cur.UniqueConstraints) ||
-		!reflect.DeepEqual(prev.CheckConstraints, cur.CheckConstraints) ||
-		!reflect.DeepEqual(prev.ForeignKeys, cur.ForeignKeys)
+	constraintsDiffer := !sameConstraintMap(prev.CompositePrimaryKeys, cur.CompositePrimaryKeys) ||
+		!sameConstraintMap(prev.UniqueConstraints, cur.UniqueConstraints) ||
+		!sameConstraintMap(prev.CheckConstraints, cur.CheckConstraints) ||
+		!sameConstraintMap(prev.ForeignKeys, cur.ForeignKeys)
 
 	needsRebuild := len(dropped) > 0 || len(changed) > 0 ||
 		len(addedNotAddable) > 0 || constraintsDiffer
@@ -294,7 +294,13 @@ func writeColumnDefSQL(b *strings.Builder, c *ColumnSnapshot, allowInlinePK bool
 		if c.AutoIncrement {
 			b.WriteString(" AUTOINCREMENT")
 		}
-	} else if c.NotNull {
+	}
+	// A key column keeps its NOT NULL here for the same reason
+	// CreateTable emits one: SQLite does not imply it, and a rebuild
+	// that dropped it would both weaken the constraint and leave the
+	// table diffing against its declaration on the next run — so the
+	// migration would never converge.
+	if c.NotNull {
 		b.WriteString(" NOT NULL")
 	}
 	if c.Unique && !c.PrimaryKey {
@@ -351,4 +357,28 @@ func quoteIdentList(names []string) []string {
 		out[i] = quoteIdent(n)
 	}
 	return out
+}
+
+// sameConstraintMap compares two constraint sets, treating a nil map
+// and an empty one as the same thing.
+//
+// reflect.DeepEqual does not: it reports a nil map and an empty map as
+// different. Snapshots reach this function from two producers that
+// disagree — BuildSnapshot initialises every map, Introspect leaves
+// one nil when the table has no such constraint — so comparing them
+// directly reported a constraint change for every table with no CHECK
+// constraints. On SQLite a constraint change means a full table
+// rebuild, so a schema that already matched its declaration would copy
+// itself on every deploy.
+func sameConstraintMap[V any](a, b map[string]V) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || !reflect.DeepEqual(av, bv) {
+			return false
+		}
+	}
+	return true
 }

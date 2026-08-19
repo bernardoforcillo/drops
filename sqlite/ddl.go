@@ -112,7 +112,16 @@ func writeColumnDef(b *drops.Builder, c *Column, allowInlinePK bool) {
 		if c.autoInc {
 			b.WriteString(" AUTOINCREMENT")
 		}
-	} else if c.notNull {
+	}
+	// NOT NULL is emitted for a key column too, not skipped as
+	// redundant. SQLite does not imply it: a TEXT PRIMARY KEY declared
+	// without NOT NULL accepts a NULL key, so a column drops reports as
+	// NOT NULL would silently hold one. It also keeps introspection
+	// agreeing with the declaration — pragma table_info reports
+	// notnull=0 for a key declared without it, which made a freshly
+	// created schema diff against itself and emit a table rebuild on
+	// every deploy.
+	if c.notNull {
 		b.WriteString(" NOT NULL")
 	}
 	if c.unique && !c.primary {

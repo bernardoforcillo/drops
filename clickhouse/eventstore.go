@@ -35,8 +35,8 @@ import (
 //	)
 //	if errors.Is(err, clickhouse.ErrConcurrencyConflict) { ... }
 //
-//	// Replay
-//	events, _ := store.Load(ctx, "match", "abc-123", 0)
+//	// Replay. -1, not 0: versions start at 0 and Load is exclusive.
+//	events, _ := store.Load(ctx, "match", "abc-123", -1)
 //	state := MatchState{}
 //	for _, ev := range events {
 //	    state.Apply(ev)
@@ -202,7 +202,14 @@ func encodeEventPayload(payload any) (json.RawMessage, error) {
 }
 
 // Load returns events for an aggregate in version order, starting
-// after fromVersion. Pass 0 to read from the beginning.
+// strictly after fromVersion — pass the version of the last event you
+// have already applied and Load resumes from the next one.
+//
+// Pass -1, not 0, to read a stream from the beginning. Versions start
+// at 0, so 0 is the first event's own version and asking for events
+// after it skips it. -1 is the same sentinel LatestVersion answers
+// with for an empty stream, which makes "load everything, then append
+// at LatestVersion" one consistent convention.
 func (s *EventStore) Load(ctx context.Context, aggregateType, aggregateID string, fromVersion int64) ([]Event, error) {
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
@@ -248,11 +255,22 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 // or -1 when the stream is empty. Use this before Append to compute
 // the expectedVersion for a fresh write.
 //
-// The aggregate is maxOrNull, not max: ClickHouse answers an
-// aggregate over an empty set with the return type's default rather
-// than NULL, so a plain max("version") reports 0 for a stream that
-// has never been written and Append's expectedVersion of -1 then
-// looks like a concurrency conflict.
+// The aggregate is maxOrNull, not max, and the reason is a ClickHouse
+// departure from the SQL standard. An aggregate over an empty set
+// answers with the return type's default, not NULL: the documented
+// example is SELECT SUM(-1), MAX(0) FROM system.one WHERE 0, which
+// returns 0 and 0. NULL is what the non-default setting
+// aggregate_functions_null_for_empty = 1 buys, and it buys it by
+// rewriting every aggregate to its -OrNull form. So coalesce(max(v),
+// -1) reports 0 for a stream nobody has written, Append's
+// expectedVersion of -1 reads as a conflict, and the store can never
+// lay down its first event.
+//
+// Naming the -OrNull form outright gets the standard answer without
+// depending on a server setting — and it is stable if that setting is
+// on, because the rewrite skips any function whose name already ends
+// in OrNull. TestCHEventStoreFreshStreamStartsAtMinusOne in the
+// integration suite asserts both halves against a real server.
 func (s *EventStore) LatestVersion(ctx context.Context, aggregateType, aggregateID string) (int64, error) {
 	sql := fmt.Sprintf(`SELECT coalesce(maxOrNull("version"), -1) FROM %s WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)

@@ -309,6 +309,120 @@ func TestMySQLSelfJoinResolvesThroughTheAlias(t *testing.T) {
 	}
 }
 
+// The alias has to reach past SELECT. A shallow copy was the disease
+// and the self-join was only the first symptom: UPDATE and DELETE
+// qualify their predicates through the same column handles, and MariaDB
+// answers 1064 to "DELETE FROM t AS a", so the multi-table spelling is
+// the one both servers take.
+func TestMySQLAliasReachesUpdateAndDelete(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "staff"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	for _, r := range []struct {
+		id   int64
+		name string
+	}{{1, "Ada"}, {2, "Grace"}, {3, "Alan"}} {
+		if _, err := db.Insert(tbl).Row(id.Val(r.id), name.Val(r.name)).Exec(ctx); err != nil {
+			t.Fatalf("seed %s: %v", r.name, err)
+		}
+	}
+
+	u := tbl.As("u")
+	if _, err := db.Update(u).
+		Set(mysql.Bind(u.Col("name"), "Ada L")).
+		Where(mysql.Eq(u.Col("id"), int64(1))).
+		Exec(ctx); err != nil {
+		t.Fatalf("UPDATE through the alias: %v", err)
+	}
+	if _, err := db.Delete(u).Where(mysql.Eq(u.Col("id"), int64(3))).Exec(ctx); err != nil {
+		t.Fatalf("DELETE through the alias: %v", err)
+	}
+
+	var rows []struct {
+		ID   int64  `drop:"id"`
+		Name string `drop:"name"`
+	}
+	if err := db.Select(id, name).From(tbl).OrderBy(id.Asc()).All(ctx, &rows); err != nil {
+		t.Fatal(err)
+	}
+	want := []struct {
+		ID   int64
+		Name string
+	}{{1, "Ada L"}, {2, "Grace"}}
+	if len(rows) != len(want) {
+		t.Fatalf("%d rows left, want %d: %+v", len(rows), len(want), rows)
+	}
+	for i, w := range want {
+		if rows[i].ID != w.ID || rows[i].Name != w.Name {
+			t.Errorf("row %d = %+v, want %+v", i, rows[i], w)
+		}
+	}
+}
+
+// A relation reached through an alias must rebind its near side to that
+// alias. The failure is not a syntax error the server would catch: the
+// un-rebound predicate is still valid SQL, it just compares one
+// instance of the table to itself and quietly returns the wrong rows.
+func TestMySQLRelationThroughAnAliasJoinsTheRightInstance(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "staff"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	managerID := mysql.Add(tbl, mysql.BigInt("managerId"))
+	mysql.NewRelations(tbl).BelongsTo("manager", tbl, managerID, id)
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	for _, r := range []struct {
+		id      int64
+		name    string
+		manager int64
+	}{{1, "Ada", 0}, {2, "Grace", 1}, {3, "Alan", 1}} {
+		row := []mysql.ColumnValue{id.Val(r.id), name.Val(r.name)}
+		if r.manager != 0 {
+			row = append(row, managerID.Val(r.manager))
+		}
+		if _, err := db.Insert(tbl).Row(row...).Exec(ctx); err != nil {
+			t.Fatalf("seed %s: %v", r.name, err)
+		}
+	}
+
+	// The employee is the aliased instance; the manager is reached
+	// through the un-aliased handles, which is what the relation's far
+	// side still names.
+	emp := tbl.As("e")
+	rel := emp.Rel("manager")
+	var rows []struct {
+		Staff   string `drop:"staff"`
+		Manager string `drop:"manager"`
+	}
+	err := db.Select(emp.Col("name").As("staff"), name.As("manager")).
+		From(emp).
+		Join(tbl, mysql.Eq(rel.ChildKey, rel.ParentKey)).
+		OrderBy(emp.Col("name").Asc()).
+		All(ctx, &rows)
+	if err != nil {
+		t.Fatalf("relation join: %v", err)
+	}
+	want := map[string]string{"Alan": "Ada", "Grace": "Ada"}
+	if len(rows) != len(want) {
+		t.Fatalf("relation join returned %d rows, want %d: %+v", len(rows), len(want), rows)
+	}
+	for _, r := range rows {
+		if want[r.Staff] != r.Manager {
+			t.Errorf("%s reports to %q, want %q", r.Staff, r.Manager, want[r.Staff])
+		}
+	}
+}
+
 // A foreign key whose target belongs to no table has no table name to
 // render, and the REFERENCES clause the server sees is a syntax error.
 // drops refuses the declaration instead of emitting it.
@@ -436,6 +550,68 @@ func TestMySQLUpsertAllWhenEveryColumnIsAKey(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("%d rows after upserting the same key twice, want 1", n)
+	}
+}
+
+// The refusal in ErrAliasedDeleteBounded rests on a claim about the
+// server, so ask the server. The statement the builder would have sent
+// is rendered here and executed raw: an aliased DELETE has to use the
+// multi-table form, and that form takes no ORDER BY and no LIMIT. Once
+// that is established, the builder refusing to send it is the right
+// answer rather than a guess.
+func TestMySQLAliasedDeleteCannotBeBounded(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "queue"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	for i := int64(1); i <= 3; i++ {
+		if _, err := db.Insert(tbl).Row(id.Val(i)).Exec(ctx); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	u := tbl.As("u")
+	bounded := db.Delete(u).Where(mysql.Lt(u.Col("id"), 100)).OrderBy(u.Col("id").Asc()).Limit(1)
+
+	sqlText, args := bounded.ToSQL()
+	if !strings.Contains(sqlText, "DELETE `u` FROM") {
+		t.Fatalf("not the multi-table form, so this test proves nothing: %s", sqlText)
+	}
+	_, err := db.Exec(ctx, sqlText, args...)
+	if err == nil {
+		t.Fatalf("the server accepted %q; the refusal is now wrong and should be removed", sqlText)
+	}
+	var me *mysqldriver.MySQLError
+	if !errors.As(err, &me) || me.Number != 1064 {
+		t.Fatalf("server answered %v, want the 1064 the refusal is built on", err)
+	}
+
+	// So Exec refuses rather than sending it.
+	if _, err := bounded.Exec(ctx); !errors.Is(err, mysql.ErrAliasedDeleteBounded) {
+		t.Errorf("Exec = %v, want ErrAliasedDeleteBounded", err)
+	}
+
+	// Nothing was deleted by either attempt.
+	var n int64
+	if err := db.Select(mysql.CountAll()).From(tbl).One(ctx, &n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("%d rows left, want all 3 untouched", n)
+	}
+
+	// The un-aliased handle is the documented way to batch, and it works.
+	if _, err := db.Delete(tbl).Where(mysql.Lt(id, 100)).OrderBy(id.Asc()).Limit(1).Exec(ctx); err != nil {
+		t.Fatalf("un-aliased batched DELETE: %v", err)
+	}
+	if err := db.Select(mysql.CountAll()).From(tbl).One(ctx, &n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("%d rows left after batching one away, want 2", n)
 	}
 }
 

@@ -105,10 +105,16 @@ func TestCreateIndexUniqueWhereInclude(t *testing.T) {
 	// the table-qualified form ("users"."name") — PostgreSQL rejects a
 	// qualified name inside a CREATE INDEX column list (SQLSTATE 42601).
 	// The WHERE predicate, by contrast, is an ordinary expression and
-	// stays qualified.
+	// stays qualified; the server resolves it against the indexed
+	// table.
+	//
+	// The 18 is written out rather than bound. CREATE INDEX is a
+	// utility statement with no parameter slot, so the "$1" this used
+	// to emit never survived contact with a server: the driver
+	// reported a mismatched parameter count and the index was never
+	// created.
 	checkExpr(t, pg.CreateIndex(idx),
-		`CREATE UNIQUE INDEX "usersActiveEmailIdx" ON "users" USING btree ("name") INCLUDE ("id") WHERE ("users"."age" >= $1)`,
-		int32(18),
+		`CREATE UNIQUE INDEX "usersActiveEmailIdx" ON "users" USING btree ("name") INCLUDE ("id") WHERE ("users"."age" >= 18)`,
 	)
 }
 

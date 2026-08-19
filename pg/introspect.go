@@ -25,8 +25,14 @@ type IntrospectOptions struct {
 // and can be diffed against a Go-schema snapshot via Diff. Everything
 // the schema layer can declare has to be read back here, or Diff sees
 // the difference between "absent" and "not looked at" as work to do and
-// Push stops being idempotent. Composite keys, enums, sequences and
-// views are the remaining gaps.
+// Push stops being idempotent. Enums, sequences, views, RLS and
+// policies are the remaining gaps; Push's doc comment lists what that
+// costs.
+//
+// The expressions read back here — a CHECK's body, a partial index's
+// predicate — are PostgreSQL's own spelling of them, not the one a Go
+// schema wrote. Comparing the two needs the declared side respelled by
+// the server first; see renormaliseExpressions.
 func Introspect(ctx context.Context, db *DB, opts ...IntrospectOptions) (*Snapshot, error) {
 	var opt IntrospectOptions
 	if len(opts) > 0 {
@@ -227,10 +233,20 @@ func hasSequenceDefault(def string) bool {
 	return strings.HasPrefix(strings.TrimSpace(def), "nextval(")
 }
 
-// readIntrospectPrimaryKeys marks PK columns on each table.
+// readIntrospectPrimaryKeys records each table's PRIMARY KEY.
+//
+// Where the key lands mirrors BuildSnapshot: a single-column key on the
+// column, a multi-column one in CompositePrimaryKeys under the name the
+// catalogue holds. Marking every column of a two-column key
+// PrimaryKey=true instead would describe a table PostgreSQL cannot
+// have — two inline primary keys — and would leave the composite map
+// empty, so Diff saw the declared key as new work on every push.
+//
+// Key columns are NOT NULL either way; PostgreSQL sets attnotnull when
+// the key is created.
 func readIntrospectPrimaryKeys(ctx context.Context, db *DB, schemas []string, tables map[string]*TableSnapshot) error {
 	rows, err := db.Query(ctx, fmt.Sprintf(`
-		SELECT tc.table_schema, tc.table_name, kcu.column_name
+		SELECT tc.table_schema, tc.table_name, tc.constraint_name, kcu.column_name
 		FROM information_schema.table_constraints tc
 		JOIN information_schema.key_column_usage kcu
 			ON kcu.constraint_schema = tc.constraint_schema
@@ -244,21 +260,46 @@ func readIntrospectPrimaryKeys(ctx context.Context, db *DB, schemas []string, ta
 	}
 	defer rows.Close()
 
+	type pkKey struct {
+		schema, table, name string
+	}
+	var order []pkKey
+	cols := map[pkKey][]string{}
 	for rows.Next() {
-		var schema, table, column string
-		if err := rows.Scan(&schema, &table, &column); err != nil {
+		var schema, table, name, column string
+		if err := rows.Scan(&schema, &table, &name, &column); err != nil {
 			return err
 		}
-		ts, ok := tables[introspectTableKey(schema, table)]
+		k := pkKey{schema, table, name}
+		if _, seen := cols[k]; !seen {
+			order = append(order, k)
+		}
+		cols[k] = append(cols[k], column)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, k := range order {
+		ts, ok := tables[introspectTableKey(k.schema, k.table)]
 		if !ok {
 			continue
 		}
-		if col, ok := ts.Columns[column]; ok {
-			col.PrimaryKey = true
-			col.NotNull = true
+		columns := cols[k]
+		for _, name := range columns {
+			if col, ok := ts.Columns[name]; ok {
+				col.NotNull = true
+				col.PrimaryKey = len(columns) == 1
+			}
+		}
+		if len(columns) > 1 {
+			ts.CompositePrimaryKeys[k.name] = &CompositePKSnapshot{
+				Name:    k.name,
+				Columns: columns,
+			}
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 // readIntrospectUniques pulls UNIQUE constraints, single- and
@@ -309,6 +350,66 @@ func readIntrospectUniques(ctx context.Context, db *DB, schemas []string, tables
 	return nil
 }
 
+// checkExprOf reduces a pg_get_constraintdef result to the expression
+// a CHECK clause wraps.
+//
+// The definition is always "CHECK (" + the deparsed expression + ")",
+// with NOT VALID or NO INHERIT appended when they apply; peeling that
+// wrapper off leaves the same spelling pg_get_expr gives for an index
+// predicate, which is what lets one probe answer for both.
+func checkExprOf(def string) string {
+	out := strings.TrimSpace(def)
+	for _, suffix := range []string{" NOT VALID", " NO INHERIT"} {
+		out = strings.TrimSuffix(out, suffix)
+	}
+	out = strings.TrimSpace(strings.TrimPrefix(out, "CHECK "))
+	if wrappedInParens(out) {
+		out = out[1 : len(out)-1]
+	}
+	return out
+}
+
+// wrappedInParens reports whether s is one parenthesised group — that
+// is, whether its leading "(" is closed by its trailing ")" rather
+// than by something in the middle, as in "(a) AND (b)".
+func wrappedInParens(s string) bool {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return false
+	}
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'', '"':
+			i = scanQuoted(s, i, s[i]) - 1
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(s)-1 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+// scanQuoted returns the index just past the quoted run starting at
+// start, honouring the doubled-quote escape both kinds of SQL literal
+// use. A parenthesis inside a literal is text, not structure.
+func scanQuoted(s string, start int, quote byte) int {
+	for i := start + 1; i < len(s); i++ {
+		if s[i] != quote {
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == quote {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(s)
+}
+
 // readIntrospectChecks pulls CHECK constraints.
 //
 // The source is pg_constraint rather than
@@ -342,7 +443,7 @@ func readIntrospectChecks(ctx context.Context, db *DB, schemas []string, tables 
 		}
 		ts.CheckConstraints[name] = &CheckSnapshot{
 			Name:  name,
-			Value: strings.TrimPrefix(def, "CHECK "),
+			Value: checkExprOf(def),
 		}
 	}
 	return rows.Err()
@@ -353,11 +454,16 @@ func readIntrospectChecks(ctx context.Context, db *DB, schemas []string, tables 
 // Indexes that back a constraint are excluded: a primary key or a
 // UNIQUE constraint owns its index, the constraint readers already
 // report it, and DROP INDEX on one is refused (SQLSTATE 2BP01).
+//
+// indkey lists the key columns and the INCLUDE columns end to end;
+// indnkeyatts is where the first ends and the second begins. Reading
+// them as one list made a covering index look like a wider plain one,
+// so a declared INCLUDE never matched what the catalogue held.
 func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables map[string]*TableSnapshot) error {
 	rows, err := db.Query(ctx, fmt.Sprintf(`
 		SELECT n.nspname, rel.relname, idx.relname, ix.indisunique, am.amname,
 			coalesce(pg_get_expr(ix.indpred, ix.indrelid), ''),
-			coalesce(a.attname, '')
+			coalesce(a.attname, ''), k.ord <= ix.indnkeyatts
 		FROM pg_index ix
 		JOIN pg_class idx ON idx.oid = ix.indexrelid
 		JOIN pg_class rel ON rel.oid = ix.indrelid
@@ -377,8 +483,8 @@ func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables
 
 	for rows.Next() {
 		var schema, table, name, method, where, column string
-		var unique bool
-		if err := rows.Scan(&schema, &table, &name, &unique, &method, &where, &column); err != nil {
+		var unique, isKey bool
+		if err := rows.Scan(&schema, &table, &name, &unique, &method, &where, &column, &isKey); err != nil {
 			return err
 		}
 		ts, ok := tables[introspectTableKey(schema, table)]
@@ -398,8 +504,13 @@ func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables
 		}
 		// An expression element has no attribute behind it; the
 		// index still exists, it just has one fewer named column.
-		if column != "" {
+		if column == "" {
+			continue
+		}
+		if isKey {
 			is.Columns = append(is.Columns, column)
+		} else {
+			is.Include = append(is.Include, column)
 		}
 	}
 	return rows.Err()

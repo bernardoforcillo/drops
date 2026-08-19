@@ -183,3 +183,21 @@ func findRule(ws []pg.SafetyWarning, rule string) pg.SafetyWarning {
 	}
 	return pg.SafetyWarning{}
 }
+
+// DROP INDEX was the one destructive statement Push can emit that the
+// analyser had no name for, which made "the package classifies it" a
+// claim rather than a fact.
+func TestSafetyFlagsDropIndex(t *testing.T) {
+	ws := pg.AnalyzeStatements([]string{`DROP INDEX "usersEmailIdx";`})
+	if !hasRule(ws, "drop-index") {
+		t.Fatalf("DROP INDEX went unclassified: %v", ws)
+	}
+	if w := findRule(ws, "drop-index"); w.Severity != pg.SeverityWarn {
+		t.Errorf("drop-index severity = %v, want warn", w.Severity)
+	}
+	// CONCURRENTLY avoids the lock, not the loss, so it is still
+	// flagged.
+	if !hasRule(pg.AnalyzeStatements([]string{`DROP INDEX CONCURRENTLY "usersEmailIdx";`}), "drop-index") {
+		t.Error("DROP INDEX CONCURRENTLY went unclassified")
+	}
+}

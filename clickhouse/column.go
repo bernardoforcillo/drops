@@ -166,13 +166,19 @@ func (c *Col[T]) Lt(v T) drops.Expression  { return Lt(c.Column, v) }
 func (c *Col[T]) Lte(v T) drops.Expression { return Lte(c.Column, v) }
 
 // Column-to-column comparisons.
-
-func (c *Col[T]) EqCol(o *Col[T]) drops.Expression  { return Eq(c.Column, o.Column) }
-func (c *Col[T]) NeCol(o *Col[T]) drops.Expression  { return Ne(c.Column, o.Column) }
-func (c *Col[T]) GtCol(o *Col[T]) drops.Expression  { return Gt(c.Column, o.Column) }
-func (c *Col[T]) GteCol(o *Col[T]) drops.Expression { return Gte(c.Column, o.Column) }
-func (c *Col[T]) LtCol(o *Col[T]) drops.Expression  { return Lt(c.Column, o.Column) }
-func (c *Col[T]) LteCol(o *Col[T]) drops.Expression { return Lte(c.Column, o.Column) }
+//
+// The operand is a ColRef, not a *Col[T], because the other side of a
+// self-join is reached through (*Table).As and (*Table).Col, which
+// answer with the type-erased *Column — the two ends of the join are
+// the same column of the same table and there is no T left to agree
+// on. Matching mysql's EqCol here costs the same-T check on both
+// operands; the typed values still flow through Eq and friends.
+func (c *Col[T]) EqCol(o ColRef) drops.Expression  { return Eq(c.Column, o.col()) }
+func (c *Col[T]) NeCol(o ColRef) drops.Expression  { return Ne(c.Column, o.col()) }
+func (c *Col[T]) GtCol(o ColRef) drops.Expression  { return Gt(c.Column, o.col()) }
+func (c *Col[T]) GteCol(o ColRef) drops.Expression { return Gte(c.Column, o.col()) }
+func (c *Col[T]) LtCol(o ColRef) drops.Expression  { return Lt(c.Column, o.col()) }
+func (c *Col[T]) LteCol(o ColRef) drops.Expression { return Lte(c.Column, o.col()) }
 
 // Set / null tests.
 

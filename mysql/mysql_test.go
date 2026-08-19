@@ -352,7 +352,7 @@ func TestSelectForUpdateOutranksForShare(t *testing.T) {
 			t.Errorf("%s: got %s, want it to end in FOR UPDATE", order.label, got)
 		}
 		if strings.Contains(got, "LOCK IN SHARE MODE") {
-			t.Errorf("%s: both lock clauses rendered: %s", order.label, got)
+			t.Errorf("%s: the shared lock won: %s", order.label, got)
 		}
 	}
 }
@@ -503,7 +503,7 @@ func TestDeleteThroughAnAliasNamesTheAlias(t *testing.T) {
 }
 
 func TestUpdateThroughAnAliasNamesTheAlias(t *testing.T) {
-	tbl, id, name, _ := usersTable()
+	tbl, id, _, _ := usersTable()
 	u := tbl.As("u")
 	got, _ := mysql.New(&fakeDriver{}).
 		Update(u).
@@ -518,7 +518,46 @@ func TestUpdateThroughAnAliasNamesTheAlias(t *testing.T) {
 	if bare, _ := sqlOf(id); bare != "`users`.`id`" {
 		t.Errorf("original column = %s", bare)
 	}
-	_ = name
+}
+
+// An aliased DELETE is written in the multi-table form, and that form
+// takes neither ORDER BY nor LIMIT on either server. There is no
+// spelling that would work, so Exec refuses instead of posting a
+// statement guaranteed to come back as 1064. ToSQL still renders what
+// was asked for: silently dropping the LIMIT would turn a batch of a
+// thousand rows into the whole table.
+func TestAliasedDeleteRefusesToBeBounded(t *testing.T) {
+	tbl, _, _, _ := usersTable()
+	u := tbl.As("u")
+	ctx := context.Background()
+
+	for _, c := range []struct {
+		label string
+		build func() *mysql.DeleteBuilder
+	}{
+		{"Limit", func() *mysql.DeleteBuilder {
+			return mysql.New(&fakeDriver{}).Delete(u).Where(mysql.Lt(u.Col("id"), 100)).Limit(10)
+		}},
+		{"OrderBy", func() *mysql.DeleteBuilder {
+			return mysql.New(&fakeDriver{}).Delete(u).OrderBy(u.Col("id").Asc())
+		}},
+	} {
+		if _, err := c.build().Exec(ctx); !errors.Is(err, mysql.ErrAliasedDeleteBounded) {
+			t.Errorf("%s: err = %v, want ErrAliasedDeleteBounded", c.label, err)
+		}
+		if got, _ := c.build().ToSQL(); !strings.Contains(got, "DELETE `u` FROM") {
+			t.Errorf("%s: ToSQL should still render the statement asked for: %s", c.label, got)
+		}
+	}
+
+	// The un-aliased handle is the way to batch, and it still works.
+	d := &fakeDriver{}
+	if _, err := mysql.New(d).Delete(tbl).Where(mysql.Lt(tbl.Col("id"), 100)).Limit(10).Exec(ctx); err != nil {
+		t.Fatalf("un-aliased batched DELETE: %v", err)
+	}
+	if !strings.Contains(d.queries[0], "LIMIT ?") {
+		t.Errorf("un-aliased DELETE lost its LIMIT: %s", d.queries[0])
+	}
 }
 
 // --- relations ---------------------------------------------------------
@@ -564,7 +603,7 @@ func TestRelationThroughAnAliasRebindsItsNearSide(t *testing.T) {
 // alias cannot reach back into the handle everyone else shares.
 func TestDeclaringARelationOnAnAliasDoesNotTouchTheOriginal(t *testing.T) {
 	users := mysql.NewTable("users")
-	id := mysql.Add(users, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(users, mysql.BigSerial("id").PrimaryKey())
 	posts := mysql.NewTable("posts")
 	mysql.Add(posts, mysql.BigSerial("id").PrimaryKey())
 	authorID := mysql.Add(posts, mysql.BigInt("authorId"))
@@ -578,7 +617,45 @@ func TestDeclaringARelationOnAnAliasDoesNotTouchTheOriginal(t *testing.T) {
 	if u.Relation("posts") == nil {
 		t.Error("the alias did not keep its own relation")
 	}
-	_ = id
+}
+
+// As snapshots the table. Go initialises package-level variables before
+// it runs init, so an alias declared as a var beside its table is taken
+// before any init that declares relations, and the alias never sees
+// them. The snapshot is deliberate — sharing the map is what let a
+// relation declared through an alias mutate the base handle — but the
+// diagnostic has to name the alias, or an empty "declared:" list reads
+// as "nobody ever declared that relation" and sends the reader to the
+// wrong file.
+func TestRelationDeclaredAfterAnAliasIsMissingAndTheDiagnosticNamesTheAlias(t *testing.T) {
+	users := mysql.NewTable("users")
+	id := mysql.Add(users, mysql.BigSerial("id").PrimaryKey())
+	managerID := mysql.Add(users, mysql.BigInt("managerId"))
+
+	u := users.As("u")
+	mysql.NewRelations(users).BelongsTo("manager", users, managerID, id)
+
+	if u.Relation("manager") != nil {
+		t.Error("the alias saw a relation declared after As, so As shares the map again")
+	}
+	if users.Relation("manager") == nil {
+		t.Fatal("the base table lost the relation")
+	}
+
+	defer func() {
+		r := recover()
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("Rel panicked with %T(%v), want the missing-relation diagnostic", r, r)
+		}
+		if !strings.Contains(msg, `alias "u"`) {
+			t.Errorf("diagnostic %q does not name the alias", msg)
+		}
+		if !strings.Contains(msg, `table "users"`) {
+			t.Errorf("diagnostic %q does not name the table", msg)
+		}
+	}()
+	u.Rel("manager")
 }
 
 // --- operators ---------------------------------------------------------

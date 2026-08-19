@@ -584,33 +584,8 @@ func TestPGCreateTableCarriesTableLevelConstraints(t *testing.T) {
 // declare must be read back by Introspect, or the second push tries to
 // create what is already there.
 func TestPGPushIsIdempotent(t *testing.T) {
-	dsn := integration.DSN(t, integration.EnvPostgres)
-	sqlDB, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	// One connection, so the SET below governs every statement.
-	sqlDB.SetMaxOpenConns(1)
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	db := pg.New(stdlib.New(sqlDB))
+	db, schemaName := pushScratchPG(t)
 	ctx := context.Background()
-
-	schemaName := "push_" + integration.UniqueName(t, "s")
-	if len(schemaName) > 60 {
-		schemaName = schemaName[:60]
-	}
-	for _, s := range []string{
-		`DROP SCHEMA IF EXISTS "` + schemaName + `" CASCADE`,
-		`CREATE SCHEMA "` + schemaName + `"`,
-		`SET search_path TO "` + schemaName + `"`,
-	} {
-		if _, err := db.Exec(ctx, s); err != nil {
-			t.Fatalf("%s: %v", s, err)
-		}
-	}
-	t.Cleanup(func() {
-		_, _ = db.Exec(context.Background(), `DROP SCHEMA IF EXISTS "`+schemaName+`" CASCADE`)
-	})
 
 	users := pg.NewSchemaTable(schemaName, "users")
 	uid := pg.Add(users, pg.BigSerial("id").PrimaryKey())
@@ -644,5 +619,355 @@ func TestPGPushIsIdempotent(t *testing.T) {
 	}
 	if len(second.Statements) != 0 {
 		t.Errorf("the second push is not a no-op:\n%s", strings.Join(second.Statements, "\n"))
+	}
+}
+
+// pushScratchPG opens a connection pinned to one physical connection —
+// so the SET search_path below governs every later statement — and
+// gives it an empty schema of its own to push into.
+func pushScratchPG(t *testing.T) (*pg.DB, string) {
+	t.Helper()
+	dsn := integration.DSN(t, integration.EnvPostgres)
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db := pg.New(stdlib.New(sqlDB))
+	ctx := context.Background()
+
+	schemaName := "push_" + integration.UniqueName(t, "s")
+	if len(schemaName) > 60 {
+		schemaName = schemaName[:60]
+	}
+	for _, s := range []string{
+		`DROP SCHEMA IF EXISTS "` + schemaName + `" CASCADE`,
+		`CREATE SCHEMA "` + schemaName + `"`,
+		`SET search_path TO "` + schemaName + `"`,
+	} {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DROP SCHEMA IF EXISTS "`+schemaName+`" CASCADE`)
+	})
+	return db, schemaName
+}
+
+// A composite PRIMARY KEY has to reach Push, not just CreateTable.
+//
+// Both spellings are exercised because they used to travel different
+// routes into the snapshot: BuildSnapshot read only the table-level
+// declaration, so a key marked on each column reached the DDL and the
+// Entity but never Diff — the first push created a table with two
+// inline PRIMARY KEY clauses, which PostgreSQL refuses outright.
+func TestPGPushSeesACompositePrimaryKey(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		declare func(*pg.Table)
+	}{
+		{"per column", func(tbl *pg.Table) {
+			pg.Add(tbl, pg.BigInt("orgId").PrimaryKey())
+			pg.Add(tbl, pg.BigInt("userId").PrimaryKey())
+			pg.Add(tbl, pg.Text("role").NotNull())
+		}},
+		{"on the table", func(tbl *pg.Table) {
+			org := pg.Add(tbl, pg.BigInt("orgId"))
+			user := pg.Add(tbl, pg.BigInt("userId"))
+			pg.Add(tbl, pg.Text("role").NotNull())
+			tbl.PrimaryKey(org, user)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, schemaName := pushScratchPG(t)
+			ctx := context.Background()
+
+			members := pg.NewSchemaTable(schemaName, "members")
+			tc.declare(members)
+			sch := pg.NewSchema(members)
+			opts := pg.PushOptions{Schema: schemaName}
+
+			first, err := pg.Push(ctx, db, sch, opts)
+			if err != nil {
+				t.Fatalf("first push: %v", err)
+			}
+			if !first.Applied {
+				t.Fatal("the first push applied nothing")
+			}
+			got := primaryKeyColumnsPG(t, db, "members")
+			if len(got) != 2 || got[0] != "orgId" || got[1] != "userId" {
+				t.Fatalf("primary key columns = %v, want [orgId userId]", got)
+			}
+
+			second, err := pg.Push(ctx, db, sch, opts)
+			if err != nil {
+				t.Fatalf("second push: %v", err)
+			}
+			if len(second.Statements) != 0 {
+				t.Errorf("the second push is not a no-op:\n%s", strings.Join(second.Statements, "\n"))
+			}
+		})
+	}
+}
+
+// indexDefPG returns pg_get_indexdef for one index in one schema, or
+// "" when the index is not there. The reconstructed DDL is the whole
+// point: it shows the INCLUDE list and the partial predicate exactly
+// as the server holds them, not as drops hoped it wrote them.
+func indexDefPG(t *testing.T, db *pg.DB, schema, name string) string {
+	t.Helper()
+	rows, err := db.Query(context.Background(), `
+		SELECT pg_get_indexdef(c.oid)
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind = 'i' AND n.nspname = $1 AND c.relname = $2`, schema, name)
+	if err != nil {
+		t.Fatalf("read index definition: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return ""
+	}
+	var def string
+	if err := rows.Scan(&def); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	return def
+}
+
+// noticeFor returns the first notice with the given rule, or the zero
+// value when the push reported none.
+func noticeFor(notices []pg.SchemaNotice, rule string) pg.SchemaNotice {
+	for _, n := range notices {
+		if n.Rule == rule {
+			return n
+		}
+	}
+	return pg.SchemaNotice{}
+}
+
+// An index the Go schema never declared is the one object most often
+// created outside it — by a DBA under load, by an extension, by
+// another migration tool. Since Introspect started reporting
+// standalone indexes, Diff has emitted a DROP INDEX for every one of
+// them. Push withholds it and says so; the caller can opt back in.
+func TestPGPushLeavesAnUndeclaredIndexAlone(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	users := pg.NewSchemaTable(schemaName, "users")
+	pg.Add(users, pg.BigSerial("id").PrimaryKey())
+	pg.Add(users, pg.Text("email").NotNull())
+	sch := pg.NewSchema(users)
+	opts := pg.PushOptions{Schema: schemaName}
+
+	if _, err := pg.Push(ctx, db, sch, opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	// Somebody adds an index by hand, at 3am, for a query that was
+	// timing out. It is in no Go file.
+	if _, err := db.Exec(ctx, `CREATE INDEX "usersEmailIdx" ON "`+schemaName+`"."users" ("email")`); err != nil {
+		t.Fatalf("hand-made index: %v", err)
+	}
+
+	second, err := pg.Push(ctx, db, sch, opts)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	for _, s := range second.Statements {
+		if strings.Contains(s, "DROP INDEX") {
+			t.Errorf("Push dropped an index it did not declare: %s", s)
+		}
+	}
+	notice := noticeFor(second.Notices, "unmanaged-index")
+	if notice.Object != "usersEmailIdx" {
+		t.Fatalf("no unmanaged-index notice for the hand-made index, got %v", second.Notices)
+	}
+	if !strings.Contains(notice.SQL, "DROP INDEX") {
+		t.Errorf("the notice must carry the statement it withheld, got %q", notice.SQL)
+	}
+	if def := indexDefPG(t, db, schemaName, "usersEmailIdx"); def == "" {
+		t.Fatal("the hand-made index is gone")
+	}
+
+	// The safety analyser has to have a name for what was withheld,
+	// or "make it visible" is only a promise.
+	warnings := pg.AnalyzeStatements([]string{notice.SQL})
+	if len(warnings) == 0 || warnings[0].Rule != "drop-index" {
+		t.Errorf("AnalyzeStatements does not classify %q: %v", notice.SQL, warnings)
+	}
+
+	// Opting in performs the drop.
+	optIn := opts
+	optIn.DropUnmanagedIndexes = true
+	third, err := pg.Push(ctx, db, sch, optIn)
+	if err != nil {
+		t.Fatalf("opt-in push: %v", err)
+	}
+	if !third.Applied {
+		t.Fatalf("DropUnmanagedIndexes applied nothing: %v", third.Statements)
+	}
+	if def := indexDefPG(t, db, schemaName, "usersEmailIdx"); def != "" {
+		t.Errorf("DropUnmanagedIndexes left the index in place: %s", def)
+	}
+}
+
+// A covering index and a partial one have to survive the round trip
+// through the snapshot. Both halves used to be dropped on the floor:
+// the INCLUDE list was never recorded, so the index was created plain
+// and the push looked idempotent because neither side knew the
+// difference, and the predicate was never recorded either.
+func TestPGPushCarriesIncludeAndPredicate(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	build := func(minAge int32) *pg.Schema {
+		users := pg.NewSchemaTable(schemaName, "users")
+		pg.Add(users, pg.BigSerial("id").PrimaryKey())
+		email := pg.Add(users, pg.Text("email").NotNull())
+		name := pg.Add(users, pg.Text("name").NotNull())
+		age := pg.Add(users, pg.Integer("age").NotNull())
+		users.AddIndex(pg.NewIndex("usersCoverIdx", users, email).Include(name.Column))
+		users.AddIndex(pg.NewIndex("usersAdultIdx", users, name).Where(age.Gte(minAge)))
+		return pg.NewSchema(users)
+	}
+	opts := pg.PushOptions{Schema: schemaName}
+
+	if _, err := pg.Push(ctx, db, build(18), opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	cover := indexDefPG(t, db, schemaName, "usersCoverIdx")
+	if !strings.Contains(cover, "INCLUDE (name)") {
+		t.Errorf("the covering index lost its INCLUDE list: %s", cover)
+	}
+	adult := indexDefPG(t, db, schemaName, "usersAdultIdx")
+	if !strings.Contains(adult, "WHERE (age >= 18)") {
+		t.Errorf("the partial index lost its predicate: %s", adult)
+	}
+
+	second, err := pg.Push(ctx, db, build(18), opts)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if len(second.Statements) != 0 {
+		t.Errorf("the second push is not a no-op:\n%s", strings.Join(second.Statements, "\n"))
+	}
+
+	// Tightening the predicate has to reach the server. The
+	// comparison was loosened to ignore Where entirely, which was
+	// only safe while the snapshot carried none.
+	third, err := pg.Push(ctx, db, build(21), opts)
+	if err != nil {
+		t.Fatalf("predicate change push: %v", err)
+	}
+	if !third.Applied {
+		t.Fatalf("a changed index predicate produced no migration: %v", third.Notices)
+	}
+	if adult := indexDefPG(t, db, schemaName, "usersAdultIdx"); !strings.Contains(adult, "WHERE (age >= 21)") {
+		t.Errorf("the predicate change did not reach the index: %s", adult)
+	}
+	fourth, err := pg.Push(ctx, db, build(21), opts)
+	if err != nil {
+		t.Fatalf("fourth push: %v", err)
+	}
+	if len(fourth.Statements) != 0 {
+		t.Errorf("the push after the predicate change is not a no-op:\n%s", strings.Join(fourth.Statements, "\n"))
+	}
+}
+
+// A CHECK constraint was compared by name alone, so tightening its
+// expression under an unchanged name produced no migration at all.
+// Comparing the text needs the two sides spelled alike, which is what
+// the server is asked for: pg_get_constraintdef reports `"age" >= 0`
+// as `(age >= 0)`, and no amount of tidying in Go reproduces that.
+func TestPGPushSeesAChangedCheckExpression(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	build := func(expr string) *pg.Schema {
+		users := pg.NewSchemaTable(schemaName, "users")
+		pg.Add(users, pg.BigSerial("id").PrimaryKey())
+		pg.Add(users, pg.Integer("age").NotNull())
+		users.AddCheck("usersAgeSane", expr)
+		return pg.NewSchema(users)
+	}
+	opts := pg.PushOptions{Schema: schemaName}
+
+	if _, err := pg.Push(ctx, db, build(`"age" >= 0`), opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	second, err := pg.Push(ctx, db, build(`"age" >= 0`), opts)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if len(second.Statements) != 0 {
+		t.Errorf("the second push is not a no-op:\n%s", strings.Join(second.Statements, "\n"))
+	}
+
+	third, err := pg.Push(ctx, db, build(`"age" >= 18`), opts)
+	if err != nil {
+		t.Fatalf("tightened push: %v", err)
+	}
+	if !third.Applied {
+		t.Fatalf("a changed CHECK expression produced no migration: %v", third.Notices)
+	}
+	// The server is the judge of whether the constraint changed.
+	if _, err := db.Exec(ctx, `INSERT INTO "`+schemaName+`"."users" ("age") VALUES (5)`); err == nil {
+		t.Error("the tightened CHECK is not enforced")
+	}
+	fourth, err := pg.Push(ctx, db, build(`"age" >= 18`), opts)
+	if err != nil {
+		t.Fatalf("fourth push: %v", err)
+	}
+	if len(fourth.Statements) != 0 {
+		t.Errorf("the push after the CHECK change is not a no-op:\n%s", strings.Join(fourth.Statements, "\n"))
+	}
+}
+
+// When the server will not parse a declared expression there is
+// nothing to compare against, so Push leaves the constraint as the
+// database has it and says which one it could not check — rather than
+// dropping and re-adding it on every run because the two spellings
+// will never match.
+//
+// The good constraint alongside it has to keep working: each probe
+// runs under its own savepoint, so one failure does not poison the
+// transaction the rest of them share.
+func TestPGPushReportsAnUnparseableCheck(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	build := func(broken string) *pg.Schema {
+		users := pg.NewSchemaTable(schemaName, "users")
+		pg.Add(users, pg.BigSerial("id").PrimaryKey())
+		pg.Add(users, pg.Integer("age").NotNull())
+		pg.Add(users, pg.Integer("score").NotNull())
+		users.AddCheck("usersAgeSane", broken)
+		users.AddCheck("usersScoreSane", `"score" >= 0`)
+		return pg.NewSchema(users)
+	}
+	opts := pg.PushOptions{Schema: schemaName}
+
+	if _, err := pg.Push(ctx, db, build(`"age" >= 0`), opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+
+	second, err := pg.Push(ctx, db, build(`"age" >>> 0`), opts)
+	if err != nil {
+		t.Fatalf("push with an unparseable check: %v", err)
+	}
+	if len(second.Statements) != 0 {
+		t.Errorf("Push acted on an expression it could not check:\n%s", strings.Join(second.Statements, "\n"))
+	}
+	notice := noticeFor(second.Notices, "check-not-normalised")
+	if notice.Object != "usersAgeSane" {
+		t.Fatalf("no notice for the unparseable check, got %v", second.Notices)
+	}
+	// The other constraint went through the same transaction and must
+	// still compare clean.
+	if n := noticeFor(second.Notices, "check-not-normalised"); n.Object == "usersScoreSane" {
+		t.Error("a valid constraint was reported unparseable")
 	}
 }

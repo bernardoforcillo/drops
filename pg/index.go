@@ -109,8 +109,41 @@ func writeIndexCreate(b *drops.Builder, idx *Index, ifNotExists bool) {
 	}
 	if idx.where != nil {
 		b.WriteString(" WHERE ")
-		b.Append(idx.where)
+		if pred, ok := indexPredicateSQL(idx.where); ok {
+			b.WriteString(pred)
+		} else {
+			b.Append(idx.where)
+		}
 	}
+}
+
+// indexPredicateSQL renders a partial-index predicate as the static SQL
+// a CREATE INDEX can carry, reporting false when it cannot.
+//
+// CREATE INDEX is a utility statement: PostgreSQL's grammar has no
+// parameter slot in it. A predicate written the ordinary way —
+// age.Gte(18) — binds its 18, so the statement arrives as
+// "WHERE (age >= $1)" with one argument and the driver refuses it
+// before the server ever parses it. The values are known where the
+// schema is declared, not at query time, so they are folded into the
+// text here, the same choice CommentOnTable makes for its literal.
+//
+// The fold is refused, rather than guessed at, for a value with no
+// literal spelling; the caller then binds as before and the failure is
+// the server's to report.
+func indexPredicateSQL(e drops.Expression) (string, bool) {
+	if e == nil {
+		return "", false
+	}
+	sql, args := drops.StringWithDialect(Dialect, e)
+	if len(args) == 0 {
+		return sql, true
+	}
+	out, err := inlineSQLLiterals(sql, args)
+	if err != nil {
+		return "", false
+	}
+	return out, true
 }
 
 // writeIndexColumn renders one entry of a CREATE INDEX column list.

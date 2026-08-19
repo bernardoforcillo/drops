@@ -116,6 +116,8 @@ var safetyRules = []func(stmt string) (SafetyWarning, bool){
 	ruleAddColumnDynamicDefault,
 	ruleDeleteWithoutWhere,
 	ruleUpdateWithoutWhere,
+	ruleRebuildDropsIndex,
+	ruleRebuildStaleTrigger,
 }
 
 var (
@@ -127,6 +129,8 @@ var (
 	reHasNotNull     = regexp.MustCompile(`(?i)\bNOT\s+NULL\b`)
 	reHasDefault     = regexp.MustCompile(`(?i)\bDEFAULT\b`)
 	reDynamicDefault = regexp.MustCompile(`(?i)\bDEFAULT\s+(CURRENT_TIME|CURRENT_DATE|CURRENT_TIMESTAMP|\()`)
+	reIndexDropped   = regexp.MustCompile(`(?i)^--\s*index\s+".*"\s+dropped with column\b`)
+	reTriggerStale   = regexp.MustCompile(`(?i)^--\s*trigger\s+".*"\s+names dropped column\b`)
 	reDelete         = regexp.MustCompile(`(?i)^\s*DELETE\s+FROM\b`)
 	reUpdate         = regexp.MustCompile(`(?i)^\s*UPDATE\b`)
 	reHasWhere       = regexp.MustCompile(`(?i)\bWHERE\b`)
@@ -207,6 +211,40 @@ func ruleAddColumnDynamicDefault(stmt string) (SafetyWarning, bool) {
 		Statement:  stmt,
 		Message:    "SQLite forbids ADD COLUMN with a non-constant DEFAULT (CURRENT_TIMESTAMP, a parenthesised expression, etc.) — the statement will be rejected.",
 		Suggestion: "Add the column with a constant DEFAULT (or nullable), then backfill the dynamic value with an UPDATE.",
+	}, true
+}
+
+// ruleRebuildDropsIndex surfaces the index a table rebuild could not
+// keep. Diff already records it as a comment in the migration, but a
+// comment is easy to scroll past, and an index that silently stops
+// existing is the difference between a query plan and a table scan.
+func ruleRebuildDropsIndex(stmt string) (SafetyWarning, bool) {
+	if !reIndexDropped.MatchString(stmt) {
+		return SafetyWarning{}, false
+	}
+	return SafetyWarning{
+		Severity:   SeverityWarn,
+		Rule:       "rebuild-drops-index",
+		Statement:  stmt,
+		Message:    "The table rebuild drops this index along with the column it keys, and will not re-create it.",
+		Suggestion: "If the index is still wanted over the remaining columns, add the CREATE INDEX to this migration by hand.",
+	}, true
+}
+
+// ruleRebuildStaleTrigger surfaces a trigger a rebuild put back even
+// though it names a column that is now gone. SQLite accepts the CREATE
+// TRIGGER regardless — it does not resolve the body until the trigger
+// fires — so nothing else in the pipeline can catch this.
+func ruleRebuildStaleTrigger(stmt string) (SafetyWarning, bool) {
+	if !reTriggerStale.MatchString(stmt) {
+		return SafetyWarning{}, false
+	}
+	return SafetyWarning{
+		Severity:   SeverityError,
+		Rule:       "rebuild-stale-trigger",
+		Statement:  stmt,
+		Message:    "This trigger is re-created naming a column the rebuild removed; SQLite accepts it now and fails when it fires.",
+		Suggestion: "Rewrite the trigger against the new shape in this migration, or drop it.",
 	}, true
 }
 

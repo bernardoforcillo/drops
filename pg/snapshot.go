@@ -86,10 +86,14 @@ type TableSnapshot struct {
 }
 
 // IndexSnapshot is one entry in TableSnapshot.Indexes. JSON keys
-// follow drizzle-kit's v7 PostgreSQL schema.
+// follow drizzle-kit's v7 PostgreSQL schema, with one addition:
+// "include" has no counterpart there, and a covering index whose
+// INCLUDE columns went unrecorded was indistinguishable from a plain
+// one — so Push created it plain and never noticed.
 type IndexSnapshot struct {
 	Name             string         `json:"name"`
 	Columns          []string       `json:"columns"`
+	Include          []string       `json:"include,omitempty"`
 	IsUnique         bool           `json:"isUnique"`
 	Where            string         `json:"where"`
 	With             map[string]any `json:"with"`
@@ -191,10 +195,24 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 				WithCheck: p.WithCheckExpr(),
 			}
 		}
-		// Composite primary key.
-		if pk := t.CompositePrimaryKey(); len(pk) > 0 {
-			cols := make([]string, len(pk))
-			for i, c := range pk {
+		// The PRIMARY KEY, however the schema spelled it.
+		//
+		// A key spanning one column rides on the column definition;
+		// a key spanning two cannot, because PostgreSQL rejects a
+		// second inline PRIMARY KEY, so it is recorded table-level.
+		// That is the same rule writeTableBody applies to the CREATE
+		// TABLE, and the two have to agree: a key the snapshot puts
+		// in both places is emitted twice, and one it puts in
+		// neither never reaches Diff at all.
+		keys := t.primaryKeyColumns()
+		inKey := make(map[*Column]bool, len(keys))
+		for _, c := range keys {
+			inKey[c] = true
+		}
+		compositeKey := len(keys) > 1
+		if compositeKey {
+			cols := make([]string, len(keys))
+			for i, c := range keys {
 				cols[i] = c.Name()
 			}
 			name := compositePKName(t.Name(), cols)
@@ -249,8 +267,13 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			cs := &ColumnSnapshot{
 				Name:       c.Name(),
 				Type:       c.Type().TypeSQL(),
-				PrimaryKey: c.IsPrimaryKey(),
-				NotNull:    c.IsNotNull(),
+				PrimaryKey: inKey[c] && !compositeKey,
+				// A key column is NOT NULL whether or not the schema
+				// said so — PostgreSQL sets attnotnull when the key is
+				// created and Introspect reads it back that way, so a
+				// snapshot that recorded it nullable would have every
+				// push emit a DROP NOT NULL the next push undoes.
+				NotNull: c.IsNotNull() || inKey[c],
 			}
 			if c.HasDefault() {
 				d := c.DefaultSQL()
@@ -258,7 +281,7 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			}
 			ts.Columns[c.Name()] = cs
 
-			if c.IsUnique() && !c.IsPrimaryKey() {
+			if c.IsUnique() && !inKey[c] {
 				name := uniqueName(t.Name(), []string{c.Name()})
 				ts.UniqueConstraints[name] = &UniqueSnapshot{
 					Name:             name,
@@ -415,11 +438,20 @@ func compositePKName(table string, cols []string) string {
 	return out
 }
 
-// indexSnapshotOf extracts the snapshot form of an *Index. Only
-// the well-known shape (simple column refs, btree default) is
-// captured cleanly; functional or expression indexes pass through
-// as empty Columns and the original DDL is recoverable from the
-// schema-level renderer rather than the snapshot.
+// indexSnapshotOf extracts the snapshot form of an *Index.
+//
+// Only the well-known shape is captured: simple column refs, the
+// INCLUDE list, the partial predicate and the access method. An
+// operator class, a WITH storage parameter, and a functional or
+// expression element are not representable here — an expression
+// element leaves Columns one entry shorter, and Push's notices say so
+// rather than letting Diff quietly compare a truncated index against
+// the real one.
+//
+// The predicate is recorded in the spelling a CREATE INDEX would
+// carry, which is the Go program's, not PostgreSQL's. Push
+// renormalises it against the server before diffing; see
+// renormaliseExpressions.
 func indexSnapshotOf(idx *Index) *IndexSnapshot {
 	is := &IndexSnapshot{
 		Name:         idx.Name(),
@@ -430,6 +462,12 @@ func indexSnapshotOf(idx *Index) *IndexSnapshot {
 	}
 	if is.Method == "" {
 		is.Method = "btree"
+	}
+	if pred, ok := indexPredicateSQL(idx.where); ok {
+		is.Where = pred
+	}
+	for _, c := range idx.include {
+		is.Include = append(is.Include, c.Name())
 	}
 	for _, expr := range idx.columns {
 		if c, ok := expr.(*Column); ok {

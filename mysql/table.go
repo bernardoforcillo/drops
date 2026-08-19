@@ -66,6 +66,13 @@ func (t *Table) Alias() string    { return t.alias }
 // alone. On a self-referential relation that is the whole point: the
 // two ends of the edge are two instances of one table, and only one of
 // them is the aliased one.
+//
+// The copy is a snapshot. A column or relation added to the base table
+// after As returned does not reach the alias, which matters because Go
+// initialises package-level variables before it runs init: an alias
+// declared as a var beside its table is taken before any init that
+// declares relations. Take the alias at the query site, or after the
+// schema is complete.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
@@ -143,8 +150,17 @@ func (t *Table) Rel(name string) *Relation {
 			declared = append(declared, n)
 		}
 		sort.Strings(declared)
-		panic(fmt.Sprintf("drops/mysql: table %q has no relation %q; declared: %s",
-			t.name, name, strings.Join(declared, ", ")))
+		// An alias carries the relations its table had at the moment As
+		// was called, so a relation declared afterwards reaches the base
+		// handle and not this one. Naming the alias is what separates
+		// that from "the relation was never declared at all" — the two
+		// look identical from the empty list.
+		subject := fmt.Sprintf("table %q", t.name)
+		if t.alias != "" {
+			subject = fmt.Sprintf("alias %q of table %q", t.alias, t.name)
+		}
+		panic(fmt.Sprintf("drops/mysql: %s has no relation %q; declared: %s",
+			subject, name, strings.Join(declared, ", ")))
 	}
 	return r
 }

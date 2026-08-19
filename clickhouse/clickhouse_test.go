@@ -505,3 +505,190 @@ func TestEventStoreEmptyStreamVersionIsMinusOne(t *testing.T) {
 		t.Errorf("an empty ClickHouse aggregate answers with the type default, not NULL:\n%s", fd.queries[0])
 	}
 }
+
+// --- Table aliases ---------------------------------------------------
+//
+// (*Table).As used to hand back a shallow copy, so the aliased handle's
+// columns still pointed at the un-aliased table and every reference
+// through it rendered "events"."id" under a FROM that had renamed the
+// relation to "e". ClickHouse resolves identifiers against what the
+// FROM clause put in scope, so those references name a relation the
+// query no longer has. The tests below walk each clause that can carry
+// a column reference, because an alias that works in FROM and breaks in
+// JOIN is the same defect wearing a different hat.
+
+func TestAliasQualifiesEveryClauseWithTheAlias(t *testing.T) {
+	db := clickhouse.New(nil)
+	e := events.As("e")
+
+	got, _ := db.Select(e.Col("id")).
+		From(e).
+		Prewhere(clickhouse.Eq(e.Col("kind"), "click")).
+		Where(clickhouse.Gt(e.Col("durationMs"), 1.0)).
+		GroupBy(e.Col("userId")).
+		Having(clickhouse.Gt(clickhouse.CountAll(), 1)).
+		OrderBy(e.Col("ts").Desc()).
+		ToSQL()
+
+	want := `SELECT "e"."id" FROM "events" AS "e"` +
+		` PREWHERE ("e"."kind" = ?) WHERE ("e"."durationMs" > ?)` +
+		` GROUP BY "e"."userId" HAVING (count() > ?)` +
+		` ORDER BY "e"."ts" DESC`
+	if got != want {
+		t.Errorf("sql\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+// The headline case: two handles on one table, both addressable at
+// once. Before the fix both sides rendered "events"."userId" and the ON
+// clause was the tautology x = x.
+func TestSelfJoinAddressesBothSides(t *testing.T) {
+	db := clickhouse.New(nil)
+	a, b := events.As("a"), events.As("b")
+
+	got, _ := db.Select(a.Col("id"), b.Col("id")).
+		From(a).
+		Join(b, clickhouse.Eq(a.Col("userId"), b.Col("userId"))).
+		Where(clickhouse.Lt(a.Col("ts"), b.Col("ts"))).
+		ToSQL()
+
+	want := `SELECT "a"."id", "b"."id" FROM "events" AS "a"` +
+		` INNER JOIN "events" AS "b" ON ("a"."userId" = "b"."userId")` +
+		` WHERE ("a"."ts" < "b"."ts")`
+	if got != want {
+		t.Errorf("sql\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+// A typed handle on one side and an aliased handle on the other is the
+// ordinary shape of a self-join predicate, so the *Col comparison
+// methods take a ColRef.
+func TestColComparisonAcceptsAnAliasedHandle(t *testing.T) {
+	e := events.As("e")
+	checkExpr(t, eventUser.EqCol(e.Col("userId")),
+		`("events"."userId" = "e"."userId")`)
+	checkExpr(t, eventTS.LtCol(e.Col("ts")),
+		`("events"."ts" < "e"."ts")`)
+}
+
+func TestAliasSurvivesSubqueryAndCTE(t *testing.T) {
+	db := clickhouse.New(nil)
+	e := events.As("e")
+
+	sub := db.Select(e.Col("userId")).From(e).Where(clickhouse.Eq(e.Col("kind"), "signup"))
+	got, _ := db.Select(eventID).From(events).
+		Where(clickhouse.InSub(eventUser, sub)).
+		ToSQL()
+	want := `SELECT "events"."id" FROM "events"` +
+		` WHERE ("events"."userId" IN (SELECT "e"."userId" FROM "events" AS "e" WHERE ("e"."kind" = ?)))`
+	if got != want {
+		t.Errorf("subquery sql\n  got:  %s\n  want: %s", got, want)
+	}
+
+	cte := clickhouse.CTEDef("recent", db.Select(e.Col("id")).From(e))
+	got, _ = db.Select().From(events).With(cte).ToSQL()
+	want = `WITH "recent" AS (SELECT "e"."id" FROM "events" AS "e") SELECT * FROM "events"`
+	if got != want {
+		t.Errorf("cte sql\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
+// The alias copy owns its columns, so nothing it does can reach the
+// package-level handles — the point of the copy is that both are live
+// at the same time.
+func TestAliasLeavesTheOriginalHandlesAlone(t *testing.T) {
+	db := clickhouse.New(nil)
+	e := events.As("e")
+
+	if e.Col("id") == eventID.Column {
+		t.Error("aliased Col returned the original column pointer")
+	}
+	if e.Col("id").Table() != e {
+		t.Error("aliased column is not bound to the aliased table")
+	}
+	if eventID.Column.Table() != events {
+		t.Error("As rebound the original column")
+	}
+	got, _ := db.Select(eventID).From(events).ToSQL()
+	if want := `SELECT "events"."id" FROM "events"`; got != want {
+		t.Errorf("original handle\n  got:  %s\n  want: %s", got, want)
+	}
+	_ = e
+}
+
+// CREATE TABLE names the relation, never the alias — the alias exists
+// only in a query's scope.
+func TestAliasDoesNotReachDDL(t *testing.T) {
+	tbl := clickhouse.NewTable("t")
+	ts := clickhouse.Add(tbl, clickhouse.DateTime("ts", "UTC"))
+	clickhouse.Add(tbl, clickhouse.UInt64("n"))
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(ts)
+
+	got, _ := clickhouse.ToSQL(clickhouse.CreateTable(tbl.As("x")))
+	if strings.Contains(got, `"x"`) {
+		t.Errorf("alias leaked into DDL: %s", got)
+	}
+	if !strings.Contains(got, `CREATE TABLE "t"`) || !strings.Contains(got, "ORDER BY (\"ts\")") {
+		t.Errorf("unexpected DDL: %s", got)
+	}
+}
+
+// A default filter is built against the un-aliased columns and is not
+// rewritten by As — see the method's doc. Dropping it would silence a
+// tenant or soft-delete guard, so it is left in place and the server
+// rejects the query; an aliased SELECT wants Unscoped and an explicit
+// predicate. Pin the decision so a future change to it is deliberate.
+func TestAliasDoesNotRewriteDefaultFilters(t *testing.T) {
+	db := clickhouse.New(nil)
+	tbl := clickhouse.NewTable("scoped")
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	tenant := clickhouse.Add(tbl, clickhouse.UInt64("tenantId"))
+	tbl.DefaultFilter(tenant.Eq(7))
+
+	s := tbl.As("s")
+	got, _ := db.Select(s.Col("id")).From(s).ToSQL()
+	want := `SELECT "s"."id" FROM "scoped" AS "s" WHERE ("scoped"."tenantId" = ?)`
+	if got != want {
+		t.Errorf("scoped\n  got:  %s\n  want: %s", got, want)
+	}
+
+	got, _ = db.Select(s.Col("id")).From(s).Unscoped().
+		Where(clickhouse.Eq(s.Col("tenantId"), 7)).ToSQL()
+	want = `SELECT "s"."id" FROM "scoped" AS "s" WHERE ("s"."tenantId" = ?)`
+	if got != want {
+		t.Errorf("unscoped\n  got:  %s\n  want: %s", got, want)
+	}
+	_ = id
+}
+
+func TestAliasPanicsOnInvalidIdentifier(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic")
+		}
+		err, ok := r.(error)
+		if !ok || !errors.Is(err, clickhouse.ErrInvalidIdentifier) {
+			t.Errorf("expected ErrInvalidIdentifier, got %v", r)
+		}
+	}()
+	events.As("")
+}
+
+// The alias owns a copy of the column list, so it is a snapshot of the
+// table as it stood — which is the price of the columns being separate
+// objects at all.
+func TestAliasSnapshotsTheColumnList(t *testing.T) {
+	tbl := clickhouse.NewTable("late")
+	clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	e := tbl.As("e")
+	clickhouse.Add(tbl, clickhouse.String("added"))
+
+	if got := e.Col("added"); got != nil {
+		t.Errorf("alias saw a column added after As: %v", got.Name())
+	}
+	if len(e.Columns()) != 1 || len(tbl.Columns()) != 2 {
+		t.Errorf("alias has %d columns, table has %d; want 1 and 2",
+			len(e.Columns()), len(tbl.Columns()))
+	}
+}

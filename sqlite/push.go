@@ -38,6 +38,12 @@ var ErrSchemaRequired = errors.New("drops/sqlite: Push requires a non-nil schema
 //   - Otherwise applies them in a single transaction; any failure rolls
 //     the whole push back.
 //
+// Push never creates or drops an index or a trigger. The Go schema DSL
+// cannot declare either, so every one in the database is undeclared by
+// construction and dropping the undeclared ones would drop all of them.
+// Where a change forces a table rebuild, the indexes and triggers that
+// rebuild destroys are put back — see Diff.
+//
 // Push is convenient for development but skips migration history; prefer
 // the Migrator for production, so changes are reviewable and reproducible.
 func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*PushResult, error) {

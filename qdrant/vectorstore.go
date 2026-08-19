@@ -270,15 +270,6 @@ func (v filterVisitor) Compare(op vector.Op, field string, value any) (Condition
 	}
 }
 
-// Qdrant's grammar has no literal true or false. A filter with no
-// clauses constrains nothing, so it is the term that matches every
-// point, and a must_not over it is the term that matches none.
-func matchEverything() Condition { return Condition{Nested: &Filter{}} }
-
-func matchNothing() Condition {
-	return Condition{Nested: &Filter{MustNot: []Condition{matchEverything()}}}
-}
-
 func (v filterVisitor) Set(op vector.Op, field string, values []any) (Condition, error) {
 	switch op {
 	case vector.OpIn:

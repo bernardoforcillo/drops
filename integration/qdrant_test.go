@@ -220,3 +220,54 @@ func fmtID(v any) string {
 	}
 	return "?"
 }
+
+// The most destructive thing this package can do. A lookup that
+// returned nothing gives an empty id set, and an empty set used to
+// render a condition with no clauses in it — which Qdrant reads not as
+// "no points" but as "every point". Handed to DeleteByFilter, the
+// obvious next call, that empties the collection.
+//
+// Only a server can settle it: the fix is a claim about how Qdrant
+// reads `{"must_not":[{}]}`, and no amount of string comparison in the
+// unit suite can check a claim about a parser.
+func TestQdrantDeleteByAnEmptyIDSetDeletesNothing(t *testing.T) {
+	cli := openQdrant(t)
+	ctx := context.Background()
+	name := collection(t, cli, 3, qdrant.DistanceCosine)
+
+	points := []qdrant.Point{
+		{ID: 1, Vector: []float32{1, 0, 0}},
+		{ID: 2, Vector: []float32{0, 1, 0}},
+		{ID: 3, Vector: []float32{0, 0, 1}},
+	}
+	if err := cli.Upsert(ctx, name, points, qdrant.WriteOptions{Wait: true}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// This is the shape a caller writes: look up ids, find none, delete
+	// what you found.
+	var found []any
+	if err := cli.DeleteByFilter(ctx, name, qdrant.Must(qdrant.HasID(found...)), qdrant.WriteOptions{Wait: true}); err != nil {
+		t.Fatalf("DeleteByFilter with an empty id set: %v", err)
+	}
+
+	page, err := cli.Scroll(ctx, name, qdrant.ScrollRequest{Limit: 10})
+	if err != nil {
+		t.Fatalf("Scroll: %v", err)
+	}
+	if len(page.Points) != len(points) {
+		t.Fatalf("deleting by an empty id set removed %d of %d points", len(points)-len(page.Points), len(points))
+	}
+
+	// And the same condition must select nothing, not everything.
+	sel, err := cli.Scroll(ctx, name, qdrant.ScrollRequest{
+		Limit:  10,
+		Filter: qdrant.Must(qdrant.HasID()),
+	})
+	if err != nil {
+		t.Fatalf("Scroll with an empty id set: %v", err)
+	}
+	if len(sel.Points) != 0 {
+		t.Fatalf("an empty id set selected %d points, want 0", len(sel.Points))
+	}
+}

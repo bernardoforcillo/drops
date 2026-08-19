@@ -130,12 +130,27 @@ func Eq(field string, value any) Condition {
 }
 
 // In tests payload.<field> ∈ values.
+//
+// With no values it matches nothing, which is what membership of the
+// empty set means. Qdrant cannot be asked that directly — every
+// variant of its match union has a required key, so an empty match
+// object is a 400 rather than a predicate — so it compiles to the
+// must_not form instead.
 func In(field string, values ...any) Condition {
+	if len(values) == 0 {
+		return matchNothing()
+	}
 	return Condition{Key: field, Match: &MatchCondition{Any: values}}
 }
 
 // NotIn tests payload.<field> ∉ values.
+//
+// With no values it matches everything, for the same reason In matches
+// nothing: no point is excluded by the empty set.
 func NotIn(field string, values ...any) Condition {
+	if len(values) == 0 {
+		return matchEverything()
+	}
 	return Condition{Key: field, Match: &MatchCondition{Except: values}}
 }
 
@@ -171,7 +186,30 @@ func Range(field string, opts RangeOpts) Condition {
 func F(v float64) *float64 { return &v }
 
 // HasID tests that the point's ID is in the given set.
-func HasID(ids ...any) Condition { return Condition{HasID: ids} }
+//
+// With no ids it matches nothing, and getting that right matters more
+// here than anywhere else in this file. Condition.HasID carries
+// `omitempty`, so an empty set is dropped from the object entirely and
+// the condition renders as `{}` — which in Qdrant's grammar is a
+// condition that constrains nothing, and therefore one that matches
+// every point in the collection. Passed to DeleteByFilter, the
+// obvious use of a lookup that came back empty, that deletes the
+// collection.
+func HasID(ids ...any) Condition {
+	if len(ids) == 0 {
+		return matchNothing()
+	}
+	return Condition{HasID: ids}
+}
+
+// Qdrant's grammar has no literal true or false. A filter with no
+// clauses constrains nothing, so it is the term that matches every
+// point, and a must_not over it is the term that matches none.
+func matchEverything() Condition { return Condition{Nested: &Filter{}} }
+
+func matchNothing() Condition {
+	return Condition{Nested: &Filter{MustNot: []Condition{matchEverything()}}}
+}
 
 // IsEmpty tests that payload.<field> is missing or empty.
 func IsEmpty(field string) Condition {

@@ -63,7 +63,12 @@ Early. Two dialects ship today:
 - **`drops/mirror`** — one Postgres table, mirrored into ClickHouse for
   analytics and Qdrant for search. The ClickHouse schema is *derived*
   from the pg one rather than declared twice, and changes flow through
-  the durable outbox so the copies cannot silently diverge.
+  the durable outbox so the copies cannot silently diverge. It also
+  covers what an operator has to do to a running mirror: `Reseeder`
+  replays history into a mirror that never had it, `Verifier` answers
+  whether the copies are actually equal, and `Evolver` walks the
+  mirror's schema forward when the source's moves — adding and widening
+  on its own, refusing a drop or a narrowing by name.
 - **`drops/clickhouse`** — ClickHouse. Engine-bound tables
   (MergeTree family + replicated/distributed via `Raw`), CH-specific
   types (`Array`, `Nullable`, `LowCardinality`, `Decimal`,

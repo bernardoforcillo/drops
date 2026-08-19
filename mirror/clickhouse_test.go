@@ -39,9 +39,12 @@ func derive(t *testing.T, src *pg.Table, opts ...mirror.DeriveOption) *clickhous
 
 func ddl(t *testing.T, tbl *clickhouse.Table) string {
 	t.Helper()
-	sql, _ := drops.String(clickhouse.CreateTable(tbl))
+	sql, _ := dropsString(clickhouse.CreateTable(tbl))
 	return sql
 }
+
+// dropsString renders an expression, shared with the examples.
+func dropsString(e drops.Expression) (string, []any) { return drops.String(e) }
 
 func TestDeriveProducesMirroredSchema(t *testing.T) {
 	got := ddl(t, derive(t, sourceTable()))

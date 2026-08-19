@@ -55,6 +55,15 @@ Early. Two dialects ship today:
   the distance operators (`<->` L2, `<#>` inner product, `<=>` cosine,
   `<+>` L1) for similarity search in Postgres. HNSW/IVFFlat indexes
   with the right operator class via `Index.OpClass(...)`.
+- **`drops/mysql`** — MySQL / MariaDB. Backtick identifiers, `?`
+  placeholders, AUTO_INCREMENT, `ON DUPLICATE KEY UPDATE`, prefix
+  indexes, and `ORDER BY`/`LIMIT` on UPDATE and DELETE for batched
+  maintenance. Because MySQL has no `RETURNING`, `Entity.Create` reads
+  a generated key back through the driver's `LastInsertId`.
+- **`drops/mirror`** — one Postgres table, mirrored into ClickHouse for
+  analytics and Qdrant for search. The ClickHouse schema is *derived*
+  from the pg one rather than declared twice, and changes flow through
+  the durable outbox so the copies cannot silently diverge.
 - **`drops/clickhouse`** — ClickHouse. Engine-bound tables
   (MergeTree family + replicated/distributed via `Raw`), CH-specific
   types (`Array`, `Nullable`, `LowCardinality`, `Decimal`,
@@ -1083,8 +1092,10 @@ drops/sqlite/                SQLite schema, query builders, entities,
                              relations, migrations, pagination, soft delete
 drops/clickhouse/            ClickHouse schema, engines, query builder,
                              analytical aggregates
+drops/mysql/                 MySQL / MariaDB schema, query builders, entities
 drops/qdrant/                Qdrant vector-database HTTP client
 drops/vector/                portable vector search shared by pg/CH/Qdrant
+drops/mirror/                keeps a pg table mirrored into ClickHouse + Qdrant
 drops/cache/                 Cache interface + sentinels
 drops/cache/memory/          in-process cache backend
 drops/cache/redis/           Redis cache backend (own RESP2 client)

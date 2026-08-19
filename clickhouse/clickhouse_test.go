@@ -82,8 +82,8 @@ func TestCreateTableMergeTree(t *testing.T) {
 		`"tags" Array(String)`,
 		`"durationMs" Float64`,
 		`ENGINE = MergeTree()`,
-		`ORDER BY ("events"."ts", "events"."userId")`,
-		`PARTITION BY (toYYYYMM("events"."ts"))`,
+		`ORDER BY ("ts", "userId")`,
+		`PARTITION BY (toYYYYMM("ts"))`,
 		`SETTINGS index_granularity = 8192`,
 	} {
 		if !strings.Contains(got, want) {

@@ -55,6 +55,16 @@ func (t *Table) As(alias string) *Table {
 	return &cp
 }
 
+// OrderByColumns returns the names of the table's sorting key, in
+// declaration order. Empty when no ORDER BY was set.
+func (t *Table) OrderByColumns() []string {
+	out := make([]string, 0, len(t.orderBy))
+	for _, c := range t.orderBy {
+		out = append(out, c.col().Name())
+	}
+	return out
+}
+
 // Col looks up a column by name.
 func (t *Table) Col(name string) *Column { return t.byName[name] }
 

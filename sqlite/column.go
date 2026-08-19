@@ -61,6 +61,12 @@ type ColRef interface {
 // WriteSQL writes a table-qualified column reference. The dialect on
 // the Builder controls the quote character.
 func (c *Column) WriteSQL(b *drops.Builder) {
+	if b.BareIdents() {
+		// DDL that defines this very table cannot qualify the
+		// reference — see (*drops.Builder).BareIdents.
+		b.WriteIdent(c.name)
+		return
+	}
 	if c.table != nil {
 		c.table.writeRef(b)
 		b.WriteByte('.')

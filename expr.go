@@ -26,6 +26,7 @@ type Builder struct {
 	args        []any
 	placeholder func(n int) string
 	dialect     Dialect
+	bareIdents  bool
 }
 
 // BuilderOption configures a Builder at construction time.
@@ -58,6 +59,33 @@ func WithDialect(d Dialect) BuilderOption {
 // Dialect returns the Builder's installed dialect, or nil when it is
 // using the default PostgreSQL syntax.
 func (b *Builder) Dialect() Dialect { return b.dialect }
+
+// BareIdents reports whether column references should render as
+// unqualified identifiers ("id") rather than table-qualified ones
+// ("docs"."id"). Column implementations consult it in WriteSQL.
+//
+// The distinction is not cosmetic. Qualification is required in a
+// SELECT and rejected in DDL that defines the very table being
+// referenced: an index column list, a ClickHouse sorting or
+// partitioning key. Rendering "docs"."id" there is a syntax error,
+// and because it is a syntax error the database never sees a working
+// statement — which is how such bugs survive a test suite that only
+// string-compares generated SQL.
+func (b *Builder) BareIdents() bool { return b.bareIdents }
+
+// SetBareIdents switches the mode and returns the previous value, so
+// a DDL renderer can scope it to one clause:
+//
+//	defer b.SetBareIdents(b.SetBareIdents(true))
+//
+// It is a Builder mode rather than a per-call argument because the
+// column reference is often nested inside an arbitrary expression —
+// toYYYYMM(ts) — where the renderer has no way to reach it.
+func (b *Builder) SetBareIdents(on bool) bool {
+	prev := b.bareIdents
+	b.bareIdents = on
+	return prev
+}
 
 // NewBuilder returns an empty Builder.
 func NewBuilder(opts ...BuilderOption) *Builder {

@@ -67,14 +67,14 @@ func writeCreate(b *drops.Builder, t *Table, ifNotExists bool) {
 // / SAMPLE BY / TTL / SETTINGS clauses, in the order ClickHouse
 // expects.
 func writeTableSuffix(b *drops.Builder, t *Table) {
+	// Every clause below names columns of the table being created, so
+	// none of them may qualify the reference. The mode covers columns
+	// nested inside expressions too — toYYYYMM(ts) in a PARTITION BY.
+	defer b.SetBareIdents(b.SetBareIdents(true))
+
 	if len(t.orderBy) > 0 {
 		b.WriteString("\nORDER BY (")
-		for i, c := range t.orderBy {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			c.WriteSQL(b)
-		}
+		writeCols(b, t.orderBy)
 		b.WriteByte(')')
 	}
 	if len(t.partition) > 0 {
@@ -89,12 +89,7 @@ func writeTableSuffix(b *drops.Builder, t *Table) {
 	}
 	if len(t.primaryKey) > 0 {
 		b.WriteString("\nPRIMARY KEY (")
-		for i, c := range t.primaryKey {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			c.WriteSQL(b)
-		}
+		writeCols(b, t.primaryKey)
 		b.WriteByte(')')
 	}
 	if t.sampleBy != nil {
@@ -212,4 +207,15 @@ func DropDatabaseIfExists(name string) drops.Expression {
 		b.WriteString("DROP DATABASE IF EXISTS ")
 		b.WriteIdent(name)
 	})
+}
+
+// writeCols renders a comma-separated column list. It relies on the
+// caller having put the Builder in bare-identifier mode.
+func writeCols(b *drops.Builder, cols []ColRef) {
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		c.WriteSQL(b)
+	}
 }

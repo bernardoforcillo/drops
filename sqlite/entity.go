@@ -368,15 +368,87 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	ins := db.Insert(e.table)
+	bound := make([][]ColumnValue, len(rows))
 	for i := range rows {
 		if err := e.stampTenant(ctx, &rows[i]); err != nil {
 			return nil, err
 		}
-		vals := e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)
+		bound[i] = e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)
+	}
+	ins := db.Insert(e.table)
+	for _, vals := range e.alignBindings(bound) {
 		ins.Values(vals...)
 	}
 	return ins.Exec(ctx)
+}
+
+// alignBindings widens every row to the same column list.
+//
+// bindings omits an autoincrement / defaulted / key column the caller
+// left zero, so the server supplies it. That is right for one row and
+// wrong for a batch: INSERT names its columns once, from the first
+// row, so a row that bound a different set has its values read under
+// the wrong names. Where the sets differ in size SQLite catches it
+// ("all VALUES must have the same number of terms"); where they merely
+// differ — one row sets its key and leaves a defaulted column zero,
+// the next does the reverse — nothing catches it and the values land
+// shifted. So the comparison is by column, not by width. A row missing
+// a column the batch binds is filled with that column's declared
+// DEFAULT, or NULL when it has none — which is what the server would
+// have stored had the row been inserted on its own.
+func (e *Entity[T]) alignBindings(rows [][]ColumnValue) [][]ColumnValue {
+	bound := map[*Column]bool{}
+	for _, r := range rows {
+		for _, cv := range r {
+			bound[cv.column()] = true
+		}
+	}
+	var cols []*Column
+	for _, cf := range e.colFields {
+		if bound[cf.col] {
+			cols = append(cols, cf.col)
+		}
+	}
+	if rowsMatchColumns(rows, cols) {
+		return rows
+	}
+	out := make([][]ColumnValue, len(rows))
+	for i, r := range rows {
+		byCol := make(map[*Column]ColumnValue, len(r))
+		for _, cv := range r {
+			byCol[cv.column()] = cv
+		}
+		wide := make([]ColumnValue, 0, len(cols))
+		for _, c := range cols {
+			if cv, ok := byCol[c]; ok {
+				wide = append(wide, cv)
+				continue
+			}
+			fill := "NULL"
+			if c.hasDefault {
+				fill = c.defaultSQL
+			}
+			wide = append(wide, &exprBinding{col: c, expr: drops.Raw(fill)})
+		}
+		out[i] = wide
+	}
+	return out
+}
+
+// rowsMatchColumns reports whether every row already binds exactly cols,
+// in order.
+func rowsMatchColumns(rows [][]ColumnValue, cols []*Column) bool {
+	for _, r := range rows {
+		if len(r) != len(cols) {
+			return false
+		}
+		for i, cv := range r {
+			if cv.column() != cols[i] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Update writes every non-PK column of r, matched by primary key. Applies

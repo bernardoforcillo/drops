@@ -112,6 +112,12 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.AddArg(*s.limit)
 	}
 	if s.offset != nil {
+		// SQLite's grammar only reaches OFFSET through LIMIT, so an
+		// offset alone needs one; -1 is the documented spelling of
+		// "no limit".
+		if s.limit == nil {
+			b.WriteString(" LIMIT -1")
+		}
 		b.WriteString(" OFFSET ")
 		b.AddArg(*s.offset)
 	}

@@ -282,6 +282,9 @@ func TestCHEventStoreQuotesItsTableName(t *testing.T) {
 	execCH(t, db, clickhouse.CreateTable(snapTbl))
 
 	store := clickhouse.NewEventStore(db, name)
+	if v, err := store.LatestVersion(ctx, "match", "abc"); err != nil || v != -1 {
+		t.Fatalf("LatestVersion on an untouched stream = %d (err %v), want -1", v, err)
+	}
 	err := store.Append(ctx, "match", "abc", -1,
 		clickhouse.EventInput{Type: "matchStarted", Payload: map[string]string{"map": "dust"}})
 	if err != nil {

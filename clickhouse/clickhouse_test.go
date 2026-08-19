@@ -92,6 +92,31 @@ func TestCreateTableMergeTree(t *testing.T) {
 	}
 }
 
+// ClickHouse's column-declaration parser reads the optional clauses in
+// one fixed pass — DEFAULT, then COMMENT, then CODEC, then TTL — so a
+// comment emitted after either of the last two ends the declaration
+// early and the whole CREATE TABLE fails to parse.
+func TestCreateTableColumnClauseOrder(t *testing.T) {
+	tbl := clickhouse.NewTable("annotated")
+	ts := clickhouse.Add(tbl, clickhouse.DateTime("ts", "UTC"))
+	clickhouse.Add(tbl, clickhouse.Float64("amount").
+		Comment("money").
+		Codec("ZSTD(3)").
+		TTL("ts + INTERVAL 30 DAY"))
+	clickhouse.Add(tbl, clickhouse.UInt64("n").Default("7").Comment("c").Codec("LZ4"))
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(ts)
+
+	got, _ := clickhouse.ToSQL(clickhouse.CreateTable(tbl))
+	for _, want := range []string{
+		`"amount" Float64 COMMENT 'money' CODEC(ZSTD(3)) TTL ts + INTERVAL 30 DAY`,
+		`"n" UInt64 DEFAULT 7 COMMENT 'c' CODEC(LZ4)`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing fragment %q in:\n%s", want, got)
+		}
+	}
+}
+
 func TestCreateTableErrReturnsErrWhenEngineMissing(t *testing.T) {
 	bare := clickhouse.NewTable("no_engine")
 	clickhouse.Add(bare, clickhouse.UInt32("x"))
@@ -260,6 +285,17 @@ func TestInsertSingleRow(t *testing.T) {
 	}
 }
 
+// An aliased handle is what a caller holds once it has written a
+// self-join, and INSERT has no alias position in ClickHouse's grammar.
+func TestInsertIgnoresTableAlias(t *testing.T) {
+	db := clickhouse.New(nil)
+	got, _ := db.Insert(events.As("e")).Row(eventUser.Val(42)).ToSQL()
+	want := `INSERT INTO "events" ("userId") VALUES (?)`
+	if got != want {
+		t.Errorf("sql\n  got:  %s\n  want: %s", got, want)
+	}
+}
+
 func TestInsertBatchAlignsAndDefaultsNull(t *testing.T) {
 	db := clickhouse.New(nil)
 	q := db.Insert(events).
@@ -412,5 +448,60 @@ func TestCloseDelegates(t *testing.T) {
 	}
 	if !fd.closed {
 		t.Error("driver Close was not called")
+	}
+}
+
+// The event store writes through one quoting helper and reads through
+// another until the two agreed; a name carrying a quote is where they
+// part company.
+func TestEventStoreQuotesTableNameOnEveryPath(t *testing.T) {
+	fd := &fakeDriver{}
+	db := clickhouse.New(fd)
+	store := clickhouse.NewEventStore(db, `ev"log`)
+	ctx := context.Background()
+
+	if err := store.Append(ctx, "match", "abc", -1,
+		clickhouse.EventInput{Type: "started", Payload: map[string]int{"a": 1}}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if _, err := store.Load(ctx, "match", "abc", -1); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := store.Stream(ctx, 0, 10); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if err := store.SaveSnapshot(ctx, `ev"log`, clickhouse.AggregateSnapshot{
+		AggregateType: "match", AggregateID: "abc",
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if _, _, err := store.LoadSnapshot(ctx, `ev"log`, "match", "abc"); err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+
+	if len(fd.queries) != 6 {
+		t.Fatalf("expected six statements, got %d: %v", len(fd.queries), fd.queries)
+	}
+	for _, q := range fd.queries {
+		if !strings.Contains(q, `ev""log`) {
+			t.Errorf("table name not escaped in:\n%s", q)
+		}
+	}
+}
+
+// LatestVersion has to report -1 for a stream nobody has written, and
+// Append's expectedVersion of -1 is only reachable when it does.
+func TestEventStoreEmptyStreamVersionIsMinusOne(t *testing.T) {
+	fd := &fakeDriver{}
+	store := clickhouse.NewEventStore(clickhouse.New(fd), "events")
+	v, err := store.LatestVersion(context.Background(), "match", "abc")
+	if err != nil {
+		t.Fatalf("LatestVersion: %v", err)
+	}
+	if v != -1 {
+		t.Errorf("version = %d, want -1", v)
+	}
+	if !strings.Contains(fd.queries[0], "maxOrNull") {
+		t.Errorf("an empty ClickHouse aggregate answers with the type default, not NULL:\n%s", fd.queries[0])
 	}
 }

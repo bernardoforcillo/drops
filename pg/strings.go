@@ -122,9 +122,6 @@ func Decode(text, format any) drops.Expression {
 	return funcCall("decode", []any{text, format})
 }
 
-// funcCall is the shared renderer for "<name>(<args>)" expressions.
-// args is a slice so the caller passes variadic-shaped data already
-// flattened — avoids the recursive variadic-of-variadic awkwardness.
 // variadicAnyCall renders a call to a VARIADIC "any" function, naming
 // the type of every bound argument.
 //
@@ -179,6 +176,9 @@ func pgTypeOf(v any) string {
 	return "text"
 }
 
+// funcCall is the shared renderer for "<name>(<args>)" expressions.
+// args is a slice so the caller passes variadic-shaped data already
+// flattened — avoids the recursive variadic-of-variadic awkwardness.
 func funcCall(name string, args []any) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString(name)

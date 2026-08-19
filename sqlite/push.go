@@ -32,7 +32,8 @@ var ErrSchemaRequired = errors.New("drops/sqlite: Push requires a non-nil schema
 //
 //   - Reads the current state via Introspect.
 //   - Builds the target snapshot from schema.
-//   - Diffs the two.
+//   - Diffs the two, over the tables schema declares — a table drops was
+//     never told about belongs to somebody else and is left alone.
 //   - If DryRun, returns the statements unexecuted.
 //   - Otherwise applies them in a single transaction; any failure rolls
 //     the whole push back.
@@ -54,7 +55,7 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}
 	desired := BuildSnapshot(schema)
 
-	stmts := Diff(current, desired)
+	stmts := Diff(ownedBy(current, desired), desired)
 	if len(stmts) == 0 {
 		return &PushResult{Statements: nil, Applied: false}, nil
 	}
@@ -73,6 +74,38 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		return nil, err
 	}
 	return &PushResult{Statements: stmts, Applied: true}, nil
+}
+
+// ownedBy narrows a live introspection to the tables the Schema
+// declares.
+//
+// A SQLite file is often shared: another migration tool keeps its
+// bookkeeping there, an unrelated service keeps a table there, and a
+// drops migration history under a name Migrator.WithTable chose is not
+// the default one Introspect skips. To Diff, every one of those looks
+// like a table that used to exist and no longer should, and it emits a
+// DROP for it — so a push against a database drops did not create alone
+// deletes someone else's data.
+//
+// A hard-coded list of foreign table names cannot work; the Schema is
+// the only statement of ownership drops has, so a table it never names
+// is left alone. The cost is that dropping a table now means writing
+// the DROP into a migration rather than deleting the Go declaration and
+// pushing, which is the reviewable path anyway.
+func ownedBy(live, declared *Snapshot) *Snapshot {
+	out := &Snapshot{
+		ID:      live.ID,
+		PrevID:  live.PrevID,
+		Version: live.Version,
+		Dialect: live.Dialect,
+		Tables:  make(map[string]*TableSnapshot, len(live.Tables)),
+	}
+	for name, ts := range live.Tables {
+		if _, ok := declared.Tables[name]; ok {
+			out.Tables[name] = ts
+		}
+	}
+	return out
 }
 
 // excerptSQL trims a statement to a short single-line form for error

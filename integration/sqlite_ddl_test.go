@@ -3,6 +3,7 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -262,4 +263,190 @@ func TestKeysetPaginationWalksEveryRowOnce(t *testing.T) {
 	}
 	_ = label
 	_ = time.Now
+}
+
+// SQLite's grammar reaches OFFSET only through LIMIT, so a query that
+// sets an offset and no limit has to carry one anyway. Rendering shows
+// nothing wrong; the engine rejects it outright.
+func TestOffsetWithoutLimitIsAcceptedByTheEngine(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	tbl := sqlite.NewTable("rows")
+	id := sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey().AutoIncrement())
+	sqlite.Add(tbl, sqlite.Text("label").NotNull())
+	exec(t, db, sqlite.CreateTable(tbl))
+
+	type row struct {
+		ID    int64
+		Label string
+	}
+	ent := sqlite.NewEntity[row](tbl)
+	for _, l := range []string{"a", "b", "c"} {
+		r := row{Label: l}
+		if err := ent.Create(db, ctx, &r); err != nil {
+			t.Fatalf("seed %q: %v", l, err)
+		}
+	}
+
+	var got []row
+	sel := db.Select().From(tbl).OrderBy(id.Asc()).Offset(1)
+	if err := sel.All(ctx, &got); err != nil {
+		text, args := drops.StringWithDialect(sqlite.Dialect, sel)
+		t.Fatalf("SQLite rejected an offset without a limit: %v\n%s\nargs: %v", err, text, args)
+	}
+	if len(got) != 2 || got[0].Label != "b" {
+		t.Errorf("offset 1 returned %+v", got)
+	}
+}
+
+// CreateMany renders one multi-row INSERT, and a row whose key the
+// caller left zero binds one fewer column than a row that set it. The
+// two shapes cannot share a VALUES list, and the engine is the only
+// thing that says so.
+func TestCreateManyWithMixedKeysIsAcceptedByTheEngine(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	tbl := sqlite.NewTable("accounts")
+	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey().AutoIncrement())
+	sqlite.Add(tbl, sqlite.Text("name").NotNull())
+	sqlite.Add(tbl, sqlite.Text("role").NotNull().Default("'member'"))
+	exec(t, db, sqlite.CreateTable(tbl))
+
+	type account struct {
+		ID   int64
+		Name string
+		Role string
+	}
+	ent := sqlite.NewEntity[account](tbl)
+	if _, err := ent.CreateMany(db, ctx, []account{
+		{Name: "generated"},
+		{ID: 42, Name: "explicit"},
+		{Name: "promoted", Role: "admin"},
+	}); err != nil {
+		t.Fatalf("CreateMany with mixed keys: %v", err)
+	}
+
+	all, err := ent.Query(db).All(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("inserted %d rows, want 3", len(all))
+	}
+	byName := map[string]account{}
+	for _, a := range all {
+		byName[a.Name] = a
+	}
+	if byName["generated"].ID == 0 {
+		t.Error("the zero key was written through instead of being generated")
+	}
+	if byName["explicit"].ID != 42 {
+		t.Errorf("the explicit key did not survive: %+v", byName["explicit"])
+	}
+	// A column a row left zero must still land on its declared
+	// default, exactly as it would had the row been inserted alone.
+	if byName["generated"].Role != "member" {
+		t.Errorf("default not applied to the widened row: %+v", byName["generated"])
+	}
+	if byName["promoted"].Role != "admin" {
+		t.Errorf("an explicit value was overwritten by the default: %+v", byName["promoted"])
+	}
+}
+
+// A cursor is built to travel through a query string, so its bytes are
+// the client's. A malformed one renders as a false predicate carrying
+// the decode error inside a block comment — and the error quotes the
+// cursor's own type tag, so a tag holding "*/" used to close the
+// comment and leave the rest of it standing as SQL.
+func TestMaliciousCursorCannotEscapeItsComment(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	tbl := sqlite.NewTable("posts")
+	id := sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(tbl, sqlite.Text("body").NotNull())
+	exec(t, db, sqlite.CreateTable(tbl))
+
+	type post struct {
+		ID   int64
+		Body string
+	}
+	ent := sqlite.NewEntity[post](tbl)
+	secret := post{ID: 1, Body: "secret"}
+	if err := ent.Create(db, ctx, &secret); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := sqlite.NewCursorSpec(sqlite.OrderKey{Col: id})
+	// Two paths quote the client's own bytes back into the error: an
+	// unknown type tag, and a "t" value that time.Parse rejects.
+	for name, payload := range map[string]string{
+		"unknown tag":  `{"v":[{"t":"*/ OR 1=1 --","v":null}]}`,
+		"bad RFC 3339": `{"v":[{"t":"t","v":"*/ OR 1=1 --"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			hostile := sqlite.Cursor(base64.RawURLEncoding.EncodeToString([]byte(payload)))
+			sel := db.Select().From(tbl).OrderByCursor(spec).AfterCursor(spec, hostile)
+			text, _ := drops.StringWithDialect(sqlite.Dialect, sel)
+			var got []post
+			if err := sel.All(ctx, &got); err != nil {
+				t.Fatalf("the guarded query did not run at all: %v\n%s", err, text)
+			}
+			if len(got) != 0 {
+				t.Errorf("a hostile cursor matched %d row(s); the guard was escaped:\n%s", len(got), text)
+			}
+		})
+	}
+}
+
+// Two rows can bind the same *number* of columns and still bind
+// different ones: a row that sets its key but leaves a defaulted column
+// zero binds (id, name), while a row that omits its key but sets that
+// column binds (name, role). The engine cannot object — the tuples are
+// the same width — so the values land under the wrong column names.
+func TestCreateManyWithEquallyWideButDifferentRows(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	tbl := sqlite.NewTable("members")
+	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey().AutoIncrement())
+	sqlite.Add(tbl, sqlite.Text("name").NotNull())
+	sqlite.Add(tbl, sqlite.Text("role").NotNull().Default("'member'"))
+	exec(t, db, sqlite.CreateTable(tbl))
+
+	type member struct {
+		ID   int64
+		Name string
+		Role string
+	}
+	ent := sqlite.NewEntity[member](tbl)
+	if _, err := ent.CreateMany(db, ctx, []member{
+		{Name: "generated", Role: "admin"},
+		{ID: 7, Name: "explicit"},
+	}); err != nil {
+		t.Fatalf("CreateMany: %v", err)
+	}
+
+	all, err := ent.Query(db).All(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]member{}
+	for _, m := range all {
+		byName[m.Name] = m
+	}
+	if _, ok := byName["explicit"]; !ok {
+		t.Fatalf("the second row was written under the wrong columns: %+v", all)
+	}
+	if byName["explicit"].ID != 7 {
+		t.Errorf("the explicit key did not reach the id column: %+v", byName["explicit"])
+	}
+	if byName["explicit"].Role != "member" {
+		t.Errorf("the unset column did not fall back to its default: %+v", byName["explicit"])
+	}
+	if byName["generated"].Role != "admin" {
+		t.Errorf("an explicit value was lost: %+v", byName["generated"])
+	}
 }

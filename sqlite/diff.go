@@ -174,13 +174,38 @@ func rebuildTable(prev, cur *TableSnapshot, reason string) []string {
 
 // columnAddable reports whether an added column can be introduced with
 // ALTER TABLE ADD COLUMN. SQLite forbids adding a PRIMARY KEY or UNIQUE
-// column, a NOT NULL column without a default, or (here, conservatively)
-// a column that is the source of a foreign key.
+// column, a NOT NULL column without a default, a column whose default is
+// not a constant, or (here, conservatively) a column that is the source
+// of a foreign key.
 func columnAddable(c *ColumnSnapshot, hasFK bool) bool {
 	if c.PrimaryKey || c.Unique || hasFK {
 		return false
 	}
 	if c.NotNull && c.Default == nil {
+		return false
+	}
+	if c.Default != nil && !constantDefault(*c.Default) {
+		return false
+	}
+	return true
+}
+
+// constantDefault reports whether d is a default SQLite will accept on
+// ALTER TABLE ADD COLUMN.
+//
+// The value has to be a constant there: CURRENT_TIME, CURRENT_DATE,
+// CURRENT_TIMESTAMP and any parenthesised expression are rejected with
+// "Cannot add a column with non-constant default". A CREATE TABLE takes
+// all of them, so a column carrying one reaches the table through a
+// rebuild instead. This is the same shape AnalyzeMigration's
+// add-column-dynamic-default rule warns about after the fact.
+func constantDefault(d string) bool {
+	t := strings.TrimSpace(d)
+	if strings.HasPrefix(t, "(") {
+		return false
+	}
+	switch strings.ToUpper(t) {
+	case "CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP":
 		return false
 	}
 	return true

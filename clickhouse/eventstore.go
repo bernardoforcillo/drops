@@ -247,8 +247,14 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 // LatestVersion returns the highest version recorded for the stream,
 // or -1 when the stream is empty. Use this before Append to compute
 // the expectedVersion for a fresh write.
+//
+// The aggregate is maxOrNull, not max: ClickHouse answers an
+// aggregate over an empty set with the return type's default rather
+// than NULL, so a plain max("version") reports 0 for a stream that
+// has never been written and Append's expectedVersion of -1 then
+// looks like a concurrency conflict.
 func (s *EventStore) LatestVersion(ctx context.Context, aggregateType, aggregateID string) (int64, error) {
-	sql := fmt.Sprintf(`SELECT coalesce(max("version"), -1) FROM %s WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(s.table))
+	sql := fmt.Sprintf(`SELECT coalesce(maxOrNull("version"), -1) FROM %s WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
 	if err != nil {
 		return -1, err

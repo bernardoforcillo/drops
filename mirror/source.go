@@ -19,6 +19,30 @@ import (
 //
 // A Fetch that returns no changes means "nothing right now"; the pump
 // waits and asks again.
+//
+// # What a source owes the version column
+//
+// A mirror keeps the highest [Change.Version] per key and discards
+// everything below it, so the order a source stamps is the order the
+// mirror is stuck with. A source that has a sequence number for its
+// committed changes — an outbox id, an LSN, a binlog position —
+// should map it through [LiveVersion] and hand that over;
+// [OutboxSource] does, and that is what makes it the supported
+// source.
+//
+// A source that has no such number cannot offer the guarantee, and
+// this package would rather say so than fake it. Leave Version at
+// zero and the [Pump] falls back to [ClockVersion], which orders the
+// stream only as well as the clocks of the hosts that wrote it agree
+// — two updates to one key a millisecond apart from two hosts a few
+// milliseconds out of step will be applied in the wrong order, and
+// the mirror will keep the older value with nothing to report it.
+// Because that band sits below the live one, such a source is safe
+// to run alongside a sequenced one (the sequenced change always
+// wins) and safe to reseed over, but a mirror fed only by it has
+// approximate freshness rather than fidelity. Do not paper over it
+// by inventing a version: a number that is not derived from the
+// source's own commit order is a guess with a tie-break attached.
 type Source interface {
 	Fetch(ctx context.Context, max int) (changes []Change, commit func(context.Context) error, err error)
 }
@@ -38,6 +62,19 @@ const EventKind = "drops.mirror.change"
 // was committed. That is the guarantee a trigger-and-NOTIFY feed
 // cannot give.
 //
+// The change's version is not the caller's to set, and a non-zero
+// [Change.Version] is refused here rather than quietly overridden at
+// drain. The row this INSERT is about to write carries the number
+// that orders it — the outbox id — and [OutboxSource] stamps it on
+// the way out; see the package doc's "Versions" section. A version
+// the emitter chose comes from some other space (a clock, a row's
+// updatedAt, a counter) and is not comparable with an id, so an
+// application that set it on some paths and not others would have
+// two spaces racing in one mirror. That is the defect this package
+// used to ship: EmitChange stamped the wall clock, the id was never
+// reached, and two hosts a few milliseconds apart inverted two
+// updates a millisecond apart.
+//
 //	err := db.InTx(ctx, func(tx *pg.DB) error {
 //	    if err := Docs.Update(tx, ctx, &doc); err != nil {
 //	        return err
@@ -55,7 +92,17 @@ func EmitChange(ob *pg.Outbox, tx *pg.DB, ctx context.Context, ch Change) error 
 	if err := ch.Validate(); err != nil {
 		return err
 	}
-	ch = ch.Normalized(time.Now())
+	if ch.Version != 0 {
+		return fmt.Errorf("drops/mirror: EmitChange: change for key %s carries Version %d, but an outbox change is ordered by its event id — leave Version zero and OutboxSource stamps it at drain",
+			ch.Key, ch.Version)
+	}
+	// At is filled here and the version deliberately is not: this is
+	// the emitter's reading of when the mutation happened, which a
+	// sink may want, while the ordering comes from the id the INSERT
+	// below is about to be assigned.
+	if ch.At.IsZero() {
+		ch.At = time.Now()
+	}
 	return ob.EmitWith(tx, ctx, EventKind, ch, pg.EmitOptions{
 		// Per-aggregate ordering keeps two changes to the same row
 		// in the order they were written, which is what lets a sink
@@ -71,6 +118,15 @@ func EmitChange(ob *pg.Outbox, tx *pg.DB, ctx context.Context, ch Change) error 
 // acknowledges only after the sinks have accepted a batch — see the
 // package doc for why the LISTEN/NOTIFY changefeed is not a
 // substitute.
+//
+// It is also the only source in this package that can version a
+// change properly. The outbox id is a BigSerial in the same database
+// as the rows being mirrored, so it is skew-free and totally
+// ordered, and an emitter that mutates a row and emits in one
+// transaction gets ids in commit order per key: a second writer of
+// that row waits on its lock until the first commits, so it cannot
+// take an id ahead of it. Fetch maps that id into the live band with
+// [LiveVersion].
 type OutboxSource struct {
 	ob *pg.Outbox
 }
@@ -107,11 +163,17 @@ func (s *OutboxSource) Fetch(ctx context.Context, max int) ([]Change, func(conte
 		if err := json.Unmarshal(e.Payload, &ch); err != nil {
 			return nil, nil, fmt.Errorf("drops/mirror: outbox event %d: %w", e.ID, err)
 		}
-		if ch.Version == 0 {
-			// The outbox id is monotonic, which is exactly the
-			// ordering guarantee a version column needs.
-			ch.Version = uint64(e.ID)
-		}
+		// The event id is the version, unconditionally — see
+		// [LiveVersion] for why it is the right number and the
+		// package doc for why it is offset into the live band rather
+		// than used raw. Any version in the payload predates this
+		// rule (or comes from an emitter that ignored EmitChange's
+		// refusal) and is in a space that cannot be compared with the
+		// ids around it, so it is replaced rather than honoured: two
+		// changes to one key must be ordered by the same yardstick or
+		// the mirror keeps whichever happened to be measured in the
+		// larger unit.
+		ch.Version = LiveVersion(e.ID)
 		if ch.At.IsZero() {
 			ch.At = e.CreatedAt
 		}

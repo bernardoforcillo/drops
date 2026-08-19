@@ -103,10 +103,15 @@ func TestOutboxSourceDecodesChanges(t *testing.T) {
 	if !changes[1].IsDelete() {
 		t.Errorf("second change should be a delete: %+v", changes[1])
 	}
-	// The outbox id is monotonic, which is exactly what the version
-	// column needs when the emitter did not set one.
-	if changes[0].Version != 1 || changes[1].Version != 2 {
-		t.Errorf("versions = %d, %d; want the outbox ids 1, 2", changes[0].Version, changes[1].Version)
+	// The outbox id is the version: one sequence in one database,
+	// handed out in commit order per key, lifted into the live band
+	// so a reseed has room below it.
+	if changes[0].Version != mirror.LiveVersion(1) || changes[1].Version != mirror.LiveVersion(2) {
+		t.Errorf("versions = %d, %d; want the outbox ids 1, 2 in the live band (%d, %d)",
+			changes[0].Version, changes[1].Version, mirror.LiveVersion(1), mirror.LiveVersion(2))
+	}
+	if changes[0].Version < mirror.LiveVersionBase {
+		t.Errorf("version %d is below the live band, so a seed could outrank it", changes[0].Version)
 	}
 	if commit == nil {
 		t.Fatal("Fetch returned no commit function")
@@ -119,11 +124,18 @@ func TestOutboxSourceDecodesChanges(t *testing.T) {
 	}
 }
 
-// An explicit version from the emitter beats the outbox id.
-func TestOutboxSourceKeepsExplicitVersion(t *testing.T) {
+// A version in the payload is not honoured: it comes from a space
+// that cannot be compared with the ids around it, and a mirror fed by
+// two spaces keeps whichever was measured in the larger unit. Events
+// written before EmitChange started refusing one arrive this way, so
+// the drain has to be the backstop.
+func TestOutboxSourceOverridesAPayloadVersion(t *testing.T) {
 	d := &outboxDriver{rows: func() drops.Rows {
 		return &outboxRows{data: [][]any{
 			event(5, mirror.EventKind, mirror.Change{Op: mirror.OpUpdate, Key: "1", Version: 99}),
+			// A stale wall-clock stamp of the kind this package used
+			// to write. Left alone it would outrank every id.
+			event(6, mirror.EventKind, mirror.Change{Op: mirror.OpUpdate, Key: "1", Version: uint64(time.Now().UnixNano())}),
 		}}
 	}}
 	src, _ := mirror.NewOutboxSource(pg.NewOutbox(pg.New(d), "outbox"))
@@ -131,8 +143,48 @@ func TestOutboxSourceKeepsExplicitVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changes[0].Version != 99 {
-		t.Errorf("Version = %d, want the emitter's 99", changes[0].Version)
+	if changes[0].Version != mirror.LiveVersion(5) {
+		t.Errorf("Version = %d, want the event id 5 in the live band (%d), not the emitter's 99", changes[0].Version, mirror.LiveVersion(5))
+	}
+	if changes[1].Version != mirror.LiveVersion(6) {
+		t.Errorf("Version = %d, want the event id 6 in the live band (%d), not a clock stamp", changes[1].Version, mirror.LiveVersion(6))
+	}
+	if changes[1].Version <= changes[0].Version {
+		t.Errorf("event 6 (%d) must outrank event 5 (%d): the ids are the order", changes[1].Version, changes[0].Version)
+	}
+}
+
+// The version belongs to the outbox, so an emitter that sets one is
+// stopped at the call site — inside its own transaction, where the
+// mistake is cheap — rather than having it silently replaced at drain
+// or, worse, honoured.
+func TestEmitChangeRefusesAPresetVersion(t *testing.T) {
+	d := &outboxDriver{}
+	ob := pg.NewOutbox(pg.New(d), "outbox")
+	err := mirror.EmitChange(ob, pg.New(d), context.Background(), mirror.Change{
+		Op: mirror.OpUpdate, Key: "7", Version: uint64(time.Now().UnixNano()),
+	})
+	if err == nil {
+		t.Fatal("expected EmitChange to refuse a change that came with its own version")
+	}
+	for _, want := range []string{"Version", "7"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %q, got %v", want, err)
+		}
+	}
+	if len(d.execs) != 0 {
+		t.Errorf("nothing should have been written to the outbox, got %v", d.execs)
+	}
+
+	// The version is the only thing refused: At is the emitter's to
+	// state, and a change that leaves both alone is written.
+	if err := mirror.EmitChange(ob, pg.New(d), context.Background(), mirror.Change{
+		Op: mirror.OpUpdate, Key: "7", At: time.Unix(1700000000, 0),
+	}); err != nil {
+		t.Fatalf("EmitChange with an explicit At: %v", err)
+	}
+	if len(d.execs) != 1 {
+		t.Fatalf("expected one outbox insert, got %d", len(d.execs))
 	}
 }
 

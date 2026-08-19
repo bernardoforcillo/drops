@@ -43,6 +43,12 @@ type recSink struct {
 }
 
 func (s *recSink) Name() string { return s.name }
+
+// Version-aware, so it can stand in for ClickHouse as a fill-reseed
+// target. It records rather than deduplicates; what the declaration
+// buys these tests is the constructor check, and the ordering the
+// declaration promises is asserted on the versions it recorded.
+func (s *recSink) VersionAware() bool { return true }
 func (s *recSink) Apply(_ context.Context, c []mirror.Change) error {
 	if s.failFor > 0 {
 		s.failFor--

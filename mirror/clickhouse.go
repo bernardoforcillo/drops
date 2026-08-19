@@ -325,6 +325,25 @@ func NewClickHouseSink(db *clickhouse.DB, t *clickhouse.Table) (*ClickHouseSink,
 
 func (s *ClickHouseSink) Name() string { return "clickhouse:" + s.table.Name() }
 
+// VersionAware reports true: this sink is a [VersionAwareSink].
+//
+// It does not compare anything itself — it appends, and the engine
+// resolves. ReplacingMergeTree keyed on [VersionColumn] keeps the
+// highest version per sorting key and drops the rest at merge time,
+// and a FINAL read applies the same rule before the merge has
+// happened, so a change written with a version below the stored one
+// is inert. That is what makes this sink a legal target for a
+// fill-mode reseed, which writes outside the ordered stream.
+//
+// The claim rests on the engine [DeriveClickHouse] gives the derived
+// table. Override it with [WithEngine] — a plain MergeTree for an
+// insert-only table, say — and nothing deduplicates: every write
+// survives, so a fill would add a second row for a key that already
+// has one, and a replayed batch would duplicate rows the same way.
+// WithEngine's doc says as much; it is repeated here because this is
+// the promise that breaks.
+func (s *ClickHouseSink) VersionAware() bool { return true }
+
 // Apply inserts the batch as one statement.
 func (s *ClickHouseSink) Apply(ctx context.Context, changes []Change) error {
 	if len(changes) == 0 {

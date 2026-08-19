@@ -78,6 +78,26 @@ func NewQdrantSink(cli *qdrant.Client, collection string, embed Embedder, opts .
 
 func (s *QdrantSink) Name() string { return "qdrant:" + s.collection }
 
+// VersionAware reports false: this sink ignores [Change.Version], and
+// is therefore not a [VersionAwareSink].
+//
+// It is not an omission. Qdrant's upsert overwrites a point whole and
+// takes no condition on what that point already holds — there is no
+// "upsert if the stored payload's version is lower", and no
+// compare-and-set to build one out of. Reading the point first and
+// deciding in Go would be a race with the next writer, which is worse
+// than not pretending.
+//
+// So this sink is correct exactly as far as the order it is applied
+// in is correct: the [Pump] delivers changes in outbox id order, and
+// the last write for a key wins because it arrived last. Everything
+// that writes to Qdrant has to go through that stream — which is why
+// [NewFillReseeder] refuses this sink, and why seeding a collection
+// after the fact is [NewRepairReseeder]'s job: a repair emits into
+// the outbox behind a row lock, so a writer racing the seed is
+// delivered after it rather than being overwritten by it.
+func (s *QdrantSink) VersionAware() bool { return false }
+
 // Apply writes the batch.
 //
 // Changes are applied in runs of the same kind rather than split into

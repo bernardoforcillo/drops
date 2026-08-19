@@ -4,35 +4,54 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
 )
 
-// SeedVersion is the version [NewFillReseeder] stamps on every row it
-// writes. It is the smallest version a change can carry, and that is
-// the whole point: a filled row has to lose every race it is in.
+// seedPass is the highest seed version this process has handed out.
 //
-// The mirror keeps the highest version per key and nothing else, so
-// the only safe floor is one below every version the live stream can
-// produce. Both version spaces the pipeline can be running in are
-// above it: the outbox event id (drops' outbox key is a BigSerial)
-// and the nanosecond stamp [Change.Normalized] falls back to. A
-// filled row therefore loses to every live change for its key —
-// applied already or still queued in the outbox — and wins only where
-// there is no live row at all, which is exactly the set of keys a
-// fill is meant to cover.
-//
-// The one value the two spaces share is outbox id 1, the first event
-// ever emitted against that outbox. A fill that races that single
-// event leaves ReplacingMergeTree free to pick either row; if a table
-// is mirrored from its very first write, seed it before the outbox
-// has an event in it, or repair it instead of filling it.
-const SeedVersion uint64 = 1
+// A pass takes the millisecond count of the moment it started (see
+// [SeedVersionAt]), which orders passes across restarts and across
+// machines as far as their clocks agree. This counter orders the case
+// the clock cannot: two passes that start inside one millisecond, as
+// a script that fills ten tables in a row will do, and as a test
+// will do every time.
+var seedPass atomic.Uint64
 
-// reseedMode selects which of the two legal seed versions a
-// [Reseeder] uses. It is unexported because the choice is made by
+// nextSeedVersion allocates the version one fill pass stamps on every
+// row it writes.
+//
+// It is the clock reading, or one above the previous pass when the
+// clock has not moved — or has moved backwards, which is the whole
+// reason the previous value is remembered rather than trusted. The
+// result never leaves the seed band, so however the clock behaves,
+// nothing allocated here can outrank a change the stream carried.
+func nextSeedVersion(now time.Time) uint64 {
+	for {
+		want := SeedVersionAt(now)
+		prev := seedPass.Load()
+		if want <= prev {
+			want = prev + 1
+		}
+		if want > MaxSeedVersion {
+			// A millisecond count reaches the top of the band in the
+			// year 2527, so this is unreachable in practice.
+			// Clamping rather than wrapping keeps the failure mode
+			// "a later pass cannot overwrite an earlier one" instead
+			// of "a seed outranks live traffic".
+			want = MaxSeedVersion
+		}
+		if seedPass.CompareAndSwap(prev, want) {
+			return want
+		}
+	}
+}
+
+// reseedMode selects which of the two legal ways a seeded row is
+// versioned. It is unexported because the choice is made by
 // picking a constructor — a mode that could be flipped afterwards
 // would force every option to document what it means in the other
 // mode, and the choice is too load-bearing to be a setter.
@@ -70,33 +89,50 @@ func (m reseedMode) String() string {
 // silently repairs nothing. Two choices are defensible and this
 // package offers a constructor for each.
 //
-// [NewFillReseeder] stamps [SeedVersion] and writes straight to the
-// sinks. Every seeded row loses to every live change, so a fill can
-// only populate keys the stream never covered. It cannot correct a
-// wrong value, and it cannot damage a right one.
+// [NewFillReseeder] stamps a version from the seed band — see
+// [SeedVersionAt] — and writes straight to the sinks. The band lies
+// below every version the change stream can produce, so every seeded
+// row loses to every live change and a fill can only populate keys
+// the stream never covered. It cannot correct a wrong value, and it
+// cannot damage a right one. Each pass draws its own version, above
+// the last, so a fill that has to be re-run overwrites its own
+// earlier answer instead of tying with it: two rows for one key at
+// equal versions is the one case ReplacingMergeTree cannot resolve,
+// and it would make a FINAL read stop being a function of the key.
 //
 // [NewRepairReseeder] emits the row into the outbox instead, inside
 // the chunk transaction and after locking the row FOR SHARE. The seed
-// is then an ordinary change carrying an ordinary version: it beats
-// every mirror row written before it, and loses to any writer racing
-// it, because that writer blocks on the row lock and emits after the
-// seed does. This is the only mode that can overwrite a wrong value.
-// It costs a full pass through the outbox and every sink — Qdrant
-// re-embeds every row it sees.
+// is then an ordinary change carrying an ordinary version — the
+// outbox id, in the live band: it beats every mirror row written
+// before it, and loses to any writer racing it, because that writer
+// blocks on the row lock and so takes its id after the seed does.
+// This is the only mode that can overwrite a wrong value. It costs a
+// full pass through the outbox and every sink — Qdrant re-embeds
+// every row it sees.
 //
 // The third option is the one to refuse: stamping the seed with the
 // reseeder's own clock, "now". A change that commits after the seed
 // read the row may carry a lower stamp, because it was emitted before
 // the seed took its reading. The seed then wins, the row is stale
-// forever, and nothing reports it. Any version this type invents for
-// itself has that defect; the two modes above work precisely because
-// neither invents one.
+// forever, and nothing reports it. The bands narrow the blast radius
+// — a clock reading cannot reach the live band, so it could not
+// revert a sequenced change — but they do not make the option sound:
+// rows written by a clock-stamped [Source], and every row a mirror
+// carried over from before the bands existed, are in the clock band
+// too, and a seed that invented a stamp would outrank them without
+// ever having been ordered against them. The two modes above work
+// precisely because neither invents a version.
 //
 // # Running against a live mirror
 //
 // A fill is safe next to live writers and a running [Pump], with no
 // coordination: its rows lose to everything the stream carries, in
-// either arrival order.
+// either arrival order. "Lose" is the sink's verb, not the
+// reseeder's — a fill hands a sink a low-versioned change and relies
+// on it to discard it, so [NewFillReseeder] accepts only sinks that
+// declare themselves [VersionAwareSink]. Against a sink that ignores
+// the version there is no safety argument at all, only an unlocked
+// read racing the pump.
 //
 // A repair is safe next to live writers, and needs a running Pump —
 // it writes to the outbox and nothing else, so nothing reaches a sink
@@ -107,14 +143,14 @@ func (m reseedMode) String() string {
 // name interleave chunks and corrupt the cursor, and two runs under
 // two names do the work twice. Serialise them.
 //
-// Repair inherits the version its change is stamped with by
-// [EmitChange], the same stamp every live change gets. That is
-// deliberate: a seed is ordered against live writers by the same rule
-// live writers are ordered against each other, and if that rule is
-// weak — a wall clock across hosts is not monotonic with commit order
-// — the seed is no worse than the traffic around it. Fixing that
-// belongs in the emitter, not here, and papering over it with a
-// version chosen locally is the third option this type refuses.
+// Repair inherits the version every live change gets: the id its
+// outbox row is assigned, stamped by [OutboxSource] at drain. That is
+// deliberate, and it is what makes the FOR SHARE lock enough. A seed
+// is ordered against live writers by the same rule live writers are
+// ordered against each other, and that rule is the sequence: a writer
+// that wants a row the chunk holds waits for the chunk transaction,
+// so it takes a later id and is applied after the seed. Nothing here
+// invents a version, which is the third option this type refuses.
 //
 // # Resuming
 //
@@ -127,9 +163,26 @@ func (m reseedMode) String() string {
 // [github.com/bernardoforcillo/drops/pg.NewBackfillStateTable].
 //
 // A chunk that fails leaves the cursor where it was, so the chunk is
-// replayed on the next run. Replay re-reads the same rows and stamps
-// them the same way, which is the same idempotence every [Sink]
-// already owes the pump.
+// replayed on the next run. The cursor moves only after the chunk
+// transaction has committed, and it moves to the last key of that
+// chunk and no further — a failure anywhere in a chunk, including in
+// the third of three sinks, leaves it at the last key a committed
+// chunk covered. What a failed chunk does not undo is a sink that
+// already accepted the batch: in fill mode the sink writes leave the
+// database, and nothing rolls a ClickHouse insert back because a
+// later statement in the chunk failed. So a failed chunk can leave
+// the first sink holding rows the second one never saw, and the
+// replay is what closes that gap.
+//
+// The replay is not the same write twice:
+// it re-reads the rows as they are now, and a row that changed in
+// between — through a path that never emitted a change, which is why
+// the table needed a reseed in the first place — comes back with
+// different content. That is why a fill draws a fresh version per
+// pass rather than a constant. The replay's rows outrank the ones the
+// failed pass managed to write, so the mirror converges on the later
+// read instead of holding two rows at one version and letting the
+// merge pick.
 //
 // # Deletes
 //
@@ -162,6 +215,13 @@ type Reseeder struct {
 	sinks []Sink
 	ob    *pg.Outbox
 
+	// pass is the seed version of the run in progress, allocated by
+	// Run. Held on the reseeder rather than threaded through the
+	// chunk loop because pg.Backfill's Process signature is fixed;
+	// safe because a Reseeder walks one chunk at a time and two
+	// concurrent runs of one table are already forbidden.
+	pass uint64
+
 	name       string
 	stateTable string
 	chunkSize  int
@@ -173,17 +233,41 @@ type Reseeder struct {
 }
 
 // NewFillReseeder returns a [Reseeder] that writes rows straight to
-// the sinks at [SeedVersion], bypassing the outbox and the [Pump].
+// the sinks in the seed band, bypassing the outbox and the [Pump].
 //
 // Use it to populate a mirror that is empty or has holes: a new
-// ClickHouse table, a Qdrant collection built after the fact, a
-// mirror whose outbox was truncated before a sink caught up. It fills
-// what is missing and overwrites nothing, so it is safe to run
-// against a live mirror with writers and a pump both going.
+// ClickHouse table, a mirror whose outbox was truncated before a sink
+// caught up. It fills what is missing and overwrites nothing the
+// change stream wrote, so it is safe to run against a live mirror
+// with writers and a pump both going. The one thing a pass does
+// overwrite is what an earlier pass of its own left behind: seed
+// versions increase from pass to pass, on purpose, so a re-run
+// replaces its predecessor's answer instead of tying with it.
 //
 // It cannot correct a row that is present but wrong — that row's
-// version is in the live space and beats [SeedVersion] every time.
-// Use [NewRepairReseeder] when a value has to be overwritten.
+// version is in the live band and beats a seed every time. Use
+// [NewRepairReseeder] when a value has to be overwritten.
+//
+// # Only version-aware sinks
+//
+// Every sink must implement [VersionAwareSink] and answer yes, and a
+// sink that does not is refused here rather than at 3am. The whole
+// safety argument for writing outside the ordered stream is the
+// version: the walk deliberately takes no row lock, so a chunk can
+// read a row, the application can update it, the pump can deliver
+// that update, and the chunk can then hand the sink the pre-image —
+// out of order, on purpose, because the sink is supposed to drop it.
+// A sink that ignores the version accepts it instead, and there is
+// nothing left to repair the damage: no future change mentions that
+// key, so the mirror holds the old value for good. Where the change
+// the fill raced was a delete, a version-blind sink resurrects a row
+// that no longer exists at the source.
+//
+// [QdrantSink] is refused for exactly this reason — Qdrant has no
+// conditional upsert to build the check out of. Seed a collection
+// with [NewRepairReseeder], which is ordered by delivery rather than
+// by comparison, or wrap the sink in something that does the
+// comparison itself and declares it.
 //
 // The sinks are applied in order and the chunk stops at the first one
 // that fails, for the same reason [Pump.Step] does: the chunk will be
@@ -200,6 +284,10 @@ func NewFillReseeder(db *pg.DB, src *pg.Table, sinks ...Sink) (*Reseeder, error)
 	for i, s := range sinks {
 		if s == nil {
 			return nil, fmt.Errorf("drops/mirror: NewFillReseeder sink %d is nil", i)
+		}
+		if !sinkHonoursVersion(s) {
+			return nil, fmt.Errorf("drops/mirror: NewFillReseeder cannot fill through sink %d (%s): a fill writes seeded rows outside the ordered stream and relies on the sink to discard the ones a live change has already superseded, which only a VersionAwareSink does; use NewRepairReseeder to seed %q through the outbox instead",
+				i, s.Name(), src.Name())
 		}
 	}
 	r.sinks = sinks
@@ -403,7 +491,15 @@ func (r *Reseeder) Reset(ctx context.Context) error {
 // starting over — including when the failure was a sink refusing the
 // batch. Run on a job that already finished returns nil without
 // reading a row; call [Reseeder.Reset] first to walk it again.
+//
+// A fill draws its seed version here, so every row one Run writes
+// carries the same one and the next Run carries a higher one. That is
+// what orders a resumed walk, a replayed chunk and a second pass
+// against the rows an earlier pass left behind.
 func (r *Reseeder) Run(ctx context.Context) error {
+	if r.mode == reseedFill {
+		r.pass = nextSeedVersion(time.Now())
+	}
 	return r.backfill().Run(ctx)
 }
 
@@ -482,9 +578,11 @@ func (r *Reseeder) processChunk(ctx context.Context, tx *pg.DB, keys []int64) er
 		return err
 	}
 	if len(changes) == 0 {
-		// Every key in the chunk was deleted between the two reads.
-		// The deletes are in the change stream, so there is nothing
-		// to seed and nothing to report.
+		// Every key in the chunk went away between the two reads:
+		// deleted, or — where [Reseeder.Where] is in play — changed
+		// so that it no longer belongs in the mirror. Either way the
+		// change stream carries it, so there is nothing to seed and
+		// nothing to report, and the cursor may move past the chunk.
 		return nil
 	}
 	if r.mode == reseedRepair {
@@ -560,15 +658,27 @@ func (r *Reseeder) readRange(ctx context.Context, tx *pg.DB, lo, hi int64) ([]Ch
 }
 
 // seedVersion is the mode's version choice in one place, because it
-// is the decision the whole type exists to get right. Fill pins the
-// floor; repair leaves the field unset so the change is stamped by
-// the same emitter that stamps live traffic, and inherits its
-// ordering rather than inventing one.
+// is the decision the whole type exists to get right. Fill carries
+// this run's seed-band version; repair leaves the field unset, which
+// is what [EmitChange] requires, so the change is numbered by the
+// outbox exactly like live traffic and inherits its ordering instead
+// of inventing one.
+//
+// The fallback matters as much as the value: a repair that returned
+// anything non-zero here would be refused by EmitChange rather than
+// quietly landing below the rows it exists to overwrite.
 func (r *Reseeder) seedVersion() uint64 {
 	if r.mode == reseedRepair {
 		return 0
 	}
-	return SeedVersion
+	if r.pass == 0 {
+		// Run allocates the pass; this covers a chunk driven some
+		// other way, and keeps a fill from ever stamping zero, which
+		// Normalized would rewrite into the clock band and hand the
+		// seed a version above the rows it must lose to.
+		r.pass = nextSeedVersion(time.Now())
+	}
+	return r.pass
 }
 
 // keysSQL renders the cursor-advancing scan.

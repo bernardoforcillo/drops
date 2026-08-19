@@ -61,6 +61,27 @@ type reseedDriver struct {
 	// string, which is what a driver the reseeder cannot work with
 	// looks like from the inside.
 	keyAsText bool
+
+	// pred and excluded together model a WHERE the server actually
+	// applies: a statement whose SQL carries pred does not see the
+	// key excluded, and a statement that lost the predicate does.
+	// Asserting on the rendered text alone cannot tell those two
+	// apart, and the difference is a row seeded into a mirror the
+	// caller scoped it out of.
+	pred     string
+	excluded int64
+
+	// failOutboxNth refuses that emit, counting from one. It is what
+	// lets a repair fail in the middle of the walk rather than at its
+	// first statement.
+	failOutboxNth int
+	outboxCalls   int
+}
+
+// hides reports whether stmt is subject to the driver's predicate, in
+// which case the excluded key is not in its result.
+func (d *reseedDriver) hides(sql string) bool {
+	return d.pred != "" && strings.Contains(sql, d.pred)
 }
 
 type reseedStmt struct {
@@ -112,6 +133,9 @@ func (d *reseedDriver) Query(_ context.Context, sql string, args ...any) (drops.
 		limit := int(args[len(args)-1].(int64))
 		var data [][]any
 		for _, r := range d.rows {
+			if r.id == d.excluded && d.hides(sql) {
+				continue
+			}
 			if r.id > after && len(data) < limit {
 				data = append(data, []any{r.id})
 			}
@@ -126,6 +150,9 @@ func (d *reseedDriver) Query(_ context.Context, sql string, args ...any) (drops.
 		lo, hi := args[0].(int64), args[1].(int64)
 		var data [][]any
 		for _, r := range d.rows {
+			if r.id == d.excluded && d.hides(sql) {
+				continue
+			}
 			if r.id >= lo && r.id <= hi {
 				var key any = r.id
 				if d.keyAsText {
@@ -167,6 +194,14 @@ func (d *reseedDriver) Exec(_ context.Context, sql string, args ...any) (drops.R
 		d.state[name] = job
 	case strings.HasPrefix(strings.TrimSpace(sql), "DELETE"):
 		delete(d.state, args[0].(string))
+	case strings.Contains(sql, `INSERT INTO "outbox"`):
+		d.outboxCalls++
+		if d.outboxCalls == d.failOutboxNth {
+			// Recorded above before failing: the statement was
+			// issued, and a test that counts emits should see the
+			// attempt as well as where the walk stopped.
+			return nil, fmt.Errorf("outbox insert %d refused", d.outboxCalls)
+		}
 	}
 	return recResult{}, nil
 }
@@ -284,6 +319,37 @@ func newFill(t *testing.T, d *reseedDriver, sinks ...mirror.Sink) *mirror.Reseed
 	return r.ChunkSize(2).Throttle(0)
 }
 
+// chunkSink refuses one nominated batch and records the rest.
+//
+// recSink (pump_test.go) refuses the first n batches, which cannot
+// express "the sink took chunk one and refused chunk two" — and that
+// is the ordering that decides whether a committed chunk's cursor
+// survives a later failure, and whether a sink that already accepted
+// a batch sees the replay outrank it.
+type chunkSink struct {
+	name    string
+	failNth int // 1-based batch to refuse; 0 refuses nothing
+	calls   int
+	seen    [][]mirror.Change
+}
+
+func (s *chunkSink) Name() string { return s.name }
+
+// Version-aware so it can be a fill target at all. Like recSink it
+// records rather than deduplicates; what these tests assert is the
+// version it was handed, which is what a real version-aware sink
+// would compare.
+func (s *chunkSink) VersionAware() bool { return true }
+
+func (s *chunkSink) Apply(_ context.Context, c []mirror.Change) error {
+	s.calls++
+	if s.calls == s.failNth {
+		return fmt.Errorf("sink %s refused batch %d", s.name, s.calls)
+	}
+	s.seen = append(s.seen, append([]mirror.Change(nil), c...))
+	return nil
+}
+
 // --- fill mode -------------------------------------------------------
 
 func TestFillReseedSeedsEveryRowInKeyOrder(t *testing.T) {
@@ -320,41 +386,34 @@ func TestFillReseedSeedsEveryRowInKeyOrder(t *testing.T) {
 	}
 }
 
-func TestFillReseedStampsTheFloorVersion(t *testing.T) {
-	d := newReseedDriver(1, 2)
+// One pass, one version: every row a run seeds carries the same
+// seed-band value, so the pass is a unit and nothing inside it can
+// tie with anything else inside it. Where that version sits relative
+// to live traffic, and how two passes are ordered against each other,
+// is version_test.go's subject.
+func TestFillReseedStampsOneSeedBandVersionPerPass(t *testing.T) {
+	d := newReseedDriver(1, 2, 3)
 	sink := &recSink{name: "sink"}
 	if err := newFill(t, d, sink).Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	var first uint64
 	for _, b := range sink.seen {
 		for _, ch := range b {
-			if ch.Version != mirror.SeedVersion {
-				t.Errorf("key %s seeded at version %d, want SeedVersion (%d)", ch.Key, ch.Version, mirror.SeedVersion)
+			if ch.Version == 0 || ch.Version > mirror.MaxSeedVersion {
+				t.Errorf("key %s seeded at version %d, which is outside the seed band [1, %d]", ch.Key, ch.Version, mirror.MaxSeedVersion)
+			}
+			if first == 0 {
+				first = ch.Version
+				continue
+			}
+			if ch.Version != first {
+				t.Errorf("key %s seeded at %d but the pass started at %d; one pass must be one version", ch.Key, ch.Version, first)
 			}
 		}
 	}
-}
-
-// The ordering argument SeedVersion rests on: it must sit below every
-// version a live change can carry, and it must survive a trip through
-// Normalized — a zero would be rewritten into a clock reading and
-// would then outrank the stream it is supposed to lose to.
-func TestSeedVersionLosesToEveryLiveChange(t *testing.T) {
-	if mirror.SeedVersion == 0 {
-		t.Fatal("SeedVersion must be non-zero: Normalized treats 0 as unset and replaces it")
-	}
-	live := mirror.Change{Op: mirror.OpUpdate, Key: "1"}.Normalized(time.Now())
-	if live.Version <= mirror.SeedVersion {
-		t.Errorf("a clock-stamped live change is version %d, which does not beat the seed floor %d", live.Version, mirror.SeedVersion)
-	}
-	// The outbox id space starts at 1, so anything past the very first
-	// event outranks a seed too.
-	if mirror.SeedVersion > 1 {
-		t.Errorf("SeedVersion is %d, which outranks outbox event ids below it", mirror.SeedVersion)
-	}
-	seeded := mirror.Change{Op: mirror.OpInsert, Key: "1", Version: mirror.SeedVersion}.Normalized(time.Now())
-	if seeded.Version != mirror.SeedVersion {
-		t.Errorf("normalizing a seeded change moved it to %d", seeded.Version)
+	if first == 0 {
+		t.Fatal("nothing was seeded")
 	}
 }
 
@@ -418,9 +477,10 @@ func TestReseedResumesFromThePersistedCursor(t *testing.T) {
 }
 
 // A chunk the sinks refused must be replayed, not skipped: the cursor
-// stays where it was and the next run re-seeds the same keys with the
-// same versions, which is the idempotence every sink already owes the
-// pump.
+// stays where it was and the next run re-seeds the same keys. Not at
+// the same version — the replay re-reads the rows as they are now and
+// draws a fresh, higher seed version, which is what
+// TestReplayedChunkOutranksWhatTheFailedPassWrote pins.
 func TestReseedFailedChunkDoesNotAdvanceTheCursor(t *testing.T) {
 	d := newReseedDriver(1, 2, 3)
 	sink := &recSink{name: "sink", failFor: 1}
@@ -448,6 +508,90 @@ func TestReseedFailedChunkDoesNotAdvanceTheCursor(t *testing.T) {
 	}
 	if got := reseedChangeKeys(sink.seen); !reflect.DeepEqual(got, []string{"1", "2", "3"}) {
 		t.Errorf("replay seeded %v, want the whole table including the failed chunk", got)
+	}
+}
+
+// The failure that matters is not the one on the first chunk — that
+// one leaves the cursor at zero, which any implementation that never
+// writes the cursor at all would also do. A chunk that fails after an
+// earlier chunk committed has to leave the cursor exactly at the last
+// committed key: one key further and the failed chunk is skipped for
+// good, one key back and the committed one is seeded twice.
+func TestReseedCursorStaysAtTheLastCommittedChunk(t *testing.T) {
+	d := newReseedDriver(1, 2, 3, 4)
+	sink := &chunkSink{name: "clickhouse:docs", failNth: 2}
+	r := newFill(t, d, sink)
+	ctx := context.Background()
+
+	if err := r.Run(ctx); err == nil {
+		t.Fatal("expected the second chunk's failure to surface")
+	}
+	status, err := r.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.LastID != 2 {
+		t.Errorf("cursor at %d after chunk one committed and chunk two failed, want 2", status.LastID)
+	}
+	if status.Processed != 2 {
+		t.Errorf("processed = %d, want the two keys of the one chunk that committed", status.Processed)
+	}
+
+	if err := r.Run(ctx); err != nil {
+		t.Fatalf("resumed Run: %v", err)
+	}
+	if got := reseedChangeKeys(sink.seen); !reflect.DeepEqual(got, []string{"1", "2", "3", "4"}) {
+		t.Errorf("seeded %v across both runs, want each key exactly once", got)
+	}
+	if len(sink.seen) != 2 {
+		t.Errorf("the sink accepted %d batches, want one per chunk", len(sink.seen))
+	}
+}
+
+// A failed chunk is replayed in full, and a sink that already
+// accepted it keeps what it was given — nothing rolls a ClickHouse
+// insert back because a later sink in the same chunk refused. So the
+// replay has to outrank what the failed pass managed to write, or the
+// mirror holds two rows for one key at one version and the merge, not
+// the data, decides which one a FINAL read returns.
+func TestReplayedChunkOutranksWhatTheFailedPassWrote(t *testing.T) {
+	d := newReseedDriver(1, 2)
+	took := &chunkSink{name: "clickhouse:docs"}
+	refused := &chunkSink{name: "second:docs", failNth: 1}
+	r, err := mirror.NewFillReseeder(pg.New(d), reseedSourceTable(), took, refused)
+	if err != nil {
+		t.Fatalf("NewFillReseeder: %v", err)
+	}
+	r.ChunkSize(2).Throttle(0)
+	ctx := context.Background()
+
+	if err := r.Run(ctx); err == nil {
+		t.Fatal("expected the second sink's refusal to surface")
+	}
+	if len(took.seen) != 1 {
+		t.Fatalf("the first sink accepted %d batches, want the one it was handed before the second refused", len(took.seen))
+	}
+	first := took.seen[0][0].Version
+
+	// The row changed before the replay, through a path that emitted
+	// nothing — the reason the table needed a reseed at all. The
+	// replay therefore carries different content for the same key.
+	d.rows[0].title = "changed by a path that never emitted"
+	if err := r.Run(ctx); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(took.seen) != 2 {
+		t.Fatalf("the replay handed the first sink %d batches in total, want 2", len(took.seen))
+	}
+	replay := took.seen[1][0]
+	if replay.Key != "1" || replay.Row["title"] != "changed by a path that never emitted" {
+		t.Errorf("replay seeded %+v, want key 1 as it now reads", replay)
+	}
+	if replay.Version <= first {
+		t.Errorf("replay seeded key 1 at %d, the failed pass at %d: the later read must outrank the earlier one", replay.Version, first)
+	}
+	if replay.Version > mirror.MaxSeedVersion {
+		t.Errorf("replay seeded at %d, outside the seed band, so it can outrank live changes", replay.Version)
 	}
 }
 
@@ -564,11 +708,14 @@ func TestRepairReseedEmitsThroughTheOutbox(t *testing.T) {
 	if ch.Row["title"] != "doc-1" {
 		t.Errorf("payload row = %v, want the whole row", ch.Row)
 	}
-	// The repair takes whatever version the emitter stamps on live
-	// traffic. Stamping the seed floor here would sort the repair
-	// below the stale rows it exists to overwrite.
-	if ch.Version == mirror.SeedVersion {
-		t.Error("a repair must not carry the fill floor version")
+	// The repair is numbered by the outbox, exactly like live
+	// traffic, so the payload leaves the field unset. Any value here
+	// would be one this type invented, and would sort the repair
+	// somewhere below the stale rows it exists to overwrite —
+	// EmitChange refuses it outright, which is why the Run above
+	// would already have failed.
+	if ch.Version != 0 {
+		t.Errorf("payload version = %d, want 0 so the outbox id orders the repair", ch.Version)
 	}
 }
 
@@ -591,6 +738,40 @@ func TestRepairReseedLocksTheRowsItReads(t *testing.T) {
 		if strings.Contains(s.sql, "FOR UPDATE") {
 			t.Errorf("FOR UPDATE blocks writers for the whole chunk; FOR SHARE is enough: %s", s.sql)
 		}
+	}
+}
+
+// The other half of the cursor argument: a repair writes nothing to a
+// sink, so its only failure mode is the emit, and it has to stop the
+// walk the same way a refused sink does. The chunk transaction rolls
+// the emits back; the cursor has to stay behind them, or the rows the
+// aborted chunk covered are never repaired and nothing says so.
+func TestRepairReseedFailedEmitDoesNotAdvanceTheCursor(t *testing.T) {
+	d := newReseedDriver(1, 2, 3, 4)
+	d.failOutboxNth = 3 // the first row of the second chunk
+	r := newRepair(t, d)
+	ctx := context.Background()
+
+	err := r.Run(ctx)
+	if err == nil {
+		t.Fatal("expected the refused emit to surface")
+	}
+	if !contains(err.Error(), "emitting key 3") {
+		t.Errorf("error should name the key the walk stopped on, got %v", err)
+	}
+	status, statusErr := r.Status(ctx)
+	if statusErr != nil {
+		t.Fatalf("Status: %v", statusErr)
+	}
+	if status.LastID != 2 {
+		t.Errorf("cursor at %d after the second chunk failed to emit, want 2", status.LastID)
+	}
+	// Two emits from the chunk that committed, plus the attempt that
+	// failed. Key 4 must not have been tried: the chunk is going to be
+	// replayed in full, so emitting the rest of it only writes outbox
+	// rows the replay will write again.
+	if n := len(d.outboxInserts()); n != 3 {
+		t.Errorf("%d outbox statements were issued, want 2 for the committed chunk and 1 refused attempt", n)
 	}
 }
 
@@ -645,25 +826,67 @@ func TestReseedWalksWithALagGateInstalled(t *testing.T) {
 
 // --- scoping and validation ------------------------------------------
 
+// Both halves of a chunk have to be scoped the same way. A predicate
+// the key scan applies and the row read does not seeds rows the
+// caller excluded from the mirror; the other way round the scan
+// counts keys as seeded that were never sent, and the cursor walks
+// past them. The driver here applies the predicate the way a server
+// would — the excluded key is absent from any statement carrying it
+// and present in any statement that lost it — so the assertion is on
+// what was seeded, not on the text of the SQL.
 func TestReseedWhereNarrowsBothStatements(t *testing.T) {
 	src := reseedSourceTable()
-	d := newReseedDriver(1, 2)
-	r, err := mirror.NewFillReseeder(pg.New(d), src, &recSink{name: "sink"})
+	d := newReseedDriver(1, 2, 3)
+	d.pred, d.excluded = `"docs"."views" <> $`, 2
+	sink := &recSink{name: "sink"}
+	r, err := mirror.NewFillReseeder(pg.New(d), src, sink)
 	if err != nil {
 		t.Fatalf("NewFillReseeder: %v", err)
 	}
-	r.ChunkSize(2).Throttle(0).Where(pg.IsNull(src.Col("title")))
+	// views is id*10, so this is doc 2 and nothing else. A bound
+	// argument rather than IS NULL on purpose: the two statements
+	// number their placeholders differently — the key scan's LIMIT
+	// comes after the predicate, the row read's range before it — and
+	// a predicate whose argument went to the wrong position would
+	// render fine and filter on the wrong value.
+	r.ChunkSize(2).Throttle(0).Where(pg.Ne(src.Col("views"), int32(20)))
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// Both halves of a chunk have to agree on what the mirror holds:
-	// keys the scan yields but the read filters out would be counted
-	// as seeded and never sent.
+
+	if got := reseedChangeKeys(sink.seen); !reflect.DeepEqual(got, []string{"1", "3"}) {
+		t.Errorf("seeded %v, want only the keys the predicate leaves in the mirror", got)
+	}
+	// One chunk, not two: the key scan skipped doc 2 as well, so its
+	// LIMIT 2 reached doc 3 and the walk finished in one pass. A scan
+	// that lost the predicate would have stopped at doc 2 and needed a
+	// second chunk to reach doc 3 — the same seeded keys, a different
+	// walk.
+	if len(sink.seen) != 1 {
+		t.Errorf("the walk took %d chunks, want 1: the key scan must skip the excluded key too", len(sink.seen))
+	}
+	scans := d.keyScans()
+	if len(scans) < 2 || scans[1].args[0] != int64(3) {
+		t.Fatalf("second key scan resumed from %v, want 3", scans[1].args[0])
+	}
+
 	for _, s := range append(d.keyScans(), d.rowReads()...) {
-		if !strings.Contains(s.sql, `"docs"."title" IS NULL`) {
+		if !strings.Contains(s.sql, `"docs"."views" <> $`) {
 			t.Errorf("predicate missing from %s", s.sql)
 		}
+		if !containsArg(s.args, int32(20)) {
+			t.Errorf("predicate argument missing from %s: args %v", s.sql, s.args)
+		}
 	}
+}
+
+func containsArg(args []any, want any) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 // A key the reseeder cannot render as text is a stop, not a guess: a

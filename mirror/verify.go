@@ -79,14 +79,70 @@ type Divergence struct {
 	// arrived", which [MissingFromMirror] covers alike.
 	Tombstoned bool
 
-	// Settled is set by [Verifier.Recheck]: the mirror row for this
-	// key did not move between the two reads, so lag arriving late
-	// does not explain the difference. It is a necessary condition
-	// for a real defect, not a sufficient one — see Recheck.
+	// Settled is set by [Verifier.Recheck]: MirrorVersion is what it
+	// was at the first read, so nothing this package writes was
+	// applied for this key in between and lag arriving late does not
+	// explain the difference. It is a necessary condition for a real
+	// defect, not a sufficient one — see Recheck for both limits.
 	Settled bool
 
 	// SeenAt is when the reads behind this record were issued.
 	SeenAt time.Time
+}
+
+// VersionOrigin says which of the three version bands a mirrored
+// row's [VersionColumn] falls in, and so what put the row there.
+type VersionOrigin string
+
+const (
+	// OriginAbsent is a key the mirror holds no row for at all.
+	// Nothing in this package ever stamps version zero — [OutboxSource]
+	// numbers a change and [Change.Normalized] backstops it — so a
+	// zero version is the absence of a row and not a row that was
+	// written carelessly.
+	OriginAbsent VersionOrigin = "absent"
+
+	// OriginFill is a row a fill-mode reseed wrote: its version is in
+	// the seed band, at or below [MaxSeedVersion], which nothing that
+	// travels the change stream can reach.
+	OriginFill VersionOrigin = "fill"
+
+	// OriginClock is a row stamped from a wall clock by
+	// [ClockVersion] — a change from a source with no sequence of its
+	// own, or a row a release older than the version bands wrote.
+	OriginClock VersionOrigin = "clock"
+
+	// OriginStream is a row the pump delivered, numbered by the
+	// source's own sequence through [LiveVersion]: at or above
+	// [LiveVersionBase].
+	OriginStream VersionOrigin = "stream"
+)
+
+// Origin says what put the winning mirror row for this key there,
+// read off the band [Divergence.MirrorVersion] falls in.
+//
+// It costs nothing — the version is already in hand — and it answers
+// the question the three divergence kinds cannot: whether the row the
+// mirror is holding ever came down the change stream. That decides
+// which repair can work. A mismatch on an [OriginStream] row is
+// beyond a fill-mode reseed, because a seed-band version loses to a
+// live one by construction, so the remedy is [NewRepairReseeder],
+// which re-emits through the outbox and lands above it. The same
+// mismatch on an [OriginFill] row says the opposite: no change has
+// ever been pumped over that key, so the stream does not cover it,
+// and a fresh fill pass does outrank the row the last one left —
+// seed versions increase from pass to pass.
+func (d Divergence) Origin() VersionOrigin {
+	switch {
+	case d.MirrorVersion == 0:
+		return OriginAbsent
+	case d.MirrorVersion <= MaxSeedVersion:
+		return OriginFill
+	case d.MirrorVersion < LiveVersionBase:
+		return OriginClock
+	default:
+		return OriginStream
+	}
 }
 
 // Direction reports which side holds more for this key.
@@ -164,8 +220,11 @@ type VerifyReport struct {
 
 	// Resume is empty when the pass reached the end of the key
 	// space. Otherwise — a cancelled context, a failed read — it is
-	// the last key fully compared, to hand to [Verifier.From] to
-	// carry on from.
+	// the point to hand to [Verifier.From] to carry on from: the last
+	// key fully compared, or, when the pass stopped before it finished
+	// a single range, the key it was started after. A pass started at
+	// the head of the key space has no such key, so an interrupted one
+	// resumes from the head, which is where it began.
 	Resume string
 
 	StartedAt  time.Time
@@ -173,6 +232,12 @@ type VerifyReport struct {
 }
 
 // Aligned reports that the pass found nothing to act on.
+//
+// It is a statement about what was compared, not about the two
+// tables, so it only means "these agree" for a pass that returned no
+// error. A pass that stopped on a failed read compared the ranges up
+// to [VerifyReport.Resume] and none after it, and reports the same
+// true — read the error first.
 func (r VerifyReport) Aligned() bool {
 	return r.Behind == 0 && r.Ahead == 0 && r.Unclear == 0
 }
@@ -457,6 +522,14 @@ func (v *Verifier) Verify(ctx context.Context) (VerifyReport, error) {
 			rep.FinishedAt = v.now()
 			return rep, err
 		}
+		// Resume starts where the caller did. A pass that fails on its
+		// first range has compared nothing, but it has also not
+		// un-compared what came before it, and reporting an empty
+		// Resume there would send the resume loop in this method's doc
+		// back to the head of the key space — so a table large enough
+		// to need resuming would re-scan the same prefix on every
+		// transient read error and never reach its tail.
+		rep.Resume = v.from
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -499,6 +572,19 @@ func (v *Verifier) Verify(ctx context.Context) (VerifyReport, error) {
 			// span of the key space.
 			mirRows = verifyTrim(v.key, mirRows, through)
 			srcRows = verifyTrim(v.key, srcRows, through)
+			if len(mirRows) == 0 && len(srcRows) == 0 {
+				// through is one of the two sides' last keys, so that
+				// side keeps every row it returned and a bounded range
+				// can never come out empty. If it did, the order the
+				// range was cut by is not the order the rows arrived
+				// in, and the two sides no longer describe the same
+				// span. Comparing nothing would then report agreement
+				// — zero rows against zero rows, checksums equal — for
+				// a range neither side was actually asked about, which
+				// is a clean verdict over data nobody looked at.
+				rep.FinishedAt = v.now()
+				return rep, fmt.Errorf("drops/mirror: verify range after key %q ending at key %q kept no rows from either side, so nothing in it was compared; the two sides are not being ordered the same way", cur.key, through)
+			}
 		}
 		v.compareRange(&rep, cur.key, through, mirRows, srcRows)
 		if !bounded {
@@ -526,17 +612,36 @@ func (v *Verifier) Verify(ctx context.Context) (VerifyReport, error) {
 // a row in flight, or lag that has since drained, and it is dropped
 // from the result. A key that still disagrees is returned with
 // [Divergence.Settled] set when the mirror's version for it is the
-// same as it was — nothing was applied for that key between the two
-// reads, so a change still on its way through the pump does not
-// explain the difference.
+// same as it was.
 //
-// Settled is a necessary condition for a defect, not a sufficient one:
-// a change sitting in the outbox that neither read saw applied looks
-// exactly like one that will never arrive. The discharge that closes
-// that gap is timing, and it belongs to the caller, who is the only
-// one who knows their pump: recheck once the outbox backlog that
-// existed at the first read has drained. Recheck deliberately has no
-// timer of its own.
+// What an unchanged version proves is that nothing this package wrote
+// landed on that key in between, and it proves it because every writer
+// here moves the version when it rewrites a row: the pump stamps
+// [LiveVersion] of an outbox id that only ever goes up, and a
+// fill-mode reseed draws a fresh seed version per pass, so even
+// re-running a fill over the same key changes the number. A change
+// still on its way through the pump therefore does not explain a
+// settled difference.
+//
+// Two things it does not see, both worth knowing before acting on it:
+//
+//   - A writer that does not maintain [VersionColumn] — a hand-run
+//     INSERT into the mirror, a second ingestion path — moves the row
+//     without moving the version, and reads as settled. It is also
+//     invisible to ReplacingMergeTree's tie-break, so it is a hazard
+//     well beyond this report.
+//   - Settled is a necessary condition for a defect, not a sufficient
+//     one: a change sitting in the outbox that neither read saw
+//     applied looks exactly like one that will never arrive. The
+//     discharge that closes that gap is timing, and it belongs to the
+//     caller, who is the only one who knows their pump: recheck once
+//     the outbox backlog that existed at the first read has drained.
+//     Recheck deliberately has no timer of its own.
+//
+// [Divergence.Origin] is the other half of the picture and does not
+// need a second read: it says whether the row that is still wrong was
+// ever delivered by the pump at all, which is what decides whether a
+// fill or a repair can correct it.
 func (v *Verifier) Recheck(ctx context.Context, prior []Divergence) (VerifyReport, error) {
 	plan, err := v.plan()
 	if err != nil {
@@ -795,9 +900,18 @@ func (v *Verifier) readMirrorKeys(ctx context.Context, plan verifyPlan, keys []s
 // FINAL collapses the superseded versions so each key is represented
 // by the row with the highest [VersionColumn], and [DeletedColumn] is
 // selected rather than filtered so a tombstone can be reported as one.
-// Unscoped skips the table's default filters: they are an application
-// read scope, and applying one here would hide rows from the
-// comparison and report them as extra in the mirror.
+//
+// Unscoped skips the table's default filters, and the filter it is
+// really there for is [NotDeleted] — the natural thing to hang on a
+// mirror table so that application reads cannot forget it. Left
+// applied, it would hide from the comparison exactly the rows the
+// comparison is here to see: a key whose mirror row is a wrongly
+// applied tombstone would come back as no row at all, and be reported
+// MissingFromMirror with Tombstoned false — "the insert never
+// arrived" instead of "the delete was applied and should not have
+// been", which is the distinction [Divergence.Tombstoned] exists to
+// preserve. Any other filter hides live rows the same way and reports
+// them missing from a mirror that holds them.
 func (v *Verifier) mirrorSelect(plan verifyPlan) *clickhouse.SelectBuilder {
 	sel := make([]drops.Expression, 0, len(plan.cols)+2)
 	for _, c := range plan.cols {
@@ -1116,12 +1230,9 @@ func canonicalValue(chType string, v any) (string, error) {
 	case "Date", "Date32":
 		return canonicalDate(rv, chType)
 	case "DateTime", "DateTime64":
-		// A timezone argument makes the column an instant, so the
-		// two sides are compared in UTC; without one it is a wall
-		// clock reading, and the reading itself is the value.
-		return canonicalTimestamp(rv, chType, strings.Contains(args, "'"))
+		return canonicalTimestamp(rv, chType)
 	case "Decimal", "Decimal32", "Decimal64", "Decimal128", "Decimal256":
-		return canonicalDecimal(rv, chType, args)
+		return canonicalDecimal(rv, chType, base, args)
 	case "String", "FixedString":
 		return canonicalString(rv, chType)
 	}
@@ -1269,8 +1380,23 @@ func canonicalDate(rv reflect.Value, chType string) (string, error) {
 
 // canonicalTimestamp encodes to microseconds, the resolution both
 // PostgreSQL's timestamp types and the DateTime64(6) they map to
-// carry.
-func canonicalTimestamp(rv reflect.Value, chType string, instant bool) (string, error) {
+// carry, and always in UTC.
+//
+// Always, because DateTime and DateTime64 are a tick count since the
+// epoch whatever their arguments say. A timezone argument names the
+// zone the server renders the ticks in and parses text against; it
+// does not make the column an instant, because the column already was
+// one. Reading the argument as "this is an instant, that is a wall
+// clock" and skipping the conversion for the second — which is what
+// this did — compares the source's reading against the mirror's
+// reading of the same tick in another zone, so every row of a
+// timestamp column diverges on a ClickHouse server that is not on
+// UTC. That is the false positive the Go-side encoding exists to
+// prevent.
+//
+// [canonicalDate] is the genuine wall-clock case and is deliberately
+// not converted: a Date has no instant behind it.
+func canonicalTimestamp(rv reflect.Value, chType string) (string, error) {
 	t, ok := rv.Interface().(time.Time)
 	if !ok {
 		s, isText := verifyText(rv)
@@ -1283,23 +1409,16 @@ func canonicalTimestamp(rv reflect.Value, chType string, instant bool) (string, 
 		}
 		t = parsed
 	}
-	if instant {
-		t = t.UTC()
-	}
-	return "t" + t.Format("2006-01-02T15:04:05.000000"), nil
+	return "t" + t.UTC().Format("2006-01-02T15:04:05.000000"), nil
 }
 
 // canonicalDecimal encodes at the column's declared scale, so "12.3",
 // "12.30" and 12.3 all reach the hash as the same digits. big.Rat
 // carries the value exactly on the way, which a float64 would not.
-func canonicalDecimal(rv reflect.Value, chType, args string) (string, error) {
-	scale := 0
-	if i := strings.IndexByte(args, ','); i >= 0 {
-		n, err := strconv.Atoi(strings.TrimSpace(args[i+1:]))
-		if err != nil {
-			return "", fmt.Errorf("mirrored type %q has no readable scale", chType)
-		}
-		scale = n
+func canonicalDecimal(rv reflect.Value, chType, base, args string) (string, error) {
+	scale, err := verifyDecimalScale(chType, base, args)
+	if err != nil {
+		return "", err
 	}
 	var s string
 	switch rv.Kind() {
@@ -1321,6 +1440,36 @@ func canonicalDecimal(rv reflect.Value, chType, args string) (string, error) {
 		return "", fmt.Errorf("a column declared %s came back as %q, which is not a decimal", chType, s)
 	}
 	return "m" + r.FloatString(scale), nil
+}
+
+// verifyDecimalScale reads the number of decimal places a Decimal
+// column keeps, which is where its argument list is, and that differs
+// between the two spellings ClickHouse accepts.
+//
+// Decimal(P, S) carries the precision first and the scale second.
+// Decimal32(S) through Decimal256(S) fix the precision in the type
+// name, so their sole argument is the scale. Taking the scale from
+// after a comma alone would read every one-argument form as scale 0,
+// round both sides to whole numbers, and hash 10.9999 and 10.5001
+// alike — a verifier reporting a corrupt mirror as clean, which is the
+// one failure it must not have. So the scale is required, and a type
+// that does not carry one is an error rather than a silent zero.
+func verifyDecimalScale(chType, base, args string) (int, error) {
+	text := strings.TrimSpace(args)
+	i := strings.IndexByte(text, ',')
+	switch {
+	case base == "Decimal" && i >= 0:
+		text = strings.TrimSpace(text[i+1:])
+	case base == "Decimal":
+		return 0, fmt.Errorf("mirrored type %q has no readable scale; Decimal takes a precision and a scale", chType)
+	case i >= 0:
+		return 0, fmt.Errorf("mirrored type %q has no readable scale; %s takes the scale as its only argument", chType, base)
+	}
+	n, err := strconv.Atoi(text)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("mirrored type %q has no readable scale", chType)
+	}
+	return n, nil
 }
 
 func canonicalString(rv reflect.Value, chType string) (string, error) {

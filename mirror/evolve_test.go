@@ -50,12 +50,35 @@ func evolveLive(t *testing.T, src *pg.Table, opts ...mirror.DeriveOption) []mirr
 	out := make([]mirror.MirrorColumn, 0, len(tbl.Columns()))
 	for _, c := range tbl.Columns() {
 		out = append(out, mirror.MirrorColumn{
-			Name:  c.Name(),
-			Type:  c.Type().TypeSQL(),
-			InKey: key[c.Name()],
+			Name: c.Name(),
+			Type: c.Type().TypeSQL(),
+			// A derived mirror's only key is its sorting key, so
+			// both flags say the same thing here. They are set
+			// separately because a plan compares the sorting key on
+			// its own: a shape that left InSortingKey false would be
+			// a mirror that sorts by nothing.
+			InKey:        key[c.Name()],
+			InSortingKey: key[c.Name()],
 		})
 	}
 	return out
+}
+
+// evolvePartitioned marks a column as taking part in the live table's
+// partition key, which is how ClickHouse reports PARTITION BY: the
+// columns the expression names, never the expression.
+func evolvePartitioned(t *testing.T, live []mirror.MirrorColumn, name string) []mirror.MirrorColumn {
+	t.Helper()
+	out := append([]mirror.MirrorColumn(nil), live...)
+	for i := range out {
+		if out[i].Name == name {
+			out[i].InKey = true
+			out[i].InPartitionKey = true
+			return out
+		}
+	}
+	t.Fatalf("no column %q in the live shape", name)
+	return nil
 }
 
 func evolveWithout(live []mirror.MirrorColumn, name string) []mirror.MirrorColumn {
@@ -120,6 +143,7 @@ type evolveDriver struct {
 	queries   []string
 	queryArgs [][]any
 	execs     []string
+	execArgs  [][]any
 
 	queryErr error
 	execErr  error
@@ -133,17 +157,29 @@ func (d *evolveDriver) Query(_ context.Context, sql string, args ...any) (drops.
 	}
 	data := make([][]any, 0, len(d.live))
 	for _, c := range d.live {
-		var sorting uint8
-		if c.InKey {
+		// The three flags are answered separately so a shape
+		// survives the round trip through InspectMirror: a column
+		// that is in a key but in neither of the two named ones is
+		// reported through is_in_primary_key, which is where
+		// ClickHouse would put it.
+		var sorting, primary, part uint8
+		if c.InSortingKey {
 			sorting = 1
 		}
-		data = append(data, []any{c.Name, c.Type, sorting, uint8(0), uint8(0)})
+		if c.InPartitionKey {
+			part = 1
+		}
+		if c.InKey && !c.InSortingKey && !c.InPartitionKey {
+			primary = 1
+		}
+		data = append(data, []any{c.Name, c.Type, sorting, primary, part})
 	}
 	return &evolveRows{data: data}, nil
 }
 
-func (d *evolveDriver) Exec(_ context.Context, sql string, _ ...any) (drops.Result, error) {
+func (d *evolveDriver) Exec(_ context.Context, sql string, args ...any) (drops.Result, error) {
 	d.execs = append(d.execs, sql)
+	d.execArgs = append(d.execArgs, args)
 	if d.execErr != nil {
 		return nil, d.execErr
 	}
@@ -419,7 +455,7 @@ func TestEvolveWidensWithoutAsking(t *testing.T) {
 		if step.Kind != mirror.EvolveModifyColumn || step.From != "Int16" || step.To != "Int32" {
 			t.Fatalf("step = %+v", step)
 		}
-		if !strings.Contains(step.SQL, `MODIFY COLUMN "views" Int32`) {
+		if !strings.Contains(step.SQL, `MODIFY COLUMN IF EXISTS "views" Int32`) {
 			t.Errorf("SQL = %s", step.SQL)
 		}
 	})
@@ -427,7 +463,7 @@ func TestEvolveWidensWithoutAsking(t *testing.T) {
 	t.Run("gaining nullable", func(t *testing.T) {
 		live := evolveRetyped(t, evolveLive(t, src), "body", "String")
 		step := evolveStepFor(t, evolver(t, db, src).PlanAgainst(live), "body")
-		if !strings.Contains(step.SQL, `MODIFY COLUMN "body" Nullable(String)`) {
+		if !strings.Contains(step.SQL, `MODIFY COLUMN IF EXISTS "body" Nullable(String)`) {
 			t.Errorf("SQL = %s", step.SQL)
 		}
 	})
@@ -458,7 +494,7 @@ func TestEvolveTreatsAnUnprovableCastAsAnOptIn(t *testing.T) {
 			if len(allowed.Refusals) != 0 {
 				t.Fatalf("still refused after AllowTypeChange: %v", allowed.Refusals)
 			}
-			if s := evolveStepFor(t, allowed, "views"); !strings.Contains(s.SQL, `MODIFY COLUMN "views" Int32`) {
+			if s := evolveStepFor(t, allowed, "views"); !strings.Contains(s.SQL, `MODIFY COLUMN IF EXISTS "views" Int32`) {
 				t.Errorf("SQL = %s", s.SQL)
 			}
 		})
@@ -705,5 +741,414 @@ func TestTargetIsAFreshTable(t *testing.T) {
 	}
 	if first.Col(mirror.VersionColumn) == nil || first.Col(mirror.DeletedColumn) == nil {
 		t.Error("the target is what the replacement sink is built from and must carry the bookkeeping columns")
+	}
+}
+
+// --- the table's own shape ------------------------------------------
+
+// evolveKeyedSource is evolveSource's shape with a second candidate
+// key, so a migration can move the primary key without changing a
+// single derived column type — the case a column diff cannot see.
+func evolveKeyedSource(t *testing.T, key string) *pg.Table {
+	t.Helper()
+	tbl := pg.NewTable("docs")
+	if key == "id" {
+		pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+		pg.Add(tbl, pg.Text("slug").NotNull())
+	} else {
+		pg.Add(tbl, pg.BigInt("id").NotNull())
+		pg.Add(tbl, pg.Text("slug").PrimaryKey())
+	}
+	pg.Add(tbl, pg.Text("title").NotNull())
+	return tbl
+}
+
+// A mirror whose ORDER BY is no longer the derived one is broken in a
+// way no column type shows: ReplacingMergeTree deduplicates on the
+// sorting key and ClickHouseSink addresses a tombstone by the derived
+// one, so every delete would land under a key the table does not sort
+// by and the deleted rows would stay readable for good.
+func TestEvolveRefusesASortingKeyThatMoved(t *testing.T) {
+	before := evolveKeyedSource(t, "id")
+	after := evolveKeyedSource(t, "slug")
+	live := evolveLive(t, before)
+
+	// The premise: nothing about the columns changed.
+	sameShape := evolveLive(t, after)
+	for i := range live {
+		if live[i].Name != sameShape[i].Name || live[i].Type != sameShape[i].Type {
+			t.Fatalf("column %d differs (%+v vs %+v); the test needs a pure key change", i, live[i], sameShape[i])
+		}
+	}
+
+	d := &evolveDriver{live: live}
+	plan := evolver(t, clickhouse.New(d), after).PlanAgainst(live)
+
+	if len(plan.Steps) != 0 {
+		t.Fatalf("there is no ALTER for a key change: %+v", plan.Steps)
+	}
+	if plan.Aligned() {
+		t.Fatal("a mirror sorted by the wrong column is not aligned")
+	}
+	if len(plan.Refusals) != 1 {
+		t.Fatalf("refusals = %+v", plan.Refusals)
+	}
+	r := plan.Refusals[0]
+	if r.Kind != mirror.EvolveSortingKey || r.Reason != mirror.RefusedNotInPlace {
+		t.Fatalf("refusal = %+v", r)
+	}
+	for _, want := range []string{`"id"`, `"slug"`, "tombstone", "MODIFY ORDER BY"} {
+		if !strings.Contains(r.Detail, want) {
+			t.Errorf("the refusal must name %s: %s", want, r.Detail)
+		}
+	}
+	// No column, so no empty pair of quotes in the review line.
+	if strings.Contains(r.String(), `""`) {
+		t.Errorf("Refusal.String = %s", r.String())
+	}
+
+	// And it stops an Apply, which is the whole point: the operator
+	// who ignores the plan and builds a sink from Target() is the one
+	// who loses the deletes.
+	e := evolver(t, clickhouse.New(d), after)
+	if _, err := e.Apply(context.Background()); !errors.Is(err, mirror.ErrEvolutionRefused) {
+		t.Fatalf("Apply err = %v, want ErrEvolutionRefused", err)
+	}
+	if len(d.execs) != 0 {
+		t.Errorf("Apply ran %v", d.execs)
+	}
+}
+
+// The same blindness in the other direction: a mirror that is
+// partitioned when the derived table is not, or the reverse.
+// ReplacingMergeTree only collapses rows inside one partition, so this
+// decides whether the mirror converges at all.
+func TestEvolveRefusesPartitioningThatDoesNotMatch(t *testing.T) {
+	src := pg.NewTable("docs")
+	pg.Add(src, pg.BigSerial("id").PrimaryKey())
+	pg.Add(src, pg.Text("title").NotNull())
+	madeAt := pg.Add(src, pg.Timestamp("created_at", true).NotNull())
+
+	t.Run("live has one and the declaration does not", func(t *testing.T) {
+		live := evolvePartitioned(t, evolveLive(t, src), "created_at")
+		plan := evolver(t, clickhouse.New(&evolveDriver{}), src).PlanAgainst(live)
+		// Length first: indexing an empty slice would panic, and a
+		// panic takes the whole test binary down with it — the
+		// failure this test exists to report would be the last thing
+		// the run said.
+		if len(plan.Refusals) != 1 {
+			t.Fatalf("refusals = %+v", plan.Refusals)
+		}
+		r := plan.Refusals[0]
+		if r.Kind != mirror.EvolvePartitionKey || r.Reason != mirror.RefusedNotInPlace {
+			t.Fatalf("refusal = %+v", r)
+		}
+		if !strings.Contains(r.Detail, "partition") {
+			t.Errorf("detail = %s", r.Detail)
+		}
+	})
+
+	t.Run("the declaration has one and live does not", func(t *testing.T) {
+		part := mirror.WithPartitionBy(clickhouse.Func("toYYYYMM", madeAt))
+		live := evolveLive(t, src, part)
+		plan := evolver(t, clickhouse.New(&evolveDriver{}), src, part).PlanAgainst(live)
+		if len(plan.Refusals) != 1 || plan.Refusals[0].Kind != mirror.EvolvePartitionKey {
+			t.Fatalf("refusals = %+v", plan.Refusals)
+		}
+	})
+
+	t.Run("both, and they agree as far as this can tell", func(t *testing.T) {
+		part := mirror.WithPartitionBy(clickhouse.Func("toYYYYMM", madeAt))
+		live := evolvePartitioned(t, evolveLive(t, src, part), "created_at")
+		plan := evolver(t, clickhouse.New(&evolveDriver{}), src, part).PlanAgainst(live)
+		if !plan.Aligned() {
+			t.Fatalf("steps %+v refusals %+v", plan.Steps, plan.Refusals)
+		}
+	})
+}
+
+// InspectMirror has to hand the plan the sorting key on its own:
+// is_in_sorting_key is what the comparison runs on, and folding it
+// into InKey with the partition columns would make a partitioned
+// mirror look like one keyed on the partition column.
+func TestInspectMirrorKeepsTheKeyFlagsApart(t *testing.T) {
+	src := pg.NewTable("docs")
+	pg.Add(src, pg.BigSerial("id").PrimaryKey())
+	madeAt := pg.Add(src, pg.Timestamp("created_at", true).NotNull())
+	part := mirror.WithPartitionBy(clickhouse.Func("toYYYYMM", madeAt))
+
+	live := evolvePartitioned(t, evolveLive(t, src, part), "created_at")
+	d := &evolveDriver{live: live}
+	e := evolver(t, clickhouse.New(d), src, part)
+
+	got, err := mirror.InspectMirror(context.Background(), clickhouse.New(d), e.Target())
+	if err != nil {
+		t.Fatalf("InspectMirror: %v", err)
+	}
+	byName := map[string]mirror.MirrorColumn{}
+	for _, c := range got {
+		byName[c.Name] = c
+	}
+	if id := byName["id"]; !id.InSortingKey || id.InPartitionKey || !id.InKey {
+		t.Errorf("the sorting key column came back as %+v", id)
+	}
+	if at := byName["created_at"]; at.InSortingKey || !at.InPartitionKey || !at.InKey {
+		t.Errorf("the partition column came back as %+v", at)
+	}
+	if title := byName["title"]; title.InKey || title.InSortingKey || title.InPartitionKey {
+		t.Errorf("a plain column came back as %+v", title)
+	}
+}
+
+// --- statements ------------------------------------------------------
+
+// Every statement has to name the database the evolver was built for.
+// An unqualified ALTER runs against whatever database the session
+// happens to be in, which is a different table with the same name —
+// and the assertions elsewhere in this file all read the clause after
+// ALTER TABLE, so nothing else here would notice.
+func TestGeneratedStatementsNameTheQualifiedTable(t *testing.T) {
+	src := evolveSource()
+	grown := evolveSource()
+	pg.Add(grown, pg.Text("summary"))
+
+	const qualified = `"analytics"."docs"`
+	db := clickhouse.New(&evolveDriver{})
+
+	// One plan carrying an add, a modify and a drop, plus the create
+	// that a missing table produces.
+	live := evolvePlus(
+		evolveRetyped(t, evolveLive(t, src), "views", "Int16"),
+		mirror.MirrorColumn{Name: "legacy", Type: "String"})
+	plan := evolver(t, db, grown, mirror.WithDatabase("analytics")).
+		AllowDrop("legacy").PlanAgainst(live)
+
+	kinds := map[mirror.EvolutionKind]bool{}
+	for _, s := range plan.Steps {
+		kinds[s.Kind] = true
+		if !strings.HasPrefix(s.SQL, "ALTER TABLE "+qualified+" ") {
+			t.Errorf("%s does not alter %s: %s", s.Kind, qualified, s.SQL)
+		}
+	}
+	for _, want := range []mirror.EvolutionKind{mirror.EvolveAddColumn, mirror.EvolveModifyColumn, mirror.EvolveDropColumn} {
+		if !kinds[want] {
+			t.Errorf("the plan should exercise %s: %+v", want, plan.Steps)
+		}
+	}
+
+	created := evolver(t, db, grown, mirror.WithDatabase("analytics")).PlanAgainst(nil)
+	if sql := created.Steps[0].SQL; !strings.Contains(sql, "CREATE TABLE IF NOT EXISTS "+qualified) {
+		t.Errorf("CREATE does not name %s: %s", qualified, sql)
+	}
+}
+
+// A MODIFY is the one statement that aborts the rest of the plan when
+// it loses a race, because Apply stops at the first failure — and the
+// step queued behind it is usually the ADD COLUMN that stops the live
+// sink rejecting every batch. IF EXISTS turns that abort into a
+// skipped statement, which is what Apply's doc promises for every
+// statement it runs.
+func TestModifyColumnToleratesAColumnThatIsAlreadyGone(t *testing.T) {
+	src := evolveSource()
+	live := evolveRetyped(t, evolveLive(t, src), "views", "Int16")
+
+	step := evolveStepFor(t, evolver(t, clickhouse.New(&evolveDriver{}), src).PlanAgainst(live), "views")
+	if !strings.Contains(step.SQL, `MODIFY COLUMN IF EXISTS "views" Int32`) {
+		t.Errorf("SQL = %s", step.SQL)
+	}
+	for _, s := range evolver(t, clickhouse.New(&evolveDriver{}), src).PlanAgainst(live).Steps {
+		if strings.Contains(s.SQL, "ALTER TABLE") && !strings.Contains(s.SQL, "IF EXISTS") && !strings.Contains(s.SQL, "IF NOT EXISTS") {
+			t.Errorf("statement carries no existence guard: %s", s.SQL)
+		}
+	}
+}
+
+// A DeriveOption may bind a value — a partition bucket of so many
+// days — and then the DDL is not self-contained text. Dropping the
+// args sends ClickHouse a statement with a bare ? in it.
+func TestCreateTableCarriesTheArgsItsDDLBinds(t *testing.T) {
+	src := pg.NewTable("docs")
+	pg.Add(src, pg.BigSerial("id").PrimaryKey())
+	madeAt := pg.Add(src, pg.Timestamp("created_at", true).NotNull())
+
+	d := &evolveDriver{} // no columns: the mirror does not exist yet
+	e := evolver(t, clickhouse.New(d), src, mirror.WithPartitionBy(
+		clickhouse.Func("toStartOfInterval", madeAt, clickhouse.Func("toIntervalDay", 7))))
+
+	plan, err := e.Apply(context.Background())
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].Kind != mirror.EvolveCreateTable {
+		t.Fatalf("steps = %+v", plan.Steps)
+	}
+	if !strings.Contains(plan.Steps[0].SQL, "toIntervalDay(?)") {
+		t.Fatalf("the fixture no longer binds anything: %s", plan.Steps[0].SQL)
+	}
+	if got := plan.Steps[0].Args; !reflect.DeepEqual(got, []any{7}) {
+		t.Errorf("step args = %#v, want the bound 7", got)
+	}
+	if len(d.execArgs) != 1 || !reflect.DeepEqual(d.execArgs[0], []any{7}) {
+		t.Errorf("Apply executed with args %#v; a statement run without them reaches ClickHouse with a bare ?", d.execArgs)
+	}
+}
+
+// --- what the steps tell the operator to do next ---------------------
+
+// An ALTER cannot backfill, and the reseed that can is the repair one:
+// a fill is stamped in the seed band, below every version the stream
+// has written, so a sink discards it for every key the mirror already
+// holds — which is every key the new column is empty for.
+func TestAddColumnSendsTheOperatorToARepairReseed(t *testing.T) {
+	src := evolveSource()
+	live := evolveWithout(evolveLive(t, src), "body")
+
+	step := evolveStepFor(t, evolver(t, clickhouse.New(&evolveDriver{}), src).PlanAgainst(live), "body")
+	if !strings.Contains(step.Why, "NewRepairReseeder") {
+		t.Errorf("the remedy for an un-backfilled column is a repair reseed: %s", step.Why)
+	}
+	if strings.Contains(step.Why, "until a fill-mode reseed writes them") {
+		t.Errorf("a fill cannot backfill a column: %s", step.Why)
+	}
+}
+
+// The prescribed order is per step kind, not one order for all four: a
+// drop run before the sink is swapped stops the pump dead.
+func TestDropColumnSaysToSwapTheSinkFirst(t *testing.T) {
+	src := evolveSource()
+	live := evolvePlus(evolveLive(t, src), mirror.MirrorColumn{Name: "legacy", Type: "String"})
+
+	plan := evolver(t, clickhouse.New(&evolveDriver{}), src).AllowDrop("legacy").PlanAgainst(live)
+	step := evolveStepFor(t, plan, "legacy")
+	if !strings.Contains(step.Why, "before running this statement") {
+		t.Errorf("a drop has to say the sink goes first: %s", step.Why)
+	}
+}
+
+// --- LowCardinality --------------------------------------------------
+
+// The wrapper is the operator's tuning decision and the derived
+// declaration says nothing about encodings, so a type change carries
+// it across rather than rewriting the column back to an unencoded one.
+func TestEvolveCarriesLowCardinalityOntoTheNewType(t *testing.T) {
+	before := evolveSource()
+	after := pg.NewTable("docs")
+	pg.Add(after, pg.BigSerial("id").PrimaryKey())
+	pg.Add(after, pg.Text("title")) // NOT NULL dropped: String -> Nullable(String)
+	pg.Add(after, pg.Integer("views").NotNull())
+	pg.Add(after, pg.Text("body"))
+
+	live := evolveRetyped(t, evolveLive(t, before), "title", "LowCardinality(String)")
+	plan := evolver(t, clickhouse.New(&evolveDriver{}), after).PlanAgainst(live)
+
+	if len(plan.Refusals) != 0 {
+		t.Fatalf("refusals = %+v", plan.Refusals)
+	}
+	step := evolveStepFor(t, plan, "title")
+	if step.To != "LowCardinality(Nullable(String))" {
+		t.Fatalf("To = %q: the wrapper must survive the widening", step.To)
+	}
+	if !strings.Contains(step.SQL, `MODIFY COLUMN IF EXISTS "title" LowCardinality(Nullable(String))`) {
+		t.Errorf("SQL = %s", step.SQL)
+	}
+	if !strings.Contains(step.Why, "LowCardinality") {
+		t.Errorf("Why = %s", step.Why)
+	}
+}
+
+// Where the wrapper cannot be carried across, both answers are
+// destructive, so the plan asks instead of picking one: ClickHouse
+// refuses LowCardinality over a small fixed-size type unless
+// allow_suspicious_low_cardinality_types is set, and unwrapping
+// rewrites the whole column.
+func TestEvolveRefusesToUnwrapLowCardinalityOnItsOwn(t *testing.T) {
+	src := evolveSource()
+	live := evolveRetyped(t, evolveLive(t, src), "views", "LowCardinality(Int16)")
+	db := clickhouse.New(&evolveDriver{})
+
+	plan := evolver(t, db, src).PlanAgainst(live)
+	if len(plan.Steps) != 0 {
+		t.Fatalf("the encoding is not drops' to discard: %+v", plan.Steps)
+	}
+	r := evolveRefusalFor(t, plan, "views")
+	if r.Reason != mirror.RefusedNeedsOptIn {
+		t.Fatalf("refusal = %+v", r)
+	}
+	for _, want := range []string{"LowCardinality(Int32)", "allow_suspicious_low_cardinality_types", "AllowTypeChange"} {
+		if !strings.Contains(r.Detail, want) {
+			t.Errorf("detail missing %q: %s", want, r.Detail)
+		}
+	}
+
+	// Told to, it accepts the loss and emits the derived type bare.
+	allowed := evolver(t, db, src).AllowTypeChange("views").PlanAgainst(live)
+	step := evolveStepFor(t, allowed, "views")
+	if !strings.Contains(step.SQL, `MODIFY COLUMN IF EXISTS "views" Int32`) {
+		t.Errorf("SQL = %s", step.SQL)
+	}
+}
+
+// The wrapper is not always the only thing at stake. Where the derived
+// type is one the live values do not all fit into, the cast is the
+// larger risk of the two, and a refusal that names only the encoding
+// invites an AllowTypeChange nobody would have granted knowing the
+// column may not survive the mutation.
+func TestEvolveNamesTheCastRiskTheWrapperHides(t *testing.T) {
+	src := evolveSource()
+
+	t.Run("the values do not all fit", func(t *testing.T) {
+		// Int32 -> Int16 under a wrapper: the encoding goes, and so
+		// may every value above 32767.
+		narrowed := pg.NewTable("docs")
+		pg.Add(narrowed, pg.BigSerial("id").PrimaryKey())
+		pg.Add(narrowed, pg.Text("title").NotNull())
+		pg.Add(narrowed, pg.SmallInt("views").NotNull())
+		pg.Add(narrowed, pg.Text("body"))
+
+		live := evolveRetyped(t, evolveLive(t, src), "views", "LowCardinality(Int32)")
+		r := evolveRefusalFor(t, evolver(t, clickhouse.New(&evolveDriver{}), narrowed).PlanAgainst(live), "views")
+		for _, want := range []string{"allow_suspicious_low_cardinality_types", "overflow"} {
+			if !strings.Contains(r.Detail, want) {
+				t.Errorf("detail missing %q: %s", want, r.Detail)
+			}
+		}
+
+		// And the operator who grants the opt-in is told the same
+		// thing on the step they are about to run.
+		step := evolveStepFor(t, evolver(t, clickhouse.New(&evolveDriver{}), narrowed).
+			AllowTypeChange("views").PlanAgainst(live), "views")
+		if !strings.Contains(step.Why, "overflow") {
+			t.Errorf("the step hides the cast risk: %s", step.Why)
+		}
+	})
+
+	t.Run("only the encoding is at stake", func(t *testing.T) {
+		// Int16 -> Int32 is a widening: no value is in danger, so
+		// saying they are would be crying wolf.
+		live := evolveRetyped(t, evolveLive(t, src), "views", "LowCardinality(Int16)")
+		r := evolveRefusalFor(t, evolver(t, clickhouse.New(&evolveDriver{}), src).PlanAgainst(live), "views")
+		if strings.Contains(r.Detail, "overflow") {
+			t.Errorf("a widening puts no value at risk: %s", r.Detail)
+		}
+	})
+}
+
+// A sorting key of nothing is far more often a caller who built the
+// shape by hand and left InSortingKey false than a mirror that really
+// sorts by no column, and the two have very different remedies —
+// rebuilding a 10M-row table is not the answer to a missing flag.
+func TestASortingKeyOfNothingPointsAtTheShapeFirst(t *testing.T) {
+	src := evolveSource()
+	live := evolveLive(t, src)
+	for i := range live {
+		live[i].InSortingKey = false // the shape a pre-InSortingKey caller builds
+	}
+
+	plan := evolver(t, clickhouse.New(&evolveDriver{}), src).PlanAgainst(live)
+	if len(plan.Refusals) != 1 || plan.Refusals[0].Kind != mirror.EvolveSortingKey {
+		t.Fatalf("refusals = %+v", plan.Refusals)
+	}
+	if d := plan.Refusals[0].Detail; !strings.Contains(d, "InSortingKey") {
+		t.Errorf("the refusal sends the operator to rebuild a table without saying the shape may be at fault: %s", d)
 	}
 }

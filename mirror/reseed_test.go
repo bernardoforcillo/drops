@@ -62,14 +62,16 @@ type reseedDriver struct {
 	// looks like from the inside.
 	keyAsText bool
 
-	// pred and excluded together model a WHERE the server actually
-	// applies: a statement whose SQL carries pred does not see the
-	// key excluded, and a statement that lost the predicate does.
-	// Asserting on the rendered text alone cannot tell those two
-	// apart, and the difference is a row seeded into a mirror the
-	// caller scoped it out of.
-	pred     string
-	excluded int64
+	// hidden models a WHERE the server actually applies: a statement
+	// whose SQL carries a predicate does not see the key that
+	// predicate removes, and a statement that lost it does. Asserting
+	// on the rendered text alone cannot tell those two apart, and the
+	// difference is a row seeded into a mirror the caller scoped it
+	// out of. A list rather than one pair because [Reseeder.Where]
+	// ANDs its predicates: a walk that rendered only the first would
+	// narrow correctly by that one and seed everything the second
+	// excluded.
+	hidden []reseedHidden
 
 	// failOutboxNth refuses that emit, counting from one. It is what
 	// lets a repair fail in the middle of the walk rather than at its
@@ -78,10 +80,21 @@ type reseedDriver struct {
 	outboxCalls   int
 }
 
-// hides reports whether stmt is subject to the driver's predicate, in
-// which case the excluded key is not in its result.
-func (d *reseedDriver) hides(sql string) bool {
-	return d.pred != "" && strings.Contains(sql, d.pred)
+// reseedHidden pairs a predicate with the key it removes from the
+// result of any statement that carries it.
+type reseedHidden struct {
+	pred string
+	key  int64
+}
+
+// hides reports whether sql carries a predicate that removes key.
+func (d *reseedDriver) hides(sql string, key int64) bool {
+	for _, h := range d.hidden {
+		if h.key == key && strings.Contains(sql, h.pred) {
+			return true
+		}
+	}
+	return false
 }
 
 type reseedStmt struct {
@@ -133,7 +146,7 @@ func (d *reseedDriver) Query(_ context.Context, sql string, args ...any) (drops.
 		limit := int(args[len(args)-1].(int64))
 		var data [][]any
 		for _, r := range d.rows {
-			if r.id == d.excluded && d.hides(sql) {
+			if d.hides(sql, r.id) {
 				continue
 			}
 			if r.id > after && len(data) < limit {
@@ -150,7 +163,7 @@ func (d *reseedDriver) Query(_ context.Context, sql string, args ...any) (drops.
 		lo, hi := args[0].(int64), args[1].(int64)
 		var data [][]any
 		for _, r := range d.rows {
-			if r.id == d.excluded && d.hides(sql) {
+			if d.hides(sql, r.id) {
 				continue
 			}
 			if r.id >= lo && r.id <= hi {
@@ -833,54 +846,102 @@ func TestReseedWalksWithALagGateInstalled(t *testing.T) {
 // the key scan applies and the row read does not seeds rows the
 // caller excluded from the mirror; the other way round the scan
 // counts keys as seeded that were never sent, and the cursor walks
-// past them. The driver here applies the predicate the way a server
-// would — the excluded key is absent from any statement carrying it
-// and present in any statement that lost it — so the assertion is on
-// what was seeded, not on the text of the SQL.
+// past them. The driver here applies the predicates the way a server
+// would — an excluded key is absent from any statement carrying the
+// predicate that excludes it and present in any statement that lost
+// it — so the assertion is on what was seeded, not on the text of
+// the SQL.
+//
+// Two predicates, because [Reseeder.Where] ANDs them and a walk that
+// rendered only the first would still narrow correctly by that one.
 func TestReseedWhereNarrowsBothStatements(t *testing.T) {
 	src := reseedSourceTable()
-	d := newReseedDriver(1, 2, 3)
-	d.pred, d.excluded = `"docs"."views" <> $`, 2
+	d := newReseedDriver(1, 2, 3, 4)
+	// views is id*10 and the titles are doc-N, so these are doc 2 and
+	// doc 4 and nothing else.
+	d.hidden = []reseedHidden{
+		{`"docs"."views" <> $`, 2},
+		{`"docs"."title" <> $`, 4},
+	}
 	sink := &recSink{name: "sink"}
 	r, err := mirror.NewFillReseeder(pg.New(d), src, sink)
 	if err != nil {
 		t.Fatalf("NewFillReseeder: %v", err)
 	}
-	// views is id*10, so this is doc 2 and nothing else. A bound
-	// argument rather than IS NULL on purpose: the two statements
-	// number their placeholders differently — the key scan's LIMIT
-	// comes after the predicate, the row read's range before it — and
-	// a predicate whose argument went to the wrong position would
-	// render fine and filter on the wrong value.
-	r.ChunkSize(2).Throttle(0).Where(pg.Ne(src.Col("views"), int32(20)))
+	// Bound arguments rather than IS NULL on purpose: the two
+	// statements number their placeholders differently — the key
+	// scan's LIMIT comes after the predicates, the row read's range
+	// before them — and a predicate whose argument went to the wrong
+	// position would render fine and filter on the wrong value.
+	r.ChunkSize(2).Throttle(0).
+		Where(pg.Ne(src.Col("views"), int32(20)), pg.Ne(src.Col("title"), "doc-4"))
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
 	if got := reseedChangeKeys(sink.seen); !reflect.DeepEqual(got, []string{"1", "3"}) {
-		t.Errorf("seeded %v, want only the keys the predicate leaves in the mirror", got)
+		t.Errorf("seeded %v, want only the keys the predicates leave in the mirror", got)
 	}
 	// One chunk, not two: the key scan skipped doc 2 as well, so its
 	// LIMIT 2 reached doc 3 and the walk finished in one pass. A scan
-	// that lost the predicate would have stopped at doc 2 and needed a
-	// second chunk to reach doc 3 — the same seeded keys, a different
-	// walk.
+	// that lost a predicate would have stopped short and needed a
+	// second chunk — sometimes for the same keys, so the chunk count
+	// is the assertion that sees it.
 	if len(sink.seen) != 1 {
-		t.Errorf("the walk took %d chunks, want 1: the key scan must skip the excluded key too", len(sink.seen))
+		t.Errorf("the walk took %d chunks, want 1: the key scan must skip the excluded keys too", len(sink.seen))
 	}
 	scans := d.keyScans()
 	if len(scans) < 2 || scans[1].args[0] != int64(3) {
 		t.Fatalf("second key scan resumed from %v, want 3", scans[1].args[0])
 	}
+	reads := d.rowReads()
+	if len(reads) == 0 {
+		t.Fatal("no row read was issued")
+	}
 
-	for _, s := range append(d.keyScans(), d.rowReads()...) {
-		if !strings.Contains(s.sql, `"docs"."views" <> $`) {
-			t.Errorf("predicate missing from %s", s.sql)
-		}
-		if !containsArg(s.args, int32(20)) {
+	// The clause whole, not a substring of it. What a
+	// strings.Contains of the predicate cannot see is how the
+	// predicates are joined to the key bound, and a fake that applies
+	// a predicate by recognising its text cannot see it either. The
+	// expected strings are the ones PostgreSQL 16 was handed and
+	// accepted for this walk, table name aside.
+	//
+	// An ORed predicate is not a narrowing at all: the server answers
+	// `"id" > 3 OR (("views" <> 20))` with keys 1 and 3 — behind the
+	// cursor that asked for keys past 3 — so fetchKeys returns a
+	// non-empty chunk whose highest key never passes lastKey, and
+	// pg.Backfill.Run loops on it forever.
+	const (
+		wantKeyScan = `"docs"."id" > $1 AND (("docs"."views" <> $2)) AND (("docs"."title" <> $3))`
+		wantRowRead = `"docs"."id" >= $1 AND "docs"."id" <= $2 AND (("docs"."views" <> $3)) AND (("docs"."title" <> $4))`
+	)
+	if got := reseedWhereClause(scans[0].sql); got != wantKeyScan {
+		t.Errorf("key scan WHERE = %s\nwant                %s", got, wantKeyScan)
+	}
+	if got := reseedWhereClause(reads[0].sql); got != wantRowRead {
+		t.Errorf("row read WHERE = %s\nwant               %s", got, wantRowRead)
+	}
+
+	for _, s := range append(d.keyScans(), reads...) {
+		if !containsArg(s.args, int32(20)) || !containsArg(s.args, "doc-4") {
 			t.Errorf("predicate argument missing from %s: args %v", s.sql, s.args)
 		}
 	}
+}
+
+// reseedWhereClause returns what a statement puts between WHERE and
+// ORDER BY, which is where a reseed's key bound and its predicates
+// meet. A statement missing either marker yields "" rather than
+// something that could compare equal by accident — including a repair
+// read whose predicates ended up behind its FOR SHARE.
+func reseedWhereClause(sql string) string {
+	const from, to = ` WHERE `, ` ORDER BY `
+	i := strings.Index(sql, from)
+	j := strings.Index(sql, to)
+	if i < 0 || j < i {
+		return ""
+	}
+	return sql[i+len(from) : j]
 }
 
 func containsArg(args []any, want any) bool {

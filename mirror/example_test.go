@@ -128,9 +128,11 @@ func ExampleEvolver_PlanAgainst() {
 
 	// What ClickHouse actually holds, read back with InspectMirror in
 	// anything but an example: no "views", and a "legacy" column the
-	// source has never had.
+	// source has never had. The sorting key is flagged because the
+	// plan compares it — a shape that names no sorting key describes
+	// a mirror that has none, and is refused as such.
 	live := []mirror.MirrorColumn{
-		{Name: "id", Type: "Int64", InKey: true},
+		{Name: "id", Type: "Int64", InKey: true, InSortingKey: true},
 		{Name: "title", Type: "String"},
 		{Name: "lang", Type: "Nullable(String)"},
 		{Name: "created_at", Type: "DateTime64(6, 'UTC')"},

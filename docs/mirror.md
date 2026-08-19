@@ -143,7 +143,7 @@ happened while a sink was down and the outbox was truncated out from
 under it. `Reseeder` walks the source and replays it.
 
 ```go
-seed, _ := mirror.NewFillReseeder(db, docs, chSink, qSink)
+seed, _ := mirror.NewFillReseeder(db, docs, chSink)
 seed = seed.Named("docs-into-clickhouse").ChunkSize(5000)
 
 if err := seed.Run(ctx); err != nil {
@@ -158,17 +158,27 @@ leaves the cursor alone, so the chunk is replayed rather than skipped.
 
 There are two modes, and the difference is which rows they can correct.
 
-`NewFillReseeder` writes straight to the sinks at `SeedVersion`, below
+`NewFillReseeder` writes straight to the sinks in the seed band, below
 every version a live write can produce. That makes it safe to run
 against a live mirror: a row the pump already delivered wins, and only
 the holes get filled. It cannot fix a row that is present but wrong,
-because that row's version is in the live space and beats the seed.
+because that row's version is in the live band and beats the seed.
 
-`NewRepairReseeder` emits into the outbox instead, so the seed travels
-the ordinary path and a running pump delivers it. That is what
-overwrites a wrong value — and it is expensive, since every row passes
-through every sink and a Qdrant mirror re-embeds the whole table. It
-locks each chunk `FOR SHARE` before reading, which is what makes a
+That safety is a claim about *versions*, so it only holds for a sink
+that reads them — which is why `NewFillReseeder` refuses one that does
+not. `ClickHouseSink` qualifies: a `ReplacingMergeTree` resolves by
+version, so a seeded row that arrives late still loses. `QdrantSink`
+does not, and cannot: Qdrant's upsert is last-write-wins with no
+version and no compare-and-set, so a seed applied after a live change
+would overwrite it, permanently and silently. Reseeding a Qdrant
+mirror therefore goes through repair mode, which is ordered by
+delivery rather than by comparison.
+
+`NewRepairReseeder` emits into the outbox, so the seed travels the
+ordinary path and a running pump delivers it. That is what overwrites
+a wrong value — and it is expensive, since every row passes through
+every sink and a Qdrant mirror re-embeds the whole table. It locks
+each chunk `FOR SHARE` before reading, which is what makes a
 concurrent writer beat the seed rather than the other way around.
 
 Two things a reseed cannot do, both for the same reason — it reads the
@@ -187,12 +197,17 @@ compares the two.
 
 ```go
 v, _ := mirror.NewVerifier(db, docs, chDB, chDocs)
-rep, err := v.RangeSize(10_000).Verify(ctx)
 
-if !rep.Aligned() {
-    for _, d := range rep.Divergences {
-        log.Printf("%s %s: %s", d.Direction(), d.Key, d.Kind)
-    }
+rep, err := v.RangeSize(10_000).Verify(ctx)
+if err != nil {
+    // A pass that died half-way still reports what it compared, and
+    // rep.Resume is where to carry on from. Check err first: Aligned
+    // over a pass that compared nothing is true, and means nothing.
+    log.Printf("verify stopped at %q: %v", rep.Resume, err)
+}
+
+for _, d := range rep.Divergences {
+    log.Printf("%s %s: %s (%s wrote the mirror row)", d.Direction(), d.Key, d.Kind, d.Origin())
 }
 ```
 
@@ -201,7 +216,11 @@ disagree, so a clean mirror costs one scan of each side and a dirty one
 costs detail exactly where the dirt is. Divergences are classified
 rather than counted: a row the mirror never received reads differently
 from one it received wrong, which reads differently again from one it
-tombstoned while the source still has it.
+tombstoned while the source still has it. `Origin` adds the other half
+of the diagnosis — which version band the surviving mirror row came
+from, and therefore what can still overwrite it. A row in the seed
+band can be corrected by another fill; one in the live band needs a
+repair.
 
 Neither engine computes the checksum. Both return rows, and every value
 from either side is encoded in Go against the mirror column's declared
@@ -219,6 +238,13 @@ least consistent with the mirror lagging — the normal, self-healing
 state. `Recheck` is how a candidate is discharged: re-read the named
 keys, and the ones that still disagree are real.
 
+One cost worth knowing before you point this at a large table. A `uuid`
+primary key is compared as text, because ClickHouse and PostgreSQL do
+not order UUIDs the same way, and `toString(id)` is not monotone in a
+ClickHouse table's sorting key. So on the mirror side each range is a
+full `FINAL` scan rather than an indexed one, and the pass is quadratic
+in the row count. Integer and text keys walk the index normally.
+
 ## Evolve it
 
 The source table gains a column. The mirror does not, and the sink
@@ -229,14 +255,11 @@ ev, _ := mirror.NewEvolver(chDB, docs)
 plan, _ := ev.Plan(ctx)
 
 for _, s := range plan.Steps {
-    fmt.Println(s.SQL)
+    fmt.Println(s.SQL, s.Args)
 }
 if err := plan.Refused(); err != nil {
     log.Fatal(err)
 }
-
-_, err := ev.Apply(ctx)
-sink, _ := mirror.NewClickHouseSink(chDB, ev.Target())
 ```
 
 `Plan` reads the live mirror and compares it against the table the
@@ -257,3 +280,39 @@ apply, which is the moment you least want a blanket permission.
 A rename arrives as a drop plus an add, and no comparison of two
 schemas can tell that apart from an unrelated pair. `Evolver` flags the
 pair rather than guessing, and leaves the choice where it belongs.
+
+It also compares the table's own shape, not only its columns: a sorting
+key or a partitioning expression that no longer matches the derived one
+is a refusal rather than a plan, because ClickHouse cannot change
+either in place. That refusal matters more than it sounds. A mirror
+whose `ORDER BY` has moved still accepts every insert, and
+`ClickHouseSink` addresses its tombstones by the *derived* key — so
+every delete lands under a key the table does not sort by, and deleted
+rows stay visible through `FINAL` forever.
+
+### The order matters, and it is not the same order twice
+
+For an **add**, apply the DDL first, then build the replacement sink:
+
+```go
+_, err := ev.Apply(ctx)
+sink, _ := mirror.NewClickHouseSink(chDB, ev.Target())
+```
+
+The running sink was built from a snapshot of the old columns, so it
+names only those — ClickHouse fills the new one with its default until
+the new sink takes over.
+
+For a **drop** the order is the reverse: swap the sink first, then run
+the DDL. A sink built before the drop still names the dropped column on
+every insert, so the moment the `ALTER` lands ClickHouse rejects every
+batch with `UNKNOWN_IDENTIFIER`, the pump stops acknowledging, and it
+retries the same failing batch until you finish. `AllowPartial` is
+there for exactly this: apply the adds, swap the sink, then come back
+with `AllowDrop` for the removal.
+
+A newly added column reads as its type's default for every row already
+in the mirror. Backfilling it takes `NewRepairReseeder` — a fill writes
+in the seed band and loses to every row the pump has already delivered,
+so it would leave the new column empty on precisely the rows you wanted
+to fill.

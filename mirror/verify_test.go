@@ -1011,6 +1011,22 @@ func TestVerifyKeepsTheCallersStartingPointWhenTheFirstRangeFails(t *testing.T) 
 	}
 }
 
+// The other half of the same contract. Seeding Resume with the
+// caller's own starting point means a pass that runs to the end has to
+// clear it again: an empty Resume is how the report says "the key
+// space is exhausted", and a pass started with From that finished
+// would otherwise report the key it began at and read as interrupted
+// forever.
+func TestVerifyClearsTheResumePointWhenAPassStartedFromAKeyFinishes(t *testing.T) {
+	v, _, _, _ := vfyRig(t, vfyTable(), nil, nil)
+	v.From("41")
+
+	rep := vfyRun(t, v)
+	if rep.Resume != "" {
+		t.Errorf("Resume = %q, want empty: the walk reached the end of the key space", rep.Resume)
+	}
+}
+
 // --- what wrote the mirror row ---------------------------------------
 
 // A version says more than whether the row moved: which band it is in
@@ -1046,5 +1062,41 @@ func TestDivergenceOriginNamesTheBandTheMirrorVersionIsIn(t *testing.T) {
 	clocked := mirror.Divergence{MirrorVersion: mirror.ClockVersion(vfyAt)}
 	if clocked.Origin() != mirror.OriginClock {
 		t.Errorf("a wall-clock version reads as %s, want %s", clocked.Origin(), mirror.OriginClock)
+	}
+}
+
+// Naming the band a version is comfortably inside proves the switch
+// reads the right end of the number line; it does not prove the line
+// is cut where the bands are declared. A version one past a boundary
+// is the whole difference between "a fill pass wrote this" and "the
+// pump did", and that is the answer Origin is consulted for, so every
+// boundary is pinned at the exact value the band documents:
+// SeedVersionAt tops out at MaxSeedVersion, ClockVersion starts one
+// above it, and LiveVersion(0) is LiveVersionBase itself.
+func TestDivergenceOriginCutsTheBandsWhereTheyAreDeclared(t *testing.T) {
+	cases := []struct {
+		version uint64
+		want    mirror.VersionOrigin
+		why     string
+	}{
+		{0, mirror.OriginAbsent, "no row at all"},
+		{1, mirror.OriginFill, "the floor of the seed band"},
+		{mirror.MaxSeedVersion, mirror.OriginFill, "the top of the seed band, which a clamped seed pass lands on"},
+		{mirror.MaxSeedVersion + 1, mirror.OriginClock, "the floor of the clock band, which ClockVersion lifts a low reading to"},
+		{mirror.LiveVersionBase - 1, mirror.OriginClock, "the top of the clock band"},
+		{mirror.LiveVersionBase, mirror.OriginStream, "the floor of the live band, which LiveVersion(0) is"},
+	}
+	for _, c := range cases {
+		d := mirror.Divergence{MirrorVersion: c.version}
+		if got := d.Origin(); got != c.want {
+			t.Errorf("version %d reads as %s, want %s — %s", c.version, got, c.want, c.why)
+		}
+	}
+	if mirror.LiveVersion(0) != mirror.LiveVersionBase {
+		t.Errorf("LiveVersion(0) = %d, want LiveVersionBase %d", mirror.LiveVersion(0), mirror.LiveVersionBase)
+	}
+	if mirror.ClockVersion(time.Unix(0, 0)) != mirror.MaxSeedVersion+1 {
+		t.Errorf("a clock reading at the epoch = %d, want the clock band's floor %d",
+			mirror.ClockVersion(time.Unix(0, 0)), mirror.MaxSeedVersion+1)
 	}
 }

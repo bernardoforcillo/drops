@@ -9,6 +9,24 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Version bands in `drops/mirror`** — `Change.Version` decides which
+  of two writes to a row the mirror keeps, and a `ReplacingMergeTree`
+  never revisits that decision. Two incomparable spaces were in play
+  at once and the live one was the application's wall clock: two hosts
+  five milliseconds apart inverted two updates one millisecond apart,
+  permanently and silently. The `uint64` line is cut into three bands
+  instead — a seed band, a clock band for a source with no sequence of
+  its own, and a live band that is the outbox event id offset to
+  `1<<63`. A `ReplacingMergeTree` written by an older version of this
+  package needs no migration: every version it ever stamped was a
+  nanosecond reading, so every row it holds sits below every sequenced
+  change.
+- **`mirror.VersionAwareSink`** — a fill-mode reseed is safe because
+  seeded rows lose on version, which is a claim only a sink that reads
+  versions can honour. `QdrantSink` cannot: Qdrant's upsert is
+  last-write-wins with no compare-and-set. `NewFillReseeder` now
+  refuses such a sink by name rather than corrupting it quietly.
+
 - **Typed ad-hoc queries** (`drops.All[T]` / `drops.One[T]`) — an
   entity query was already typed, but an entity is exactly what a
   join, an aggregate or a projection does not have, so the interesting
@@ -31,9 +49,10 @@ once a 1.0 is cut.
   `Verifier` answers whether the mirror is equal to the source, by
   range digests that narrow only where they disagree and that encode
   both sides in Go rather than trusting two engines to agree on the
-  text of a value. `Evolver` reconciles the mirror's columns with the
-  source's, adding and widening on its own and refusing a drop, a
-  narrowing, a key column or an unprovable cast by name. See
+  text of a value. `Evolver` reconciles the mirror's *shape* with the
+  source's — columns, sorting key and partitioning — adding and
+  widening on its own and refusing a drop, a narrowing, a key column,
+  a moved sorting key or an unprovable cast by name. See
   `docs/mirror.md`.
 - **Scalar destinations in `One`/`All`** — `One(ctx, &n)` for a
   `COUNT(*)` failed with "requires a pointer to struct". A
@@ -96,6 +115,44 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **`qdrant.HasID()` with an empty id set matched every point.** The
+  field carries `omitempty`, so an empty set left a condition with no
+  clauses in it, and Qdrant reads a condition that constrains nothing
+  as one that matches everything. The route is the shortest there is —
+  look up ids, find none, delete what you found — and it empties the
+  collection while reporting success. `In` and `NotIn` had the same
+  hole in milder form.
+- **A SQLite table rebuild destroyed every index and trigger on the
+  table.** SQLite cannot `ALTER` most things, so `drops/sqlite` renders
+  those changes as a rebuild — create the new shape, copy, `DROP
+  TABLE`, rename — and `DROP TABLE` takes the table's indexes and
+  triggers with it. `TableSnapshot` carried no record of either, so
+  they were gone, silently, and a migration that dropped the index a
+  hot query depends on reported success. `Introspect` now reads the
+  stored `CREATE INDEX` / `CREATE TRIGGER` text out of `sqlite_master`
+  and the rebuild replays it after the rename. What a rebuild cannot
+  preserve is now said out loud rather than assumed: an index keyed on
+  a removed column is dropped with the column and reported
+  (`rebuild-drops-index`); an index that reaches a removed column
+  through a partial predicate or an expression is replayed and the
+  engine's rejection fails the migration; a trigger is replayed
+  verbatim, because SQLite does not resolve a trigger body until it
+  fires, and one naming a removed column is reported
+  (`rebuild-stale-trigger`). `Diff` still emits no `CREATE INDEX` or
+  `DROP INDEX` of its own — the schema DSL cannot declare an index, so
+  every index in a database is undeclared and diffing them would drop
+  all of them.
+- **Every SQLite table with a `UNIQUE` constraint rebuilt itself on
+  every push.** SQLite does not store a `UNIQUE` constraint's name — an
+  inline `email TEXT UNIQUE`, a `UNIQUE (email)` and a `CONSTRAINT c
+  UNIQUE (email)` all leave one anonymous index, which `PRAGMA
+  index_list` reports as `sqlite_autoindex_users_1`. Comparing names
+  therefore reported a constraint change against the table's own
+  declaration, forever, and on SQLite a constraint change means a full
+  table rebuild. Unique constraints are now compared as a set of column
+  tuples, which is the only part the engine remembers. `Introspect` also
+  stops filing a standalone `CREATE UNIQUE INDEX` as a table
+  constraint; it is an index, and it is preserved as one.
 - **The shared scanner mapped a column to the wrong field whenever two
   fields could claim it**, and which one won depended on declaration
   order. An embedded `Key.ID` displaced the outer `ID` when the

@@ -577,11 +577,15 @@ func (r *Reseeder) processChunk(ctx context.Context, tx *pg.DB, keys []int64) er
 		return err
 	}
 	if len(changes) == 0 {
-		// Every key in the chunk went away between the two reads:
-		// deleted, or — where [Reseeder.Where] is in play — changed
-		// so that it no longer belongs in the mirror. Either way the
-		// change stream carries it, so there is nothing to seed and
-		// nothing to report, and the cursor may move past the chunk.
+		// Nothing the key scan saw is still in scope: the rows were
+		// deleted between the two reads, or — where [Reseeder.Where]
+		// is in play — changed so that they no longer belong in the
+		// mirror. Either way there is nothing to seed and the cursor
+		// moves past them, because a reseed reads the source and a
+		// key that is not there is one it can neither seed nor say
+		// anything about. What that costs where the mirror still
+		// holds the key is the Deletes section above: the stale row
+		// survives the reseed untouched and unreported.
 		return nil
 	}
 	if r.mode == reseedRepair {

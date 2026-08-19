@@ -20,9 +20,17 @@ jobs:
           go-version: '1.24'
           check-latest: true
       - run: go mod tidy
-      # Whole-tree diff: this module has no external deps, so go.sum does
-      # not exist — naming it explicitly errored with "no such path". A
-      # bare diff still catches any go.mod (or future go.sum) drift.
+      # The integration suite is a second module on purpose — its
+      # drivers must never reach a user's build. Tidying it here is what
+      # keeps that true: a dependency that creeps into the root module
+      # shows up as a diff, and a driver added to integration/ without
+      # its go.sum entry fails the same way.
+      - run: go mod tidy
+        working-directory: integration
+      # Whole-tree diff: the root module has no external deps, so its
+      # go.sum does not exist — naming it explicitly errored with "no
+      # such path". A bare diff still catches any go.mod (or go.sum)
+      # drift in either module.
       - run: git diff --exit-code
 
   # ── test matrix ──────────────────────────────────────────────────────
@@ -48,6 +56,12 @@ jobs:
         run: go test ./... -count=1
       - name: race
         run: go test ./... -race -count=1
+      # The integration module is not reachable from the root ./... , so
+      # without this it compiles for the first time in the integration
+      # job — after the servers have been paid for and started.
+      - name: vet integration
+        run: go vet ./...
+        working-directory: integration
 
   # ── integration ──────────────────────────────────────────────────────
   # Everything above tests the SQL drops *generates*, by comparing it to
@@ -121,6 +135,8 @@ jobs:
           cache: true
       - run: go install honnef.co/go/tools/cmd/staticcheck@latest
       - run: staticcheck ./...
+      - run: staticcheck ./...
+        working-directory: integration
 
   golangci-lint:
     name: golangci-lint
@@ -153,3 +169,8 @@ jobs:
           cache: true
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
+      # The root module has no dependencies to be vulnerable; the
+      # integration module has four drivers, which is where an advisory
+      # would actually land.
+      - run: govulncheck ./...
+        working-directory: integration

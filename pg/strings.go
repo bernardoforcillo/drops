@@ -1,18 +1,23 @@
 package pg
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"reflect"
+	"time"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // PostgreSQL string functions. Each helper produces a SQL fragment;
 // arguments may be drops.Expression (column/expr) or Go values (bound
 // as parameters).
 
 // Concat renders concat(args...).
-func Concat(args ...any) drops.Expression { return funcCall("concat", args) }
+func Concat(args ...any) drops.Expression { return variadicAnyCall("concat", args) }
 
 // ConcatWS renders concat_ws(sep, args...).
 func ConcatWS(sep any, args ...any) drops.Expression {
 	all := append([]any{sep}, args...)
-	return funcCall("concat_ws", all)
+	return variadicAnyCall("concat_ws", all)
 }
 
 // ConcatOp renders the SQL || concatenation operator: (a || b).
@@ -120,6 +125,60 @@ func Decode(text, format any) drops.Expression {
 // funcCall is the shared renderer for "<name>(<args>)" expressions.
 // args is a slice so the caller passes variadic-shaped data already
 // flattened — avoids the recursive variadic-of-variadic awkwardness.
+// variadicAnyCall renders a call to a VARIADIC "any" function, naming
+// the type of every bound argument.
+//
+// concat and concat_ws declare their arguments as VARIADIC "any", and
+// PostgreSQL will not resolve a bare placeholder against that: the
+// statement fails to parse with "could not determine data type of
+// parameter" (SQLSTATE 42P18), before any argument is sent. Spelling
+// the type on the placeholder is what makes the call resolvable, and
+// the Go value is the only place that type can come from.
+func variadicAnyCall(name string, args []any) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteString(name)
+		b.WriteByte('(')
+		for i, a := range args {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if e, ok := a.(drops.Expression); ok {
+				e.WriteSQL(b)
+				continue
+			}
+			b.AddArg(a)
+			b.WriteString("::")
+			b.WriteString(pgTypeOf(a))
+		}
+		b.WriteByte(')')
+	})
+}
+
+// pgTypeOf names the PostgreSQL type a bound Go value should be cast
+// to. Anything unrecognised is called text, which is what concat would
+// have coerced it to anyway.
+func pgTypeOf(v any) string {
+	switch v.(type) {
+	case nil:
+		return "text"
+	case time.Time:
+		return "timestamptz"
+	case []byte:
+		return "bytea"
+	}
+	switch reflect.ValueOf(v).Kind() {
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return "bigint"
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "numeric"
+	case reflect.Float32, reflect.Float64:
+		return "double precision"
+	}
+	return "text"
+}
+
 func funcCall(name string, args []any) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString(name)

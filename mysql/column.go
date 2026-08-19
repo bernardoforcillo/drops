@@ -1,6 +1,10 @@
 package mysql
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"fmt"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // ColumnType describes a column's SQL type as it appears in CREATE
 // TABLE — "BIGINT", "VARCHAR(255)", "DATETIME(6)".
@@ -25,6 +29,7 @@ type Column struct {
 	hasDefault bool
 	onUpdate   string
 	comment    string
+	keyPrefix  int
 	ref        *FK
 	managed    bool
 }
@@ -51,6 +56,10 @@ func (c *Column) HasDefault() bool      { return c.hasDefault }
 func (c *Column) DefaultSQL() string    { return c.defaultSQL }
 func (c *Column) ForeignKey() *FK       { return c.ref }
 func (c *Column) Comment() string       { return c.comment }
+
+// KeyPrefixLength returns the prefix length the column carries into a
+// PRIMARY KEY or UNIQUE KEY, or zero when it has none.
+func (c *Column) KeyPrefixLength() int { return c.keyPrefix }
 
 // IsManaged reports whether drops writes this column rather than the
 // application — see (*Col[T]).Managed.
@@ -134,6 +143,19 @@ func (c *Col[T]) OnUpdateExpr(sqlExpr string) *Col[T] {
 	return c
 }
 
+// KeyPrefix indexes only the first n characters of the column when it
+// takes part in the table's PRIMARY KEY or a UNIQUE KEY.
+//
+// A TEXT or BLOB column cannot enter a key without one — MySQL answers
+// error 1170, "used in key specification without a key length" — and
+// [CreateTable] has nowhere else to learn the length from. A secondary
+// index says the same thing through (*Index).Prefix, which is the knob
+// to reach for when the column is not part of the table definition.
+func (c *Col[T]) KeyPrefix(n int) *Col[T] {
+	c.Column.keyPrefix = n
+	return c
+}
+
 // Comment attaches a COMMENT to the column.
 func (c *Col[T]) Comment(text string) *Col[T] {
 	c.Column.comment = text
@@ -141,7 +163,16 @@ func (c *Col[T]) Comment(text string) *Col[T] {
 }
 
 // References declares a single-column foreign key to target.
+//
+// The target must already belong to a table: REFERENCES names a table,
+// and a column that was never registered with one cannot supply that
+// name. Add the target to its table first.
 func (c *Col[T]) References(target *Col[T], opts ...func(*FK)) *Col[T] {
+	if target.Column.table == nil {
+		panic(fmt.Sprintf(
+			"drops/mysql: column %q references %q, which belongs to no table; Add the target to its table first",
+			c.Column.name, target.Column.name))
+	}
 	fk := &FK{Target: target.Column}
 	for _, o := range opts {
 		o(fk)

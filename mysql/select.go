@@ -98,7 +98,12 @@ func (s *SelectBuilder) ForUpdateSkipLocked() *SelectBuilder {
 	return s
 }
 
-// ForShare appends FOR SHARE (LOCK IN SHARE MODE's modern spelling).
+// ForShare appends a shared read lock, rendered as LOCK IN SHARE MODE.
+//
+// MySQL 8.0 introduced FOR SHARE as the modern spelling and kept the
+// older one; MariaDB has never accepted FOR SHARE at all, answering a
+// syntax error. LOCK IN SHARE MODE is the form both servers take, and
+// drops targets the intersection.
 func (s *SelectBuilder) ForShare() *SelectBuilder { s.forShare = true; return s }
 
 // Unscoped opts out of the FROM table's DefaultFilter predicates.
@@ -164,7 +169,7 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 	if s.forUpd != "" {
 		b.WriteString(s.forUpd)
 	} else if s.forShare {
-		b.WriteString(" FOR SHARE")
+		b.WriteString(" LOCK IN SHARE MODE")
 	}
 }
 

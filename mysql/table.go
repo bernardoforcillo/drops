@@ -51,10 +51,27 @@ func (t *Table) Database() string { return t.database }
 func (t *Table) Alias() string    { return t.alias }
 
 // As returns a copy of the table under an alias, for self-joins.
+//
+// The copy carries its own columns, bound to the aliased table, so a
+// reference reached through it — u := users.As("u"); u.Col("id") —
+// qualifies with the alias while the original package-level handles go
+// on qualifying with the table name. That is what makes both sides of a
+// self-join addressable at once. Default filters are not rewritten:
+// they were built against the un-aliased columns and would resolve
+// against a table the aliased query no longer names, so scope an
+// aliased query with Unscoped and an explicit predicate.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
 	cp.alias = alias
+	cp.columns = make([]*Column, len(t.columns))
+	cp.byName = make(map[string]*Column, len(t.byName))
+	for i, c := range t.columns {
+		aliased := *c
+		aliased.table = &cp
+		cp.columns[i] = &aliased
+		cp.byName[aliased.name] = &aliased
+	}
 	return &cp
 }
 

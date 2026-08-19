@@ -14,8 +14,8 @@ type Index struct {
 	method       string // btree / hash / gist / gin / brin / spgist / hnsw / ivfflat
 	include      []*Column
 	where        drops.Expression
-	opClass      string // optional pgvector-style operator class (vector_cosine_ops, …)
-	with         string // raw WITH (key = value, …) clause
+	opClasses    []string // per-column operator class, positionally paired with columns
+	with         string   // raw WITH (key = value, …) clause
 }
 
 // NewIndex declares an index on t spanning cols. Cols may be column
@@ -86,9 +86,9 @@ func writeIndexCreate(b *drops.Builder, idx *Index, ifNotExists bool) {
 			b.WriteString(", ")
 		}
 		writeIndexColumn(b, c)
-		if idx.opClass != "" {
+		if j < len(idx.opClasses) && idx.opClasses[j] != "" {
 			b.WriteByte(' ')
-			b.WriteString(idx.opClass)
+			b.WriteString(idx.opClasses[j])
 		}
 	}
 	b.WriteByte(')')

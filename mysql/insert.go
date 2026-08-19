@@ -64,6 +64,10 @@ func (i *InsertBuilder) OnDuplicateKeyUpdate(assignments ...ColumnValue) *Insert
 
 // OnDuplicateKeyUpdateAll sets every non-key column to the value the
 // insert would have written, which is the "upsert this row" shorthand.
+//
+// On a table whose every column is part of the key there is nothing to
+// assign, and the clause degrades to "do nothing on conflict" rather
+// than vanishing.
 func (i *InsertBuilder) OnDuplicateKeyUpdateAll() *InsertBuilder {
 	i.upsert = true
 	for _, c := range i.cols {
@@ -133,8 +137,18 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 		b.AppendList(", ", row)
 		b.WriteByte(')')
 	}
-	if i.upsert && len(i.upserts) > 0 {
+	if i.upsert && len(i.cols) > 0 {
 		b.WriteString(" ON DUPLICATE KEY UPDATE ")
+		if len(i.upserts) == 0 {
+			// Nothing to copy over — every column the insert names
+			// belongs to the key. Assigning a column to itself is
+			// MySQL's spelling of "do nothing on conflict"; dropping
+			// the clause instead would turn the upsert back into a
+			// plain INSERT that raises 1062.
+			b.WriteIdent(i.cols[0].name)
+			b.WriteString(" = ")
+			b.WriteIdent(i.cols[0].name)
+		}
 		for n, a := range i.upserts {
 			if n > 0 {
 				b.WriteString(", ")

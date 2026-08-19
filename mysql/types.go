@@ -21,9 +21,10 @@ func (p parametrisedType) TypeSQL() string { return p.base + "(" + p.args + ")" 
 //
 // Note that MySQL cannot index a TEXT column without a prefix length,
 // so a column you intend to index or make UNIQUE wants [Varchar]
-// instead. That is a real constraint of the engine, not a drops
-// limitation, and it is the most common surprise when porting a
-// PostgreSQL schema where every string is `text`.
+// instead, or a length from [Col.KeyPrefix] / [Index.Prefix]. That is a
+// real constraint of the engine, not a drops limitation, and it is the
+// most common surprise when porting a PostgreSQL schema where every
+// string is `text`.
 func Text(name string) *Col[string] { return newCol[string](name, simpleType("TEXT")) }
 
 // LongText is a LONGTEXT column, for values past TEXT's 64KB.
@@ -154,14 +155,24 @@ func Enum(name string, members ...string) *Col[string] {
 func Custom[T any](name, typeSQL string) *Col[T] { return newCol[T](name, simpleType(typeSQL)) }
 
 // quoteLiteral escapes a string for a single-quoted SQL literal. Used
-// only for schema text (enum members, defaults), never for values —
+// only for schema text (enum members, comments), never for values —
 // those are always bound.
+//
+// The quote is doubled rather than backslash-escaped because \' is not
+// an escape under the NO_BACKSLASH_ESCAPES sql_mode, where 'it\'s'
+// ends the literal early and the rest of the DDL is a syntax error.
+// A doubled quote closes it in every mode. A backslash has no portable
+// form — it must be doubled under the default mode and left alone
+// under NO_BACKSLASH_ESCAPES — so it is doubled, which corrupts the
+// text under that mode but never the statement around it.
 func quoteLiteral(s string) string {
 	out := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
-		case '\'', '\\':
-			out = append(out, '\\', s[i])
+		case '\'':
+			out = append(out, '\'', '\'')
+		case '\\':
+			out = append(out, '\\', '\\')
 		default:
 			out = append(out, s[i])
 		}

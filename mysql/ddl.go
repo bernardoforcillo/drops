@@ -1,7 +1,9 @@
 package mysql
 
 import (
+	"hash/fnv"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -45,7 +47,7 @@ func createTable(t *Table, ifNotExists bool) drops.Expression {
 				if i > 0 {
 					b.WriteString(", ")
 				}
-				b.WriteIdent(c.name)
+				writeKeyPart(b, c)
 			}
 			b.WriteByte(')')
 		}
@@ -54,9 +56,9 @@ func createTable(t *Table, ifNotExists bool) drops.Expression {
 				continue
 			}
 			b.WriteString(",\n\tUNIQUE KEY ")
-			b.WriteIdent("uq_" + t.name + "_" + c.name)
+			b.WriteIdent(constraintName("uq_", t.name, c.name))
 			b.WriteString(" (")
-			b.WriteIdent(c.name)
+			writeKeyPart(b, c)
 			b.WriteByte(')')
 		}
 		for _, c := range t.columns {
@@ -114,9 +116,45 @@ func writeColumnDef(b *drops.Builder, c *Column) {
 	}
 }
 
+// writeKeyPart renders one member of a PRIMARY KEY or UNIQUE KEY,
+// carrying the column's prefix length when it has one — which a TEXT
+// or BLOB column must, since MySQL refuses to key on one otherwise.
+func writeKeyPart(b *drops.Builder, c *Column) {
+	b.WriteIdent(c.name)
+	if c.keyPrefix > 0 {
+		b.WriteByte('(')
+		b.WriteString(strconv.Itoa(c.keyPrefix))
+		b.WriteByte(')')
+	}
+}
+
+// constraintName derives the name of a table-level constraint from the
+// table and column it is built over.
+//
+// MySQL caps an identifier at 64 bytes, and the two halves can each
+// approach that on their own, so the plain concatenation is not always
+// legal — the server answers error 1059 and the whole CREATE TABLE
+// fails. An over-long name is folded back under the limit with a hash
+// of the full derivation, which keeps it deterministic across renders
+// and distinct between columns rather than merely short.
+func constraintName(prefix, table, column string) string {
+	name := prefix + table + "_" + column
+	if len(name) <= 64 {
+		return name
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	suffix := "_" + strconv.FormatUint(h.Sum64(), 36)
+	cut := 64 - len(suffix)
+	for cut > 0 && !utf8.ValidString(name[:cut]) {
+		cut--
+	}
+	return name[:cut] + suffix
+}
+
 func writeForeignKey(b *drops.Builder, t *Table, c *Column) {
 	fk := c.ref
-	name := "fk_" + t.name + "_" + c.name
+	name := constraintName("fk_", t.name, c.name)
 	b.WriteString(",\n\tCONSTRAINT ")
 	b.WriteIdent(name)
 	b.WriteString(" FOREIGN KEY (")

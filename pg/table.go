@@ -313,6 +313,26 @@ func (t *Table) PrimaryKey(cols ...ColRef) *Table {
 // when the table uses a single-column PK (or none).
 func (t *Table) CompositePrimaryKey() []*Column { return t.compositePK }
 
+// primaryKeyColumns returns the table's PRIMARY KEY columns in key
+// order, whichever of the two declarations the schema used.
+//
+// A key can arrive as Table.PrimaryKey(cols...) or by marking columns
+// with (*Col[T]).PrimaryKey(). Every reader that needs "the key" —
+// the CREATE TABLE body, NewEntity — has to accept both, or a table
+// declared one way silently loses its key in the other.
+func (t *Table) primaryKeyColumns() []*Column {
+	if len(t.compositePK) > 0 {
+		return t.compositePK
+	}
+	var out []*Column
+	for _, c := range t.columns {
+		if c.primary {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // AddUnique declares a multi-column UNIQUE constraint named name
 // spanning cols. Single-column uniques continue to live on the
 // column via *Col[T].Unique().

@@ -216,30 +216,43 @@ func DropSequenceIfExists(name string) drops.Expression {
 // NextVal returns the SQL expression nextval('"name"'::regclass).
 func NextVal(name string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(`nextval('`)
-		b.WriteString(name)
-		b.WriteString(`'::regclass)`)
+		b.WriteString(`nextval(`)
+		b.WriteString(sequenceLiteral(name))
+		b.WriteString(`::regclass)`)
 	})
 }
 
 // CurrVal returns currval('"name"').
 func CurrVal(name string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(`currval('`)
-		b.WriteString(name)
-		b.WriteString(`')`)
+		b.WriteString(`currval(`)
+		b.WriteString(sequenceLiteral(name))
+		b.WriteByte(')')
 	})
 }
 
 // SetVal returns setval('"name"', value).
 func SetVal(name string, value any) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(`setval('`)
-		b.WriteString(name)
-		b.WriteString(`', `)
+		b.WriteString(`setval(`)
+		b.WriteString(sequenceLiteral(name))
+		b.WriteString(`, `)
 		writeOperand(b, value)
 		b.WriteByte(')')
 	})
+}
+
+// sequenceLiteral renders a sequence name as the string literal the
+// nextval/currval/setval family takes.
+//
+// The literal is parsed as an identifier, so an unquoted one is
+// case-folded: a sequence created as "orderSeq" — CreateSequence
+// quotes it — is looked up as orderseq and reported missing
+// (SQLSTATE 42P01). Quoting it inside the literal is what makes the
+// two spellings agree, which matters here because drops schemas are
+// camelCase throughout.
+func sequenceLiteral(name string) string {
+	return quoteLiteral(drops.StdQuoteIdent(name))
 }
 
 // --- Views ------------------------------------------------------------
@@ -445,14 +458,19 @@ func DropTriggerIfExists(name string, table *Table) drops.Expression {
 
 // --- Comments ---------------------------------------------------------
 
-// CommentOnTable returns COMMENT ON TABLE <t> IS 'text'. text must not
-// contain unsanitised single quotes.
+// CommentOnTable returns COMMENT ON TABLE <t> IS 'text'.
+//
+// The text is rendered as a literal rather than bound as a parameter:
+// COMMENT is a utility statement and PostgreSQL's grammar has no place
+// for a placeholder there, so "IS $1" is a syntax error before the
+// argument is ever looked at. Embedded quotes are doubled by
+// quoteLiteral.
 func CommentOnTable(t *Table, text string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("COMMENT ON TABLE ")
 		t.writeName(b)
 		b.WriteString(" IS ")
-		b.AddArg(text)
+		b.WriteString(quoteLiteral(text))
 	})
 }
 
@@ -467,7 +485,7 @@ func CommentOnColumn(c ColRef, text string) drops.Expression {
 		}
 		b.WriteIdent(col.Name())
 		b.WriteString(" IS ")
-		b.AddArg(text)
+		b.WriteString(quoteLiteral(text))
 	})
 }
 
@@ -481,13 +499,16 @@ func CommentOnColumn(c ColRef, text string) drops.Expression {
 // them, and PostgreSQL rejects the statement with "multiple primary
 // keys for table are not allowed". The table-level form is the only
 // one that works for both, so the choice is made here from the number
-// of columns marked, rather than at each column.
+// of key columns, rather than at each column.
+//
+// The key itself comes from Table.primaryKeyColumns, so a table that
+// declared it with PrimaryKey(cols...) and one that marked each
+// column render the same clause.
 func writeTableBody(b *drops.Builder, t *Table) {
-	keys := make([]*Column, 0, 2)
-	for _, c := range t.Columns() {
-		if c.IsPrimaryKey() {
-			keys = append(keys, c)
-		}
+	keys := t.primaryKeyColumns()
+	inKey := make(map[*Column]bool, len(keys))
+	for _, c := range keys {
+		inKey[c] = true
 	}
 	composite := len(keys) > 1
 
@@ -495,7 +516,7 @@ func writeTableBody(b *drops.Builder, t *Table) {
 		if i > 0 {
 			b.WriteString(",\n  ")
 		}
-		writeColumnDefKey(b, c, !composite)
+		writeColumnDefKey(b, c, inKey[c] && !composite, inKey[c])
 	}
 	if !composite {
 		return
@@ -510,19 +531,21 @@ func writeTableBody(b *drops.Builder, t *Table) {
 	b.WriteByte(')')
 }
 
-// writeColumnDefKey renders one column. inlineKey is false when the
-// table declares a composite key, in which case a key column carries
-// NOT NULL here and its key membership is stated once, table-level.
-func writeColumnDefKey(b *drops.Builder, c *Column, inlineKey bool) {
+// writeColumnDefKey renders one column. inlineKey asks for the inline
+// PRIMARY KEY; it is false when the table declares a composite key, in
+// which case a key column carries NOT NULL here and its key membership
+// is stated once, table-level. keyMember says whether the column is
+// part of the key at all, which is what suppresses a redundant UNIQUE.
+func writeColumnDefKey(b *drops.Builder, c *Column, inlineKey, keyMember bool) {
 	b.WriteIdent(c.Name())
 	b.WriteByte(' ')
 	b.WriteString(c.Type().TypeSQL())
-	if inlineKey && c.IsPrimaryKey() {
+	if inlineKey {
 		b.WriteString(" PRIMARY KEY")
 	} else if c.IsNotNull() {
 		b.WriteString(" NOT NULL")
 	}
-	if c.IsUnique() && !c.IsPrimaryKey() {
+	if c.IsUnique() && !keyMember {
 		b.WriteString(" UNIQUE")
 	}
 	if c.HasDefault() {

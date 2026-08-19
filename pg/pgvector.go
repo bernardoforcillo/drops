@@ -125,10 +125,22 @@ const (
 //	    OpClass(pg.VectorCosineOps).
 //	    With("m = 16, ef_construction = 64")
 //
+// Only that column carries the class. Stamping it on every column of a
+// multi-column index is not a harmless extra: PostgreSQL rejects an
+// operator class whose input type does not match the column, so
+// `("name" text_pattern_ops, "id" text_pattern_ops)` fails with
+// SQLSTATE 42704 as soon as "id" is not text.
+//
 // (Index.With and OpClass are pgvector additions to the Index type;
 // see index.go for the underlying fields.)
 func (i *Index) OpClass(class VectorOpClass) *Index {
-	i.opClass = string(class)
+	if len(i.columns) == 0 {
+		return i
+	}
+	for len(i.opClasses) < len(i.columns) {
+		i.opClasses = append(i.opClasses, "")
+	}
+	i.opClasses[len(i.columns)-1] = string(class)
 	return i
 }
 

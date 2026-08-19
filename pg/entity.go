@@ -144,12 +144,7 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	}
 	fields := fieldMap(rt)
 
-	var pks []*Column
-	for _, c := range t.Columns() {
-		if c.IsPrimaryKey() {
-			pks = append(pks, c)
-		}
-	}
+	pks := t.primaryKeyColumns()
 	if len(pks) == 0 {
 		panic(fmt.Sprintf("drops/pg: NewEntity[%s]: table %q has no PRIMARY KEY column; CRUD shortcuts require one", rt.Name(), t.Name()))
 	}

@@ -543,6 +543,12 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 }
 
 // Limit / Offset bound the result window.
+// Unscoped opts out of the table's DefaultFilter predicates for this
+// query. Without it a soft-deleted row is unreachable through the
+// entity at all, which makes an audit or a restore flow impossible to
+// write.
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 

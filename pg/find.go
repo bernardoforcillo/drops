@@ -146,6 +146,27 @@ func (c *RelConfig) WithRel(name string, fn func(*RelConfig)) *RelConfig {
 	return c
 }
 
+// Load declares deeper relations by handle — the checked counterpart
+// of [RelConfig.With].
+func (c *RelConfig) Load(rels ...*Relation) *RelConfig {
+	for _, r := range rels {
+		if r == nil {
+			continue
+		}
+		c.With(r.Name)
+	}
+	return c
+}
+
+// LoadRel declares a deeper, individually configured relation by
+// handle.
+func (c *RelConfig) LoadRel(rel *Relation, fn func(*RelConfig)) *RelConfig {
+	if rel == nil {
+		return c
+	}
+	return c.WithRel(rel.Name, fn)
+}
+
 // Find begins a relational query against t. The result type passed to
 // All/One determines what columns are scanned (via the same struct-field
 // mapping rules as Select.All).
@@ -230,6 +251,43 @@ func (f *FindBuilder) WithRel(name string, fn func(*RelConfig)) *FindBuilder {
 		fn(&RelConfig{node: leaf, err: &f.relErr})
 	}
 	return f
+}
+
+// Load eager-loads relations given as handles rather than names.
+//
+//	var UserPosts = Users.Rel("posts")
+//	db.Find(Users).Load(UserPosts).All(ctx, &users)
+//
+// It is the checked counterpart of [FindBuilder.With]. Both exist on
+// purpose: Load is for the relations a query knows statically, where
+// a typo should be a compile error and a rename should be a
+// refactor; With takes strings for the case Load cannot serve, where
+// the set comes from outside the program — an `?include=posts,author`
+// query parameter, a GraphQL selection set.
+//
+// A nil relation is ignored, so an optional handle needs no guard.
+func (f *FindBuilder) Load(rels ...*Relation) *FindBuilder {
+	for _, r := range rels {
+		if r == nil {
+			continue
+		}
+		f.With(r.Name)
+	}
+	return f
+}
+
+// LoadRel is [FindBuilder.WithRel] taking a relation handle. Nested
+// relations inside the callback can be declared with
+// [RelConfig.Load], keeping the whole path checked.
+//
+//	db.Find(Users).LoadRel(UserPosts, func(p *pg.RelConfig) {
+//	    p.Where(PostPublished.Eq(true)).Load(PostComments)
+//	})
+func (f *FindBuilder) LoadRel(rel *Relation, fn func(*RelConfig)) *FindBuilder {
+	if rel == nil {
+		return f
+	}
+	return f.WithRel(rel.Name, fn)
 }
 
 // All runs the find and populates dest, which must be *[]Struct or

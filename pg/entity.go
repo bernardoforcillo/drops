@@ -842,6 +842,20 @@ func (q *EntityQuery[T]) WithRel(name string, fn func(*RelConfig)) *EntityQuery[
 	return q
 }
 
+// Load eager-loads relations given as handles — see [FindBuilder.Load]
+// for why both this and the string-taking With exist.
+func (q *EntityQuery[T]) Load(rels ...*Relation) *EntityQuery[T] {
+	q.fb.Load(rels...)
+	return q
+}
+
+// LoadRel eager-loads a relation by handle with per-edge
+// configuration.
+func (q *EntityQuery[T]) LoadRel(rel *Relation, fn func(*RelConfig)) *EntityQuery[T] {
+	q.fb.LoadRel(rel, fn)
+	return q
+}
+
 // Unscoped opts out of the table's DefaultFilter predicates.
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 	q.fb.Unscoped()

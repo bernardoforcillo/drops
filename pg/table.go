@@ -1,6 +1,12 @@
 package pg
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // Table represents a schema-qualified PostgreSQL table.
 type Table struct {
@@ -80,6 +86,33 @@ func NewSchemaTable(schema, name string) *Table {
 // Relation looks up a registered relation by name. Returns nil if no
 // such relation exists.
 func (t *Table) Relation(name string) *Relation { return t.relations[name] }
+
+// Rel returns the named relation, panicking if it was never declared.
+//
+// It is how a relation becomes a Go identifier rather than a string
+// literal at the query site:
+//
+//	var UserPosts = Users.Rel("posts")
+//	...
+//	db.Find(Users).Load(UserPosts)
+//
+// The name is still spelled once, at declaration, where a typo panics
+// at process start instead of failing the first query that happens to
+// eager-load it. Everywhere the relation is used it is a symbol the
+// compiler checks and a rename refactors.
+func (t *Table) Rel(name string) *Relation {
+	r := t.relations[name]
+	if r == nil {
+		declared := make([]string, 0, len(t.relations))
+		for n := range t.relations {
+			declared = append(declared, n)
+		}
+		sort.Strings(declared)
+		panic(fmt.Sprintf("drops/pg: table %q has no relation %q; declared: %s",
+			t.name, name, strings.Join(declared, ", ")))
+	}
+	return r
+}
 
 // Name returns the table's unqualified name.
 func (t *Table) Name() string { return t.name }

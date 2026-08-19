@@ -38,7 +38,14 @@ func FieldKey(idx []int) string {
 // tagged `dropRel` holds an eager-loaded relation and is bound to a
 // query, not a column. Reporting either as a suspect would train
 // readers to ignore the message.
+//
+// A column reached through an embedded struct is bound at a nested
+// path — "0.1", not "0" — so an embedded field is judged by whether
+// anything under it was bound. Without that, every entity that
+// embeds a shared base would see the base named as the likely cause
+// of a mistake it had nothing to do with.
 func SpareFields(rt reflect.Type, bound map[string]bool) []string {
+	roots := rootsOf(bound)
 	var out []string
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
@@ -48,10 +55,23 @@ func SpareFields(rt reflect.Type, bound map[string]bool) []string {
 		if f.Tag.Get("drop") == "-" || f.Tag.Get("dropRel") != "" {
 			continue
 		}
-		if bound[FieldKey([]int{i})] {
+		if roots[strconv.Itoa(i)] {
 			continue
 		}
 		out = append(out, f.Name)
+	}
+	return out
+}
+
+// rootsOf collects the outermost field index of every bound path.
+func rootsOf(bound map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(bound))
+	for key, ok := range bound {
+		if !ok {
+			continue
+		}
+		head, _, _ := strings.Cut(key, ".")
+		out[head] = true
 	}
 	return out
 }

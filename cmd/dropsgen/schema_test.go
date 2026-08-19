@@ -1,8 +1,13 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -216,5 +221,143 @@ func TestSchemaNoDirectives(t *testing.T) {
 	_ = os.WriteFile(in, []byte("package models\n\ntype User struct{}\n"), 0o600)
 	if err := runSchema(in, ""); err == nil {
 		t.Error("expected an error when nothing is marked for generation")
+	}
+}
+
+// `type=` is the only option that puts a Go type in the output, as
+// pg.Custom's type argument. A qualified one needs its package
+// imported or the generated file does not compile — and format.Source
+// only parses, so nothing upstream notices.
+func TestSchemaExplicitTypeCarriesItsImport(t *testing.T) {
+	src := `package models
+
+import "time"
+
+//drops:schema table=Events name=events
+type Event struct {
+	ID int64     ` + "`drop:\"id,primaryKey\"`" + `
+	At time.Time ` + "`drop:\"at,type=timestamptz\"`" + `
+}
+`
+	got := generateSchema(t, src)
+	if !strings.Contains(got, `pg.Custom[time.Time]("at", "timestamptz")`) {
+		t.Fatalf("explicit type= should win:\n%s", got)
+	}
+	if !strings.Contains(got, `"time"`) {
+		t.Errorf("generated file references time.Time but imports no time:\n%s", got)
+	}
+	assertParsesAndResolves(t, got)
+}
+
+// An import whose package name is not its last path element still has
+// to resolve, which means the generated file spells the alias out.
+func TestSchemaExplicitTypeAliasesAnUnusualImport(t *testing.T) {
+	src := `package models
+
+import (
+	uuid "github.com/example/go-uuid"
+)
+
+//drops:schema table=Rows name=rows
+type Row struct {
+	ID uuid.UUID ` + "`drop:\"id,primaryKey,type=uuid\"`" + `
+}
+`
+	got := generateSchema(t, src)
+	if !strings.Contains(got, `uuid "github.com/example/go-uuid"`) {
+		t.Errorf("an aliased import must be reproduced with its alias:\n%s", got)
+	}
+}
+
+// assertParsesAndResolves checks that every qualifier the generated
+// file uses is one it imports — the compile error the golden compare
+// cannot see.
+func assertParsesAndResolves(t *testing.T, src string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	af, err := parser.ParseFile(fset, "gen.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("generated file does not parse: %v", err)
+	}
+	imported := map[string]bool{}
+	for _, spec := range af.Imports {
+		p, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := path.Base(p)
+		if spec.Name != nil {
+			name = spec.Name.Name
+		}
+		imported[name] = true
+	}
+	ast.Inspect(af, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		id, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if !imported[id.Name] {
+			t.Errorf("generated file uses %s.%s but imports no %q", id.Name, sel.Sel.Name, id.Name)
+		}
+		return true
+	})
+}
+
+// The runtime path over the same tag — pg.AutoTable — refuses an
+// option it does not know. The generator must too: a `notnull` that
+// generates a nullable column is a schema bug with nothing downstream
+// left to catch it.
+func TestSchemaRejectsUnknownTagOption(t *testing.T) {
+	for _, tag := range []string{
+		`drop:"email,notnull"`,
+		`drop:"email,uniqe"`,
+		`drop:"email,defualt=x"`,
+		`drop:"email,default"`,
+		`drop:"email,type"`,
+	} {
+		src := "package models\n\n//drops:schema table=T name=t\ntype Row struct {\n\tID int64 `drop:\"id,primaryKey\"`\n\tEmail string `" + tag + "`\n}\n"
+		dir := t.TempDir()
+		in := filepath.Join(dir, "models.go")
+		if err := os.WriteFile(in, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := runSchema(in, ""); err == nil {
+			t.Errorf("%s: expected an error, got a silently weaker column", tag)
+		}
+	}
+}
+
+// Schema mode is blind to embedded structs for the same reason
+// bind/scan mode is: the AST names the type and stops. Their columns
+// would simply be missing from the generated table, which is exactly
+// the drift this mode exists to remove.
+func TestSchemaRejectsEmbeddedFields(t *testing.T) {
+	src := `package models
+
+//drops:schema table=Users name=users
+type User struct {
+	ID int64 ` + "`drop:\"id,primaryKey\"`" + `
+	Timestamps
+}
+
+type Timestamps struct {
+	CreatedAt string ` + "`drop:\"createdAt\"`" + `
+}
+`
+	dir := t.TempDir()
+	in := filepath.Join(dir, "models.go")
+	if err := os.WriteFile(in, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runSchema(in, "")
+	if err == nil {
+		t.Fatal("an embedded field should be refused, not silently dropped from the schema")
+	}
+	if !strings.Contains(err.Error(), "Timestamps") {
+		t.Errorf("the error should name the embedded type: %v", err)
 	}
 }

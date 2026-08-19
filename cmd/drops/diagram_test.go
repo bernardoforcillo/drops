@@ -96,3 +96,50 @@ func TestRunDiagramWritesOutput(t *testing.T) {
 		t.Errorf("output missing erDiagram, got:\n%s", b)
 	}
 }
+
+// Types straight out of pg.BuildSnapshot: pg.DoublePrecision writes
+// "double precision" and pg.Numeric writes "numeric(10,2)". Mermaid
+// reads an attribute line as `<type> <name> [key] [comment]`, so a
+// space or a comma in the type silently turns one column into two
+// tokens and the whole diagram stops rendering.
+const spacedTypeSnapshot = `{
+  "tables": {
+    "public.orders": {
+      "name": "orders",
+      "columns": {
+        "id":     {"name": "id",     "type": "bigserial",      "primaryKey": true},
+        "amount": {"name": "amount", "type": "double precision"},
+        "price":  {"name": "price",  "type": "numeric(10,2)"},
+        "note":   {"name": "note",   "type": "timestamp with time zone"}
+      },
+      "foreignKeys": {}
+    }
+  }
+}`
+
+func TestRenderMermaidKeepsAttributesToOneWordEach(t *testing.T) {
+	tmp := t.TempDir()
+	snap := filepath.Join(tmp, "snap.json")
+	if err := os.WriteFile(snap, []byte(spacedTypeSnapshot), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := renderMermaid(snap)
+	if err != nil {
+		t.Fatalf("renderMermaid: %v", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "    ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[2] == "PK" {
+			continue
+		}
+		if len(fields) != 2 {
+			t.Errorf("attribute line is not `<type> <name>[ PK]`: %q", line)
+		}
+	}
+	if !strings.Contains(string(out), "double_precision amount") {
+		t.Errorf("expected the spaced type to collapse to one word:\n%s", out)
+	}
+}

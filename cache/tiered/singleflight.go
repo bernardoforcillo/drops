@@ -1,6 +1,9 @@
 package tiered
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // singleflight deduplicates concurrent calls keyed by a string: while one
 // call for a key is in flight, other calls for the same key block and
@@ -37,11 +40,26 @@ func (g *singleflight) Do(key string, fn func() ([]byte, error)) (val []byte, er
 	g.m[key] = c
 	g.mu.Unlock()
 
-	c.val, c.err = fn()
-	c.wg.Done()
+	// The teardown runs even when fn panics. Left to the happy path it
+	// would be skipped, and the abandoned in-flight record then blocks
+	// every later caller for that key forever — one panicking loader
+	// wedging a hot key for the life of the process. Waiters are handed
+	// the panic as an error so they don't read the zero value as a
+	// successful empty result; the caller that ran fn still panics.
+	defer func() {
+		r := recover()
+		if r != nil {
+			c.err = fmt.Errorf("cache/tiered: load panicked: %v", r)
+		}
+		c.wg.Done()
+		g.mu.Lock()
+		delete(g.m, key)
+		g.mu.Unlock()
+		if r != nil {
+			panic(r)
+		}
+	}()
 
-	g.mu.Lock()
-	delete(g.m, key)
-	g.mu.Unlock()
+	c.val, c.err = fn()
 	return c.val, c.err, false
 }

@@ -165,6 +165,20 @@ func TestAllPointerElements(t *testing.T) {
 	}
 }
 
+func TestAllPointerScalarTakesNull(t *testing.T) {
+	src := query(t, []string{"nickname"},
+		[]driver.Value{"ada"},
+		[]driver.Value{nil},
+	)
+	got, err := drops.All[*string](context.Background(), src)
+	if err != nil {
+		t.Fatalf("All[*string]: %v", err)
+	}
+	if len(got) != 2 || got[0] == nil || *got[0] != "ada" || got[1] != nil {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestAllEmptyResultIsEmptySlice(t *testing.T) {
 	got, err := drops.All[projection](context.Background(), query(t, []string{"author", "posts"}))
 	if err != nil {

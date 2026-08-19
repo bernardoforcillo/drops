@@ -193,6 +193,11 @@ func (i *Instrumentation) span(ctx context.Context, e drops.QueryEvent, attrs []
 	end := i.now()
 	start := end.Add(-e.Duration)
 	_, span := i.cfg.Tracer.Start(ctx, i.spanName(e), start)
+	// Deferred, because everything below runs inside the caller's
+	// adapter. drops.CallHook swallows a panic raised there, so a
+	// straight-line End would leave the span open — and an unended
+	// span is one the exporter holds forever rather than one it drops.
+	defer span.End(end)
 
 	spanAttrs := attrs
 	if i.cfg.RecordStatement && e.SQL != "" {
@@ -205,7 +210,6 @@ func (i *Instrumentation) span(ctx context.Context, e drops.QueryEvent, attrs []
 	if e.Err != nil {
 		span.RecordError(e.Err)
 	}
-	span.End(end)
 }
 
 func (i *Instrumentation) spanName(e drops.QueryEvent) string {

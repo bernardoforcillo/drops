@@ -156,3 +156,89 @@ SELECT $1;
 		t.Errorf("functions should be emitted in alphabetical order; got A=%d B=%d", posA, posB)
 	}
 }
+
+// The generated function already binds db and ctx as parameters and
+// out, rows and err as locals. An argument reusing one of those names
+// still parses, so gofmt passes it and dropsgen exits 0 on a file the
+// compiler then rejects — "db redeclared in this block".
+func TestParseRejectsArgumentsThatCollideWithGeneratedNames(t *testing.T) {
+	for _, name := range []string{"db", "ctx", "out", "rows", "err"} {
+		sql := "-- name: Get(" + name + " int64) :exec\nSELECT $1;\n"
+		if _, err := parseSQLFile(sql); err == nil {
+			t.Errorf("argument %q should be refused: the generated function already uses it", name)
+		}
+	}
+}
+
+func TestParseRejectsArgumentsThatAreNotIdentifiers(t *testing.T) {
+	for _, name := range []string{"type", "func", "1st", "a-b"} {
+		sql := "-- name: Get(" + name + " int64) :exec\nSELECT $1;\n"
+		if _, err := parseSQLFile(sql); err == nil {
+			t.Errorf("argument %q is not a Go identifier and should be refused", name)
+		}
+	}
+}
+
+func TestParseRejectsDuplicateArguments(t *testing.T) {
+	sql := `-- name: Get(id int64, id int64) :exec
+SELECT $1;
+`
+	if _, err := parseSQLFile(sql); err == nil {
+		t.Error("a repeated argument name should be refused")
+	}
+}
+
+// Two queries of the same name become two Go functions of the same
+// name. Reporting it here names the query; leaving it produces a
+// compile error in someone else's package.
+func TestRunSQLRejectsDuplicateQueryNames(t *testing.T) {
+	tmp := t.TempDir()
+	in := filepath.Join(tmp, "q")
+	if err := os.MkdirAll(in, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"a.sql", "b.sql"} {
+		if err := os.WriteFile(filepath.Join(in, f), []byte("-- name: Get(id int64) :exec\nSELECT $1;\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := runSQL(in, filepath.Join(tmp, "out"), "out")
+	if err == nil {
+		t.Fatal("two queries named Get should be refused")
+	}
+	if !strings.Contains(err.Error(), "Get") {
+		t.Errorf("the error should name the query: %v", err)
+	}
+}
+
+// Same contract as the other modes: regenerating an unchanged
+// directory must produce an identical file.
+func TestSQLGenIsDeterministic(t *testing.T) {
+	first := sqlGenOnce(t)
+	for i := 0; i < 20; i++ {
+		if got := sqlGenOnce(t); got != first {
+			t.Fatalf("run %d differs from the first:\n--- first ---\n%s\n--- got ---\n%s", i, first, got)
+		}
+	}
+}
+
+func sqlGenOnce(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	in := filepath.Join(tmp, "queries")
+	if err := os.MkdirAll(in, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(in, "users.sql"), []byte(sampleSQL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(tmp, "outpkg")
+	if err := runSQL(in, out, "outpkg"); err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.ReadFile(filepath.Join(out, "queries_gen.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(src)
+}

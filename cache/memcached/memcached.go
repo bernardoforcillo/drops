@@ -34,7 +34,9 @@ type Options struct {
 	// Addr is the host:port of the server. Default "127.0.0.1:11211".
 	Addr string
 
-	// MaxConns caps the simultaneous pooled connections. Default 10.
+	// MaxConns caps the simultaneous connections, idle and checked out
+	// alike. Callers beyond the cap wait for one to come free, or for
+	// their context to end. Default 10.
 	MaxConns int
 
 	// DialTimeout caps a single TCP dial. Default 5s.
@@ -65,10 +67,13 @@ type Options struct {
 type Cache struct {
 	opts Options
 
-	mu      sync.Mutex
-	idle    []*conn
-	numOpen int
-	closed  bool
+	// sem holds one slot per allowed connection. Taking a slot is what
+	// bounds the sockets open at once, idle or checked out alike.
+	sem chan struct{}
+
+	mu     sync.Mutex
+	idle   []*conn
+	closed bool
 }
 
 type conn struct {
@@ -97,7 +102,7 @@ func New(opts Options) (*Cache, error) {
 	if opts.WriteTimeout == 0 {
 		opts.WriteTimeout = 3 * time.Second
 	}
-	return &Cache{opts: opts}, nil
+	return &Cache{opts: opts, sem: make(chan struct{}, opts.MaxConns)}, nil
 }
 
 // Compile-time interface conformance.
@@ -125,10 +130,7 @@ func (c *Cache) Get(ctx context.Context, key string) (_ []byte, err error) {
 	return v, nil
 }
 
-// Set stores value under key. ttl=0 means no expiry. Memcached treats an
-// exptime above 30 days as an absolute unix timestamp; TTLs longer than
-// that are not supported and return ErrInvalidKey-free but capped
-// behaviour — keep cache TTLs under 30 days.
+// Set stores value under key. ttl=0 means no expiry.
 func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) (err error) {
 	start := time.Now()
 	defer c.emit(ctx, "cache.set", start, &err)
@@ -436,10 +438,20 @@ func (c *Cache) withConn(ctx context.Context, fn func(*conn) error) error {
 	return nil
 }
 
+// acquire checks out a connection, waiting for a free slot when every
+// allowed connection is busy. Waiting is the point: dialling regardless
+// lets a burst of goroutines open a socket each and run the process out
+// of file descriptors, which is what MaxConns exists to prevent.
 func (c *Cache) acquire(ctx context.Context) (*conn, error) {
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		<-c.sem
 		return nil, cache.ErrClosed
 	}
 	if n := len(c.idle); n > 0 {
@@ -448,30 +460,26 @@ func (c *Cache) acquire(ctx context.Context) (*conn, error) {
 		c.mu.Unlock()
 		return cn, nil
 	}
-	c.numOpen++
 	c.mu.Unlock()
 
 	cn, err := c.dial(ctx)
 	if err != nil {
-		c.mu.Lock()
-		c.numOpen--
-		c.mu.Unlock()
+		<-c.sem
 		return nil, err
 	}
 	return cn, nil
 }
 
 // release returns a healthy connection to the pool, or accounts for a
-// dropped one when cn is nil.
+// dropped one when cn is nil, and frees the slot either way.
 func (c *Cache) release(cn *conn) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer func() { <-c.sem }()
 	if cn == nil {
-		c.numOpen--
 		return
 	}
-	if c.closed || len(c.idle) >= c.opts.MaxConns {
-		c.numOpen--
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
 		_ = cn.nc.Close()
 		return
 	}
@@ -589,18 +597,31 @@ func validateKey(key string) error {
 	return nil
 }
 
-// exptime converts a TTL to Memcached's exptime seconds. 0 (or negative)
+// maxRelativeExptime is Memcached's cutoff between the two readings of
+// the exptime field: 30 days in seconds.
+const maxRelativeExptime = 60 * 60 * 24 * 30
+
+// exptime converts a TTL to Memcached's exptime field. 0 (or negative)
 // means "no expiry"; a positive sub-second TTL rounds up to 1 second so
 // it does not accidentally become "never expire".
+//
+// Anything above 30 days is sent as an absolute unix timestamp, which is
+// how the server reads such a value anyway. Sent as a relative count it
+// would be read as a timestamp somewhere in 1970 and the entry would
+// expire on arrival — a silent, total cache miss for exactly the
+// long-lived entries the caller asked to keep.
 func exptime(ttl time.Duration) int {
 	if ttl <= 0 {
 		return 0
 	}
-	secs := int(ttl / time.Second)
-	if secs == 0 {
+	secs := int64(ttl / time.Second)
+	switch {
+	case secs == 0:
 		return 1
+	case secs > maxRelativeExptime:
+		return int(time.Now().Add(ttl).Unix())
 	}
-	return secs
+	return int(secs)
 }
 
 // metaFlagInt extracts the integer value of a single-letter meta flag from

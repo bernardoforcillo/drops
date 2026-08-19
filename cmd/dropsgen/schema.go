@@ -8,10 +8,12 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -34,6 +36,11 @@ type schemaEntity struct {
 	TableName  string // SQL table name, e.g. "users"
 	Schema     string // optional SQL schema qualifier
 	Columns    []schemaColumn
+
+	// Qualifiers holds the package names the generated declarations
+	// mention — "time" for a pg.Custom[time.Time]. The generated file
+	// has to import them or it does not compile.
+	Qualifiers map[string]bool
 }
 
 // schemaColumn is one generated column declaration.
@@ -44,8 +51,39 @@ type schemaColumn struct {
 
 // colOption is a parsed `drop` tag option.
 type colOption struct {
-	Key   string
-	Value string
+	Key      string
+	Value    string
+	HasValue bool
+}
+
+// knownOptions is the `drop` tag vocabulary schema mode understands:
+// pg.AutoTable's, plus the `type=` escape hatch only a generator
+// needs. It is closed for the reason AutoTable's is — a mistyped
+// `notnull` that quietly generates a nullable column is a schema bug
+// with nothing downstream left to notice it.
+var knownOptions = map[string]bool{
+	"primaryKey":    true,
+	"autoIncrement": true,
+	"notNull":       true,
+	"unique":        true,
+	"version":       true,
+	"pii":           true,
+	"default":       true,
+	"type":          true,
+}
+
+// checkOptions rejects a tag schema mode cannot honour, in the words
+// pg.AutoTable already uses for the same tag.
+func checkOptions(column string, opts []colOption) error {
+	for _, o := range opts {
+		if !knownOptions[o.Key] {
+			return fmt.Errorf("column %q: unknown drop tag option %q", column, o.Key)
+		}
+		if !o.HasValue && (o.Key == "default" || o.Key == "type") {
+			return fmt.Errorf("column %q: `%s` option requires a value: %s=<sql>", column, o.Key, o.Key)
+		}
+	}
+	return nil
 }
 
 // columnExpr renders the constructor chain for one field.
@@ -55,14 +93,10 @@ type colOption struct {
 // produces an identical file — a generator whose output churns is one
 // nobody reruns.
 func columnExpr(goType, column string, opts []colOption) (string, error) {
-	has := func(k string) bool {
-		for _, o := range opts {
-			if o.Key == k {
-				return true
-			}
-		}
-		return false
+	if err := checkOptions(column, opts); err != nil {
+		return "", err
 	}
+	has := func(k string) bool { return hasOption(opts, k) }
 	value := func(k string) (string, bool) {
 		for _, o := range opts {
 			if o.Key == k {
@@ -155,13 +189,89 @@ func constructorFor(goType, column string, autoInc bool) (string, error) {
 	}
 }
 
+// hasOption reports whether the tag carried key.
+func hasOption(opts []colOption, key string) bool {
+	for _, o := range opts {
+		if o.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// typeQualifiers records the package qualifiers a type expression
+// mentions — "time" for time.Time or *time.Time, nothing for a type
+// declared in the same package.
+func typeQualifiers(e ast.Expr, into map[string]bool) {
+	switch t := e.(type) {
+	case *ast.SelectorExpr:
+		if id, ok := t.X.(*ast.Ident); ok {
+			into[id.Name] = true
+		}
+	case *ast.StarExpr:
+		typeQualifiers(t.X, into)
+	case *ast.ArrayType:
+		typeQualifiers(t.Elt, into)
+	}
+}
+
+// importsFor resolves qualifiers against the input file's own import
+// block and returns the import lines the generated file needs, sorted.
+// An unresolvable qualifier is an error rather than an omission: the
+// alternative is a generated file that does not compile, discovered
+// one build later with nothing pointing back here.
+func importsFor(af *ast.File, qualifiers map[string]bool) ([]string, error) {
+	names := make([]string, 0, len(qualifiers))
+	for q := range qualifiers {
+		names = append(names, q)
+	}
+	sort.Strings(names)
+
+	out := make([]string, 0, len(names))
+	for _, q := range names {
+		spec, ok := importSpecFor(af, q)
+		if !ok {
+			return nil, fmt.Errorf("cannot tell which import the qualifier %q names; give that import an explicit alias", q)
+		}
+		out = append(out, spec)
+	}
+	return out, nil
+}
+
+func importSpecFor(af *ast.File, q string) (string, bool) {
+	for _, spec := range af.Imports {
+		p, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			continue
+		}
+		name := path.Base(p)
+		if spec.Name != nil {
+			name = spec.Name.Name
+		}
+		// gopkg.in/yaml.v3 is imported as yaml: the last path element
+		// carries the major version, the package name does not.
+		if base, _, ok := strings.Cut(path.Base(p), ".v"); ok && spec.Name == nil {
+			name = base
+		}
+		if name != q {
+			continue
+		}
+		if path.Base(p) == q {
+			return strconv.Quote(p), true
+		}
+		return q + " " + strconv.Quote(p), true
+	}
+	return "", false
+}
+
 // varName builds the Go identifier for a column handle:
 // struct name + field name, so User.Email becomes UserEmail and two
 // tables with an "id" column do not collide.
 func varName(structName, fieldName string) string { return structName + fieldName }
 
-// emitSchema renders the generated schema file.
-func emitSchema(pkg string, ents []schemaEntity) ([]byte, error) {
+// emitSchema renders the generated schema file. imports names the
+// packages the column declarations reach for beyond drops/pg.
+func emitSchema(pkg string, ents []schemaEntity, imports []string) ([]byte, error) {
 	for _, e := range ents {
 		if e.TableName == "" {
 			return nil, fmt.Errorf("%s: //drops:schema needs a name= key naming the SQL table", e.StructName)
@@ -175,7 +285,17 @@ func emitSchema(pkg string, ents []schemaEntity) ([]byte, error) {
 	b.WriteString("// source file. Edit the struct, not this file: a change here is\n")
 	b.WriteString("// reverted the next time dropsgen runs, and a schema that disagrees\n")
 	b.WriteString("// with its struct is exactly the drift this generator removes.\n\n")
-	fmt.Fprintf(&b, "package %s\n\nimport \"github.com/bernardoforcillo/drops/pg\"\n", pkg)
+	const pgImport = `"github.com/bernardoforcillo/drops/pg"`
+	fmt.Fprintf(&b, "package %s\n\n", pkg)
+	if len(imports) == 0 {
+		fmt.Fprintf(&b, "import %s\n", pgImport)
+	} else {
+		fmt.Fprintf(&b, "import (\n\t%s\n", pgImport)
+		for _, imp := range imports {
+			fmt.Fprintf(&b, "\t%s\n", imp)
+		}
+		b.WriteString(")\n")
+	}
 
 	for _, e := range ents {
 		ctor := fmt.Sprintf("pg.NewTable(%q)", e.TableName)
@@ -197,8 +317,9 @@ func emitSchema(pkg string, ents []schemaEntity) ([]byte, error) {
 	return src, nil
 }
 
-// parseSchemaFile reads path and returns the structs carrying a
-// `//drops:schema` directive.
+// parseSchemaFile reads filename and returns the structs carrying a
+// `//drops:schema` directive, along with the import lines their
+// generated declarations need.
 //
 //	//drops:schema table=Users name=users [schema=public]
 //	type User struct {
@@ -210,14 +331,15 @@ func emitSchema(pkg string, ents []schemaEntity) ([]byte, error) {
 // name= the SQL table it addresses. They are separate because the Go
 // name is plural and exported by convention while the SQL name is
 // whatever the database already calls it.
-func parseSchemaFile(path string) ([]schemaEntity, string, error) {
+func parseSchemaFile(filename string) ([]schemaEntity, string, []string, error) {
 	fset := token.NewFileSet()
-	af, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	af, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 
 	var out []schemaEntity
+	qualifiers := map[string]bool{}
 	for _, decl := range af.Decls {
 		gd, ok := decl.(*ast.GenDecl)
 		if !ok || gd.Tok != token.TYPE {
@@ -243,12 +365,19 @@ func parseSchemaFile(path string) ([]schemaEntity, string, error) {
 			}
 			ent, err := schemaEntityFrom(ts.Name.Name, match, st)
 			if err != nil {
-				return nil, "", fmt.Errorf("%s: %s: %w", path, ts.Name.Name, err)
+				return nil, "", nil, fmt.Errorf("%s: %s: %w", filename, ts.Name.Name, err)
+			}
+			for q := range ent.Qualifiers {
+				qualifiers[q] = true
 			}
 			out = append(out, ent)
 		}
 	}
-	return out, af.Name.Name, nil
+	imports, err := importsFor(af, qualifiers)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("%s: %w", filename, err)
+	}
+	return out, af.Name.Name, imports, nil
 }
 
 var schemaDirective = regexp.MustCompile(`drops:schema\b[^\n]*`)
@@ -261,12 +390,16 @@ func schemaEntityFrom(structName, directive string, st *ast.StructType) (schemaE
 		TableVar:   keys["table"],
 		TableName:  keys["name"],
 		Schema:     keys["schema"],
+		Qualifiers: map[string]bool{},
 	}
 	if ent.TableVar == "" {
 		return ent, fmt.Errorf("//drops:schema needs a table= key naming the Go variable")
 	}
 
 	for _, f := range st.Fields.List {
+		if len(f.Names) == 0 {
+			return ent, embeddedFieldError(structName, f)
+		}
 		if f.Tag == nil {
 			continue
 		}
@@ -279,13 +412,23 @@ func schemaEntityFrom(structName, directive string, st *ast.StructType) (schemaE
 		column := parts[0]
 		opts := make([]colOption, 0, len(parts)-1)
 		for _, p := range parts[1:] {
-			k, v, _ := strings.Cut(strings.TrimSpace(p), "=")
-			opts = append(opts, colOption{Key: k, Value: v})
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			k, v, hasVal := strings.Cut(p, "=")
+			opts = append(opts, colOption{Key: k, Value: v, HasValue: hasVal})
 		}
 		goType := typeString(f.Type)
 		expr, err := columnExpr(goType, column, opts)
 		if err != nil {
 			return ent, err
+		}
+		// Only `type=` puts the Go type itself in the output, as
+		// pg.Custom's type argument; every other constructor takes
+		// nothing but the column name.
+		if hasOption(opts, "type") {
+			typeQualifiers(f.Type, ent.Qualifiers)
 		}
 		for _, name := range f.Names {
 			if !ast.IsExported(name.Name) {
@@ -318,14 +461,14 @@ func directiveKeys(directive string) map[string]string {
 
 // runSchema is the CLI entry point for schema generation.
 func runSchema(in, out string) error {
-	ents, pkg, err := parseSchemaFile(in)
+	ents, pkg, imports, err := parseSchemaFile(in)
 	if err != nil {
 		return err
 	}
 	if len(ents) == 0 {
 		return fmt.Errorf("no `//drops:schema` directives found in %s", in)
 	}
-	src, err := emitSchema(pkg, ents)
+	src, err := emitSchema(pkg, ents, imports)
 	if err != nil {
 		return err
 	}

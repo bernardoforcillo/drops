@@ -94,3 +94,40 @@ func TestReportAgreesWithItselfOnNumber(t *testing.T) {
 		t.Errorf("plural: %s", two)
 	}
 }
+
+// An embedded struct lends its fields to the outer type, so its
+// columns bind at a nested path. Judging it by its own index alone
+// named every base struct as the cause of someone else's typo.
+type embedder struct {
+	Base
+	Name  string
+	Stray string
+}
+
+// Base is embedded by value and exported, the shape a shared
+// audit/identity mixin takes.
+type Base struct {
+	ID int64
+}
+
+func TestSpareFieldsLooksInsideEmbeddedStructs(t *testing.T) {
+	bound := map[string]bool{
+		drift.FieldKey([]int{0, 0}): true, // Base.ID
+		drift.FieldKey([]int{1}):    true, // Name
+	}
+	got := drift.SpareFields(reflect.TypeOf(embedder{}), bound)
+	if len(got) != 1 || got[0] != "Stray" {
+		t.Errorf("SpareFields = %v, want only [Stray] — Base lent a bound column", got)
+	}
+}
+
+// An embedded struct that lent nothing is still a suspect: it is
+// exactly the shape a `drop:` typo inside a shared base produces.
+func TestSpareFieldsStillReportsAnUnboundEmbeddedStruct(t *testing.T) {
+	got := drift.SpareFields(reflect.TypeOf(embedder{}), map[string]bool{
+		drift.FieldKey([]int{1}): true,
+	})
+	if len(got) != 2 || got[0] != "Base" || got[1] != "Stray" {
+		t.Errorf("SpareFields = %v, want [Base Stray]", got)
+	}
+}

@@ -65,7 +65,10 @@ func parseFile(path string) ([]entity, string, error) {
 			if err != nil {
 				return nil, "", fmt.Errorf("%s: %s: %w", path, ts.Name.Name, err)
 			}
-			fields := collectFields(st)
+			fields, err := collectFields(ts.Name.Name, st)
+			if err != nil {
+				return nil, "", fmt.Errorf("%s: %s: %w", path, ts.Name.Name, err)
+			}
 			out = append(out, entity{
 				StructName: ts.Name.Name,
 				TableVar:   tableVar,
@@ -110,9 +113,12 @@ func tableFromDirective(directive string) (string, error) {
 // (primaryKey, autoIncrement, notNull, …) are ignored here because dropsgen
 // itself does not generate the schema declaration, only the
 // bind/scan helpers.
-func collectFields(st *ast.StructType) []field {
+func collectFields(structName string, st *ast.StructType) ([]field, error) {
 	var out []field
 	for _, f := range st.Fields.List {
+		if len(f.Names) == 0 {
+			return nil, embeddedFieldError(structName, f)
+		}
 		if f.Tag == nil {
 			continue
 		}
@@ -136,7 +142,19 @@ func collectFields(st *ast.StructType) []field {
 			})
 		}
 	}
-	return out
+	return out, nil
+}
+
+// embeddedFieldError refuses an embedded field. A generator working
+// from the AST sees the embedded type's name and nothing else, so the
+// columns it contributes are missing from everything emitted here —
+// while pg's reflection scanner walks straight into them. The two then
+// disagree on how wide a row is, and every query through the entity
+// fails on the destination count rather than on anything a reader
+// would connect back to this struct.
+func embeddedFieldError(structName string, f *ast.Field) error {
+	return fmt.Errorf("%s embeds %s: dropsgen cannot see the columns an embedded struct contributes; name the field or flatten it into %s",
+		structName, typeString(f.Type), structName)
 }
 
 // typeString renders an ast.Expr back to its source form — sufficient

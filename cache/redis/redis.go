@@ -468,6 +468,14 @@ func isAppLevelError(err error) bool {
 	if errors.Is(err, cache.ErrNotFound) {
 		return true
 	}
+	// A protocol error is phrased like an -ERR reply but is the opposite
+	// of app-level: the parser stopped somewhere in the middle of the
+	// stream and cannot say how many bytes of the reply are still
+	// unread. Reusing that connection serves the tail of one command's
+	// reply as the next command's answer.
+	if errors.Is(err, ErrProtocol) {
+		return false
+	}
 	return strings.HasPrefix(err.Error(), "redis: ") &&
 		!strings.Contains(err.Error(), "dial ")
 }
@@ -523,7 +531,7 @@ func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Dura
 	return c.exec(ctx, "cache.set", func(cn *conn) error {
 		args := []any{"SET", c.k(key), value}
 		if ttl > 0 {
-			args = append(args, "PX", strconv.FormatInt(ttl.Milliseconds(), 10))
+			args = append(args, "PX", strconv.FormatInt(expireMillis(ttl), 10))
 		}
 		_, err := c.cmd(ctx, cn, args)
 		return err
@@ -621,6 +629,10 @@ func (c *Cache) GetMulti(ctx context.Context, keys ...string) (map[string][]byte
 		if r.kind != '*' {
 			return fmt.Errorf("%w: MGET expected array, got 0x%02x", ErrProtocol, r.kind)
 		}
+		if len(r.array) != len(keys) {
+			return fmt.Errorf("%w: MGET returned %d elements for %d keys",
+				ErrProtocol, len(r.array), len(keys))
+		}
 		for i, el := range r.array {
 			if el.isNil() {
 				continue
@@ -655,7 +667,7 @@ func (c *Cache) SetMulti(ctx context.Context, items map[string][]byte, ttl time.
 	return c.exec(ctx, "cache.mset", func(cn *conn) error {
 		for k, v := range items {
 			args := []any{"SET", c.k(k), v, "PX",
-				strconv.FormatInt(ttl.Milliseconds(), 10)}
+				strconv.FormatInt(expireMillis(ttl), 10)}
 			if _, err := c.cmd(ctx, cn, args); err != nil {
 				return err
 			}
@@ -770,3 +782,15 @@ func (c *Cache) guard(key string) error {
 }
 
 func (c *Cache) isClosed() bool { return c.closing.Load() }
+
+// expireMillis renders a positive TTL as Redis's PX argument. Anything
+// under a millisecond truncates to 0, which Redis rejects as an invalid
+// expire time, so it rounds up — the same trade the memcached backend
+// makes for sub-second TTLs.
+func expireMillis(ttl time.Duration) int64 {
+	ms := ttl.Milliseconds()
+	if ms == 0 {
+		return 1
+	}
+	return ms
+}

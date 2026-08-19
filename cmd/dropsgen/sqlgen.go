@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/format"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -53,6 +54,11 @@ func runSQL(in, out, pkg string) error {
 		return fmt.Errorf("no `-- name:` directives found under %s", in)
 	}
 	sort.Slice(queries, func(i, j int) bool { return queries[i].Name < queries[j].Name })
+	for i := 1; i < len(queries); i++ {
+		if queries[i].Name == queries[i-1].Name {
+			return fmt.Errorf("two queries are both named %s; one Go function cannot be declared twice", queries[i].Name)
+		}
+	}
 
 	if pkg == "" {
 		pkg = filepath.Base(filepath.Clean(out))
@@ -130,6 +136,9 @@ func parseSQLFile(text string) ([]sqlQuery, error) {
 		if m := directiveRE.FindStringSubmatch(trim); m != nil {
 			flush()
 			q := sqlQuery{Name: m[1], Kind: m[3], ResultType: m[4]}
+			if !token.IsIdentifier(q.Name) || token.IsKeyword(q.Name) {
+				return nil, fmt.Errorf("query name %q is not a Go identifier", q.Name)
+			}
 			args, err := parseArgs(m[2])
 			if err != nil {
 				return nil, fmt.Errorf("query %s: %w", m[1], err)
@@ -152,6 +161,20 @@ func parseSQLFile(text string) ([]sqlQuery, error) {
 	return queries, nil
 }
 
+// reservedIdents are the names the emitted function already binds: the
+// two parameters it prepends and the locals its body declares. An
+// argument that reuses one produces a duplicate parameter or a
+// shadowed local, so the generated file does not compile — and, unlike
+// a Go keyword, it parses, so gofmt lets it through and dropsgen exits
+// 0 on a file nobody can build.
+var reservedIdents = map[string]bool{
+	"db":   true,
+	"ctx":  true,
+	"out":  true,
+	"rows": true,
+	"err":  true,
+}
+
 // parseArgs splits "a int64, b string" into typed entries.
 // Empty input returns an empty slice.
 func parseArgs(raw string) ([]sqlArg, error) {
@@ -161,6 +184,7 @@ func parseArgs(raw string) ([]sqlArg, error) {
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]sqlArg, 0, len(parts))
+	seen := map[string]bool{}
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -171,12 +195,30 @@ func parseArgs(raw string) ([]sqlArg, error) {
 		if len(fields) < 2 {
 			return nil, fmt.Errorf("argument %q is missing a type", p)
 		}
+		name := fields[0]
+		if err := checkArgName(name); err != nil {
+			return nil, err
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("argument %q is declared twice", name)
+		}
+		seen[name] = true
 		out = append(out, sqlArg{
-			Name: fields[0],
+			Name: name,
 			Type: strings.Join(fields[1:], " "),
 		})
 	}
 	return out, nil
+}
+
+func checkArgName(name string) error {
+	if !token.IsIdentifier(name) || token.IsKeyword(name) {
+		return fmt.Errorf("argument %q is not a Go identifier", name)
+	}
+	if reservedIdents[name] {
+		return fmt.Errorf("argument %q collides with a name the generated function already uses; rename it", name)
+	}
+	return nil
 }
 
 // emitSQL renders the generated source.

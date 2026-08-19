@@ -34,8 +34,17 @@ func (d *poolDriver) Exec(ctx context.Context, sqlStr string, args ...any) (drop
 	return d.db.ExecContext(ctx, sqlStr, args...)
 }
 
+// Query returns an explicit nil cursor on failure. database/sql hands
+// back a nil *sql.Rows next to the error, and returning that straight
+// into a drops.Rows would make an interface that is non-nil and
+// unusable — the `if rows != nil { rows.Close() }` every caller writes
+// would panic instead of skipping.
 func (d *poolDriver) Query(ctx context.Context, sqlStr string, args ...any) (drops.Rows, error) {
-	return d.db.QueryContext(ctx, sqlStr, args...)
+	rows, err := d.db.QueryContext(ctx, sqlStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (d *poolDriver) Begin(ctx context.Context) (drops.Tx, error) {
@@ -53,7 +62,11 @@ func (t *txDriver) Exec(ctx context.Context, sqlStr string, args ...any) (drops.
 }
 
 func (t *txDriver) Query(ctx context.Context, sqlStr string, args ...any) (drops.Rows, error) {
-	return t.tx.QueryContext(ctx, sqlStr, args...)
+	rows, err := t.tx.QueryContext(ctx, sqlStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (t *txDriver) Begin(ctx context.Context) (drops.Tx, error) {

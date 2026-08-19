@@ -235,6 +235,40 @@ func TestConcurrentAccessIsRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
+func TestWriteRacingCloseReturnsErrClosed(t *testing.T) {
+	ctx := context.Background()
+	// Set reads the clock once on entry and once more after the closed
+	// check but before it takes the write lock. Closing on that second
+	// read pins the interleaving a graceful shutdown hits by chance.
+	closeOnSecondTick := func(c **memory.Cache) func() time.Time {
+		var ticks int
+		return func() time.Time {
+			ticks++
+			if ticks == 2 {
+				_ = (*c).Close()
+			}
+			return time.Now()
+		}
+	}
+
+	t.Run("Set", func(t *testing.T) {
+		var c *memory.Cache
+		c = memory.New(memory.Options{Clock: closeOnSecondTick(&c)})
+		if err := c.Set(ctx, "k", []byte("v"), 0); !errors.Is(err, cache.ErrClosed) {
+			t.Errorf("Set into a cache closed mid-call: %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("SetMulti", func(t *testing.T) {
+		var c *memory.Cache
+		c = memory.New(memory.Options{Clock: closeOnSecondTick(&c)})
+		err := c.SetMulti(ctx, map[string][]byte{"k": []byte("v")}, 0)
+		if !errors.Is(err, cache.ErrClosed) {
+			t.Errorf("SetMulti into a cache closed mid-call: %v, want ErrClosed", err)
+		}
+	})
+}
+
 // --- helpers --------------------------------------------------------
 
 type mockClock struct {

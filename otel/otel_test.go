@@ -3,6 +3,7 @@ package otel_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,5 +196,80 @@ func TestCustomSpanName(t *testing.T) {
 	inst.Hook()(context.Background(), drops.QueryEvent{Kind: "ping"})
 	if tr.spans[0].name != "custom:ping" {
 		t.Errorf("custom span name: %q", tr.spans[0].name)
+	}
+}
+
+// A panicking adapter — a nil OTel span, an attribute mapper that
+// does not recognise a value — must still leave the span closed.
+// drops.CallHook recovers the panic on the way out, so a span left
+// open here is one the exporter never emits.
+type panickingSpan struct {
+	fakeSpan
+	on string
+}
+
+func (s *panickingSpan) SetAttributes(a ...otel.Attr) {
+	if s.on == "attrs" {
+		panic("adapter blew up mapping an attribute")
+	}
+	s.fakeSpan.SetAttributes(a...)
+}
+
+func (s *panickingSpan) RecordError(err error) { panic("adapter blew up recording an error") }
+
+type panickingTracer struct {
+	on   string
+	span *panickingSpan
+}
+
+func (t *panickingTracer) Start(ctx context.Context, name string, start time.Time) (context.Context, otel.Span) {
+	t.span = &panickingSpan{fakeSpan: fakeSpan{name: name, started: start}, on: t.on}
+	return ctx, t.span
+}
+
+func TestSpanEndedEvenWhenTheAdapterPanics(t *testing.T) {
+	fixed := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		on    string
+		event drops.QueryEvent
+	}{
+		{"SetAttributes", "attrs", drops.QueryEvent{Kind: "query"}},
+		{"RecordError", "err", drops.QueryEvent{Kind: "query", Err: errors.New("boom")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &panickingTracer{on: tc.on}
+			hook := otel.New(otel.Config{Tracer: tr, Now: func() time.Time { return fixed }}).Hook()
+			drops.CallHook(hook, context.Background(), tc.event)
+
+			if tr.span == nil {
+				t.Fatal("no span started")
+			}
+			if tr.span.ended.IsZero() {
+				t.Error("span was never ended, so the exporter keeps it forever")
+			}
+		})
+	}
+}
+
+// Arguments are user data. The span may say how many there were and
+// nothing more, whatever the statement setting is.
+func TestArgumentValuesNeverReachTheSpan(t *testing.T) {
+	tr := &fakeTracer{}
+	otel.New(otel.Config{Tracer: tr, RecordStatement: true}).Hook()(
+		context.Background(),
+		drops.QueryEvent{
+			Kind: "query",
+			SQL:  "SELECT id FROM users WHERE ssn = $1",
+			Args: []any{"078-05-1120"},
+		},
+	)
+	for _, a := range tr.spans[0].attrs {
+		if s, ok := a.Value.(string); ok && strings.Contains(s, "078-05-1120") {
+			t.Errorf("attribute %q leaked an argument value: %v", a.Key, a.Value)
+		}
+	}
+	if n, _ := attrVal(tr.spans[0].attrs, otel.AttrArgsCount); n != int64(1) {
+		t.Errorf("args count attr = %v, want 1", n)
 	}
 }

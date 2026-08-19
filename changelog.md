@@ -141,7 +141,17 @@ once a 1.0 is cut.
   (`rebuild-stale-trigger`). `Diff` still emits no `CREATE INDEX` or
   `DROP INDEX` of its own — the schema DSL cannot declare an index, so
   every index in a database is undeclared and diffing them would drop
-  all of them.
+  all of them. The replay reaches as far as the previous snapshot does,
+  which means `Push` and `DetectDrift`, both of which diff against a
+  live `Introspect`. `GenerateMigration` diffs two snapshot files and a
+  snapshot file records no index, so a generated rebuild still destroys
+  them — and introspecting at generation time would only be a guess
+  about the server the file is applied to later. That rebuild now
+  carries a comment saying so, reported as `rebuild-loses-indexes`.
+  `DetectDrift` correspondingly does not report a hand-made index as an
+  unauthorised change; it used to report a hand-made *unique* index and
+  not a plain one, and its proposed remedy was a rebuild that would
+  have destroyed it.
 - **Every SQLite table with a `UNIQUE` constraint rebuilt itself on
   every push.** SQLite does not store a `UNIQUE` constraint's name — an
   inline `email TEXT UNIQUE`, a `UNIQUE (email)` and a `CONSTRAINT c

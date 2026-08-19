@@ -971,3 +971,124 @@ func TestPGPushReportsAnUnparseableCheck(t *testing.T) {
 		t.Error("a valid constraint was reported unparseable")
 	}
 }
+
+// A truncated index is worse than no index: it wears the declared
+// name, so both sides agree about it for ever.
+//
+// An index element that is an expression cannot be described by the
+// snapshot. When every element was one, Push said so and created
+// nothing. When only some were, the snapshot kept the columns it
+// could read — and Push created a different index under the declared
+// name, silently, idempotently, with no notice.
+func TestPGPushDoesNotShipATruncatedIndex(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	build := func() *pg.Schema {
+		users := pg.NewSchemaTable(schemaName, "users")
+		pg.Add(users, pg.BigSerial("id").PrimaryKey())
+		email := pg.Add(users, pg.Text("email").NotNull())
+		name := pg.Add(users, pg.Text("name").NotNull())
+		users.AddIndex(pg.NewIndex("usersMixedIdx", users, name, pg.Lower(email)))
+		return pg.NewSchema(users)
+	}
+	opts := pg.PushOptions{Schema: schemaName}
+
+	first, err := pg.Push(ctx, db, build(), opts)
+	if err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	for _, s := range first.Statements {
+		if strings.Contains(s, "usersMixedIdx") {
+			t.Errorf("Push created an index it cannot describe: %s", s)
+		}
+	}
+	if n := noticeFor(first.Notices, "unrepresentable-index"); n.Object != "usersMixedIdx" {
+		t.Fatalf("no unrepresentable-index notice, got %v", first.Notices)
+	}
+	if def := indexDefPG(t, db, schemaName, "usersMixedIdx"); def != "" {
+		t.Fatalf("a truncated index reached the server: %s", def)
+	}
+
+	// Declared with pg.CreateIndex, as the notice says to. Push has to
+	// leave it alone from then on: the catalogue reports one named
+	// column and one expression, and reading only the named one would
+	// have the next push drop an index the schema does declare.
+	create, _ := drops.StringWithDialect(pg.Dialect, pg.CreateIndex(
+		func() *pg.Index {
+			users := pg.NewSchemaTable(schemaName, "users")
+			email := pg.Add(users, pg.Text("email").NotNull())
+			name := pg.Add(users, pg.Text("name").NotNull())
+			return pg.NewIndex("usersMixedIdx", users, name, pg.Lower(email))
+		}()))
+	if _, err := db.Exec(ctx, create); err != nil {
+		t.Fatalf("%s: %v", create, err)
+	}
+
+	second, err := pg.Push(ctx, db, build(), opts)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if len(second.Statements) != 0 {
+		t.Errorf("the push after the index was created by hand is not a no-op:\n%s",
+			strings.Join(second.Statements, "\n"))
+	}
+	if def := indexDefPG(t, db, schemaName, "usersMixedIdx"); !strings.Contains(def, "lower") {
+		t.Errorf("the functional index did not survive the push: %q", def)
+	}
+}
+
+// The probe is DDL against a real table, so it waits for an ACCESS
+// EXCLUSIVE lock and fails when it cannot have one. That failure says
+// nothing about the expression, and reporting it as "the server would
+// not parse it" left the declared expression compared against
+// whatever the database already had — so a tightened CHECK did not
+// ship, on exactly the busy system where the lock wait happened, and
+// the push reported success.
+func TestPGPushFailsWhenTheProbeCannotTakeItsLock(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	build := func(expr string) *pg.Schema {
+		users := pg.NewSchemaTable(schemaName, "users")
+		pg.Add(users, pg.BigSerial("id").PrimaryKey())
+		pg.Add(users, pg.Integer("age").NotNull())
+		users.AddCheck("usersAgeSane", expr)
+		return pg.NewSchema(users)
+	}
+	opts := pg.PushOptions{Schema: schemaName}
+	if _, err := pg.Push(ctx, db, build(`"age" >= 0`), opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+
+	// An ordinary reader, on its own connection, holding the lock a
+	// SELECT holds.
+	blocker, err := sql.Open("pgx", integration.DSN(t, integration.EnvPostgres))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = blocker.Close() }()
+	tx, err := blocker.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`LOCK TABLE "`+schemaName+`"."users" IN ACCESS SHARE MODE`); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+
+	if _, err := db.Exec(ctx, `SET lock_timeout = '250ms'`); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+	defer func() { _, _ = db.Exec(context.Background(), `SET lock_timeout = 0`) }()
+
+	res, err := pg.Push(ctx, db, build(`"age" >= 18`), opts)
+	if err == nil {
+		t.Fatalf("a push whose probe timed out reported success: statements=%v notices=%v",
+			res.Statements, res.Notices)
+	}
+	if !strings.Contains(err.Error(), "55P03") {
+		t.Errorf("the lock timeout was not reported as one: %v", err)
+	}
+}

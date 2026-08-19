@@ -76,6 +76,12 @@ type GenerateResult struct {
 //
 // It is a no-op when there are no differences between the current Go
 // schema and the latest snapshot; no files are written in that case.
+//
+// A migration that rebuilds a table cannot preserve that table's
+// indexes or triggers, and the generated SQL says so above each
+// rebuild. Both sides of this diff are snapshot files, and a snapshot
+// file records neither; only Introspect does, which is why Push
+// survives a rebuild with its indexes. See blindRebuildNote.
 func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	if opts.Schema == nil {
 		return nil, errors.New("drops/sqlite: Schema is required")
@@ -113,7 +119,7 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	cur := BuildSnapshot(opts.Schema)
 	cur.PrevID = prev.ID
 
-	statements := Diff(prev, cur)
+	statements := noteBlindRebuilds(Diff(prev, cur))
 	if len(statements) == 0 {
 		return &GenerateResult{NoOp: true}, nil
 	}
@@ -151,7 +157,7 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 
 	var downSQL string
 	if opts.WithDown {
-		downStmts := DiffDown(prev, cur)
+		downStmts := noteBlindRebuilds(DiffDown(prev, cur))
 		if len(downStmts) > 0 {
 			downSQL = strings.Join(downStmts, "\n--> statement-breakpoint\n") + "\n"
 		}
@@ -180,6 +186,40 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 		Snapshot: snapshotBytes,
 		Journal:  journalBytes,
 	}, nil
+}
+
+// blindRebuildNote is written above every rebuild in a generated
+// migration, because this is the one path where drops knows a rebuild
+// will destroy indexes and triggers and cannot say which.
+//
+// The rebuild replays what the previous snapshot recorded, and only
+// Introspect records anything: BuildSnapshot cannot, the schema DSL
+// having no way to declare an index or a trigger, so a snapshot file
+// carries none. That is why Push comes through a rebuild with its
+// indexes and a generated migration does not.
+//
+// Reading the database here would not fix it. A migration file is
+// applied later, to databases the generator never saw, and each of them
+// has its own indexes; replaying the generator's would be a guess about
+// somebody else's server. Saying so in the file, where the person
+// reviewing the migration will read it, is the whole of what is
+// available.
+const blindRebuildNote = `-- this rebuild drops the table, and with it every index and trigger on it. ` +
+	`A snapshot file records neither, so drops cannot put them back: read them out of sqlite_master ` +
+	`on the target database and append the CREATE INDEX / CREATE TRIGGER statements to this migration.`
+
+// noteBlindRebuilds inserts blindRebuildNote above each rebuild in
+// stmts. Diff marks a rebuild with a leading "-- rebuild" comment, and
+// that comment is the only thing in the output that identifies one.
+func noteBlindRebuilds(stmts []string) []string {
+	out := make([]string, 0, len(stmts))
+	for _, s := range stmts {
+		if strings.HasPrefix(s, "-- rebuild ") {
+			out = append(out, blindRebuildNote)
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // loadPrevSnapshot reads the previous snapshot (the one with the highest

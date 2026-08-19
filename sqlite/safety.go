@@ -118,6 +118,7 @@ var safetyRules = []func(stmt string) (SafetyWarning, bool){
 	ruleUpdateWithoutWhere,
 	ruleRebuildDropsIndex,
 	ruleRebuildStaleTrigger,
+	ruleRebuildLosesIndexes,
 }
 
 var (
@@ -131,6 +132,7 @@ var (
 	reDynamicDefault = regexp.MustCompile(`(?i)\bDEFAULT\s+(CURRENT_TIME|CURRENT_DATE|CURRENT_TIMESTAMP|\()`)
 	reIndexDropped   = regexp.MustCompile(`(?i)^--\s*index\s+".*"\s+dropped with column\b`)
 	reTriggerStale   = regexp.MustCompile(`(?i)^--\s*trigger\s+".*"\s+names dropped column\b`)
+	reBlindRebuild   = regexp.MustCompile(`(?i)^--\s*this rebuild drops the table, and with it every index and trigger\b`)
 	reDelete         = regexp.MustCompile(`(?i)^\s*DELETE\s+FROM\b`)
 	reUpdate         = regexp.MustCompile(`(?i)^\s*UPDATE\b`)
 	reHasWhere       = regexp.MustCompile(`(?i)\bWHERE\b`)
@@ -245,6 +247,24 @@ func ruleRebuildStaleTrigger(stmt string) (SafetyWarning, bool) {
 		Statement:  stmt,
 		Message:    "This trigger is re-created naming a column the rebuild removed; SQLite accepts it now and fails when it fires.",
 		Suggestion: "Rewrite the trigger against the new shape in this migration, or drop it.",
+	}, true
+}
+
+// ruleRebuildLosesIndexes surfaces a rebuild in a generated migration,
+// where drops has only snapshot files to work from and those record no
+// index and no trigger. Push replays what Introspect read; this path
+// has nothing to replay, and the reviewer is the only one who can fill
+// the gap in.
+func ruleRebuildLosesIndexes(stmt string) (SafetyWarning, bool) {
+	if !reBlindRebuild.MatchString(stmt) {
+		return SafetyWarning{}, false
+	}
+	return SafetyWarning{
+		Severity:   SeverityWarn,
+		Rule:       "rebuild-loses-indexes",
+		Statement:  stmt,
+		Message:    "This rebuild destroys every index and trigger on the table, and a generated migration cannot re-create them.",
+		Suggestion: "Read the table's indexes and triggers out of sqlite_master on the target database and append their CREATE statements to this migration.",
 	}, true
 }
 

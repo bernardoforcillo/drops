@@ -692,3 +692,67 @@ func TestAliasSnapshotsTheColumnList(t *testing.T) {
 			len(e.Columns()), len(tbl.Columns()))
 	}
 }
+
+// An alias is a query-scope rename, so the handle it hands out has to
+// keep meaning the same column everywhere a column is identified
+// rather than rendered. Once As started copying columns, the copies
+// were strangers to the originals by pointer, and the two places that
+// match columns by pointer both failed quietly: alignRow dropped the
+// row's values onto its NULL fill, and an insert hook re-bound a
+// column that was already bound. Neither raises anything — the first
+// writes a row of NULLs, the second writes the column name twice.
+func TestAliasedHandleStillNamesTheSameColumnInInsert(t *testing.T) {
+	db := clickhouse.New(nil)
+	tbl := clickhouse.NewTable("moves")
+	game := clickhouse.Add(tbl, clickhouse.UInt64("gameId"))
+	seq := clickhouse.Add(tbl, clickhouse.UInt64("seq"))
+
+	// Column list fixed through the alias, values through the typed
+	// handles — the only way to write it, since Val lives on *Col[T]
+	// and (*Table).Col answers with the type-erased *Column.
+	a := tbl.As("a")
+	got, args := db.Insert(a).
+		Columns(a.Col("gameId"), a.Col("seq")).
+		Row(game.Val(7), seq.Val(2)).
+		ToSQL()
+	want := `INSERT INTO "moves" ("gameId", "seq") VALUES (?, ?)`
+	if got != want {
+		t.Errorf("sql\n  got:  %s\n  want: %s", got, want)
+	}
+	if len(args) != 2 || args[0] != uint64(7) || args[1] != uint64(2) {
+		t.Errorf("args = %v, want [7 2] — the row lost its values to the NULL fill", args)
+	}
+
+	// Re-aliasing has to collapse onto the declared column, not onto
+	// the intermediate alias, or the second hop is a stranger again.
+	c := tbl.As("a").As("b")
+	_, args = db.Insert(c).Columns(c.Col("gameId")).Row(game.Val(7)).ToSQL()
+	if len(args) != 1 || args[0] != uint64(7) {
+		t.Errorf("re-aliased args = %v, want [7]", args)
+	}
+}
+
+// The same identity, seen by an insert hook. The hook holds the
+// declared handle; the caller bound the aliased one. Has must say the
+// column is taken, or the hook appends a second binding for it.
+func TestInsertHookSeesAnAliasedBindingAsBound(t *testing.T) {
+	db := clickhouse.New(nil)
+	tbl := clickhouse.NewTable("audited")
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	at := clickhouse.Add(tbl, clickhouse.DateTime("insertedAt", "UTC"))
+	tbl.OnInsert(clickhouse.InsertHookFunc(func(ctx *clickhouse.InsertHookCtx) {
+		ctx.SetExpr(at.Column, drops.Raw("now()"))
+	}))
+
+	a := tbl.As("a")
+	got, _ := db.Insert(a).
+		Columns(a.Col("id"), a.Col("insertedAt")).
+		Row(id.Val(1), at.Val(time.Unix(0, 0).UTC())).
+		ToSQL()
+	if strings.Count(got, `"insertedAt"`) != 1 {
+		t.Errorf("hook re-bound a column the caller had already bound:\n%s", got)
+	}
+	if strings.Contains(got, "now()") {
+		t.Errorf("hook overwrote an explicit binding:\n%s", got)
+	}
+}

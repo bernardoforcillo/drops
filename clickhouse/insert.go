@@ -59,22 +59,22 @@ func columnsOf(values []ColumnValue) []*Column {
 	tbl := values[0].column().table
 	seen := map[*Column]bool{}
 	for _, v := range values {
-		seen[v.column()] = true
+		seen[v.column().key()] = true
 	}
 	out := make([]*Column, 0, len(values))
 	if tbl != nil {
 		for _, c := range tbl.Columns() {
-			if seen[c] {
+			if seen[c.key()] {
 				out = append(out, c)
-				delete(seen, c)
+				delete(seen, c.key())
 			}
 		}
 	}
 	for _, v := range values {
 		c := v.column()
-		if seen[c] {
+		if seen[c.key()] {
 			out = append(out, c)
-			delete(seen, c)
+			delete(seen, c.key())
 		}
 	}
 	return out
@@ -86,11 +86,11 @@ func columnsOf(values []ColumnValue) []*Column {
 func alignRow(cols []*Column, values []ColumnValue) []drops.Expression {
 	idx := map[*Column]ColumnValue{}
 	for _, v := range values {
-		idx[v.column()] = v
+		idx[v.column().key()] = v
 	}
 	out := make([]drops.Expression, len(cols))
 	for j, c := range cols {
-		if v, ok := idx[c]; ok {
+		if v, ok := idx[c.key()]; ok {
 			out[j] = bindingExpr(v)
 		} else {
 			out[j] = drops.Raw("NULL")
@@ -139,7 +139,7 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]drops.Expression) {
 	ctx := &InsertHookCtx{bound: make(map[*Column]bool, len(i.cols))}
 	for _, c := range i.cols {
-		ctx.bound[c] = true
+		ctx.bound[c.key()] = true
 	}
 	for _, h := range i.table.insertHooks {
 		h.BeforeInsert(ctx)

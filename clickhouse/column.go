@@ -16,6 +16,12 @@ type Column struct {
 	defSQL   string // DEFAULT <expr>
 	hasDef   bool
 	managed  bool // drops writes this column, not the application
+
+	// origin is the column this one was copied from by (*Table).As,
+	// and nil on a column as declared. An alias copy is a second
+	// handle on one column of one table, so anything that identifies
+	// a column has to see the two as equal — see key.
+	origin *Column
 }
 
 // Name returns the column's unqualified identifier.
@@ -56,6 +62,23 @@ func (c *Column) IsManaged() bool { return c.managed }
 
 // col is the ColRef implementation; *Col[T] inherits via embedding.
 func (c *Column) col() *Column { return c }
+
+// key returns the identity a column is recognised by, collapsing every
+// alias copy onto the column it was declared as.
+//
+// An INSERT names the columns of exactly one table, and a caller who
+// has aliased that table for a self-join holds handles from the alias.
+// Matching those handles against the declared ones by pointer makes
+// them strangers: the row loses its values to the NULL fill in
+// alignRow, and a hook's Has answers false for a column that is
+// already bound. Both are silent. Aliasing is a query-scope rename, so
+// it must not change which column a handle means.
+func (c *Column) key() *Column {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
+}
 
 // ColRef is implemented by *Column and *Col[T]. Use it where the value
 // type doesn't matter (engine ORDER BY / PARTITION BY, index columns,

@@ -44,9 +44,9 @@ inline at create time. There is no zoned timestamp — store UTC.
 Because `ALTER TABLE` cannot do most things, a migration that changes a
 column, drops one, or changes a constraint becomes a **table rebuild**:
 create the new shape, copy the rows, `DROP TABLE`, rename. `DROP TABLE`
-takes every index and every trigger on the table with it, so `Diff`
-reads them out of `sqlite_master` first and replays them after the
-rename. Three cases behave differently, deliberately:
+takes every index and every trigger on the table with it, so
+`Introspect` reads them out of `sqlite_master` and the rebuild replays
+them after the rename. Three cases behave differently, deliberately:
 
 - An index keyed on a column the rebuild removes is **dropped with the
   column**, the way PostgreSQL drops a dependent index, and the
@@ -64,7 +64,28 @@ rename. Three cases behave differently, deliberately:
 
 The schema DSL cannot declare an index, so `Diff` and `Push` never
 create or drop one on their own — an index you made by hand survives a
-push untouched.
+push untouched. For the same reason `DetectDrift` cannot see one: an
+index added to production by hand is not reported as an unauthorised
+change, because every index in every database would be.
+
+**That replay only happens on the paths that read the database.**
+`Push` and `DetectDrift` diff against a live `Introspect`, so they have
+the stored DDL to put back. `GenerateMigration` diffs two snapshot
+files, and a snapshot file records no index and no trigger — there is
+nothing in the schema DSL for `BuildSnapshot` to record. A generated
+migration that rebuilds a table therefore destroys its indexes and
+triggers, and reading the database at generation time would not help:
+the file is applied later, to servers the generator never saw, each
+with its own indexes. So the generated SQL carries a comment above
+every rebuild saying exactly that, `AnalyzeMigration` reports it as
+`rebuild-loses-indexes`, and re-creating them is the reviewer's job.
+
+One rebuild is impossible rather than lossy. `ALTER TABLE t_new RENAME
+TO t` resolves every view and every trigger body that names `t`, and
+between the `DROP` and the `RENAME` there is no `t` — so a table
+referenced by a view, or by a trigger on another table, cannot be
+rebuilt at all: the rename fails and the migration rolls back. Drop the
+dependent object, rebuild, and re-create it.
 
 ## MySQL / MariaDB
 

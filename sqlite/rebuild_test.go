@@ -3,6 +3,7 @@ package sqlite
 import (
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 // identsMentioned decides the wording of the warning drops prints when
@@ -238,6 +239,84 @@ func TestAnalyserIsQuietWhenARebuildLosesNothing(t *testing.T) {
 	for _, w := range AnalyzeStatements(rebuildTable(prev, cur, "constraint change")) {
 		if w.Rule == "rebuild-drops-index" || w.Rule == "rebuild-stale-trigger" {
 			t.Errorf("a rebuild that preserved everything still reported %s", w.Rule)
+		}
+	}
+}
+
+// A generated migration is the one rebuild drops cannot repair. Push
+// replays what Introspect read out of sqlite_master; GenerateMigration
+// has only snapshot files, and BuildSnapshot records no index and no
+// trigger because the schema DSL cannot declare either. The rebuild
+// therefore destroys them and puts nothing back — so the migration has
+// to say so, in the file the reviewer reads.
+func TestAGeneratedRebuildSaysItCannotKeepTheIndexes(t *testing.T) {
+	before := NewTable("accounts")
+	Add(before, BigInt("id").PrimaryKey())
+	Add(before, Text("email").NotNull())
+	Add(before, Text("legacy"))
+
+	after := NewTable("accounts")
+	Add(after, BigInt("id").PrimaryKey())
+	Add(after, Text("email").NotNull())
+
+	files := map[string][]byte{}
+	gen := func(schema *Schema, name string) *GenerateResult {
+		t.Helper()
+		fsys := fstest.MapFS{}
+		for k, v := range files {
+			fsys["m/"+k] = &fstest.MapFile{Data: v}
+		}
+		res, err := GenerateMigration(GenerateOptions{
+			Schema: NewSchema(schema.Tables()...), Dir: "m", Name: name,
+			FS: fsys, Now: func() int64 { return 1 },
+			Write: func(rel string, data []byte) error { files[rel] = data; return nil },
+		})
+		if err != nil {
+			t.Fatalf("GenerateMigration: %v", err)
+		}
+		return res
+	}
+
+	if res := gen(NewSchema(before), "init"); res.NoOp {
+		t.Fatal("the first migration produced nothing")
+	}
+	res := gen(NewSchema(after), "drop_legacy")
+	if !strings.Contains(res.SQL, "-- rebuild") {
+		t.Fatalf("dropping a column was supposed to be a rebuild:\n%s", res.SQL)
+	}
+	if !strings.Contains(res.SQL, "every index and trigger on it") {
+		t.Errorf("a generated rebuild destroys every index and trigger and said nothing:\n%s", res.SQL)
+	}
+	// The note has to come before the rebuild it is about, not after it.
+	if note, rebuild := strings.Index(res.SQL, "every index and trigger on it"),
+		strings.Index(res.SQL, "-- rebuild"); note > rebuild {
+		t.Errorf("the note follows the rebuild it warns about:\n%s", res.SQL)
+	}
+	// And the analyser has to carry it, because a comment in a file is
+	// the thing a reviewer scrolls past.
+	var found bool
+	for _, w := range AnalyzeMigration(res.SQL) {
+		if w.Rule == "rebuild-loses-indexes" {
+			found = true
+			if w.Severity != SeverityWarn {
+				t.Errorf("rebuild-loses-indexes severity = %v, want warn", w.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the analyser said nothing about a rebuild that cannot restore its indexes:\n%s", res.SQL)
+	}
+}
+
+// The note belongs to the generated path only. Push replays the real
+// objects, so telling its reviewer to go and re-create them by hand
+// would be false — and a warning that fires when nothing is wrong is
+// how a warning stops being read.
+func TestPushsRebuildCarriesNoSuchNote(t *testing.T) {
+	prev, cur := rebuildFixture()
+	for _, s := range rebuildTable(prev, cur, "drop column \"legacy\"") {
+		if strings.Contains(s, "every index and trigger on it") {
+			t.Errorf("the rebuild Push runs claims it cannot restore indexes, but it just did:\n%s", s)
 		}
 	}
 }

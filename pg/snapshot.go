@@ -442,11 +442,17 @@ func compositePKName(table string, cols []string) string {
 //
 // Only the well-known shape is captured: simple column refs, the
 // INCLUDE list, the partial predicate and the access method. An
-// operator class, a WITH storage parameter, and a functional or
-// expression element are not representable here — an expression
-// element leaves Columns one entry shorter, and Push's notices say so
-// rather than letting Diff quietly compare a truncated index against
-// the real one.
+// operator class and a WITH storage parameter are not representable
+// here, and neither is a functional or expression element.
+//
+// One unrepresentable element makes the whole index unrepresentable,
+// so Columns is left empty rather than one entry shorter. Keeping the
+// columns it could read looked harmless and was not: an index on
+// (name, lower(email)) was recorded as an index on (name), created as
+// an index on (name), and read back from the catalogue as an index on
+// (name) — a different index under the declared name, agreeing with
+// itself for ever after and reported by nothing. Empty is the shape
+// diffIndexes skips and unrepresentableIndexNotices reports.
 //
 // The predicate is recorded in the spelling a CREATE INDEX would
 // carry, which is the Go program's, not PostgreSQL's. Push
@@ -479,6 +485,8 @@ func indexSnapshotOf(idx *Index) *IndexSnapshot {
 			is.Columns = append(is.Columns, cr.col().Name())
 			continue
 		}
+		is.Columns = nil
+		break
 	}
 	return is
 }

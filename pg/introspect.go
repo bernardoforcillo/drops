@@ -459,6 +459,13 @@ func readIntrospectChecks(ctx context.Context, db *DB, schemas []string, tables 
 // indnkeyatts is where the first ends and the second begins. Reading
 // them as one list made a covering index look like a wider plain one,
 // so a declared INCLUDE never matched what the catalogue held.
+//
+// An expression element has no pg_attribute row behind it (indkey
+// carries 0), and the snapshot has no way to describe one. Such an
+// index is recorded with no columns at all, the same shape
+// BuildSnapshot gives a declared functional index, so the two sides
+// still compare equal instead of the catalogue reporting a narrower
+// index than the schema declared and Diff dropping it every push.
 func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables map[string]*TableSnapshot) error {
 	rows, err := db.Query(ctx, fmt.Sprintf(`
 		SELECT n.nspname, rel.relname, idx.relname, ix.indisunique, am.amname,
@@ -481,6 +488,10 @@ func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables
 	}
 	defer rows.Close()
 
+	// Indexes with an element the snapshot cannot describe, by
+	// pointer: the rows of one index arrive together but the verdict
+	// is only known once they all have.
+	unrepresentable := map[*IndexSnapshot]bool{}
 	for rows.Next() {
 		var schema, table, name, method, where, column string
 		var unique, isKey bool
@@ -502,9 +513,8 @@ func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables
 			}
 			ts.Indexes[name] = is
 		}
-		// An expression element has no attribute behind it; the
-		// index still exists, it just has one fewer named column.
 		if column == "" {
+			unrepresentable[is] = true
 			continue
 		}
 		if isKey {
@@ -512,6 +522,9 @@ func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables
 		} else {
 			is.Include = append(is.Include, column)
 		}
+	}
+	for is := range unrepresentable {
+		is.Columns = nil
 	}
 	return rows.Err()
 }

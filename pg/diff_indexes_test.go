@@ -318,3 +318,28 @@ func TestDiffMatchesCompositePKByColumns(t *testing.T) {
 		t.Errorf("the same key under a different name produced %v", pkStmts)
 	}
 }
+
+// One expression element makes the whole index unrepresentable.
+//
+// An index on (name, lower(email)) used to reach the snapshot as an
+// index on (name): Diff created that, Introspect read it back, and the
+// two agreed for ever after that the wrong index was the right one.
+// Nothing reported it, because the notice only fired when every
+// element was an expression.
+func TestDiffSkipsAnIndexWithOneExpressionElement(t *testing.T) {
+	users := pg.NewTable("users")
+	pg.Add(users, pg.BigSerial("id").PrimaryKey())
+	email := pg.Add(users, pg.Text("email").NotNull())
+	name := pg.Add(users, pg.Text("name").NotNull())
+	users.AddIndex(pg.NewIndex("usersMixedIdx", users, name, pg.Lower(email)))
+
+	snap := pg.BuildSnapshot(pg.NewSchema(users))
+	if cols := snap.Tables["public.users"].Indexes["usersMixedIdx"].Columns; len(cols) != 0 {
+		t.Errorf("the snapshot kept %v of an index it cannot describe", cols)
+	}
+	for _, s := range pg.Diff(pg.EmptySnapshot(), snap) {
+		if strings.Contains(s, "CREATE INDEX") {
+			t.Errorf("Diff emitted a truncated index: %q", s)
+		}
+	}
+}

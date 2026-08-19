@@ -20,6 +20,13 @@ type PushOptions struct {
 
 	// DryRun returns the statements that would be applied without
 	// executing them. Useful for previewing changes in CI.
+	//
+	// It is not a read-only operation. Push still asks the server to
+	// respell the declared CHECK expressions and index predicates
+	// before it can tell whether they changed, and that probe is DDL
+	// against the real table — see Push's doc comment for the lock it
+	// takes. Skipping the probe would make the preview list changes
+	// that are not changes, which is the more misleading of the two.
 	DryRun bool
 
 	// DropUnmanagedIndexes lets Push drop an index that exists in the
@@ -85,6 +92,7 @@ func (n SchemaNotice) String() string {
 //   - Asks the server to respell the declared CHECK expressions and
 //     partial-index predicates, so the two sides of the diff are
 //     written in the same dialect of PostgreSQL's own deparser.
+//     See "What the probe costs" below: this happens on a DryRun too.
 //   - Diffs the two using DiffOptions{Safe: opts.Safe}.
 //   - If DryRun, returns the statements unexecuted.
 //   - Otherwise applies them inside a single transaction; any failure
@@ -92,6 +100,26 @@ func (n SchemaNotice) String() string {
 //     exception — PostgreSQL refuses it inside a transaction block
 //     (SQLSTATE 25001) — so those statements run afterwards, once the
 //     rest has committed.
+//
+// # What the probe costs
+//
+// Respelling a declared expression means handing it to the server as a
+// CHECK constraint added NOT VALID and reading back what the deparser
+// makes of it. NOT VALID skips the table scan, and the whole thing is
+// rolled back, but ALTER TABLE ADD CONSTRAINT still takes an ACCESS
+// EXCLUSIVE lock on the table, and PostgreSQL holds a lock until the
+// transaction ends — not until the savepoint rolls back. So a push
+// against a schema with CHECK constraints or partial indexes briefly
+// locks every table carrying one, all at once, and blocks readers of
+// those tables for the length of the probe. It happens on a DryRun as
+// well, because there is no way to preview a change to an expression
+// without first learning how the server spells it.
+//
+// Set lock_timeout on the connection if a push must never wait behind
+// a long reader. A probe that fails for an operational reason — a lock
+// timeout, a deadlock, a cancelled statement — fails the whole push
+// rather than being reported as an unparseable expression, so a
+// change is never quietly left unapplied.
 //
 // # An index the schema never declared
 //
@@ -115,10 +143,10 @@ func (n SchemaNotice) String() string {
 //   - an index's operator class, WITH storage parameters, column
 //     ordering (ASC/DESC, NULLS FIRST/LAST) or NULLS NOT DISTINCT —
 //     none of them reach the snapshot from either side;
-//   - an index element that is an expression rather than a column,
-//     such as lower(name): the snapshot records nothing for it, so
-//     Push neither creates the index nor compares it against one the
-//     database already has. It is reported as an
+//   - an index with any element that is an expression rather than a
+//     column, such as lower(name): one such element makes the whole
+//     index unrepresentable, so Push neither creates it nor compares
+//     it against one the database already has. It is reported as an
 //     "unrepresentable-index" notice; emit pg.CreateIndex for it;
 //   - a multi-column FOREIGN KEY, which Introspect skips;
 //   - enums, sequences, views, RLS and policies, which Introspect does
@@ -308,6 +336,9 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 				return err
 			}
 			if perr != nil {
+				if !probeRefusedExpression(perr) {
+					return fmt.Errorf("probing %s on %q: %w", p.object, p.name, perr)
+				}
 				*p.target = *p.fallback
 				notices = append(notices, SchemaNotice{
 					Rule:    p.rule,
@@ -357,6 +388,31 @@ func probeConstraintDef(ctx context.Context, tx *DB, p *exprProbe, name string) 
 		return "", err
 	}
 	return checkExprOf(def), rows.Err()
+}
+
+// probeRefusedExpression reports whether err is the server refusing the
+// expression, as opposed to refusing to do the work just now.
+//
+// The probe is real DDL against a real table, so it fails for reasons
+// that say nothing about the expression: it waits on ACCESS EXCLUSIVE,
+// so a lock timeout or a deadlock is the ordinary outcome on a busy
+// table. Counting those as "unparseable" silently downgraded the
+// comparison to whatever the database already held — the tightened
+// CHECK did not ship, the push reported success, and the notice
+// blamed the declared expression. Only the SQLSTATE classes that
+// describe the statement itself qualify: 42 syntax error or access
+// rule violation, 22 data exception, 0A feature not supported.
+// Anything else aborts the push and is the caller's to retry.
+func probeRefusedExpression(err error) bool {
+	var pgErr *PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
+		return false
+	}
+	switch pgErr.Code[:2] {
+	case "42", "22", "0A":
+		return true
+	}
+	return false
 }
 
 // qualifiedTableSQL renders a table snapshot's name for use in DDL,
@@ -424,8 +480,9 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot, saf
 }
 
 // unrepresentableIndexNotices reports declared indexes the snapshot
-// cannot describe: every element was an expression rather than a
-// column reference, so nothing is left to compare or to render.
+// cannot describe: at least one element was an expression rather than
+// a column reference, which empties Columns, so nothing is left to
+// compare or to render.
 func unrepresentableIndexNotices(desired *Snapshot) []SchemaNotice {
 	var out []SchemaNotice
 	for _, key := range sortedKeys(desired.Tables) {
@@ -439,7 +496,7 @@ func unrepresentableIndexNotices(desired *Snapshot) []SchemaNotice {
 				Table:  dt.Name,
 				Object: name,
 				Message: fmt.Sprintf(
-					"index %q on %q is declared over expressions rather than columns; the snapshot cannot describe it, so Push neither creates nor compares it — emit pg.CreateIndex for it yourself",
+					"index %q on %q is declared over at least one expression rather than a plain column; the snapshot cannot describe it, so Push neither creates nor compares it — emit pg.CreateIndex for it yourself",
 					name, dt.Name),
 			})
 		}

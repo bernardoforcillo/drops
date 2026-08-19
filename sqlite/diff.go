@@ -48,6 +48,14 @@ func DiffDown(prev, cur *Snapshot) []string {
 // drift would drop the index the application's hot query depends on.
 // They appear in the output only where a rebuild has just destroyed
 // them, put back as they were — see replayObjectsSQL.
+//
+// That replay reaches only as far as prev does. Diff does not read the
+// database; it replays what prev recorded, and only Introspect records
+// an index or a trigger — BuildSnapshot cannot, having nothing to build
+// them from. So Push and DetectDrift, which diff against a live
+// introspection, come through a rebuild with their indexes, and
+// GenerateMigration, which diffs two snapshot files, does not. It says
+// so in the migration it writes; see noteBlindRebuilds.
 func Diff(prev, cur *Snapshot) []string {
 	if prev == nil {
 		prev = EmptySnapshot()
@@ -521,17 +529,6 @@ func quoteIdentList(names []string) []string {
 	return out
 }
 
-// sameConstraintMap compares two constraint sets, treating a nil map
-// and an empty one as the same thing.
-//
-// reflect.DeepEqual does not: it reports a nil map and an empty map as
-// different. Snapshots reach this function from two producers that
-// disagree — BuildSnapshot initialises every map, Introspect leaves
-// one nil when the table has no such constraint — so comparing them
-// directly reported a constraint change for every table with no CHECK
-// constraints. On SQLite a constraint change means a full table
-// rebuild, so a schema that already matched its declaration would copy
-// itself on every deploy.
 // sameUniqueKeys compares two tables' UNIQUE constraints as a set of
 // column tuples, ignoring both the constraint names and which syntax
 // declared them.
@@ -576,6 +573,17 @@ func uniqueKeyTuples(t *TableSnapshot) []string {
 	return out
 }
 
+// sameConstraintMap compares two constraint sets, treating a nil map
+// and an empty one as the same thing.
+//
+// reflect.DeepEqual does not: it reports a nil map and an empty map as
+// different. Snapshots reach this function from two producers that
+// disagree — BuildSnapshot initialises every map, Introspect leaves
+// one nil when the table has no such constraint — so comparing them
+// directly reported a constraint change for every table with no CHECK
+// constraints. On SQLite a constraint change means a full table
+// rebuild, so a schema that already matched its declaration would copy
+// itself on every deploy.
 func sameConstraintMap[V any](a, b map[string]V) bool {
 	if len(a) != len(b) {
 		return false

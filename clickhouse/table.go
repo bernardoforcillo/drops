@@ -71,9 +71,18 @@ func (t *Table) Alias() string    { return t.alias }
 // under bare identifiers (see writeTableSuffix), so the alias cannot
 // reach them and rebinding would change no output.
 //
+// The alias is validated like any other identifier and a bad one —
+// including the empty string, which used to pass through and hand back
+// an un-aliased copy — panics with ErrInvalidIdentifier.
+//
 // The column list is a snapshot: a column added to the table after this
 // call is absent from the alias. Alias at query time, which is where a
 // self-join is written anyway, not at declaration time.
+//
+// Each copy remembers the column it came from, so the two handles stay
+// interchangeable everywhere a column is identified rather than
+// rendered — INSERT column lists and hook bookkeeping (see
+// (*Column).key). Only the qualifier they render differs.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
@@ -83,6 +92,7 @@ func (t *Table) As(alias string) *Table {
 	for i, c := range t.columns {
 		aliased := *c
 		aliased.table = &cp
+		aliased.origin = c.key()
 		cp.columns[i] = &aliased
 		cp.byName[aliased.name] = &aliased
 	}

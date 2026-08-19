@@ -466,3 +466,58 @@ func TestCHSelfJoinThroughAliasIsAccepted(t *testing.T) {
 		t.Errorf("self-join counted %d pairs, want 3 (1<2, 1<3, 2<3)\n%s", n, text)
 	}
 }
+
+// The alias's column handles must still name the table's columns.
+//
+// (*Table).As copies its columns so each one can render the alias as
+// its qualifier, and the INSERT builder matches a row's values to its
+// column list by column identity. Once the copies were strangers to
+// the columns they were copied from, a caller who fixed the column
+// list through the alias — the handle it holds, having just written a
+// self-join — matched nothing, and every value fell through to the
+// NULL that stands for "no value given". ClickHouse accepts that row;
+// it is a well-formed INSERT of the wrong data. Only reading it back
+// says so, which is why this test is here and not in the unit suite.
+func TestCHInsertThroughAliasColumnsKeepsItsValues(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+
+	tbl := clickhouse.NewTable(integration.UniqueName(t, "moves"))
+	dropCH(t, db, tbl)
+	game := clickhouse.Add(tbl, clickhouse.UInt64("gameId"))
+	seq := clickhouse.Add(tbl, clickhouse.UInt64("seq"))
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(game, seq)
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	// Columns through the alias, values through the typed handles —
+	// the only way to write it, since Val lives on *Col[T] while
+	// (*Table).Col answers with the type-erased *Column.
+	a := tbl.As("a")
+	ins := db.Insert(a).
+		Columns(a.Col("gameId"), a.Col("seq")).
+		Row(game.Val(7), seq.Val(2))
+	if _, err := ins.Exec(ctx); err != nil {
+		text, args := ins.ToSQL()
+		t.Fatalf("ClickHouse rejected the INSERT: %v\n%s\nargs: %v", err, text, args)
+	}
+
+	var gotGame, gotSeq uint64
+	rows, err := db.Query(ctx, `SELECT "gameId", "seq" FROM "`+tbl.Name()+`"`)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !rows.Next() {
+		rows.Close()
+		t.Fatal("the INSERT wrote no row at all")
+	}
+	if err := rows.Scan(&gotGame, &gotSeq); err != nil {
+		rows.Close()
+		t.Fatalf("scan: %v", err)
+	}
+	rows.Close()
+	if gotGame != 7 || gotSeq != 2 {
+		text, args := ins.ToSQL()
+		t.Errorf("row read back as (%d, %d), want (7, 2)\n%s\nargs: %v",
+			gotGame, gotSeq, text, args)
+	}
+}

@@ -120,13 +120,13 @@ func writeIndexCreate(b *drops.Builder, idx *Index, ifNotExists bool) {
 // indexPredicateSQL renders a partial-index predicate as the static SQL
 // a CREATE INDEX can carry, reporting false when it cannot.
 //
-// CREATE INDEX is a utility statement: PostgreSQL's grammar has no
-// parameter slot in it. A predicate written the ordinary way —
+// CREATE INDEX is a utility statement, and PostgreSQL does not accept
+// parameters in one. A predicate written the ordinary way —
 // age.Gte(18) — binds its 18, so the statement arrives as
-// "WHERE (age >= $1)" with one argument and the driver refuses it
-// before the server ever parses it. The values are known where the
-// schema is declared, not at query time, so they are folded into the
-// text here, the same choice CommentOnTable makes for its literal.
+// "WHERE (age >= $1)" and the server rejects it with SQLSTATE 42P02,
+// "there is no parameter $1". The values are known where the schema is
+// declared, not at query time, so they are folded into the text here,
+// the same choice CommentOnTable makes for its literal.
 //
 // The fold is refused, rather than guessed at, for a value with no
 // literal spelling; the caller then binds as before and the failure is

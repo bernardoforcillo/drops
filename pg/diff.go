@@ -597,9 +597,10 @@ func diffIndexes(prev, cur *TableSnapshot, safe bool) []string {
 	for _, k := range sortedKeys(cur.Indexes) {
 		curIdx := cur.Indexes[k]
 		if len(curIdx.Columns) == 0 {
-			// Every element was an expression, so the snapshot kept
-			// none of them and there is nothing to put between the
-			// parentheses. Rendering `ON "t" ()` is not a migration,
+			// At least one element was an expression, so the
+			// snapshot kept none of them and there is nothing to put
+			// between the parentheses. Rendering `ON "t" ()` is not a
+			// migration,
 			// it is a syntax error that takes the rest of the file
 			// down with it. Push names the index it skipped here in
 			// its notices; declare it with pg.CreateIndex instead.

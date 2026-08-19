@@ -206,11 +206,11 @@ func encodeEventPayload(payload any) (json.RawMessage, error) {
 func (s *EventStore) Load(ctx context.Context, aggregateType, aggregateID string, fromVersion int64) ([]Event, error) {
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
-		FROM "%s"
+		FROM %s
 		WHERE "aggregateType" = ?
 		  AND "aggregateID" = ?
 		  AND "version" > ?
-		ORDER BY "version"`, s.table)
+		ORDER BY "version"`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID, fromVersion)
 	if err != nil {
 		return nil, err
@@ -232,10 +232,10 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 	from := time.Unix(0, fromOffset).UTC()
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
-		FROM "%s"
+		FROM %s
 		WHERE "createdAt" > ?
 		ORDER BY "createdAt"
-		LIMIT ?`, s.table)
+		LIMIT ?`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, from, int64(limit))
 	if err != nil {
 		return nil, err
@@ -349,8 +349,8 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 func (s *EventStore) LoadSnapshot(ctx context.Context, table, aggregateType, aggregateID string) (AggregateSnapshot, bool, error) {
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "state", "createdAt"
-		FROM "%s" FINAL
-		WHERE "aggregateType" = ? AND "aggregateID" = ?`, table)
+		FROM %s FINAL
+		WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
 	if err != nil {
 		return AggregateSnapshot{}, false, err

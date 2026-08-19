@@ -110,6 +110,12 @@ func Time(name string) *Col[time.Time] { return newCol[time.Time](name, simpleTy
 // so the value you get depends on the connection's time_zone. DATETIME
 // stores exactly what you gave it. Prefer DATETIME with UTC values
 // unless you need TIMESTAMP's auto-update behaviour.
+//
+// Do not bind a zero time.Time to either. drops passes the value to the
+// driver untouched, and go-sql-driver/mysql sends a zero time as the
+// literal 0000-00-00: MySQL's default sql_mode has NO_ZERO_DATE and
+// rejects it, MariaDB's does not and stores a zero date that reads back
+// as NULL. Use a *time.Time or a NULL-able column for "no timestamp".
 func Timestamp(name string, withTimeZone bool) *Col[time.Time] {
 	if withTimeZone {
 		return newCol[time.Time](name, simpleType("TIMESTAMP(6)"))

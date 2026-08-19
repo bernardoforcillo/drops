@@ -137,7 +137,7 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 		b.AppendList(", ", row)
 		b.WriteByte(')')
 	}
-	if i.upsert && len(i.cols) > 0 {
+	if i.upsert && (len(i.upserts) > 0 || len(i.cols) > 0) {
 		b.WriteString(" ON DUPLICATE KEY UPDATE ")
 		if len(i.upserts) == 0 {
 			// Nothing to copy over — every column the insert names

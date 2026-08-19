@@ -17,13 +17,16 @@ type IntrospectOptions struct {
 // Introspect queries the live database and returns a Snapshot describing
 // its current state — tables, columns (with type normalisation matching
 // drizzle-kit's conventions: bigserial / serial / smallserial detected
-// from int + nextval default), primary keys, single-column unique
-// constraints, and single-column foreign keys with referential actions.
+// from int + nextval default), primary keys, unique constraints, CHECK
+// constraints, indexes, and single-column foreign keys with referential
+// actions.
 //
 // The returned snapshot is in the same format as BuildSnapshot's output
-// and can be diffed against a Go-schema snapshot via Diff. It deliberately
-// leaves indexes, composite keys, enums, sequences and views empty —
-// those features aren't yet representable in drops's schema layer.
+// and can be diffed against a Go-schema snapshot via Diff. Everything
+// the schema layer can declare has to be read back here, or Diff sees
+// the difference between "absent" and "not looked at" as work to do and
+// Push stops being idempotent. Composite keys, enums, sequences and
+// views are the remaining gaps.
 func Introspect(ctx context.Context, db *DB, opts ...IntrospectOptions) (*Snapshot, error) {
 	var opt IntrospectOptions
 	if len(opts) > 0 {
@@ -51,6 +54,12 @@ func Introspect(ctx context.Context, db *DB, opts ...IntrospectOptions) (*Snapsh
 		return nil, err
 	}
 	if err := readIntrospectUniques(ctx, db, opt.Schemas, snap.Tables); err != nil {
+		return nil, err
+	}
+	if err := readIntrospectChecks(ctx, db, opt.Schemas, snap.Tables); err != nil {
+		return nil, err
+	}
+	if err := readIntrospectIndexes(ctx, db, opt.Schemas, snap.Tables); err != nil {
 		return nil, err
 	}
 	if err := readIntrospectForeignKeys(ctx, db, opt.Schemas, snap.Tables); err != nil {
@@ -252,8 +261,8 @@ func readIntrospectPrimaryKeys(ctx context.Context, db *DB, schemas []string, ta
 	return rows.Err()
 }
 
-// readIntrospectUniques pulls UNIQUE constraints. Composite uniques are
-// skipped (we don't model them).
+// readIntrospectUniques pulls UNIQUE constraints, single- and
+// multi-column alike.
 func readIntrospectUniques(ctx context.Context, db *DB, schemas []string, tables map[string]*TableSnapshot) error {
 	rows, err := db.Query(ctx, fmt.Sprintf(`
 		SELECT tc.table_schema, tc.table_name, tc.constraint_name, kcu.column_name
@@ -291,9 +300,6 @@ func readIntrospectUniques(ctx context.Context, db *DB, schemas []string, tables
 		if !ok {
 			continue
 		}
-		if len(columns) != 1 {
-			continue // skip composite uniques
-		}
 		ts.UniqueConstraints[k.name] = &UniqueSnapshot{
 			Name:             k.name,
 			NullsNotDistinct: false,
@@ -301,6 +307,102 @@ func readIntrospectUniques(ctx context.Context, db *DB, schemas []string, tables
 		}
 	}
 	return nil
+}
+
+// readIntrospectChecks pulls CHECK constraints.
+//
+// The source is pg_constraint rather than
+// information_schema.check_constraints, which also lists one synthetic
+// "%_not_null" row per NOT NULL column — those are attnotnull, already
+// carried on the column snapshot, and reporting them as constraints
+// would have Diff try to drop them.
+func readIntrospectChecks(ctx context.Context, db *DB, schemas []string, tables map[string]*TableSnapshot) error {
+	rows, err := db.Query(ctx, fmt.Sprintf(`
+		SELECT n.nspname, rel.relname, con.conname, pg_get_constraintdef(con.oid)
+		FROM pg_constraint con
+		JOIN pg_class rel ON rel.oid = con.conrelid
+		JOIN pg_namespace n ON n.oid = rel.relnamespace
+		WHERE con.contype = 'c'
+			AND n.nspname IN (%s)
+		ORDER BY n.nspname, rel.relname, con.conname`,
+		placeholderList(len(schemas))), anySlice(schemas)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, table, name, def string
+		if err := rows.Scan(&schema, &table, &name, &def); err != nil {
+			return err
+		}
+		ts, ok := tables[introspectTableKey(schema, table)]
+		if !ok {
+			continue
+		}
+		ts.CheckConstraints[name] = &CheckSnapshot{
+			Name:  name,
+			Value: strings.TrimPrefix(def, "CHECK "),
+		}
+	}
+	return rows.Err()
+}
+
+// readIntrospectIndexes pulls the standalone indexes on each table.
+//
+// Indexes that back a constraint are excluded: a primary key or a
+// UNIQUE constraint owns its index, the constraint readers already
+// report it, and DROP INDEX on one is refused (SQLSTATE 2BP01).
+func readIntrospectIndexes(ctx context.Context, db *DB, schemas []string, tables map[string]*TableSnapshot) error {
+	rows, err := db.Query(ctx, fmt.Sprintf(`
+		SELECT n.nspname, rel.relname, idx.relname, ix.indisunique, am.amname,
+			coalesce(pg_get_expr(ix.indpred, ix.indrelid), ''),
+			coalesce(a.attname, '')
+		FROM pg_index ix
+		JOIN pg_class idx ON idx.oid = ix.indexrelid
+		JOIN pg_class rel ON rel.oid = ix.indrelid
+		JOIN pg_namespace n ON n.oid = rel.relnamespace
+		JOIN pg_am am ON am.oid = idx.relam
+		JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+		LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+		WHERE n.nspname IN (%s)
+			AND NOT ix.indisprimary
+			AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = idx.oid)
+		ORDER BY n.nspname, rel.relname, idx.relname, k.ord`,
+		placeholderList(len(schemas))), anySlice(schemas)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, table, name, method, where, column string
+		var unique bool
+		if err := rows.Scan(&schema, &table, &name, &unique, &method, &where, &column); err != nil {
+			return err
+		}
+		ts, ok := tables[introspectTableKey(schema, table)]
+		if !ok {
+			continue
+		}
+		is := ts.Indexes[name]
+		if is == nil {
+			is = &IndexSnapshot{
+				Name:     name,
+				IsUnique: unique,
+				Method:   method,
+				Where:    where,
+				With:     map[string]any{},
+			}
+			ts.Indexes[name] = is
+		}
+		// An expression element has no attribute behind it; the
+		// index still exists, it just has one fewer named column.
+		if column != "" {
+			is.Columns = append(is.Columns, column)
+		}
+	}
+	return rows.Err()
 }
 
 // readIntrospectForeignKeys pulls single-column FOREIGN KEY constraints.

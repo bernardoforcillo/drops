@@ -110,7 +110,7 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 		cols, rows = i.applyInsertHooks()
 	}
 	b.WriteString("INSERT INTO ")
-	i.table.writeFrom(b)
+	i.table.writeName(b)
 	b.WriteString(" (")
 	for j, c := range cols {
 		if j > 0 {

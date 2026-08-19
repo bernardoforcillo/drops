@@ -19,7 +19,7 @@ type Table struct {
 
 	// indexes is the list of CREATE INDEX statements declared
 	// alongside the table — typically by a Mixin. CreateTable does
-	// not emit them; pair the table with pg.CreateTableWithIndexes if
+	// not emit them; pair the table with CreateTableWithIndexes if
 	// you want both at once.
 	indexes []*Index
 
@@ -288,8 +288,9 @@ func (t *Table) DefaultFilter(e drops.Expression) *Table {
 }
 
 // AddIndex registers an index to be created alongside the table. The
-// index is not emitted by CreateTable; use CreateTableWithIndexes or
-// emit pg.CreateIndex(idx) explicitly.
+// index is not emitted by CreateTable — PostgreSQL takes it as its own
+// statement; use CreateTableWithIndexes, or emit pg.CreateIndex(idx)
+// yourself.
 func (t *Table) AddIndex(idx *Index) *Table {
 	t.indexes = append(t.indexes, idx)
 	return t

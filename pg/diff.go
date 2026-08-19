@@ -690,11 +690,21 @@ func dropIndexSQL(name string, safe bool) string {
 
 // indexEqual reports whether two index snapshots describe the
 // same logical index.
+//
+// Concurrently is not part of the comparison: it says how an index was
+// built, not what it is, and the catalogue cannot report it — comparing
+// it would have every push drop and rebuild an index declared
+// Concurrently. The partial predicate is compared only when both sides
+// carry one, because PostgreSQL hands back its own normalised spelling
+// of the expression and a Go-declared index records none at all.
 func indexEqual(a, b *IndexSnapshot) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	if a.IsUnique != b.IsUnique || a.Method != b.Method || a.Where != b.Where || a.Concurrently != b.Concurrently {
+	if a.IsUnique != b.IsUnique || a.Method != b.Method {
+		return false
+	}
+	if a.Where != "" && b.Where != "" && a.Where != b.Where {
 		return false
 	}
 	if len(a.Columns) != len(b.Columns) {

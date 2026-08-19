@@ -173,6 +173,49 @@ func TestCreateTableForeignKey(t *testing.T) {
 
 // MySQL cannot index a TEXT column without a prefix length, so the
 // builder has to be able to express one.
+func TestCreateTableKeyPrefix(t *testing.T) {
+	tbl := mysql.NewTable("docs")
+	mysql.Add(tbl, mysql.Text("slug").KeyPrefix(64).PrimaryKey())
+	mysql.Add(tbl, mysql.Text("body").KeyPrefix(32).Unique())
+	got, _ := sqlOf(mysql.CreateTable(tbl))
+	for _, want := range []string{
+		"PRIMARY KEY (`slug`(64))",
+		"UNIQUE KEY `uq_docs_body` (`body`(32))",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DDL missing %s\ngot:\n%s", want, got)
+		}
+	}
+}
+
+// A derived constraint name is drops' own construction, so it is drops'
+// job to keep it inside MySQL's 64-byte identifier limit.
+func TestCreateTableDerivedNamesFitTheIdentifierLimit(t *testing.T) {
+	long := "a_table_name_long_enough_to_use_most_of_the_budget_on_its_own"
+	tbl := mysql.NewTable(long)
+	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(tbl, mysql.Varchar("a_reasonably_long_column_name", 64).Unique())
+	got, _ := sqlOf(mysql.CreateTable(tbl))
+
+	name := got[strings.Index(got, "UNIQUE KEY `")+len("UNIQUE KEY `"):]
+	name = name[:strings.IndexByte(name, '`')]
+	if len(name) > 64 {
+		t.Errorf("derived constraint name is %d bytes:\n%s", len(name), got)
+	}
+	if !strings.HasPrefix(name, "uq_"+long[:8]) {
+		t.Errorf("the shortened name no longer says what it is for: %q", name)
+	}
+}
+
+func TestReferencesRejectsAnUnregisteredTarget(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("a foreign key to a column with no table has no table name to render")
+		}
+	}()
+	mysql.Add(mysql.NewTable("posts"), mysql.BigInt("userId").References(mysql.BigSerial("id")))
+}
+
 func TestIndexPrefixLength(t *testing.T) {
 	tbl := mysql.NewTable("docs")
 	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
@@ -189,6 +232,21 @@ func TestDropIndexNamesTheTable(t *testing.T) {
 	got, _ := sqlOf(mysql.DropIndex("idx_users_name", tbl))
 	if !strings.Contains(got, "ON `users`") {
 		t.Errorf("DROP INDEX must name the table: %s", got)
+	}
+}
+
+// Schema text lands in a single-quoted literal rather than a bound
+// parameter, so the quote has to be doubled: a backslash escape is not
+// one under NO_BACKSLASH_ESCAPES, and the literal ends early there.
+func TestSchemaTextDoublesTheQuote(t *testing.T) {
+	tbl := mysql.NewTable("t").Comment("Ada's")
+	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(tbl, mysql.Enum("state", "it's draft"))
+	got, _ := sqlOf(mysql.CreateTable(tbl))
+	for _, want := range []string{`ENUM('it''s draft')`, `COMMENT='Ada''s'`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DDL missing %s\ngot:\n%s", want, got)
+		}
 	}
 }
 
@@ -239,6 +297,39 @@ func TestSelectDefaultFilterAndUnscoped(t *testing.T) {
 	}
 }
 
+// Both sides of a self-join have to qualify themselves: the alias copy
+// with the alias, the original with the table name.
+func TestSelectSelfJoinQualifiesThroughTheAlias(t *testing.T) {
+	tbl, id, name, _ := usersTable()
+	managerID := mysql.Add(tbl, mysql.BigInt("managerId"))
+	mgr := tbl.As("mgr")
+
+	got, _ := mysql.New(&fakeDriver{}).
+		Select(name, mgr.Col("name")).
+		From(tbl).
+		Join(mgr, mysql.Eq(managerID, mgr.Col("id"))).
+		ToSQL()
+
+	want := "SELECT `users`.`name`, `mgr`.`name` FROM `users` " +
+		"INNER JOIN `users` AS `mgr` ON (`users`.`managerId` = `mgr`.`id`)"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+	if tbl.Col("id") != id.Column {
+		t.Error("As mutated the table it aliased")
+	}
+}
+
+// MariaDB has no FOR SHARE at all; LOCK IN SHARE MODE is the spelling
+// both servers accept.
+func TestSelectForShareIsSpelledPortably(t *testing.T) {
+	tbl, _, _, _ := usersTable()
+	got, _ := mysql.New(&fakeDriver{}).Select().From(tbl).ForShare().ToSQL()
+	if !strings.HasSuffix(got, "LOCK IN SHARE MODE") {
+		t.Errorf("got %s", got)
+	}
+}
+
 func TestSelectForUpdateSkipLocked(t *testing.T) {
 	tbl, _, _, _ := usersTable()
 	got, _ := mysql.New(&fakeDriver{}).Select().From(tbl).ForUpdateSkipLocked().ToSQL()
@@ -268,6 +359,24 @@ func TestInsertOnDuplicateKeyUpdate(t *testing.T) {
 	// than MySQL 8's row alias, which MariaDB does not accept.
 	if !strings.Contains(got, "`name` = VALUES(`name`)") {
 		t.Errorf("expected VALUES(col) assignments: %s", got)
+	}
+}
+
+// Every column is part of the key, so there is nothing to assign — but
+// dropping the clause turns the upsert back into an INSERT that raises
+// 1062 on the second call.
+func TestInsertOnDuplicateKeyUpdateAllWithNoNonKeyColumns(t *testing.T) {
+	tbl := mysql.NewTable("memberships")
+	orgID := mysql.Add(tbl, mysql.BigInt("orgId").PrimaryKey())
+	userID := mysql.Add(tbl, mysql.BigInt("userId").PrimaryKey())
+
+	got, _ := mysql.New(&fakeDriver{}).
+		Insert(tbl).
+		Row(orgID.Val(1), userID.Val(2)).
+		OnDuplicateKeyUpdateAll().
+		ToSQL()
+	if !strings.HasSuffix(got, "ON DUPLICATE KEY UPDATE `orgId` = `orgId`") {
+		t.Errorf("got %s", got)
 	}
 }
 

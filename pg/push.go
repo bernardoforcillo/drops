@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // PushOptions tunes how Push applies schema changes.
@@ -40,7 +41,10 @@ type PushResult struct {
 //   - Diffs the two using DiffOptions{Safe: opts.Safe}.
 //   - If DryRun, returns the statements unexecuted.
 //   - Otherwise applies them inside a single transaction; any failure
-//     rolls back the whole push.
+//     rolls back the whole push. CREATE INDEX CONCURRENTLY is the one
+//     exception — PostgreSQL refuses it inside a transaction block
+//     (SQLSTATE 25001) — so those statements run afterwards, once the
+//     rest has committed.
 //
 // Push is convenient for development but skips migration history. For
 // production use, prefer GenerateMigration + DrizzleMigrator so changes
@@ -72,8 +76,13 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		return &PushResult{Statements: stmts, Applied: false}, nil
 	}
 
+	var deferred []string
 	if err := db.InTx(ctx, func(tx *DB) error {
 		for _, s := range stmts {
+			if needsOwnTransaction(s) {
+				deferred = append(deferred, s)
+				continue
+			}
 			if _, err := tx.Exec(ctx, s); err != nil {
 				return fmt.Errorf("applying %q: %w", excerptSQL(s), err)
 			}
@@ -82,5 +91,19 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}); err != nil {
 		return nil, err
 	}
+	for _, s := range deferred {
+		if _, err := db.Exec(ctx, s); err != nil {
+			return nil, fmt.Errorf("applying %q: %w", excerptSQL(s), err)
+		}
+	}
 	return &PushResult{Statements: stmts, Applied: true}, nil
+}
+
+// needsOwnTransaction reports whether a statement has to run outside
+// the push transaction. Only CONCURRENTLY index builds do: PostgreSQL
+// rejects them inside a transaction block with SQLSTATE 25001. They
+// come last in the diff anyway, so deferring them past the commit
+// preserves the order the diff asked for.
+func needsOwnTransaction(stmt string) bool {
+	return strings.Contains(stmt, "INDEX CONCURRENTLY ")
 }

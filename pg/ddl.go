@@ -9,9 +9,11 @@ import (
 // CreateTable returns a CREATE TABLE statement for t.
 //
 // The generated SQL covers column types, NOT NULL, DEFAULT, UNIQUE,
-// PRIMARY KEY (single-column only), and inline FOREIGN KEY references.
-// More elaborate DDL — composite keys, indexes, partitioning — is out of
-// scope; emit it via raw SQL.
+// PRIMARY KEY (composite included), CHECK constraints, and inline
+// FOREIGN KEY references. What it cannot carry is what PostgreSQL will
+// not accept inside CREATE TABLE: the indexes registered with AddIndex
+// and the multi-column foreign keys declared with ForeignKeyN, both of
+// which are separate statements — see CreateTableWithIndexes.
 func CreateTable(t *Table) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("CREATE TABLE ")
@@ -31,6 +33,59 @@ func CreateTableIfNotExists(t *Table) drops.Expression {
 		writeTableBody(b, t)
 		b.WriteString("\n)")
 	})
+}
+
+// CreateTableWithIndexes returns every statement a table needs, in
+// order: the CREATE TABLE, one ALTER TABLE ADD CONSTRAINT per
+// multi-column foreign key, and one CREATE INDEX per index registered
+// with AddIndex.
+//
+// CreateTable alone renders only what fits inside the parentheses, so
+// a table carrying either of those silently loses them.
+func CreateTableWithIndexes(t *Table) []drops.Expression {
+	out := []drops.Expression{CreateTable(t)}
+	for _, fk := range t.CompositeForeignKeys() {
+		out = append(out, addCompositeFK(t, fk))
+	}
+	for _, idx := range t.Indexes() {
+		out = append(out, CreateIndex(idx))
+	}
+	return out
+}
+
+// addCompositeFK renders the ALTER TABLE ADD CONSTRAINT that carries a
+// multi-column foreign key.
+func addCompositeFK(t *Table, fk *CompositeFK) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteString("ALTER TABLE ")
+		t.writeName(b)
+		b.WriteString(" ADD CONSTRAINT ")
+		b.WriteIdent(fk.Name)
+		b.WriteString(" FOREIGN KEY (")
+		writeBareColumns(b, fk.Columns)
+		b.WriteString(") REFERENCES ")
+		fk.Target.writeName(b)
+		b.WriteString(" (")
+		writeBareColumns(b, fk.TargetColumns)
+		b.WriteByte(')')
+		if fk.OnDelete != "" {
+			b.WriteString(" ON DELETE ")
+			b.WriteString(fk.OnDelete)
+		}
+		if fk.OnUpdate != "" {
+			b.WriteString(" ON UPDATE ")
+			b.WriteString(fk.OnUpdate)
+		}
+	})
+}
+
+func writeBareColumns(b *drops.Builder, cols []*Column) {
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteIdent(c.Name())
+	}
 }
 
 // DropTable returns a DROP TABLE statement.
@@ -518,17 +573,32 @@ func writeTableBody(b *drops.Builder, t *Table) {
 		}
 		writeColumnDefKey(b, c, inKey[c] && !composite, inKey[c])
 	}
-	if !composite {
-		return
+	if composite {
+		b.WriteString(",\n  PRIMARY KEY (")
+		writeBareColumns(b, keys)
+		b.WriteByte(')')
 	}
-	b.WriteString(",\n  PRIMARY KEY (")
-	for i, c := range keys {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteIdent(c.Name())
+	writeTableConstraints(b, t)
+}
+
+// writeTableConstraints renders the named UNIQUE and CHECK constraints
+// declared on the table. Both are keyed by name, so they are emitted in
+// name order to keep the statement stable across runs.
+func writeTableConstraints(b *drops.Builder, t *Table) {
+	for _, name := range sortedKeys(t.CompositeUniques()) {
+		b.WriteString(",\n  CONSTRAINT ")
+		b.WriteIdent(name)
+		b.WriteString(" UNIQUE (")
+		writeBareColumns(b, t.CompositeUniques()[name])
+		b.WriteByte(')')
 	}
-	b.WriteByte(')')
+	for _, name := range sortedKeys(t.Checks()) {
+		b.WriteString(",\n  CONSTRAINT ")
+		b.WriteIdent(name)
+		b.WriteString(" CHECK (")
+		b.WriteString(t.Checks()[name])
+		b.WriteByte(')')
+	}
 }
 
 // writeColumnDefKey renders one column. inlineKey asks for the inline
@@ -539,7 +609,7 @@ func writeTableBody(b *drops.Builder, t *Table) {
 func writeColumnDefKey(b *drops.Builder, c *Column, inlineKey, keyMember bool) {
 	b.WriteIdent(c.Name())
 	b.WriteByte(' ')
-	b.WriteString(c.Type().TypeSQL())
+	b.WriteString(ddlTypeSQL(c.Type()))
 	if inlineKey {
 		b.WriteString(" PRIMARY KEY")
 	} else if c.IsNotNull() {

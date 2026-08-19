@@ -160,9 +160,7 @@ func writeForeignKey(b *drops.Builder, t *Table, c *Column) {
 	b.WriteString(" FOREIGN KEY (")
 	b.WriteIdent(c.name)
 	b.WriteString(") REFERENCES ")
-	if fk.Target.table != nil {
-		fk.Target.table.writeName(b)
-	}
+	fk.Target.table.writeName(b)
 	b.WriteString(" (")
 	b.WriteIdent(fk.Target.name)
 	b.WriteByte(')')

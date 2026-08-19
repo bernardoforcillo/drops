@@ -59,8 +59,18 @@ func ReplacingMergeTree(versionCol string) Engine {
 }
 
 // SummingMergeTree(columns...) — optional list of columns to sum.
+//
+// ClickHouse reads the summed columns as one tuple argument, not as a
+// parameter list: a bare SummingMergeTree(a, b) leaves "a" over as an
+// engine argument the MergeTree parameter check then rejects.
 func SummingMergeTree(cols ...string) Engine {
-	return engineFamily{name: "SummingMergeTree", args: quoteIdents(cols)}
+	if len(cols) == 0 {
+		return engineFamily{name: "SummingMergeTree"}
+	}
+	return engineFamily{
+		name: "SummingMergeTree",
+		args: []string{"(" + strings.Join(quoteIdents(cols), ", ") + ")"},
+	}
 }
 
 // AggregatingMergeTree is the empty-constructor form.

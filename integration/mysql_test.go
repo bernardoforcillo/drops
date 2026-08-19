@@ -171,9 +171,12 @@ func TestMySQLUpsertFiresOnAnyUniqueIndex(t *testing.T) {
 	}
 }
 
-// MySQL cannot index a TEXT column without a prefix length. The
-// builder can express one; this checks the server agrees, and that the
-// unprefixed form really is rejected — which is why Prefix exists.
+// A secondary index over a TEXT column: MySQL refuses one without a
+// prefix length (error 1170), MariaDB takes it and silently narrows the
+// index to the longest prefix its engine allows. The two servers do not
+// agree, so the test pins what each one did rather than one server's
+// answer — and either way an index over the *whole* value is what
+// nobody offers, which is what Prefix exists to say out loud.
 func TestMySQLTextIndexNeedsAPrefix(t *testing.T) {
 	db := openMySQL(t)
 	tbl := mysql.NewTable(integration.UniqueName(t, "docs"))
@@ -184,14 +187,290 @@ func TestMySQLTextIndexNeedsAPrefix(t *testing.T) {
 	execMySQL(t, db, mysql.CreateTable(tbl))
 
 	ctx := context.Background()
-	unprefixed := mysql.NewIndex(integration.UniqueName(t, "np"), tbl, body)
-	if _, err := db.ExecExpr(ctx, unprefixed); err == nil {
-		t.Error("MySQL accepted a TEXT index with no prefix; Prefix would then be unnecessary")
-	} else if !strings.Contains(strings.ToLower(err.Error()), "key") {
-		t.Logf("rejected, though not with the expected message: %v", err)
+	npName := integration.UniqueName(t, "np")
+	if _, err := db.ExecExpr(ctx, mysql.NewIndex(npName, tbl, body)); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "key length") {
+			t.Errorf("rejected, but not for the missing key length: %v", err)
+		}
+	} else {
+		sub := indexPrefixLength(t, db, tbl.Name(), npName)
+		if sub == 0 {
+			t.Errorf("index %s covers the whole TEXT value, which no MySQL engine can do", npName)
+		}
+		t.Logf("this server accepted the unprefixed index and imposed a %d-byte prefix itself", sub)
 	}
 
 	execMySQL(t, db, mysql.NewIndex(integration.UniqueName(t, "p"), tbl, body).Prefix(body, 64))
+}
+
+// indexPrefixLength reads the prefix an index actually ended up with,
+// which is the only way to tell a server that imposed one from a server
+// that indexed the whole column.
+func indexPrefixLength(t *testing.T, db *mysql.DB, table, index string) int64 {
+	t.Helper()
+	rows, err := db.Query(context.Background(),
+		"SELECT COALESCE(SUB_PART, 0) AS subPart FROM information_schema.STATISTICS"+
+			" WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+		table, index)
+	if err != nil {
+		t.Fatalf("information_schema: %v", err)
+	}
+	var out []struct{ SubPart int64 }
+	if err := drops.ScanAll(rows, &out); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatalf("index %s on %s is not in information_schema", index, table)
+	}
+	return out[0].SubPart
+}
+
+// A TEXT column in the PRIMARY KEY or a UNIQUE KEY is the one place
+// both servers agree: without a prefix length it is error 1170, and
+// CreateTable has nowhere but the column to learn the length from.
+func TestMySQLTextKeyCarriesItsPrefixLength(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+
+	bare := mysql.NewTable(integration.UniqueName(t, "bare"))
+	dropMySQL(t, db, bare)
+	mysql.Add(bare, mysql.Text("slug").PrimaryKey())
+	if _, err := db.ExecExpr(ctx, mysql.CreateTable(bare)); err == nil {
+		t.Fatal("the server took a TEXT primary key with no key length; the premise of KeyPrefix is gone")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "key length") {
+		t.Fatalf("rejected, but not for the missing key length: %v", err)
+	}
+
+	tbl := mysql.NewTable(integration.UniqueName(t, "keyed"))
+	dropMySQL(t, db, tbl)
+	slug := mysql.Add(tbl, mysql.Text("slug").KeyPrefix(64).PrimaryKey())
+	mysql.Add(tbl, mysql.Text("body").KeyPrefix(32).Unique())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	if _, err := db.Insert(tbl).Row(slug.Val("a-post")).Exec(ctx); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := db.Insert(tbl).Row(slug.Val("a-post")).Exec(ctx); err == nil {
+		t.Error("the prefixed primary key did not enforce uniqueness")
+	}
+}
+
+// Both sides of a self-join have to be addressable at once: the alias
+// copy must qualify its columns with the alias, or the join condition
+// silently reads from the un-aliased table and the query returns the
+// wrong rows without erroring.
+func TestMySQLSelfJoinResolvesThroughTheAlias(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "staff"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	managerID := mysql.Add(tbl, mysql.BigInt("managerId"))
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	for _, r := range []struct {
+		id      int64
+		name    string
+		manager int64
+	}{{1, "Ada", 0}, {2, "Grace", 1}, {3, "Alan", 1}} {
+		row := []mysql.ColumnValue{id.Val(r.id), name.Val(r.name)}
+		if r.manager != 0 {
+			row = append(row, managerID.Val(r.manager))
+		}
+		if _, err := db.Insert(tbl).Row(row...).Exec(ctx); err != nil {
+			t.Fatalf("seed %s: %v", r.name, err)
+		}
+	}
+
+	mgr := tbl.As("mgr")
+	var rows []struct {
+		Staff   string `drop:"staff"`
+		Manager string `drop:"manager"`
+	}
+	err := db.Select(name.As("staff"), mgr.Col("name").As("manager")).
+		From(tbl).
+		Join(mgr, mysql.Eq(managerID, mgr.Col("id"))).
+		OrderBy(name.Asc()).
+		All(ctx, &rows)
+	if err != nil {
+		t.Fatalf("self-join: %v", err)
+	}
+	want := map[string]string{"Alan": "Ada", "Grace": "Ada"}
+	if len(rows) != len(want) {
+		t.Fatalf("self-join returned %d rows, want %d: %+v", len(rows), len(want), rows)
+	}
+	for _, r := range rows {
+		if want[r.Staff] != r.Manager {
+			t.Errorf("%s reports to %q, want %q", r.Staff, r.Manager, want[r.Staff])
+		}
+	}
+}
+
+// A foreign key whose target belongs to no table has no table name to
+// render, and the REFERENCES clause the server sees is a syntax error.
+// drops refuses the declaration instead of emitting it.
+func TestMySQLForeignKeyTargetMustBeRegistered(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+
+	parent := mysql.NewTable(integration.UniqueName(t, "parent"))
+	dropMySQL(t, db, parent)
+	parentID := mysql.Add(parent, mysql.BigInt("id").PrimaryKey())
+	execMySQL(t, db, mysql.CreateTable(parent))
+
+	child := mysql.NewTable(integration.UniqueName(t, "child"))
+	dropMySQL(t, db, child)
+	mysql.Add(child, mysql.BigSerial("id").PrimaryKey())
+	childParent := mysql.Add(child, mysql.BigInt("parentId").NotNull().References(parentID))
+	execMySQL(t, db, mysql.CreateTable(child))
+
+	if _, err := db.Insert(child).Row(childParent.Val(404)).Exec(ctx); err == nil {
+		t.Error("the foreign key is not being enforced; the rest of this test proves nothing")
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Error("References accepted a target that belongs to no table")
+		}
+	}()
+	mysql.Add(mysql.NewTable(integration.UniqueName(t, "orphan")),
+		mysql.BigInt("danglingId").References(mysql.BigInt("id")))
+}
+
+// OnDuplicateKeyUpdateAll on a table whose every column is part of the
+// key has nothing to assign. Dropping the clause turns the upsert back
+// into a plain INSERT, which raises 1062 on the second call.
+func TestMySQLUpsertAllWhenEveryColumnIsAKey(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "members"))
+	dropMySQL(t, db, tbl)
+
+	orgID := mysql.Add(tbl, mysql.BigInt("orgId").PrimaryKey())
+	userID := mysql.Add(tbl, mysql.BigInt("userId").PrimaryKey())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	upsert := func() error {
+		_, err := db.Insert(tbl).
+			Row(orgID.Val(int64(1)), userID.Val(int64(2))).
+			OnDuplicateKeyUpdateAll().
+			Exec(ctx)
+		return err
+	}
+	if err := upsert(); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	if err := upsert(); err != nil {
+		t.Fatalf("second upsert on the same key: %v", err)
+	}
+
+	var n int64
+	if err := db.Select(mysql.CountAll()).From(tbl).One(ctx, &n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("%d rows after upserting the same key twice, want 1", n)
+	}
+}
+
+// Constraint names are derived from the table and the column, and both
+// can approach MySQL's 64-byte identifier limit on their own. An
+// over-long derivation is error 1059 and takes the whole CREATE TABLE
+// with it.
+func TestMySQLDerivedConstraintNamesFitTheIdentifierLimit(t *testing.T) {
+	db := openMySQL(t)
+
+	parent := mysql.NewTable(integration.UniqueName(t, "p"))
+	dropMySQL(t, db, parent)
+	parentID := mysql.Add(parent, mysql.BigInt("id").PrimaryKey())
+	execMySQL(t, db, mysql.CreateTable(parent))
+
+	tbl := mysql.NewTable(integration.UniqueName(t, "a_table_name_that_eats_most_of_the_identifier_budget"))
+	dropMySQL(t, db, tbl)
+	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(tbl, mysql.Varchar("a_reasonably_long_column_name", 64).Unique())
+	mysql.Add(tbl, mysql.BigInt("another_long_column_name_here").References(parentID))
+	execMySQL(t, db, mysql.CreateTable(tbl))
+}
+
+// Schema text is interpolated into a single-quoted literal rather than
+// bound, so its escaping has to hold under NO_BACKSLASH_ESCAPES, where
+// \' is two characters and not an escape at all.
+func TestMySQLSchemaTextSurvivesNoBackslashEscapes(t *testing.T) {
+	db, sqlDB := openMySQLPinnedConn(t)
+	ctx := context.Background()
+	if _, err := sqlDB.ExecContext(ctx,
+		"SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')"); err != nil {
+		t.Fatalf("set sql_mode: %v", err)
+	}
+
+	const comment = "Ada's table"
+	tbl := mysql.NewTable(integration.UniqueName(t, "quoted")).Comment(comment)
+	dropMySQL(t, db, tbl)
+	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(tbl, mysql.Enum("state", "it's draft", "live"))
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	var got []struct {
+		Comment string `drop:"TABLE_COMMENT"`
+	}
+	rows, err := db.Query(ctx,
+		"SELECT TABLE_COMMENT FROM information_schema.TABLES"+
+			" WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", tbl.Name())
+	if err != nil {
+		t.Fatalf("information_schema: %v", err)
+	}
+	if err := drops.ScanAll(rows, &got); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(got) != 1 || got[0].Comment != comment {
+		t.Errorf("the comment came back as %+v, want %q", got, comment)
+	}
+}
+
+// openMySQLPinnedConn returns a DB backed by a pool of exactly one
+// connection, so a session setting made through it survives into the
+// statements that follow. The pool is this test's own: leaving a
+// modified sql_mode on a shared connection would poison whichever test
+// drew it next.
+func openMySQLPinnedConn(t *testing.T) (*mysql.DB, *sql.DB) {
+	t.Helper()
+	dsn := integration.DSN(t, integration.EnvMySQL)
+	sqlDB, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := sqlDB.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping %s: %v", dsn, err)
+	}
+	return mysql.New(stdlib.New(sqlDB)), sqlDB
+}
+
+// A shared read lock has to be spelled the way both servers accept:
+// MariaDB has never taken FOR SHARE, MySQL still takes the older form.
+func TestMySQLSharedLockIsPortable(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "locked"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	if _, err := db.Insert(tbl).Row(id.Val(int64(1))).Exec(ctx); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	err := db.InTx(ctx, func(tx *mysql.DB) error {
+		var rows []struct{ ID int64 }
+		return tx.Select(id).From(tbl).ForShare().All(ctx, &rows)
+	})
+	if err != nil {
+		t.Fatalf("shared lock: %v", err)
+	}
 }
 
 func TestMySQLCompositePrimaryKeyIsAccepted(t *testing.T) {

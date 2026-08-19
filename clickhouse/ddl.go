@@ -106,8 +106,13 @@ func writeTableSuffix(b *drops.Builder, t *Table) {
 	}
 }
 
-// writeColumnDef writes "name Type [DEFAULT …] [CODEC(…)] [TTL …]
-// [COMMENT '…']".
+// writeColumnDef writes "name Type [DEFAULT …] [COMMENT '…']
+// [CODEC(…)] [TTL …]".
+//
+// The clause order is the one ClickHouse's column-declaration parser
+// walks, and it walks it strictly: COMMENT is read before CODEC and
+// CODEC before TTL, so a comment emitted last turns the whole CREATE
+// TABLE into a syntax error.
 func writeColumnDef(b *drops.Builder, c *Column) {
 	b.WriteIdent(c.name)
 	b.WriteByte(' ')
@@ -115,6 +120,10 @@ func writeColumnDef(b *drops.Builder, c *Column) {
 	if c.hasDef {
 		b.WriteString(" DEFAULT ")
 		b.WriteString(c.defSQL)
+	}
+	if c.comment != "" {
+		b.WriteString(" COMMENT ")
+		b.WriteString(quoteLiteral(c.comment))
 	}
 	if c.codec != "" {
 		b.WriteString(" CODEC(")
@@ -124,10 +133,6 @@ func writeColumnDef(b *drops.Builder, c *Column) {
 	if c.ttl != "" {
 		b.WriteString(" TTL ")
 		b.WriteString(c.ttl)
-	}
-	if c.comment != "" {
-		b.WriteString(" COMMENT ")
-		b.WriteString(quoteLiteral(c.comment))
 	}
 }
 

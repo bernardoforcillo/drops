@@ -3,10 +3,11 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/integration"
@@ -331,12 +332,75 @@ func TestMySQLForeignKeyTargetMustBeRegistered(t *testing.T) {
 	}
 
 	defer func() {
-		if recover() == nil {
-			t.Error("References accepted a target that belongs to no table")
+		r := recover()
+		if r == nil {
+			t.Fatal("References accepted a target that belongs to no table")
+		}
+		// Any panic would satisfy a bare recover() != nil — a nil map
+		// write, a bad index — so name the one this test is about.
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panicked with %T(%v), want the References diagnostic", r, r)
+		}
+		for _, want := range []string{"danglingId", "belongs to no table"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("panic %q does not mention %q", msg, want)
+			}
 		}
 	}()
 	mysql.Add(mysql.NewTable(integration.UniqueName(t, "orphan")),
 		mysql.BigInt("danglingId").References(mysql.BigInt("id")))
+}
+
+// isDuplicateKey reports MySQL error 1062, the duplicate-key
+// collision. The number is the driver's, so it reads the same on
+// MariaDB and on MySQL where the message text does not.
+func isDuplicateKey(err error) bool {
+	var me *mysqldriver.MySQLError
+	return errors.As(err, &me) && me.Number == 1062
+}
+
+// OnDuplicateKeyUpdate with an empty assignment list renders no clause
+// at all, so the collision still reaches the caller as 1062 and the
+// row already in the table keeps its values. The list is the caller's:
+// one that came out empty by accident must not be read as consent to
+// discard the incoming row. OnDuplicateKeyUpdateAll degrades the other
+// way, and TestMySQLUpsertAllWhenEveryColumnIsAKey pins that.
+func TestMySQLOnDuplicateKeyUpdateWithNoAssignmentsStillRaises(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "settings"))
+	dropMySQL(t, db, tbl)
+
+	key := mysql.Add(tbl, mysql.BigInt("k").PrimaryKey())
+	val := mysql.Add(tbl, mysql.Varchar("v", 32).NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	insert := func(v string) error {
+		_, err := db.Insert(tbl).
+			Row(key.Val(int64(1)), val.Val(v)).
+			OnDuplicateKeyUpdate().
+			Exec(ctx)
+		return err
+	}
+	if err := insert("first"); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	err := insert("second")
+	if err == nil {
+		t.Fatal("the duplicate was swallowed; an empty assignment list must not mean INSERT IGNORE")
+	}
+	if !isDuplicateKey(err) {
+		t.Fatalf("second insert failed with %v, want error 1062", err)
+	}
+
+	var got string
+	if err := db.Select(val).From(tbl).One(ctx, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "first" {
+		t.Errorf("stored value = %q, want the row the collision protected", got)
+	}
 }
 
 // OnDuplicateKeyUpdateAll on a table whose every column is part of the

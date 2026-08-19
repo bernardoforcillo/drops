@@ -37,8 +37,20 @@ func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.unscoped = true; return d 
 
 // WriteSQL renders the DELETE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
-	b.WriteString("DELETE FROM ")
-	d.table.writeName(b)
+	if d.table.alias != "" {
+		// An aliased DELETE has to name the alias twice: once as the
+		// target and once in the FROM. MariaDB rejects the shorter
+		// "DELETE FROM t AS a" outright — error 1064 — while both it
+		// and MySQL accept the multi-table spelling against a single
+		// table, so drops emits the form the whole family takes.
+		b.WriteString("DELETE ")
+		b.WriteIdent(d.table.alias)
+		b.WriteString(" FROM ")
+		d.table.writeFrom(b)
+	} else {
+		b.WriteString("DELETE FROM ")
+		d.table.writeName(b)
+	}
 	wheres := d.wheres
 	if !d.unscoped && len(d.table.defaultFilters) > 0 {
 		wheres = append(append([]drops.Expression(nil), d.table.defaultFilters...), wheres...)

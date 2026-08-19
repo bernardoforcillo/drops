@@ -88,7 +88,8 @@ func (s *SelectBuilder) OrderBy(exprs ...drops.Expression) *SelectBuilder {
 func (s *SelectBuilder) Limit(n int64) *SelectBuilder  { s.limit = &n; return s }
 func (s *SelectBuilder) Offset(n int64) *SelectBuilder { s.offset = &n; return s }
 
-// ForUpdate appends FOR UPDATE row locking.
+// ForUpdate appends FOR UPDATE row locking. It outranks
+// [SelectBuilder.ForShare] in either order — see there.
 func (s *SelectBuilder) ForUpdate() *SelectBuilder { s.forUpd = " FOR UPDATE"; return s }
 
 // ForUpdateSkipLocked appends FOR UPDATE SKIP LOCKED — the queue-worker
@@ -104,6 +105,12 @@ func (s *SelectBuilder) ForUpdateSkipLocked() *SelectBuilder {
 // older one; MariaDB has never accepted FOR SHARE at all, answering a
 // syntax error. LOCK IN SHARE MODE is the form both servers take, and
 // drops targets the intersection.
+//
+// A builder that asks for both locks renders FOR UPDATE, whichever
+// order the calls came in: the two clauses cannot both be written, and
+// of the two the exclusive lock is the one that cannot be too weak.
+// Silently downgrading to a shared lock because ForShare happened to
+// be called second is how a read-modify-write loses a row.
 func (s *SelectBuilder) ForShare() *SelectBuilder { s.forShare = true; return s }
 
 // Unscoped opts out of the FROM table's DefaultFilter predicates.

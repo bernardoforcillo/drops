@@ -330,6 +330,33 @@ func TestSelectForShareIsSpelledPortably(t *testing.T) {
 	}
 }
 
+// A builder that asks for both locks gets the exclusive one whichever
+// order the calls arrived in. Only one of the two clauses can be
+// written, and a silent downgrade to a shared lock is how a
+// read-modify-write loses a row.
+func TestSelectForUpdateOutranksForShare(t *testing.T) {
+	for _, order := range []struct {
+		label string
+		build func(*mysql.SelectBuilder) *mysql.SelectBuilder
+	}{
+		{"ForUpdate then ForShare", func(s *mysql.SelectBuilder) *mysql.SelectBuilder {
+			return s.ForUpdate().ForShare()
+		}},
+		{"ForShare then ForUpdate", func(s *mysql.SelectBuilder) *mysql.SelectBuilder {
+			return s.ForShare().ForUpdate()
+		}},
+	} {
+		tbl, _, _, _ := usersTable()
+		got, _ := order.build(mysql.New(&fakeDriver{}).Select().From(tbl)).ToSQL()
+		if !strings.HasSuffix(got, " FOR UPDATE") {
+			t.Errorf("%s: got %s, want it to end in FOR UPDATE", order.label, got)
+		}
+		if strings.Contains(got, "LOCK IN SHARE MODE") {
+			t.Errorf("%s: both lock clauses rendered: %s", order.label, got)
+		}
+	}
+}
+
 func TestSelectForUpdateSkipLocked(t *testing.T) {
 	tbl, _, _, _ := usersTable()
 	got, _ := mysql.New(&fakeDriver{}).Select().From(tbl).ForUpdateSkipLocked().ToSQL()
@@ -377,6 +404,24 @@ func TestInsertOnDuplicateKeyUpdateAllWithNoNonKeyColumns(t *testing.T) {
 		ToSQL()
 	if !strings.HasSuffix(got, "ON DUPLICATE KEY UPDATE `orgId` = `orgId`") {
 		t.Errorf("got %s", got)
+	}
+}
+
+// The empty case of the caller-supplied form is the opposite of the
+// derived one: no clause at all, so the server still raises 1062. The
+// two spellings differ on purpose — see the methods' docs.
+func TestInsertOnDuplicateKeyUpdateWithNoAssignmentsStaysAPlainInsert(t *testing.T) {
+	tbl := mysql.NewTable("memberships")
+	orgID := mysql.Add(tbl, mysql.BigInt("orgId").PrimaryKey())
+	userID := mysql.Add(tbl, mysql.BigInt("userId").PrimaryKey())
+
+	got, _ := mysql.New(&fakeDriver{}).
+		Insert(tbl).
+		Row(orgID.Val(1), userID.Val(2)).
+		OnDuplicateKeyUpdate().
+		ToSQL()
+	if strings.Contains(got, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("an empty assignment list must not become a silent upsert: %s", got)
 	}
 }
 
@@ -442,6 +487,98 @@ func TestDeleteLimit(t *testing.T) {
 	if !strings.Contains(got, "DELETE FROM `users` WHERE (`users`.`id` < ?) LIMIT ?") {
 		t.Errorf("got %s", got)
 	}
+}
+
+// An aliased DELETE names the alias twice. MariaDB answers 1064 to
+// "DELETE FROM t AS a"; the multi-table spelling against one table is
+// what both servers take.
+func TestDeleteThroughAnAliasNamesTheAlias(t *testing.T) {
+	tbl, _, _, _ := usersTable()
+	u := tbl.As("u")
+	got, _ := mysql.New(&fakeDriver{}).Delete(u).Where(mysql.Lt(u.Col("id"), 100)).ToSQL()
+	want := "DELETE `u` FROM `users` AS `u` WHERE (`u`.`id` < ?)"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestUpdateThroughAnAliasNamesTheAlias(t *testing.T) {
+	tbl, id, name, _ := usersTable()
+	u := tbl.As("u")
+	got, _ := mysql.New(&fakeDriver{}).
+		Update(u).
+		Set(mysql.Bind(u.Col("name"), "x")).
+		Where(mysql.Eq(u.Col("id"), int64(1))).
+		ToSQL()
+	want := "UPDATE `users` AS `u` SET `name` = ? WHERE (`u`.`id` = ?)"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+	// The un-aliased handles are untouched by the alias.
+	if bare, _ := sqlOf(id); bare != "`users`.`id`" {
+		t.Errorf("original column = %s", bare)
+	}
+	_ = name
+}
+
+// --- relations ---------------------------------------------------------
+
+// A relation reached through an alias is the alias's relation: its near
+// side has to qualify with the alias, or a self-join built from it
+// silently joins one instance of the table to itself.
+func TestRelationThroughAnAliasRebindsItsNearSide(t *testing.T) {
+	users := mysql.NewTable("users")
+	id := mysql.Add(users, mysql.BigSerial("id").PrimaryKey())
+	managerID := mysql.Add(users, mysql.BigInt("managerId"))
+	mysql.NewRelations(users).
+		HasMany("reports", users, id, managerID).
+		BelongsTo("manager", users, managerID, id)
+
+	u := users.As("u")
+
+	reports := u.Rel("reports")
+	if got, _ := sqlOf(reports.ParentKey); got != "`u`.`id`" {
+		t.Errorf("HasMany near side = %s, want `u`.`id`", got)
+	}
+	if got, _ := sqlOf(reports.ChildKey); got != "`users`.`managerId`" {
+		t.Errorf("HasMany far side = %s, want the un-aliased table", got)
+	}
+
+	manager := u.Rel("manager")
+	if got, _ := sqlOf(manager.ChildKey); got != "`u`.`managerId`" {
+		t.Errorf("BelongsTo near side = %s, want `u`.`managerId`", got)
+	}
+	if got, _ := sqlOf(manager.ParentKey); got != "`users`.`id`" {
+		t.Errorf("BelongsTo far side = %s, want the un-aliased table", got)
+	}
+
+	if u.Rel("reports").From != u {
+		t.Error("the relation still points at the un-aliased table")
+	}
+	if users.Rel("reports").ParentKey != id.Column {
+		t.Error("As mutated the relation it copied")
+	}
+}
+
+// The relations map is copied with the table, so declaring through an
+// alias cannot reach back into the handle everyone else shares.
+func TestDeclaringARelationOnAnAliasDoesNotTouchTheOriginal(t *testing.T) {
+	users := mysql.NewTable("users")
+	id := mysql.Add(users, mysql.BigSerial("id").PrimaryKey())
+	posts := mysql.NewTable("posts")
+	mysql.Add(posts, mysql.BigSerial("id").PrimaryKey())
+	authorID := mysql.Add(posts, mysql.BigInt("authorId"))
+
+	u := users.As("u")
+	mysql.NewRelations(u).HasMany("posts", posts, u.Col("id"), authorID)
+
+	if users.Relation("posts") != nil {
+		t.Error("a relation declared on the alias leaked into the original table")
+	}
+	if u.Relation("posts") == nil {
+		t.Error("the alias did not keep its own relation")
+	}
+	_ = id
 }
 
 // --- operators ---------------------------------------------------------

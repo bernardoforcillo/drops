@@ -60,6 +60,12 @@ func (t *Table) Alias() string    { return t.alias }
 // they were built against the un-aliased columns and would resolve
 // against a table the aliased query no longer names, so scope an
 // aliased query with Unscoped and an explicit predicate.
+//
+// Relations are copied too, with their near side — the column that
+// belongs to this table — rebound to the alias and the far side left
+// alone. On a self-referential relation that is the whole point: the
+// two ends of the edge are two instances of one table, and only one of
+// them is the aliased one.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
@@ -71,6 +77,29 @@ func (t *Table) As(alias string) *Table {
 		aliased.table = &cp
 		cp.columns[i] = &aliased
 		cp.byName[aliased.name] = &aliased
+	}
+	// rebind maps a column declared on t to the aliased copy's handle
+	// for it, and leaves any column belonging to another table alone.
+	rebind := func(c *Column) *Column {
+		if c != nil && c.table == t {
+			if aliased := cp.byName[c.name]; aliased != nil {
+				return aliased
+			}
+		}
+		return c
+	}
+	cp.relations = make(map[string]*Relation, len(t.relations))
+	for name, rel := range t.relations {
+		r := *rel
+		r.From = &cp
+		if r.Kind == BelongsToKind {
+			// The inverse edge holds its own key in ChildKey; ParentKey
+			// names the far table.
+			r.ChildKey = rebind(r.ChildKey)
+		} else {
+			r.ParentKey = rebind(r.ParentKey)
+		}
+		cp.relations[name] = &r
 	}
 	return &cp
 }

@@ -166,15 +166,28 @@ func TestIdentValidation(t *testing.T) {
 	}
 }
 
-func TestTableAliasAndDuplicateColumn(t *testing.T) {
+func TestTableAliasQualifiesColumnsThroughTheAlias(t *testing.T) {
 	tbl, id, _, _ := usersTable()
 	aliased := tbl.As("u")
-	got, _ := sqlOf(aliased)
-	if got != "`users` AS `u`" {
+	if got, _ := sqlOf(aliased); got != "`users` AS `u`" {
 		t.Errorf("alias = %s", got)
 	}
-	// A column reference through the alias uses it.
-	_ = id
+	// A column reference through the alias uses it, and the original
+	// handle keeps the table name — the two have to disagree, or a
+	// self-join has no way to say which side it means.
+	if got, _ := sqlOf(aliased.Col("id")); got != "`u`.`id`" {
+		t.Errorf("aliased column = %s, want `u`.`id`", got)
+	}
+	if got, _ := sqlOf(id); got != "`users`.`id`" {
+		t.Errorf("original column = %s, want `users`.`id`", got)
+	}
+	if aliased.Col("id") == id.Column {
+		t.Error("the alias handed back the original column, so As only copied the table")
+	}
+}
+
+func TestDuplicateColumnNamePanics(t *testing.T) {
+	tbl, _, _, _ := usersTable()
 	defer func() {
 		if recover() == nil {
 			t.Error("a duplicate column name should panic")

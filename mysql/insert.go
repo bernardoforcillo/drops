@@ -15,7 +15,12 @@ type InsertBuilder struct {
 	rows    [][]drops.Expression
 	ignore  bool
 	upserts []ColumnValue
-	upsert  bool
+	// upsertAll records that the assignment list was derived by
+	// OnDuplicateKeyUpdateAll rather than supplied by the caller. An
+	// empty list means opposite things in the two cases — see the
+	// methods' docs — so the renderer has to be able to tell them
+	// apart.
+	upsertAll bool
 }
 
 // Row appends one row of column/value bindings. The first Row fixes
@@ -56,8 +61,19 @@ func (i *InsertBuilder) Ignore() *InsertBuilder { i.ignore = true; return i }
 // the table. A table with a unique email as well as a primary key will
 // therefore update on either, which is usually what you want and
 // occasionally a surprise.
+//
+// With no assignments the clause is not rendered at all and the
+// statement stays a plain INSERT, so a duplicate still raises error
+// 1062. This differs on purpose from the empty case of
+// [InsertBuilder.OnDuplicateKeyUpdateAll], which does render a clause:
+// there the list is empty because every column the insert names
+// belongs to the key, so the colliding row already equals the one
+// being inserted and swallowing the collision discards nothing. A list
+// the caller assembled and that came out empty carries no such
+// guarantee — the row may differ in exactly the columns nobody
+// assigned — so drops raises rather than guessing. Spell "do nothing
+// on conflict" as [InsertBuilder.Ignore], which says so.
 func (i *InsertBuilder) OnDuplicateKeyUpdate(assignments ...ColumnValue) *InsertBuilder {
-	i.upsert = true
 	i.upserts = append(i.upserts, assignments...)
 	return i
 }
@@ -66,10 +82,15 @@ func (i *InsertBuilder) OnDuplicateKeyUpdate(assignments ...ColumnValue) *Insert
 // insert would have written, which is the "upsert this row" shorthand.
 //
 // On a table whose every column is part of the key there is nothing to
-// assign, and the clause degrades to "do nothing on conflict" rather
-// than vanishing.
+// assign, and the clause degrades to a self-assignment — MySQL's
+// spelling of "do nothing on conflict" — rather than vanishing. That
+// keeps the method's promise that the row exists afterwards and no
+// error was raised, and it costs nothing: on such a table the row
+// already in the way is equal, column for column, to the one being
+// inserted. [InsertBuilder.OnDuplicateKeyUpdate] does not degrade this
+// way, and its doc explains why the two differ.
 func (i *InsertBuilder) OnDuplicateKeyUpdateAll() *InsertBuilder {
-	i.upsert = true
+	i.upsertAll = true
 	for _, c := range i.cols {
 		if c.primary {
 			continue
@@ -137,18 +158,9 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 		b.AppendList(", ", row)
 		b.WriteByte(')')
 	}
-	if i.upsert && (len(i.upserts) > 0 || len(i.cols) > 0) {
+	switch {
+	case len(i.upserts) > 0:
 		b.WriteString(" ON DUPLICATE KEY UPDATE ")
-		if len(i.upserts) == 0 {
-			// Nothing to copy over — every column the insert names
-			// belongs to the key. Assigning a column to itself is
-			// MySQL's spelling of "do nothing on conflict"; dropping
-			// the clause instead would turn the upsert back into a
-			// plain INSERT that raises 1062.
-			b.WriteIdent(i.cols[0].name)
-			b.WriteString(" = ")
-			b.WriteIdent(i.cols[0].name)
-		}
 		for n, a := range i.upserts {
 			if n > 0 {
 				b.WriteString(", ")
@@ -157,6 +169,16 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 			b.WriteString(" = ")
 			a.writeValue(b)
 		}
+	case i.upsertAll && len(i.cols) > 0:
+		// Nothing to copy over — every column the insert names
+		// belongs to the key. Assigning a column to itself is
+		// MySQL's spelling of "do nothing on conflict"; dropping
+		// the clause instead would turn the upsert back into a
+		// plain INSERT that raises 1062.
+		b.WriteString(" ON DUPLICATE KEY UPDATE ")
+		b.WriteIdent(i.cols[0].name)
+		b.WriteString(" = ")
+		b.WriteIdent(i.cols[0].name)
 	}
 }
 

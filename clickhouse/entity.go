@@ -7,6 +7,7 @@ import (
 	"reflect"
 
 	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/internal/drift"
 )
 
 // Entity binds a Go struct T to a Table and precomputes the column ↔
@@ -56,7 +57,12 @@ type entityColField struct {
 //
 // Field matching mirrors the row scanner: `drop:"colname"` tag wins,
 // otherwise field name and snake_case form are tried.
-func NewEntity[T any](t *Table) *Entity[T] {
+func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
+	var cfg entityConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	var zero T
 	rt := reflect.TypeOf(zero)
 	for rt.Kind() == reflect.Ptr {
@@ -74,7 +80,60 @@ func NewEntity[T any](t *Table) *Entity[T] {
 		}
 		colFields = append(colFields, entityColField{col: c, field: idx})
 	}
+	if err := checkDrift(rt, t, colFields, cfg); err != nil {
+		panic(err.Error())
+	}
 	return &Entity[T]{table: t, colFields: colFields}
+}
+
+// EntityOption configures [NewEntity].
+type EntityOption func(*entityConfig)
+
+type entityConfig struct {
+	allowUnmapped map[string]bool
+	allowAny      bool
+}
+
+// AllowUnmappedColumns exempts the named columns from the check that
+// every column has a struct field — for columns the database or a
+// materialized view owns rather than the application.
+func AllowUnmappedColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowUnmapped == nil {
+			c.allowUnmapped = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowUnmapped[n] = true
+		}
+	}
+}
+
+// AllowAnyUnmappedColumn disables the check entirely.
+func AllowAnyUnmappedColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAny = true }
+}
+
+// checkDrift reports columns bound to no struct field — see
+// [github.com/bernardoforcillo/drops/internal/drift].
+func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAny {
+		return nil
+	}
+	mapped := make(map[string]bool, len(colFields))
+	bound := make(map[string]bool, len(colFields))
+	for _, cf := range colFields {
+		mapped[cf.col.Name()] = true
+		bound[drift.FieldKey(cf.field)] = true
+	}
+	var missing []string
+	for _, c := range t.Columns() {
+		if mapped[c.Name()] || c.IsManaged() || cfg.allowUnmapped[c.Name()] {
+			continue
+		}
+		missing = append(missing, c.Name())
+	}
+	return drift.Report("drops/clickhouse", rt.Name(), t.Name(), missing,
+		drift.SpareFields(rt, bound), "clickhouse.AllowUnmappedColumns")
 }
 
 // Table returns the table the entity is bound to.

@@ -24,6 +24,7 @@ type Column struct {
 	hasDefault bool
 	ref        *FK
 	pii        bool
+	managed    bool // drops writes this column, not the application
 }
 
 // FK describes a single-column foreign-key reference.
@@ -101,6 +102,15 @@ func (c *Col[T]) AutoIncrement() *Col[T] {
 
 // Unique marks the column UNIQUE.
 func (c *Col[T]) Unique() *Col[T] { c.Column.unique = true; return c }
+
+// Managed marks the column as written by drops rather than by the
+// application — the soft-delete marker, the timestamps a template
+// keeps current. NewEntity's drift check skips managed columns.
+func (c *Col[T]) Managed() *Col[T] { c.Column.managed = true; return c }
+
+// IsManaged reports whether drops writes this column rather than the
+// application.
+func (c *Column) IsManaged() bool { return c.managed }
 
 // Default sets a raw SQL default expression (e.g. "0", "CURRENT_TIMESTAMP").
 func (c *Col[T]) Default(sqlExpr string) *Col[T] {

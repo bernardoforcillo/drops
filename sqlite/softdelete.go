@@ -30,7 +30,7 @@ type SoftDeleteCols struct {
 //	postEntity.SoftDeleteByID(db, ctx, id, sd) // hide the row
 //	postEntity.Restore(db, ctx, id, sd)        // bring it back
 func SoftDelete(t *Table) SoftDeleteCols {
-	col := Add(t, Timestamp("deletedAt", false))
+	col := Add(t, Timestamp("deletedAt", false).Managed())
 	t.DefaultFilter(col.IsNull())
 	return SoftDeleteCols{DeletedAt: col}
 }

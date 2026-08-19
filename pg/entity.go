@@ -7,6 +7,7 @@ import (
 	"reflect"
 
 	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/internal/drift"
 )
 
 // Entity binds a Go struct T to a Table and precomputes the metadata
@@ -118,7 +119,12 @@ type entityColField struct {
 // Field matching rules mirror the row scanner: `drop:"colname"` tag
 // wins; otherwise the field name and its snake_case form are tried.
 // Fields tagged `drop:"-"` are skipped.
-func NewEntity[T any](t *Table) *Entity[T] {
+func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
+	var cfg entityConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	var zero T
 	rt := reflect.TypeOf(zero)
 	for rt.Kind() == reflect.Ptr {
@@ -175,6 +181,10 @@ func NewEntity[T any](t *Table) *Entity[T] {
 		}
 	}
 
+	if err := checkDrift(rt, t, colFields, cfg); err != nil {
+		panic(err.Error())
+	}
+
 	return &Entity[T]{
 		table:        t,
 		pk:           pk,
@@ -183,6 +193,70 @@ func NewEntity[T any](t *Table) *Entity[T] {
 		versionCol:   versionCol,
 		versionField: versionField,
 	}
+}
+
+// EntityOption configures [NewEntity].
+type EntityOption func(*entityConfig)
+
+type entityConfig struct {
+	allowUnmapped map[string]bool
+	allowAny      bool
+}
+
+// AllowUnmappedColumns exempts the named columns from the check that
+// every column has a struct field.
+//
+// Use it for columns the database owns and the application never
+// writes — a trigger-maintained tsvector, a generated column, a
+// counter another service updates. Naming them is the point: an
+// exemption you have to type is one you have thought about, unlike
+// the silent skip this replaces.
+func AllowUnmappedColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowUnmapped == nil {
+			c.allowUnmapped = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowUnmapped[n] = true
+		}
+	}
+}
+
+// AllowAnyUnmappedColumn disables the check entirely. It exists for
+// migrating an existing codebase that has too many gaps to name at
+// once; prefer [AllowUnmappedColumns], which keeps the check working
+// for the columns you have not exempted.
+func AllowAnyUnmappedColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAny = true }
+}
+
+// checkDrift reports columns that no struct field is bound to.
+//
+// Such a column is dropped from every INSERT and UPDATE the entity
+// builds, so a renamed field or a mistyped `drop:` tag stops
+// persisting it while everything else keeps working. This panics
+// rather than returning an error, matching how NewEntity already
+// treats a missing primary key: schemas are declared in package init
+// blocks, and startup is where bad configuration should surface.
+func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAny {
+		return nil
+	}
+	mapped := make(map[string]bool, len(colFields))
+	bound := make(map[string]bool, len(colFields))
+	for _, cf := range colFields {
+		mapped[cf.col.Name()] = true
+		bound[drift.FieldKey(cf.field)] = true
+	}
+	var missing []string
+	for _, c := range t.Columns() {
+		if mapped[c.Name()] || c.IsManaged() || cfg.allowUnmapped[c.Name()] {
+			continue
+		}
+		missing = append(missing, c.Name())
+	}
+	return drift.Report("drops/pg", rt.Name(), t.Name(), missing,
+		drift.SpareFields(rt, bound), "pg.AllowUnmappedColumns")
 }
 
 // Validate registers a validator that runs before Create / Update /

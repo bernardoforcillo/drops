@@ -28,6 +28,7 @@ type Column struct {
 	ref        *FK
 	version    bool // marked via (*Col[T]).OptimisticLock()
 	pii        bool // marked via (*Col[T]).AsPII()
+	managed    bool // drops writes this column, not the application
 }
 
 // FK describes a foreign-key reference.
@@ -64,6 +65,12 @@ func (c *Column) DefaultSQL() string { return c.defaultSQL }
 
 // ForeignKey returns the foreign-key reference, or nil if none.
 func (c *Column) ForeignKey() *FK { return c.ref }
+
+// IsManaged reports whether drops writes this column rather than the
+// application — the soft-delete marker, the timestamps a mixin keeps
+// current. Such a column legitimately has no struct field, so
+// NewEntity's drift check skips it.
+func (c *Column) IsManaged() bool { return c.managed }
 
 // IsOptimisticVersion reports whether the column is the version
 // column used for optimistic locking. Marked via
@@ -170,6 +177,15 @@ func (c *Col[T]) Default(sqlExpr string) *Col[T] {
 // integer column per table.
 func (c *Col[T]) OptimisticLock() *Col[T] {
 	c.Column.version = true
+	return c
+}
+
+// Managed marks the column as written by drops rather than by the
+// application: the soft-delete marker a mixin flips, the timestamps it
+// keeps current. NewEntity's drift check skips managed columns, since
+// a struct field for them would be redundant rather than missing.
+func (c *Col[T]) Managed() *Col[T] {
+	c.Column.managed = true
 	return c
 }
 

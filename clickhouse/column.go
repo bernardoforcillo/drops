@@ -15,6 +15,7 @@ type Column struct {
 	comment  string // COMMENT '…'
 	defSQL   string // DEFAULT <expr>
 	hasDef   bool
+	managed  bool // drops writes this column, not the application
 }
 
 // Name returns the column's unqualified identifier.
@@ -44,6 +45,14 @@ func (c *Column) TTL() string { return c.ttl }
 
 // Comment returns the column comment, or empty.
 func (c *Column) Comment() string { return c.comment }
+
+// Managed marks the column as written by drops rather than by the
+// application. NewEntity's drift check skips managed columns.
+func (c *Col[T]) Managed() *Col[T] { c.Column.managed = true; return c }
+
+// IsManaged reports whether drops writes this column rather than the
+// application.
+func (c *Column) IsManaged() bool { return c.managed }
 
 // col is the ColRef implementation; *Col[T] inherits via embedding.
 func (c *Column) col() *Column { return c }

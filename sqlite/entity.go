@@ -6,6 +6,7 @@ import (
 	"reflect"
 
 	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/internal/drift"
 )
 
 // Entity is the typed CRUD layer over a Table, mirroring drops/pg's
@@ -38,7 +39,12 @@ type entityColField struct {
 
 // NewEntity builds the entity, panicking on misconfiguration (schemas
 // are declared at startup, so bad config should fail loudly there).
-func NewEntity[T any](t *Table) *Entity[T] {
+func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
+	var cfg entityConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	var zero T
 	rt := reflect.TypeOf(zero)
 	for rt != nil && rt.Kind() == reflect.Ptr {
@@ -74,7 +80,62 @@ func NewEntity[T any](t *Table) *Entity[T] {
 		}
 		colFields = append(colFields, entityColField{col: c, field: idx})
 	}
+	if err := checkDrift(rt, t, colFields, cfg); err != nil {
+		panic(err.Error())
+	}
 	return &Entity[T]{table: t, pk: pk, pkField: pkField, colFields: colFields}
+}
+
+// EntityOption configures [NewEntity].
+type EntityOption func(*entityConfig)
+
+type entityConfig struct {
+	allowUnmapped map[string]bool
+	allowAny      bool
+}
+
+// AllowUnmappedColumns exempts the named columns from the check that
+// every column has a struct field. Use it for columns the database
+// owns and the application never writes; naming them keeps the check
+// working for the rest.
+func AllowUnmappedColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowUnmapped == nil {
+			c.allowUnmapped = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowUnmapped[n] = true
+		}
+	}
+}
+
+// AllowAnyUnmappedColumn disables the check entirely, for migrating a
+// codebase with too many gaps to name at once.
+func AllowAnyUnmappedColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAny = true }
+}
+
+// checkDrift reports columns bound to no struct field — see
+// [github.com/bernardoforcillo/drops/internal/drift].
+func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAny {
+		return nil
+	}
+	mapped := make(map[string]bool, len(colFields))
+	bound := make(map[string]bool, len(colFields))
+	for _, cf := range colFields {
+		mapped[cf.col.name] = true
+		bound[drift.FieldKey(cf.field)] = true
+	}
+	var missing []string
+	for _, c := range t.columns {
+		if mapped[c.name] || c.IsManaged() || cfg.allowUnmapped[c.name] {
+			continue
+		}
+		missing = append(missing, c.name)
+	}
+	return drift.Report("drops/sqlite", rt.Name(), t.name, missing,
+		drift.SpareFields(rt, bound), "sqlite.AllowUnmappedColumns")
 }
 
 // Table returns the entity's table.

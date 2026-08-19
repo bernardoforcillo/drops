@@ -20,6 +20,7 @@ ClickHouse and Qdrant.
 | [Choosing a dialect](dialects.md) | What each of the five backends gives you, and what it does not. Read this before porting a schema. |
 | [Vector search](vector-search.md) | One query vocabulary over pgvector, ClickHouse and Qdrant. |
 | [OLTP → OLAP → vector](mirror.md) | Keeping one table mirrored across all three, without three schema declarations. |
+| [Testing](testing.md) | The two suites, why the second exists, and which of your tests belongs in which. |
 
 ## Reference
 

@@ -9,6 +9,20 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Integration suite against real servers** (`integration/`) — a
+  separate Go module, so the drivers it needs cannot reach a user's
+  build and drops keeps its zero-dependency property. SQLite's driver
+  is pure Go and runs anywhere; Postgres, MySQL, ClickHouse and Qdrant
+  run against the bundled compose services and skip with a clear
+  message when absent, except in CI where `DROPS_REQUIRE_ALL` turns a
+  missing server into a failure. New CI job. See `docs/testing.md` for
+  what belongs in which suite.
+- **`clickhouse.Dialect`** — pg, sqlite and mysql all exported one;
+  without it `drops.StringWithDialect` could not render ClickHouse SQL.
+- **`sqlite.Column.Asc/Desc/As`** and **`sqlite.EntityQuery.Unscoped`**
+  — both existed in the other dialects. Without Unscoped a
+  soft-deleted row was unreachable through the entity at all, so the
+  restore flow could not be written.
 - **OLTP → OLAP → vector mirroring** (`drops/mirror`) —
   `DeriveClickHouse` makes the analytics schema a function of the
   transactional one rather than a second declaration; `ClickHouseSink`
@@ -52,6 +66,28 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **Composite primary keys could not create their own table**
+  (`drops/pg`, `drops/sqlite`) — an inline `PRIMARY KEY` was emitted on
+  every marked column, so a two-column key rendered two of them.
+  PostgreSQL rejects that outright and so does SQLite. The support
+  added earlier in this cycle could query such a table but never build
+  one. Both now emit the table-level clause MySQL already did.
+- **SQLite `Entity.Create` bound the zero primary key**, so every row
+  claimed id 0 and the second insert failed on the key; and it never
+  read the generated key back, leaving the caller holding a row it
+  could not address. Zero auto-increment and defaulted columns are now
+  omitted, and the key comes back through `RETURNING`.
+- **A SQLite primary key was not `NOT NULL`** — treated as redundant
+  next to `PRIMARY KEY`, which PostgreSQL implies and SQLite does not.
+  Measured against the engine: a `TEXT PRIMARY KEY` without it accepts
+  and stores a NULL key.
+- **SQLite introspection never detected `AUTOINCREMENT`**, so every
+  declared auto-increment column diffed against the live table forever.
+- **A SQLite table with no `CHECK` constraints diffed against itself** —
+  `BuildSnapshot` initialises the constraint maps, `Introspect` left
+  one nil, and `reflect.DeepEqual` reports nil and empty as different.
+  On SQLite a constraint change means a full table rebuild, so a schema
+  that already matched its declaration copied itself on every deploy.
 - **ClickHouse `CREATE TABLE` emitted table-qualified column names** in
   ORDER BY / PRIMARY KEY / PARTITION BY, which the server rejects — it
   cannot resolve `"docs"."id"` against a table that does not exist yet.

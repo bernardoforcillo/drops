@@ -93,7 +93,8 @@ The [docs](docs/) directory has the explanations: a
 structs, [entities and relations](docs/entities.md),
 [which dialect gives you what](docs/dialects.md),
 [portable vector search](docs/vector-search.md), and
-[mirroring one table across all three engines](docs/mirror.md).
+[mirroring one table across all three engines](docs/mirror.md), and
+[how the two test suites divide the work](docs/testing.md).
 
 Package reference is on
 [pkg.go.dev](https://pkg.go.dev/github.com/bernardoforcillo/drops);
@@ -1112,6 +1113,7 @@ drops/mysql/                 MySQL / MariaDB schema, query builders, entities
 drops/qdrant/                Qdrant vector-database HTTP client
 drops/vector/                portable vector search shared by pg/CH/Qdrant
 drops/mirror/                keeps a pg table mirrored into ClickHouse + Qdrant
+integration/                 separate module: the suite that runs against real servers
 drops/cache/                 Cache interface + sentinels
 drops/cache/memory/          in-process cache backend
 drops/cache/redis/           Redis cache backend (own RESP2 client)

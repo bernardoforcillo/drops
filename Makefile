@@ -41,6 +41,31 @@ cover: ## Generate an HTML coverage report (opens in browser)
 test-short: ## Run only short tests (skips integration tests)
 	$(GO) test $(PKG) -count=1 -short
 
+# ── integration ───────────────────────────────────────────────────────
+# integration/ is a separate module: its drivers must not reach a user's
+# build, so it is not covered by $(PKG) and needs its own targets.
+
+.PHONY: integration
+integration: ## Run the integration suite (SQLite always; others need DSNs — see docs/testing.md)
+	$(GO) test -C integration ./... -count=1
+
+.PHONY: integration-up
+integration-up: ## Start the servers the integration suite talks to
+	docker compose -f integration/docker-compose.yml up -d --wait
+
+.PHONY: integration-down
+integration-down: ## Stop them and discard their data
+	docker compose -f integration/docker-compose.yml down -v
+
+.PHONY: integration-all
+integration-all: ## Run every backend against the compose servers
+	DROPS_PG_DSN='postgres://drops:drops@localhost:5433/drops?sslmode=disable' \
+	DROPS_MYSQL_DSN='drops:drops@tcp(localhost:3307)/drops?parseTime=true' \
+	DROPS_CLICKHOUSE_DSN='clickhouse://localhost:9001/default' \
+	DROPS_QDRANT_URL='http://localhost:6334' \
+	DROPS_REQUIRE_ALL=1 \
+	$(GO) test -C integration ./... -count=1 -v
+
 # ── lint ──────────────────────────────────────────────────────────────
 .PHONY: vet
 vet: ## Run go vet
@@ -73,7 +98,7 @@ tidy-check: ## Verify go.mod / go.sum are up to date (fails if tidy would change
 
 # ── full CI equivalent ────────────────────────────────────────────────
 .PHONY: check
-check: tidy-check build vet test race staticcheck govulncheck ## Run everything CI runs (requires tools)
+check: tidy-check build vet test race integration staticcheck govulncheck ## Run everything CI runs (requires tools)
 	@echo "$(GREEN)$(BOLD)All checks passed.$(RESET)"
 
 # ── examples ──────────────────────────────────────────────────────────

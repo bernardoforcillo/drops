@@ -9,6 +9,22 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Mirror operations** (`drops/mirror`) — a mirror could be started
+  and stopped; everything an operator actually has to do to one was
+  missing. `Reseeder` replays the source into the sinks, cursored and
+  resumable, in a fill mode that only closes holes and a repair mode
+  that goes through the outbox and can overwrite a wrong value.
+  `Verifier` answers whether the mirror is equal to the source, by
+  range digests that narrow only where they disagree and that encode
+  both sides in Go rather than trusting two engines to agree on the
+  text of a value. `Evolver` reconciles the mirror's columns with the
+  source's, adding and widening on its own and refusing a drop, a
+  narrowing, a key column or an unprovable cast by name. See
+  `docs/mirror.md`.
+- **Scalar destinations in `One`/`All`** — `One(ctx, &n)` for a
+  `COUNT(*)` failed with "requires a pointer to struct". A
+  single-column query is the most common query there is, and drops
+  could not consume its own result.
 - **Integration suite against real servers** (`integration/`) — a
   separate Go module, so the drivers it needs cannot reach a user's
   build and drops keeps its zero-dependency property. SQLite's driver

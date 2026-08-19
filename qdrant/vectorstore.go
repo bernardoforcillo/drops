@@ -203,8 +203,8 @@ func scoreFromDistance(m vector.Metric, distance float64) float64 {
 }
 
 // CompileFilter turns a portable [vector.Filter] into the Qdrant
-// filter object. The zero Filter compiles to nil — no filter at all
-// rather than an empty one, which Qdrant would reject.
+// filter object. The zero Filter compiles to nil, so the request goes
+// out with no filter key at all.
 //
 // Exported because it is useful on its own: it lets code that already
 // builds portable filters drive the Client's own Scroll, Recommend and
@@ -270,11 +270,32 @@ func (v filterVisitor) Compare(op vector.Op, field string, value any) (Condition
 	}
 }
 
+// Qdrant's grammar has no literal true or false. A filter with no
+// clauses constrains nothing, so it is the term that matches every
+// point, and a must_not over it is the term that matches none.
+func matchEverything() Condition { return Condition{Nested: &Filter{}} }
+
+func matchNothing() Condition {
+	return Condition{Nested: &Filter{MustNot: []Condition{matchEverything()}}}
+}
+
 func (v filterVisitor) Set(op vector.Op, field string, values []any) (Condition, error) {
 	switch op {
 	case vector.OpIn:
+		// An empty operand list is what an unset request parameter
+		// compiles to, and the portable contract fixes its meaning —
+		// the SQL backends emit (false) here and (true) below. Qdrant's
+		// match object has no empty form to say either: every variant
+		// of its match union has a required key, so an empty one is a
+		// 400 rather than a predicate.
+		if len(values) == 0 {
+			return matchNothing(), nil
+		}
 		return In(field, values...), nil
 	case vector.OpNotIn:
+		if len(values) == 0 {
+			return matchEverything(), nil
+		}
 		return NotIn(field, values...), nil
 	default:
 		return Condition{}, fmt.Errorf("%w: qdrant set %q", vector.ErrUnsupportedOp, op)
@@ -306,6 +327,9 @@ func (filterVisitor) MatchText(field, text string) (Condition, error) {
 }
 
 func (filterVisitor) HasID(ids []any) (Condition, error) {
+	if len(ids) == 0 {
+		return matchNothing(), nil
+	}
 	return HasID(ids...), nil
 }
 

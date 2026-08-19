@@ -9,6 +9,20 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Typed ad-hoc queries** (`drops.All[T]` / `drops.One[T]`) — an
+  entity query was already typed, but an entity is exactly what a
+  join, an aggregate or a projection does not have, so the interesting
+  queries went through `All(ctx, dest any)` and reported a mismatched
+  destination at run time. Both are generic over `drops.RowSource`,
+  which is the `Rows(ctx)` method `pg`, `mysql` and `clickhouse`
+  builders already carry, so no dialect gained a line of code. `T` may
+  be a struct, a `*struct` or — for a single-column result — a scalar,
+  `drops.All[int64]`; `One` reports an empty result as
+  `drops.ErrNoRows`. See `docs/entities.md`.
+- **Scalar slices in `drops.ScanAll`** — `ScanOne` learned scalar
+  destinations earlier in this cycle and `ScanAll` did not, so
+  `SELECT id` into a `*[]int64` was still "slice element must be
+  struct or *struct".
 - **Mirror operations** (`drops/mirror`) — a mirror could be started
   and stopped; everything an operator actually has to do to one was
   missing. `Reseeder` replays the source into the sinks, cursored and
@@ -82,6 +96,26 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **The shared scanner mapped a column to the wrong field whenever two
+  fields could claim it**, and which one won depended on declaration
+  order. An embedded `Key.ID` displaced the outer `ID` when the
+  embedded field was declared second; a field's camelCase form
+  displaced another field's explicit `drop:` tag when it came later.
+  Names now resolve by depth first — the shallower field wins, as it
+  does for ordinary Go field access — and, at equal depth, tag before
+  field name before camelCase form, with a genuine tie going to the
+  field declared first.
+- **The shared scanner skipped every field promoted out of an
+  unexported embedded struct**, so a row type that factors its
+  bookkeeping columns into an `audit` mixin silently scanned none of
+  them. Those fields are exported and settable through reflection; they
+  are now walked, as `encoding/json` walks them. An embedded
+  `time.Time` or `sql.Scanner`, conversely, is no longer walked into:
+  it receives a column, which is what `IsScalarDest` already claimed.
+- **`ScanOne` sent a `**struct` down the single-column path**, where it
+  became either "needs a single-column result" or a driver-level
+  conversion error, neither of which names the mistake. `IsScalarDest`
+  now looks through pointers, so a pointer to a struct is a struct.
 - **Composite primary keys could not create their own table**
   (`drops/pg`, `drops/sqlite`) — an inline `PRIMARY KEY` was emitted on
   every marked column, so a two-column key rendered two of them.

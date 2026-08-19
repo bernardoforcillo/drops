@@ -36,6 +36,60 @@ adults, err := UserEntity.Query(db).
 `Query` returns `[]User` rather than scanning into a slice you supply.
 Everything a `SelectBuilder` can do it can do; it just knows the type.
 
+## Queries no entity describes
+
+`Query` can be typed because the entity already says what row comes
+back. A join, an aggregate, or a projection onto three of twelve
+columns produces a row no table has — so there is no entity to hang the
+type on, and `SelectBuilder.All(ctx, dest)` falls back to an untyped
+pointer it can only complain about at run time.
+
+`drops.All` and `drops.One` take the type from the call site instead.
+They are generic over anything with a `Rows(ctx)` method, which every
+dialect's `SelectBuilder` has:
+
+```go
+type authorPosts struct {
+    Author string
+    Posts  int64
+}
+
+top, err := drops.All[authorPosts](ctx, db.
+    Select(UserName.As("author"), pg.As(pg.Count(PostID), "posts")).
+    From(Users).
+    Join(Posts, PostUserID.EqCol(UserID)).
+    GroupBy(UserName).
+    OrderBy(UserName.Asc()))
+```
+
+A single-column query needs no struct at all:
+
+```go
+ids, err := drops.All[int64](ctx, db.Select(UserID).From(Users))
+n, err := drops.One[int64](ctx, db.Select(pg.Count(UserID)).From(Users))
+nicks, err := drops.All[*string](ctx, db.Select(UserNick).From(Users))
+```
+
+`T` may be a struct, a `*struct`, or a scalar — including a pointer to
+one, which is how a nullable column comes back. It may not be a pointer
+to a struct: `One` already reports emptiness as an error, and a nil
+`*T` would be a second, quieter way to say the same thing.
+
+Which to reach for:
+
+- the entity's `Query` when the rows *are* the table — it goes through
+  the fast-scan path, the entity cache, tenant scoping and eager
+  loading, none of which an ad-hoc query has;
+- `drops.All` / `drops.One` when they are not.
+
+The two report an empty `One` with different sentinels today —
+`pg.ErrNoRows` from the entity, `drops.ErrNoRows` from `drops.One` —
+and the dialect ones do not wrap the shared one, so check against the
+sentinel of whichever you called.
+
+`pg`, `mysql` and `clickhouse` builders satisfy `drops.RowSource`;
+`sqlite`'s does not yet expose `Rows(ctx)`.
+
 ## Composite primary keys
 
 A table with more than one `PrimaryKey()` column works, and the key

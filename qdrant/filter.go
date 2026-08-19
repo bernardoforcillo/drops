@@ -1,5 +1,7 @@
 package qdrant
 
+import "encoding/json"
+
 // Filter is Qdrant's predicate object: a tree of Must / Should /
 // MustNot blocks containing Condition leaves.
 type Filter struct {
@@ -18,7 +20,53 @@ type Condition struct {
 	IsEmpty *IsEmptyCondition `json:"is_empty,omitempty"`
 	IsNull  *IsNullCondition  `json:"is_null,omitempty"`
 	Geo     *GeoBoundingBox   `json:"geo_bounding_box,omitempty"`
-	Nested  *Filter           `json:"filter,omitempty"`
+	Nested  *Filter           `json:"-"`
+}
+
+// MarshalJSON writes a sub-filter as the bare filter object Qdrant's
+// grammar asks for.
+//
+// A condition is an untagged union and one of its variants is a Filter
+// itself, so a sub-filter goes into the enclosing must / should /
+// must_not array written out plainly — `{"must_not":[{"must":[…]}]}`.
+// There is no key to put one under, and Filter is declared with
+// serde's deny_unknown_fields, so a condition wrapped in a "filter"
+// key matches no variant of the union and the whole request comes back
+// 400.
+func (c Condition) MarshalJSON() ([]byte, error) {
+	if c.Nested != nil {
+		return json.Marshal(c.Nested)
+	}
+	type plain Condition
+	return json.Marshal(plain(c))
+}
+
+// UnmarshalJSON is the inverse: an object carrying any of the block
+// keys is a sub-filter, anything else is a leaf.
+func (c *Condition) UnmarshalJSON(data []byte) error {
+	var blocks struct {
+		Must    json.RawMessage `json:"must"`
+		Should  json.RawMessage `json:"should"`
+		MustNot json.RawMessage `json:"must_not"`
+	}
+	if err := json.Unmarshal(data, &blocks); err != nil {
+		return err
+	}
+	if blocks.Must != nil || blocks.Should != nil || blocks.MustNot != nil {
+		var f Filter
+		if err := json.Unmarshal(data, &f); err != nil {
+			return err
+		}
+		*c = Condition{Nested: &f}
+		return nil
+	}
+	type plain Condition
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*c = Condition(p)
+	return nil
 }
 
 // MatchCondition expresses payload value equality / set membership /

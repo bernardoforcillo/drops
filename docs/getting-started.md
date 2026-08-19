@@ -95,6 +95,28 @@ builder.
 Rows scan into your struct by field name (`Name` ↔ `name`), or by an
 explicit `drop:"..."` tag when the two differ.
 
+When the result is not a table's row — a join, an aggregate, a
+projection — name the type at the call instead of declaring a
+destination:
+
+```go
+type authorPosts struct {
+    Author string
+    Posts  int64
+}
+
+top, err := drops.All[authorPosts](ctx, db.
+    Select(UserName.As("author"), pg.As(pg.Count(PostID), "posts")).
+    From(Users).
+    Join(Posts, PostUserID.EqCol(UserID)).
+    GroupBy(UserName))
+
+n, err := drops.One[int64](ctx, db.Select(pg.Count(UserID)).From(Users))
+```
+
+See [entities.md](entities.md#queries-no-entity-describes) for how this
+sits next to the entity's own typed `Query`.
+
 ## Entities
 
 An entity binds a struct to a table and gives you CRUD without writing

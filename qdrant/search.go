@@ -1,6 +1,9 @@
 package qdrant
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // SearchRequest is the body for /collections/{name}/points/search.
 type SearchRequest struct {
@@ -22,8 +25,31 @@ type Hit struct {
 	Payload map[string]any `json:"payload,omitempty"`
 }
 
+// UnmarshalJSON decodes a hit, keeping its ID exact — see
+// [decodePointID].
+func (h *Hit) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID      json.RawMessage `json:"id"`
+		Score   float32         `json:"score"`
+		Vector  []float32       `json:"vector"`
+		Payload map[string]any  `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	id, err := decodePointID(raw.ID)
+	if err != nil {
+		return err
+	}
+	h.ID, h.Score, h.Vector, h.Payload = id, raw.Score, raw.Vector, raw.Payload
+	return nil
+}
+
 // Search performs a single-vector similarity search.
 func (c *Client) Search(ctx context.Context, collection string, req SearchRequest) ([]Hit, error) {
+	if err := validateName("collection", collection); err != nil {
+		return nil, err
+	}
 	if req.Limit <= 0 {
 		req.Limit = 10
 	}
@@ -51,6 +77,9 @@ type RecommendRequest struct {
 // Recommend returns points similar to the positive examples and
 // dissimilar to the negative examples.
 func (c *Client) Recommend(ctx context.Context, collection string, req RecommendRequest) ([]Hit, error) {
+	if err := validateName("collection", collection); err != nil {
+		return nil, err
+	}
 	if req.Limit <= 0 {
 		req.Limit = 10
 	}
@@ -76,10 +105,33 @@ type ScrollPage struct {
 	NextPageOffset any     `json:"next_page_offset"`
 }
 
+// UnmarshalJSON decodes a scroll page. The next-page offset is itself
+// a point ID and gets the same exact treatment — a rounded one would
+// restart the walk at a point the caller has already seen, or past one
+// it never will.
+func (p *ScrollPage) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Points         []Point         `json:"points"`
+		NextPageOffset json.RawMessage `json:"next_page_offset"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	off, err := decodePointID(raw.NextPageOffset)
+	if err != nil {
+		return err
+	}
+	p.Points, p.NextPageOffset = raw.Points, off
+	return nil
+}
+
 // Scroll iterates through a collection in deterministic order,
 // optionally filtered. Pass the previous response's NextPageOffset as
 // the next call's Offset until it comes back nil.
 func (c *Client) Scroll(ctx context.Context, collection string, req ScrollRequest) (*ScrollPage, error) {
+	if err := validateName("collection", collection); err != nil {
+		return nil, err
+	}
 	if req.Limit <= 0 {
 		req.Limit = 100
 	}

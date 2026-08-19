@@ -64,9 +64,12 @@ func Char(name string, n int) *Col[string] {
 
 // Numeric columns --------------------------------------------------------
 
-func SmallInt(name string) *Col[int16]  { return newCol[int16](name, simpleType("smallint")) }
-func Integer(name string) *Col[int32]   { return newCol[int32](name, simpleType("integer")) }
-func BigInt(name string) *Col[int64]    { return newCol[int64](name, simpleType("bigint")) }
+func SmallInt(name string) *Col[int16] { return newCol[int16](name, simpleType("smallint")) }
+func Integer(name string) *Col[int32]  { return newCol[int32](name, simpleType("integer")) }
+func BigInt(name string) *Col[int64]   { return newCol[int64](name, simpleType("bigint")) }
+func SmallSerial(name string) *Col[int16] {
+	return newCol[int16](name, simpleType("smallserial"))
+}
 func Serial(name string) *Col[int32]    { return newCol[int32](name, simpleType("serial")) }
 func BigSerial(name string) *Col[int64] { return newCol[int64](name, simpleType("bigserial")) }
 

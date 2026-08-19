@@ -1,0 +1,338 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// Schema generation.
+//
+// drops has two ways to get a table declaration and both leave a gap.
+// Writing the pg.Add(...) block by hand gives typed *pg.Col[T] handles
+// — which is what makes UserAge.Gte(18) a compile-time check — but it
+// is a second declaration of the schema that can drift from the
+// struct. pg.AutoTable derives the table from the struct at runtime,
+// so nothing can drift, but it hands back only untyped columns.
+//
+// This mode closes it: the struct is the single source of truth, and
+// the generated file has the typed handles.
+
+// schemaEntity is one struct flagged with `//drops:schema`.
+type schemaEntity struct {
+	StructName string
+	TableVar   string // Go identifier for the table, e.g. "Users"
+	TableName  string // SQL table name, e.g. "users"
+	Schema     string // optional SQL schema qualifier
+	Columns    []schemaColumn
+}
+
+// schemaColumn is one generated column declaration.
+type schemaColumn struct {
+	VarName string // Go identifier, e.g. "UserEmail"
+	Expr    string // constructor chain, e.g. `pg.Text("email").NotNull()`
+}
+
+// colOption is a parsed `drop` tag option.
+type colOption struct {
+	Key   string
+	Value string
+}
+
+// columnExpr renders the constructor chain for one field.
+//
+// The Go type picks the constructor and the tag options append the
+// builder calls, in a fixed order so regenerating an unchanged struct
+// produces an identical file — a generator whose output churns is one
+// nobody reruns.
+func columnExpr(goType, column string, opts []colOption) (string, error) {
+	has := func(k string) bool {
+		for _, o := range opts {
+			if o.Key == k {
+				return true
+			}
+		}
+		return false
+	}
+	value := func(k string) (string, bool) {
+		for _, o := range opts {
+			if o.Key == k {
+				return o.Value, true
+			}
+		}
+		return "", false
+	}
+
+	// An explicit type= wins: it is the escape hatch for columns the
+	// Go type cannot describe (uuid, citext, a domain type).
+	var ctor string
+	if t, ok := value("type"); ok {
+		ctor = fmt.Sprintf("pg.Custom[%s](%q, %q)", strings.TrimPrefix(goType, "*"), column, t)
+	} else {
+		c, err := constructorFor(goType, column, has("autoIncrement"))
+		if err != nil {
+			return "", err
+		}
+		ctor = c
+	}
+
+	var b strings.Builder
+	b.WriteString(ctor)
+	if has("primaryKey") {
+		b.WriteString(".PrimaryKey()")
+	}
+	// A pointer field is nullable by nature, so notNull on one is a
+	// contradiction worth refusing rather than silently resolving.
+	if has("notNull") {
+		if strings.HasPrefix(goType, "*") {
+			return "", fmt.Errorf("column %q is a pointer field tagged notNull; drop one or the other", column)
+		}
+		b.WriteString(".NotNull()")
+	}
+	if has("unique") {
+		b.WriteString(".Unique()")
+	}
+	if d, ok := value("default"); ok {
+		fmt.Fprintf(&b, ".Default(%q)", d)
+	}
+	if has("version") {
+		b.WriteString(".OptimisticLock()")
+	}
+	if has("pii") {
+		b.WriteString(".AsPII()")
+	}
+	return b.String(), nil
+}
+
+// constructorFor maps a Go type to the pg constructor that declares
+// it. The mapping mirrors pg.AutoTable exactly — the two must agree,
+// or a project that uses both would get two different schemas from one
+// struct.
+func constructorFor(goType, column string, autoInc bool) (string, error) {
+	base := strings.TrimPrefix(goType, "*")
+	q := fmt.Sprintf("%q", column)
+	switch base {
+	case "bool":
+		return "pg.Boolean(" + q + ")", nil
+	case "int16":
+		if autoInc {
+			return "pg.SmallSerial(" + q + ")", nil
+		}
+		return "pg.SmallInt(" + q + ")", nil
+	case "int32", "int":
+		if autoInc {
+			return "pg.Serial(" + q + ")", nil
+		}
+		return "pg.Integer(" + q + ")", nil
+	case "int64":
+		if autoInc {
+			return "pg.BigSerial(" + q + ")", nil
+		}
+		return "pg.BigInt(" + q + ")", nil
+	case "float32":
+		return "pg.Real(" + q + ")", nil
+	case "float64":
+		return "pg.DoublePrecision(" + q + ")", nil
+	case "string":
+		return "pg.Text(" + q + ")", nil
+	case "[]byte":
+		return "pg.Bytea(" + q + ")", nil
+	case "time.Time":
+		return "pg.Timestamp(" + q + ", true)", nil
+	case "json.RawMessage":
+		return "pg.JSONB(" + q + ")", nil
+	default:
+		return "", fmt.Errorf("column %q: no constructor for Go type %s — give it an explicit `type=` in the drop tag", column, goType)
+	}
+}
+
+// varName builds the Go identifier for a column handle:
+// struct name + field name, so User.Email becomes UserEmail and two
+// tables with an "id" column do not collide.
+func varName(structName, fieldName string) string { return structName + fieldName }
+
+// emitSchema renders the generated schema file.
+func emitSchema(pkg string, ents []schemaEntity) ([]byte, error) {
+	for _, e := range ents {
+		if e.TableName == "" {
+			return nil, fmt.Errorf("%s: //drops:schema needs a name= key naming the SQL table", e.StructName)
+		}
+	}
+	sort.SliceStable(ents, func(i, j int) bool { return ents[i].StructName < ents[j].StructName })
+
+	var b bytes.Buffer
+	b.WriteString("// Code generated by dropsgen. DO NOT EDIT.\n//\n")
+	b.WriteString("// The schema below is derived from the `drop` struct tags in the\n")
+	b.WriteString("// source file. Edit the struct, not this file: a change here is\n")
+	b.WriteString("// reverted the next time dropsgen runs, and a schema that disagrees\n")
+	b.WriteString("// with its struct is exactly the drift this generator removes.\n\n")
+	fmt.Fprintf(&b, "package %s\n\nimport \"github.com/bernardoforcillo/drops/pg\"\n", pkg)
+
+	for _, e := range ents {
+		ctor := fmt.Sprintf("pg.NewTable(%q)", e.TableName)
+		if e.Schema != "" {
+			ctor = fmt.Sprintf("pg.NewSchemaTable(%q, %q)", e.Schema, e.TableName)
+		}
+		fmt.Fprintf(&b, "\n// %s is the %q table, derived from %s.\nvar (\n", e.TableVar, e.TableName, e.StructName)
+		fmt.Fprintf(&b, "\t%s = %s\n", e.TableVar, ctor)
+		for _, c := range e.Columns {
+			fmt.Fprintf(&b, "\t%s = pg.Add(%s, %s)\n", c.VarName, e.TableVar, c.Expr)
+		}
+		b.WriteString(")\n")
+	}
+
+	src, err := format.Source(b.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("generated schema does not parse: %w", err)
+	}
+	return src, nil
+}
+
+// parseSchemaFile reads path and returns the structs carrying a
+// `//drops:schema` directive.
+//
+//	//drops:schema table=Users name=users [schema=public]
+//	type User struct {
+//	    ID    int64  `drop:"id,primaryKey,autoIncrement"`
+//	    Email string `drop:"email,notNull,unique"`
+//	}
+//
+// table= is the Go identifier the generated *pg.Table is bound to,
+// name= the SQL table it addresses. They are separate because the Go
+// name is plural and exported by convention while the SQL name is
+// whatever the database already calls it.
+func parseSchemaFile(path string) ([]schemaEntity, string, error) {
+	fset := token.NewFileSet()
+	af, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var out []schemaEntity
+	for _, decl := range af.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		groupDoc := commentText(gd.Doc)
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			doc := groupDoc
+			if d := commentText(ts.Doc); d != "" {
+				doc = d
+			}
+			match := schemaDirective.FindString(doc)
+			if match == "" {
+				continue
+			}
+			ent, err := schemaEntityFrom(ts.Name.Name, match, st)
+			if err != nil {
+				return nil, "", fmt.Errorf("%s: %s: %w", path, ts.Name.Name, err)
+			}
+			out = append(out, ent)
+		}
+	}
+	return out, af.Name.Name, nil
+}
+
+var schemaDirective = regexp.MustCompile(`drops:schema\b[^\n]*`)
+
+// schemaEntityFrom builds one entity from its directive and fields.
+func schemaEntityFrom(structName, directive string, st *ast.StructType) (schemaEntity, error) {
+	keys := directiveKeys(directive)
+	ent := schemaEntity{
+		StructName: structName,
+		TableVar:   keys["table"],
+		TableName:  keys["name"],
+		Schema:     keys["schema"],
+	}
+	if ent.TableVar == "" {
+		return ent, fmt.Errorf("//drops:schema needs a table= key naming the Go variable")
+	}
+
+	for _, f := range st.Fields.List {
+		if f.Tag == nil {
+			continue
+		}
+		tag := reflect.StructTag(strings.Trim(f.Tag.Value, "`"))
+		raw := tag.Get("drop")
+		if raw == "" || raw == "-" {
+			continue
+		}
+		parts := strings.Split(raw, ",")
+		column := parts[0]
+		opts := make([]colOption, 0, len(parts)-1)
+		for _, p := range parts[1:] {
+			k, v, _ := strings.Cut(strings.TrimSpace(p), "=")
+			opts = append(opts, colOption{Key: k, Value: v})
+		}
+		goType := typeString(f.Type)
+		expr, err := columnExpr(goType, column, opts)
+		if err != nil {
+			return ent, err
+		}
+		for _, name := range f.Names {
+			if !ast.IsExported(name.Name) {
+				continue
+			}
+			ent.Columns = append(ent.Columns, schemaColumn{
+				VarName: varName(structName, name.Name),
+				Expr:    expr,
+			})
+		}
+	}
+	if len(ent.Columns) == 0 {
+		return ent, fmt.Errorf("no `drop`-tagged fields to declare")
+	}
+	return ent, nil
+}
+
+// directiveKeys parses the k=v pairs of a directive line.
+func directiveKeys(directive string) map[string]string {
+	out := map[string]string{}
+	for _, p := range strings.Fields(directive)[1:] {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok {
+			continue
+		}
+		out[k] = strings.Trim(v, `"`)
+	}
+	return out
+}
+
+// runSchema is the CLI entry point for schema generation.
+func runSchema(in, out string) error {
+	ents, pkg, err := parseSchemaFile(in)
+	if err != nil {
+		return err
+	}
+	if len(ents) == 0 {
+		return fmt.Errorf("no `//drops:schema` directives found in %s", in)
+	}
+	src, err := emitSchema(pkg, ents)
+	if err != nil {
+		return err
+	}
+	if out == "" {
+		dir := filepath.Dir(in)
+		base := strings.TrimSuffix(filepath.Base(in), ".go")
+		out = filepath.Join(dir, base+"_drops_schema.go")
+	}
+	return os.WriteFile(out, src, 0o644)
+}

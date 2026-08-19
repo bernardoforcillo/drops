@@ -1,11 +1,13 @@
 package drops
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrNoRows is returned by ScanOne when the result set is empty. It is
@@ -33,18 +35,29 @@ func ScanOne(rows Rows, dest any) error {
 		return fmt.Errorf("drops: ScanOne requires a non-nil pointer to struct, got %T", dest)
 	}
 	elem := rv.Elem()
-	if elem.Kind() != reflect.Struct {
-		return fmt.Errorf("drops: ScanOne requires a pointer to struct, got *%s", elem.Kind())
-	}
 	cols, err := rows.Columns()
 	if err != nil {
 		return err
+	}
+	scalar := isScalarDest(elem.Type())
+	if !scalar && elem.Kind() != reflect.Struct {
+		return fmt.Errorf("drops: ScanOne requires a pointer to struct or to a scalar, got *%s", elem.Kind())
+	}
+	if scalar && len(cols) > 1 {
+		return fmt.Errorf("drops: ScanOne into *%s needs a single-column result, got %d columns %v",
+			elem.Type(), len(cols), cols)
 	}
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
 			return err
 		}
 		return ErrNoRows
+	}
+	if scalar {
+		if err := rows.Scan(dest); err != nil {
+			return err
+		}
+		return rows.Err()
 	}
 	if err := scanRowInto(rows, elem, cols, fieldMap(elem.Type())); err != nil {
 		return err
@@ -203,3 +216,34 @@ func camelCase(s string) string {
 	}
 	return b.String()
 }
+
+// IsScalarDest reports whether a destination type should be scanned as
+// a single column rather than mapped field-by-field. Exported so the
+// dialect packages, which carry their own scanners, decide the same way.
+//
+// isScalarDest reports whether a destination type should be scanned as
+// a single column rather than mapped field-by-field.
+//
+// The distinction is not simply "is it a struct". A query returning one
+// column is the most ordinary thing there is — SELECT count(*) — and
+// requiring callers to wrap the result in a throwaway struct made drops
+// unable to express it. But some scalars *are* structs: time.Time is
+// the obvious one, and any type implementing sql.Scanner has said it
+// knows how to receive a column value, which is exactly the claim that
+// should stop drops from looking inside it.
+func IsScalarDest(t reflect.Type) bool { return isScalarDest(t) }
+
+func isScalarDest(t reflect.Type) bool {
+	if t.Kind() != reflect.Struct {
+		return true
+	}
+	if t == timeType {
+		return true
+	}
+	return reflect.PointerTo(t).Implements(scannerType)
+}
+
+var (
+	timeType    = reflect.TypeOf(time.Time{})
+	scannerType = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
+)

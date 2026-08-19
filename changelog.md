@@ -8,6 +8,68 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+### Added
+- **OLTP → OLAP → vector mirroring** (`drops/mirror`) —
+  `DeriveClickHouse` makes the analytics schema a function of the
+  transactional one rather than a second declaration; `ClickHouseSink`
+  and `QdrantSink` apply changes idempotently; `Pump` moves them from a
+  durable outbox source, refusing to acknowledge a batch any sink
+  rejected. See `docs/mirror.md`.
+- **MySQL / MariaDB dialect** (`drops/mysql`) — schema, DDL, indexes,
+  the four statement builders, operators, and Entity CRUD with the
+  drift check, composite keys and relation handles. Generated keys come
+  back through `LastInsertId` because MySQL has no `RETURNING`.
+- **Composite primary keys in Entity** (`drops/pg`, `drops/sqlite`) —
+  `Get`/`Delete` take the key variadically, `PatchKey` takes it as a
+  slice, and wrong arity is `ErrKeyArity` rather than a partial match
+  that would address every row sharing a column.
+- **Relation handles** (`drops/pg`) — `Table.Rel` resolves a relation
+  name once at declaration; `Load`/`LoadRel` take the handle so an
+  eager-load is compile-checked, alongside the string-taking
+  `With`/`WithRel` for relation sets that arrive from outside the
+  program.
+- **Schema generation from structs** (`cmd/dropsgen -schema`) — emits
+  the typed `Col[T]` declarations from `//drops:schema` tags, so the
+  struct is the single source of truth and drift is unrepresentable
+  rather than merely detected. Worked example in `examples/schemagen`.
+- **Documentation tree** (`docs/`) — getting started, schema, entities,
+  dialect comparison, vector search, mirroring. Runnable examples added
+  for `drops/mysql` and `drops/sqlite`.
+- **Bare-identifier mode on `drops.Builder`** — `BareIdents` /
+  `SetBareIdents`, so DDL that defines a table can render unqualified
+  column references even when they are nested inside an expression.
+- Smaller additions: `pg.SmallSerial`, `sqlite.Column.Asc/Desc/As`,
+  `clickhouse.Bind`, `clickhouse.Table.OrderByColumns`,
+  `(*Col[T]).Managed` on pg/sqlite/clickhouse.
+
+### Changed
+- **`NewEntity` now rejects a column bound to no struct field**
+  (`drops/pg`, `drops/sqlite`, `drops/clickhouse`). It used to skip it
+  silently, so a renamed field or a mistyped `drop:` tag removed the
+  column from every INSERT and UPDATE while everything still compiled
+  and every test that did not assert on that column still passed.
+  Columns drops itself writes are exempt automatically; the rest must
+  be mapped or named through `AllowUnmappedColumns`.
+
+### Fixed
+- **ClickHouse `CREATE TABLE` emitted table-qualified column names** in
+  ORDER BY / PRIMARY KEY / PARTITION BY, which the server rejects — it
+  cannot resolve `"docs"."id"` against a table that does not exist yet.
+  The existing test had pinned the broken output.
+- **ClickHouse's event store and matview interpolated table names into
+  a literal `"%s"`** instead of quoting them as identifiers.
+- **CI had been red since PR #5.** `.golangci.yml` was still v1 format
+  while the action installs v2, so the linter failed on config load and
+  never ran; gocritic ran with a `style` tag this codebase does not
+  follow; `sloppyReassign` was actively wrong against the named-return
+  pattern the hooks depend on. Now green, with the two real findings it
+  had been hiding fixed.
+- **SQLite entity queries never used the attached cache** — `queryKey`
+  was dead code because the query-result caching pg has was never
+  wired up. `All`/`One` now read through it with the same single-flight
+  stampede protection the PK path had.
+
+
 ## [0.6.0] - 2026-08-16
 
 ### Added

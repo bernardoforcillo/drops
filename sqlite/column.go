@@ -173,6 +173,30 @@ func (c *Col[T]) In(values ...T) drops.Expression {
 	})
 }
 
+// Asc / Desc produce ORDER BY terms.
+//
+// These exist on the untyped Column so any handle can order a query,
+// and are distinct from the package-level Asc / Desc, which build the
+// OrderingColumn that keyset pagination needs.
+func (c *Column) Asc() drops.Expression  { return orderTerm(c, " ASC") }
+func (c *Column) Desc() drops.Expression { return orderTerm(c, " DESC") }
+
+func orderTerm(c *Column, dir string) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(dir)
+	})
+}
+
+// As aliases a column in a SELECT projection.
+func (c *Column) As(alias string) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(" AS ")
+		b.WriteIdent(alias)
+	})
+}
+
 // Val binds a typed value for INSERT/UPDATE.
 func (c *Col[T]) Val(v T) ColumnValue { return columnValue{col: c.Column, val: v} }
 

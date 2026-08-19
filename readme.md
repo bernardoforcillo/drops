@@ -85,6 +85,22 @@ To use the bundled `database/sql` adapter (`drops/stdlib`) you also need
 a driver — for PostgreSQL, `github.com/jackc/pgx/v5/stdlib`; for
 ClickHouse, `github.com/ClickHouse/clickhouse-go/v2`.
 
+## Documentation
+
+The [docs](docs/) directory has the explanations: a
+[getting-started tutorial](docs/getting-started.md), how to
+[declare a schema](docs/schema.md) without it drifting from your
+structs, [entities and relations](docs/entities.md),
+[which dialect gives you what](docs/dialects.md),
+[portable vector search](docs/vector-search.md), and
+[mirroring one table across all three engines](docs/mirror.md).
+
+Package reference is on
+[pkg.go.dev](https://pkg.go.dev/github.com/bernardoforcillo/drops);
+every package ships runnable examples.
+
+The rest of this page is the tour.
+
 ## Quick start
 
 ```go

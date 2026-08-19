@@ -1,0 +1,70 @@
+# Servers for the integration suite.
+#
+# Ports are deliberately offset from the defaults (5433 rather than
+# 5432, and so on) so bringing this up cannot collide with a database
+# you already run locally — and, more usefully, so a suite pointed at
+# the wrong DSN fails to connect instead of quietly writing into it.
+#
+#   docker compose -f integration/docker-compose.yml up -d
+#   go test -C integration ./...   # with the DSNs from integration/doc.go
+#
+# SQLite is absent on purpose: its driver is pure Go, so that half of
+# the suite needs no service at all.
+
+services:
+  postgres:
+    # pgvector rather than plain postgres: the vector-store conformance
+    # tests need the extension, and a plain image would make them skip
+    # exactly where the risk is highest.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: drops
+      POSTGRES_PASSWORD: drops
+      POSTGRES_DB: drops
+    ports: ["5433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drops -d drops"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_USER: drops
+      MYSQL_PASSWORD: drops
+      MYSQL_DATABASE: drops
+    ports: ["3307:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-udrops", "-pdrops"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports:
+      - "8124:8123"  # HTTP
+      - "9001:9000"  # native
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    ports:
+      - "6334:6333"  # HTTP
+    healthcheck:
+      # The image has no shell utilities to speak of; TCP acceptance is
+      # the most this can check, and the suite retries on top of it.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

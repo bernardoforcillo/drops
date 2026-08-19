@@ -297,8 +297,14 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 		return err
 	}
 	do := func(tx *DB) error {
-		vals := e.bindings(reflect.ValueOf(r).Elem(), false)
-		if _, err := tx.Insert(e.table).Values(vals...).Exec(ctx); err != nil {
+		rv := reflect.ValueOf(r).Elem()
+		vals := e.bindings(rv, false)
+		ins := tx.Insert(e.table).Values(vals...)
+		// SQLite has had RETURNING since 3.35, so a server-assigned
+		// key comes back in the same statement rather than through a
+		// second round trip. Without this the caller holds a row whose
+		// key is still zero and cannot address what it just wrote.
+		if err := e.insertReturningKey(tx, ctx, ins, rv); err != nil {
 			return err
 		}
 		return e.recordAudit(tx, ctx, "create", r, e.pkValue(r))
@@ -313,6 +319,46 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
 	return err
+}
+
+// insertReturningKey runs the INSERT, reading server-assigned key
+// columns back into the row.
+//
+// Only columns the caller left zero are read back: one the caller set
+// is theirs, and overwriting it with what the server echoed would be
+// indistinguishable from working until the two disagree.
+func (e *Entity[T]) insertReturningKey(db *DB, ctx context.Context, ins *InsertBuilder, rv reflect.Value) error {
+	var want []int
+	for i, idx := range e.pkFields {
+		if rv.FieldByIndex(idx).IsZero() {
+			want = append(want, i)
+		}
+	}
+	if len(want) == 0 {
+		_, err := ins.Exec(ctx)
+		return err
+	}
+	dests := make([]any, 0, len(want))
+	for _, i := range want {
+		ins.Returning(e.pks[i])
+		dests = append(dests, rv.FieldByIndex(e.pkFields[i]).Addr().Interface())
+	}
+	sqlText, args := ins.ToSQL()
+	rows, err := db.Query(ctx, sqlText, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("drops/sqlite: INSERT ... RETURNING produced no row for table %q", e.table.name)
+	}
+	if err := rows.Scan(dests...); err != nil {
+		return err
+	}
+	return rows.Err()
 }
 
 // CreateMany inserts every row in a single multi-row INSERT. When the
@@ -421,13 +467,25 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 
 // bindings builds the column bindings from r. When skipPK is true the
 // primary-key column is omitted (for UPDATE SET lists).
+// bindings extracts a row's column values.
+//
+// skipPK omits the key columns, which an UPDATE must not reassign. On
+// the insert path a key column whose value is still zero is omitted
+// too, so the server assigns it: binding the zero explicitly makes
+// every row claim id 0, and the second insert fails on the primary
+// key. A column with a DEFAULT is omitted for the same reason — the
+// zero value the caller never set is not what they meant to store.
 func (e *Entity[T]) bindings(rv reflect.Value, skipPK bool) []ColumnValue {
 	out := make([]ColumnValue, 0, len(e.colFields))
 	for _, cf := range e.colFields {
 		if skipPK && e.isKeyColumn(cf.col) {
 			continue
 		}
-		out = append(out, columnValue{col: cf.col, val: rv.FieldByIndex(cf.field).Interface()})
+		fv := rv.FieldByIndex(cf.field)
+		if !skipPK && fv.IsZero() && (cf.col.autoInc || cf.col.hasDefault || e.isKeyColumn(cf.col)) {
+			continue
+		}
+		out = append(out, columnValue{col: cf.col, val: fv.Interface()})
 	}
 	return out
 }

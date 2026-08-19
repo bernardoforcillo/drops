@@ -17,12 +17,7 @@ func CreateTable(t *Table) drops.Expression {
 		b.WriteString("CREATE TABLE ")
 		t.writeName(b)
 		b.WriteString(" (\n  ")
-		for i, c := range t.Columns() {
-			if i > 0 {
-				b.WriteString(",\n  ")
-			}
-			writeColumnDef(b, c)
-		}
+		writeTableBody(b, t)
 		b.WriteString("\n)")
 	})
 }
@@ -33,12 +28,7 @@ func CreateTableIfNotExists(t *Table) drops.Expression {
 		b.WriteString("CREATE TABLE IF NOT EXISTS ")
 		t.writeName(b)
 		b.WriteString(" (\n  ")
-		for i, c := range t.Columns() {
-			if i > 0 {
-				b.WriteString(",\n  ")
-			}
-			writeColumnDef(b, c)
-		}
+		writeTableBody(b, t)
 		b.WriteString("\n)")
 	})
 }
@@ -483,11 +473,51 @@ func CommentOnColumn(c ColRef, text string) drops.Expression {
 
 // --- Helpers for column definitions inside CREATE TABLE --------------
 
-func writeColumnDef(b *drops.Builder, c *Column) {
+// writeTableBody renders the column definitions plus the table-level
+// PRIMARY KEY clause a composite key needs.
+//
+// A key spanning one column can be declared inline on it. A key
+// spanning two cannot: an inline PRIMARY KEY on each renders two of
+// them, and PostgreSQL rejects the statement with "multiple primary
+// keys for table are not allowed". The table-level form is the only
+// one that works for both, so the choice is made here from the number
+// of columns marked, rather than at each column.
+func writeTableBody(b *drops.Builder, t *Table) {
+	keys := make([]*Column, 0, 2)
+	for _, c := range t.Columns() {
+		if c.IsPrimaryKey() {
+			keys = append(keys, c)
+		}
+	}
+	composite := len(keys) > 1
+
+	for i, c := range t.Columns() {
+		if i > 0 {
+			b.WriteString(",\n  ")
+		}
+		writeColumnDefKey(b, c, !composite)
+	}
+	if !composite {
+		return
+	}
+	b.WriteString(",\n  PRIMARY KEY (")
+	for i, c := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteIdent(c.Name())
+	}
+	b.WriteByte(')')
+}
+
+// writeColumnDefKey renders one column. inlineKey is false when the
+// table declares a composite key, in which case a key column carries
+// NOT NULL here and its key membership is stated once, table-level.
+func writeColumnDefKey(b *drops.Builder, c *Column, inlineKey bool) {
 	b.WriteIdent(c.Name())
 	b.WriteByte(' ')
 	b.WriteString(c.Type().TypeSQL())
-	if c.IsPrimaryKey() {
+	if inlineKey && c.IsPrimaryKey() {
 		b.WriteString(" PRIMARY KEY")
 	} else if c.IsNotNull() {
 		b.WriteString(" NOT NULL")

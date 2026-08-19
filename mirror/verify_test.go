@@ -715,6 +715,13 @@ func TestVerifyIntegerKeysAreComparedNumerically(t *testing.T) {
 	if !rep.Aligned() {
 		t.Fatalf("numeric keys compared as text: %+v", rep.Divergences)
 	}
+	// Agreement alone proves nothing here: a comparator that puts "10"
+	// before "9" makes the range trim throw away both sides' rows, and
+	// a range holding nothing agrees with itself. The counts are what
+	// says the rows were actually compared.
+	if rep.SourceRows != 2 || rep.MirrorRows != 2 {
+		t.Errorf("rows compared = %d source / %d mirror, want 2/2", rep.SourceRows, rep.MirrorRows)
+	}
 	if len(sd.args) < 2 || sd.args[1][0] != int64(10) {
 		t.Errorf("range boundary = %v, want the numerically largest key 10", sd.args[1])
 	}
@@ -791,4 +798,253 @@ func TestNewVerifierValidates(t *testing.T) {
 			t.Errorf("err = %v, want a collision error", err)
 		}
 	})
+}
+
+// --- the encoding schema ---------------------------------------------
+
+// vfyRigTables wires a verifier to two scripted drivers over a mirror
+// table the caller declared rather than derived. NewVerifier accepts
+// any mirror whose columns line up with the source's, so the types the
+// comparison is encoded against are not limited to the ones
+// DeriveClickHouse emits.
+func vfyRigTables(t *testing.T, src *pg.Table, mir *clickhouse.Table, srcSets, mirSets [][][]any) (*mirror.Verifier, *vfyDriver, *vfyDriver) {
+	t.Helper()
+	sd := &vfyDriver{name: "source", sets: srcSets}
+	md := &vfyDriver{name: "mirror", sets: mirSets}
+	v, err := mirror.NewVerifier(pg.New(sd), src, clickhouse.New(md), mir)
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	return v, sd, md
+}
+
+// vfyDecimalTables declares a one-column mirror whose decimal is
+// spelled with the scale as its only argument, which is the form
+// DeriveClickHouse never emits and canonicalValue nonetheless claims
+// to support.
+func vfyDecimalTables(t *testing.T, chType string) (*pg.Table, *clickhouse.Table) {
+	t.Helper()
+	src := pg.NewTable("prices")
+	pg.Add(src, pg.BigSerial("id").PrimaryKey())
+	pg.Add(src, pg.Numeric("amount", 18, 4).NotNull())
+
+	mir := clickhouse.NewTable("prices")
+	clickhouse.Add(mir, clickhouse.Custom[int64]("id", "Int64"))
+	clickhouse.Add(mir, clickhouse.Custom[string]("amount", chType))
+	clickhouse.Add(mir, clickhouse.UInt64(mirror.VersionColumn))
+	clickhouse.Add(mir, clickhouse.UInt8(mirror.DeletedColumn))
+	return src, mir
+}
+
+// Decimal64(4) keeps four decimal places: the scale is the sole
+// argument, not the part after a comma. Reading it as scale 0 rounds
+// both sides to whole numbers before hashing, so two genuinely
+// different amounts encode alike and the verifier calls a corrupt
+// mirror clean — the one failure a verifier must never have.
+func TestVerifyReadsTheScaleOfADecimalDeclaredWithOneArgument(t *testing.T) {
+	src, mir := vfyDecimalTables(t, "Decimal64(4)")
+
+	t.Run("a difference below the scale is a divergence", func(t *testing.T) {
+		v, _, _ := vfyRigTables(t, src, mir,
+			[][][]any{{{int64(1), "10.9999"}}},
+			[][][]any{{{int64(1), "10.5001", uint64(7), uint8(0)}}})
+		rep := vfyRun(t, v)
+		if rep.Unclear != 1 {
+			t.Fatalf("10.9999 and 10.5001 compared equal in a Decimal64(4) column: %+v", rep)
+		}
+	})
+
+	t.Run("the same value spelled two ways still agrees", func(t *testing.T) {
+		v, _, _ := vfyRigTables(t, src, mir,
+			[][][]any{{{int64(1), "10.9999"}}},
+			[][][]any{{{int64(1), "10.99990", uint64(7), uint8(0)}}})
+		rep := vfyRun(t, v)
+		if !rep.Aligned() {
+			t.Fatalf("trailing zeros at the declared scale reported as divergence: %+v", rep.Divergences)
+		}
+	})
+}
+
+// A scale is required, not defaulted. Silently encoding at scale 0 is
+// what made the one-argument forms compare wrong in the first place,
+// so a type that carries no readable scale is an error naming itself.
+func TestVerifyRefusesADecimalWithNoScale(t *testing.T) {
+	src, mir := vfyDecimalTables(t, "Decimal64")
+	v, _, _ := vfyRigTables(t, src, mir,
+		[][][]any{{{int64(1), "10.9999"}}},
+		[][][]any{{{int64(1), "10.9999", uint64(7), uint8(0)}}})
+	_, err := v.Verify(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Decimal64") {
+		t.Errorf("err = %v, want a refusal naming the type it cannot read a scale from", err)
+	}
+}
+
+func vfyInstantTable() *pg.Table {
+	t := pg.NewTable("events")
+	pg.Add(t, pg.BigSerial("id").PrimaryKey())
+	// timestamp without time zone, which MapType renders as
+	// DateTime64(6) — no timezone argument.
+	pg.Add(t, pg.Timestamp("happened_at", false).NotNull())
+	return t
+}
+
+// DateTime64 is a tick count since the epoch whatever its arguments
+// say; a missing timezone argument means "render in the server
+// timezone", not "this is a wall clock". A ClickHouse server that is
+// not on UTC therefore hands back the same instant as a different
+// reading, and comparing the readings makes every row of every
+// timestamp column diverge — a false positive on a perfect mirror,
+// which is the whole reason the encoding happens in Go.
+func TestVerifyComparesATimestampWithoutATimezoneArgumentAsAnInstant(t *testing.T) {
+	rome := time.FixedZone("CEST", 2*60*60)
+	tbl := vfyInstantTable()
+
+	t.Run("one instant read in two zones agrees", func(t *testing.T) {
+		src := [][]any{{int64(1), time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)}}
+		mir := [][]any{{int64(1), time.Date(2026, 8, 19, 14, 0, 0, 0, rome), uint64(7), uint8(0)}}
+		v, _, _, _ := vfyRig(t, tbl, [][][]any{src}, [][][]any{mir})
+		rep := vfyRun(t, v)
+		if !rep.Aligned() {
+			t.Fatalf("a mirror on a server east of UTC reported as divergent: %+v", rep.Divergences)
+		}
+	})
+
+	t.Run("two instants still disagree", func(t *testing.T) {
+		src := [][]any{{int64(1), time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)}}
+		mir := [][]any{{int64(1), time.Date(2026, 8, 19, 14, 0, 0, 0, time.UTC), uint64(7), uint8(0)}}
+		v, _, _, _ := vfyRig(t, tbl, [][][]any{src}, [][][]any{mir})
+		rep := vfyRun(t, v)
+		if rep.Unclear != 1 {
+			t.Fatalf("two hours of difference went unreported: %+v", rep)
+		}
+	})
+}
+
+// --- the mirror read scope -------------------------------------------
+
+// The filter a mirror table is most likely to carry is NotDeleted, and
+// it is the one that must not reach this read: it hides the tombstones,
+// which turns "the delete was applied and should not have been" into
+// "the insert never arrived" and throws away the distinction
+// Divergence.Tombstoned exists to carry.
+func TestVerifyIgnoresTheMirrorsDefaultFilters(t *testing.T) {
+	tbl := vfyTable()
+	mir := derive(t, tbl)
+	mir.DefaultFilter(mirror.NotDeleted(mir))
+	v, _, md := vfyRigTables(t, tbl, mir, nil, nil)
+	vfyRun(t, v)
+
+	if len(md.sql) == 0 {
+		t.Fatal("the mirror was never read")
+	}
+	if strings.Contains(md.sql[0], "WHERE") {
+		t.Errorf("mirror read applied a default filter: %s", md.sql[0])
+	}
+	// One mention, in the projection. A second is the filter's.
+	if n := strings.Count(md.sql[0], mirror.DeletedColumn); n != 1 {
+		t.Errorf("expected %s to be selected once and not filtered, saw it %d times: %s",
+			mirror.DeletedColumn, n, md.sql[0])
+	}
+}
+
+// --- the key order the ranges are cut by ------------------------------
+
+// A range is cut at a key, and both sides are trimmed to it. If the
+// trim orders keys differently from the reads, the trim can throw away
+// every row of both sides — and a range with no rows on either side
+// agrees with itself. The verdict is then "clean" over data neither
+// side was asked about.
+func TestVerifyComparesTheRowsOfABoundedRangeRatherThanTrimmingThemAway(t *testing.T) {
+	// Keys 9 and 10 with a range size of 2: the range ends at 10, and
+	// under a text order "10" sorts before "9", so a text trim drops
+	// both rows from both sides.
+	srcSets := [][][]any{
+		{vfySrc(9, "a", 1, nil), vfySrc(10, "b", 2, nil)},
+		{},
+	}
+	mirSets := [][][]any{
+		{vfyMir(9, "WRONG", 1, nil, 10, 0), vfyMir(10, "b", 2, nil, 11, 0)},
+		{},
+	}
+	v, _, _, _ := vfyRig(t, vfyTable(), srcSets, mirSets)
+	v.RangeSize(2)
+
+	rep := vfyRun(t, v)
+	if rep.SourceRows != 2 || rep.MirrorRows != 2 {
+		t.Fatalf("rows compared = %d source / %d mirror, want 2/2: a range that keeps no rows agrees vacuously",
+			rep.SourceRows, rep.MirrorRows)
+	}
+	if len(rep.Divergences) != 1 || rep.Divergences[0].Key != "9" ||
+		rep.Divergences[0].Kind != mirror.ValueMismatch {
+		t.Fatalf("divergences = %+v, want key 9 mismatched", rep.Divergences)
+	}
+}
+
+// --- resuming ---------------------------------------------------------
+
+// The documented resume loop feeds Resume back to From on every error.
+// A pass that fails on its first range has compared nothing, but it has
+// not un-compared what came before it either: reporting an empty Resume
+// there sends the loop back to the head of the key space, so a table
+// large enough to need resuming re-scans the same prefix on every
+// transient read error and never reaches its tail.
+func TestVerifyKeepsTheCallersStartingPointWhenTheFirstRangeFails(t *testing.T) {
+	tbl := vfyTable()
+	boom := errors.New("clickhouse is down")
+	v, err := mirror.NewVerifier(
+		pg.New(&vfyDriver{name: "source"}), tbl,
+		clickhouse.New(&vfyDriver{name: "mirror", fail: boom}), derive(t, tbl))
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	v.From("500000")
+
+	rep, err := v.Verify(context.Background())
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the driver failure wrapped", err)
+	}
+	if rep.Resume != "500000" {
+		t.Errorf("Resume = %q, want the caller's own starting point 500000; empty means the walk finished", rep.Resume)
+	}
+	if rep.RangesChecked != 0 {
+		t.Errorf("RangesChecked = %d, want 0: nothing was compared", rep.RangesChecked)
+	}
+}
+
+// --- what wrote the mirror row ---------------------------------------
+
+// A version says more than whether the row moved: which band it is in
+// says what put it there, and that decides which repair can work. A
+// seed-band row means the change stream has never covered the key.
+func TestDivergenceOriginNamesTheBandTheMirrorVersionIsIn(t *testing.T) {
+	seeded := mirror.SeedVersionAt(time.Date(2026, 8, 19, 9, 0, 0, 0, time.UTC))
+	streamed := mirror.LiveVersion(4242)
+
+	src := [][]any{vfySrc(1, "a", 1, nil), vfySrc(2, "b", 2, nil), vfySrc(3, "c", 3, nil)}
+	mir := [][]any{
+		vfyMir(1, "filled", 1, nil, seeded, 0),
+		vfyMir(2, "streamed", 2, nil, streamed, 0),
+		// key 3 has no mirror row at all.
+	}
+	v, _, _, _ := vfyRig(t, vfyTable(), [][][]any{src}, [][][]any{mir})
+
+	rep := vfyRun(t, v)
+	got := map[string]mirror.VersionOrigin{}
+	for _, d := range rep.Divergences {
+		got[d.Key] = d.Origin()
+	}
+	want := map[string]mirror.VersionOrigin{
+		"1": mirror.OriginFill,
+		"2": mirror.OriginStream,
+		"3": mirror.OriginAbsent,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("origins = %v, want %v", got, want)
+	}
+	// The clock band is the third: a source with no sequence of its
+	// own, or a row written before the bands existed.
+	clocked := mirror.Divergence{MirrorVersion: mirror.ClockVersion(vfyAt)}
+	if clocked.Origin() != mirror.OriginClock {
+		t.Errorf("a wall-clock version reads as %s, want %s", clocked.Origin(), mirror.OriginClock)
+	}
 }

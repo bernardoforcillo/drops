@@ -518,7 +518,10 @@ func TestReseedFailedChunkDoesNotAdvanceTheCursor(t *testing.T) {
 // committed key: one key further and the failed chunk is skipped for
 // good, one key back and the committed one is seeded twice.
 func TestReseedCursorStaysAtTheLastCommittedChunk(t *testing.T) {
-	d := newReseedDriver(1, 2, 3, 4)
+	// Sparse keys, because the cursor is a key and not a count: a
+	// walk that advanced by the number of rows it processed would
+	// agree with this one on 1,2,3,4 and disagree here.
+	d := newReseedDriver(10, 20, 30, 40)
 	sink := &chunkSink{name: "clickhouse:docs", failNth: 2}
 	r := newFill(t, d, sink)
 	ctx := context.Background()
@@ -530,8 +533,8 @@ func TestReseedCursorStaysAtTheLastCommittedChunk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
-	if status.LastID != 2 {
-		t.Errorf("cursor at %d after chunk one committed and chunk two failed, want 2", status.LastID)
+	if status.LastID != 20 {
+		t.Errorf("cursor at %d after chunk one committed and chunk two failed, want 20 — the last key of the chunk that committed", status.LastID)
 	}
 	if status.Processed != 2 {
 		t.Errorf("processed = %d, want the two keys of the one chunk that committed", status.Processed)
@@ -540,7 +543,7 @@ func TestReseedCursorStaysAtTheLastCommittedChunk(t *testing.T) {
 	if err := r.Run(ctx); err != nil {
 		t.Fatalf("resumed Run: %v", err)
 	}
-	if got := reseedChangeKeys(sink.seen); !reflect.DeepEqual(got, []string{"1", "2", "3", "4"}) {
+	if got := reseedChangeKeys(sink.seen); !reflect.DeepEqual(got, []string{"10", "20", "30", "40"}) {
 		t.Errorf("seeded %v across both runs, want each key exactly once", got)
 	}
 	if len(sink.seen) != 2 {

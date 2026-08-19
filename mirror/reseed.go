@@ -174,15 +174,14 @@ func (m reseedMode) String() string {
 // the first sink holding rows the second one never saw, and the
 // replay is what closes that gap.
 //
-// The replay is not the same write twice:
-// it re-reads the rows as they are now, and a row that changed in
-// between — through a path that never emitted a change, which is why
-// the table needed a reseed in the first place — comes back with
-// different content. That is why a fill draws a fresh version per
-// pass rather than a constant. The replay's rows outrank the ones the
-// failed pass managed to write, so the mirror converges on the later
-// read instead of holding two rows at one version and letting the
-// merge pick.
+// The replay is not the same write twice: it re-reads the rows as
+// they are now, and a row that changed in between — through a path
+// that never emitted a change, which is why the table needed a reseed
+// in the first place — comes back with different content. That is why
+// a fill draws a fresh version per pass rather than a constant. The
+// replay's rows outrank the ones the failed pass managed to write, so
+// the mirror converges on the later read instead of holding two rows
+// at one version and letting the merge pick.
 //
 // # Deletes
 //

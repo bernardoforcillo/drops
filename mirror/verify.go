@@ -302,6 +302,35 @@ func (r VerifyReport) Aligned() bool {
 // is a full scan on each side, which is why [Verifier.Throttle] and
 // [Verifier.From] exist. A Verifier is not safe for concurrent use;
 // call the setters before Verify.
+//
+// A uuid key costs more than that, and the excess is not something
+// this package can tune away. The two engines do not order the UUID
+// type the same way, so both sides are walked in the canonical text
+// order instead, and on the mirror that renders as
+// WHERE toString(id) > ? ORDER BY toString(id). toString is not
+// monotone in the order a UUID sorting key is stored in, so neither
+// clause can use the primary index: ClickHouse cannot skip granules
+// on the predicate and cannot read in order for the LIMIT. Every
+// range therefore reads and FINAL-merges the whole mirror rather than
+// one page of it, and a pass costs one full mirror scan per range —
+// keys/RangeSize of them. On a ten-million-row uuid-keyed mirror at
+// the default range size that is ten thousand full scans, which is to
+// say the pass does not finish. The Postgres side has the same shape
+// of problem for the same reason: it is ordered by
+// (id::text COLLATE "C"), which the uuid primary key index cannot
+// serve, so an expression index on that is what turns its scan back
+// into a range read.
+//
+// There are two honest answers and no third. [Verifier.RangeSize] is
+// the only lever inside the package: the work is quadratic in the row
+// count and inversely proportional to the range size, so raising it
+// far above the default divides the number of scans, at the cost of
+// holding a range of both sides in memory. The other is to not key a
+// mirrored table on a uuid. An integer key orders identically in both
+// engines and is walked from the primary index on both sides, which is
+// the only shape for which this doc's "a full scan on each side" is
+// the whole story; a text key gets there too, once the source carries
+// an index under the C collation.
 type Verifier struct {
 	src      *pg.DB
 	srcTable *pg.Table
@@ -522,13 +551,15 @@ func (v *Verifier) Verify(ctx context.Context) (VerifyReport, error) {
 			rep.FinishedAt = v.now()
 			return rep, err
 		}
-		// Resume starts where the caller did. A pass that fails on its
-		// first range has compared nothing, but it has also not
-		// un-compared what came before it, and reporting an empty
-		// Resume there would send the resume loop in this method's doc
-		// back to the head of the key space — so a table large enough
-		// to need resuming would re-scan the same prefix on every
-		// transient read error and never reach its tail.
+		// Resume starts where the caller did. A pass that fails on
+		// its first range has compared nothing, but it has also not
+		// un-compared what came before it, and an empty Resume is
+		// reserved for a walk that reached the end of the key space.
+		// Reporting one here would send a caller feeding Resume back
+		// to From on error to the head of the key space instead, so a
+		// table large enough to need resuming would re-scan the same
+		// prefix on every transient read error and never reach its
+		// tail.
 		rep.Resume = v.from
 	}
 	for {
@@ -1039,10 +1070,16 @@ func (v *Verifier) scanSource(ctx context.Context, plan verifyPlan, q *pg.Select
 // ClickHouse orders the UUID type by an internal layout that is not
 // the order of the text it prints.
 //
-// The cost of the text case is honest and worth stating: on a database
-// whose default collation is not C, the source scan cannot use the
-// primary key index unless an index exists on the key under the C
-// collation.
+// Both text cases cost an index, and the uuid case costs both of them.
+// On a database whose default collation is not C, a text key's source
+// scan cannot use the primary key index unless an index exists on the
+// key under the C collation. A uuid key is worse on both sides at
+// once: the source is ordered by an expression over the key rather
+// than the key, and toString on the mirror side puts every range
+// beyond the reach of the ClickHouse sorting key, which turns each one
+// into a full scan of the mirror. The Verifier's "# Cost" section
+// spells that out, because it is the difference between a pass that
+// finishes and one that does not.
 type verifyKey struct {
 	name     string
 	chType   string
@@ -1394,7 +1431,7 @@ func canonicalDate(rv reflect.Value, chType string) (string, error) {
 // UTC. That is the false positive the Go-side encoding exists to
 // prevent.
 //
-// [canonicalDate] is the genuine wall-clock case and is deliberately
+// canonicalDate is the genuine wall-clock case and is deliberately
 // not converted: a Date has no instant behind it.
 func canonicalTimestamp(rv reflect.Value, chType string) (string, error) {
 	t, ok := rv.Interface().(time.Time)
@@ -1443,8 +1480,8 @@ func canonicalDecimal(rv reflect.Value, chType, base, args string) (string, erro
 }
 
 // verifyDecimalScale reads the number of decimal places a Decimal
-// column keeps, which is where its argument list is, and that differs
-// between the two spellings ClickHouse accepts.
+// column keeps. Where that number sits differs between the two
+// spellings ClickHouse accepts, which is the whole of the problem.
 //
 // Decimal(P, S) carries the precision first and the scale second.
 // Decimal32(S) through Decimal256(S) fix the precision in the type
@@ -1454,6 +1491,10 @@ func canonicalDecimal(rv reflect.Value, chType, base, args string) (string, erro
 // alike — a verifier reporting a corrupt mirror as clean, which is the
 // one failure it must not have. So the scale is required, and a type
 // that does not carry one is an error rather than a silent zero.
+// verifyMaxDecimalScale is ClickHouse's own ceiling: Decimal256 tops
+// out at 76 digits of precision and the scale cannot exceed it.
+const verifyMaxDecimalScale = 76
+
 func verifyDecimalScale(chType, base, args string) (int, error) {
 	text := strings.TrimSpace(args)
 	i := strings.IndexByte(text, ',')
@@ -1466,7 +1507,12 @@ func verifyDecimalScale(chType, base, args string) (int, error) {
 		return 0, fmt.Errorf("mirrored type %q has no readable scale; %s takes the scale as its only argument", chType, base)
 	}
 	n, err := strconv.Atoi(text)
-	if err != nil || n < 0 {
+	if err != nil || n < 0 || n > verifyMaxDecimalScale {
+		// Out of range is refused rather than clamped: a scale beyond
+		// 76 is not a type ClickHouse would have accepted, so the
+		// declaration is wrong and encoding at some other scale would
+		// only hide it — while rendering at it would ask big.Rat for
+		// a string as long as the number claims.
 		return 0, fmt.Errorf("mirrored type %q has no readable scale", chType)
 	}
 	return n, nil

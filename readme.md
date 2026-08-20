@@ -1,15 +1,31 @@
 # drops
 
-A Drizzle-inspired, driver-agnostic SQL toolkit for Go.
+A Drizzle-inspired SQL toolkit for Go, with no dependencies, across
+five engines — and one table declared once for all of them.
+
+The usual shape of a 2026 backend is Postgres for state, ClickHouse for
+analytics, and a vector store for retrieval. That is normally three
+schema declarations, three ingestion paths and three query vocabularies,
+kept in step by hand. `drops/mirror` makes the analytics and vector
+schemas a *function* of the transactional one, moves changes through a
+durable outbox, and gives you the operations nobody ships: replay a
+mirror that never had history, ask whether the copies are actually
+equal, and walk the mirror's schema forward when the source's moves.
+
+The rest of the toolkit is what that needs, and stands on its own: a
+typed schema and query builder per dialect, entities, relations,
+migrations with drift detection, and the production patterns most
+services end up writing by hand.
 
 `drops` does not wrap an existing driver — it defines its own minimal
 `Driver` interface so it stays out of the way of however you connect to
 your database. Plug in `database/sql`, `pgx`, or your own pool by
-implementing four methods.
+implementing four methods. The SQL core has **zero dependencies**; CI
+asserts it.
 
 ## Status
 
-Early. Two dialects ship today:
+Pre-1.0, and the API can still move. Five dialects ship today:
 
 - **`drops/pg`** — PostgreSQL. Full surface: SELECT (joins, grouping,
   CTEs, set ops, window functions, subqueries), INSERT (`RETURNING`,
@@ -59,7 +75,14 @@ Early. Two dialects ship today:
   placeholders, AUTO_INCREMENT, `ON DUPLICATE KEY UPDATE`, prefix
   indexes, and `ORDER BY`/`LIMIT` on UPDATE and DELETE for batched
   maintenance. Because MySQL has no `RETURNING`, `Entity.Create` reads
-  a generated key back through the driver's `LastInsertId`.
+  a generated key back through the driver's `LastInsertId`. Beyond the
+  builders: migrations that read `information_schema` and push a diff,
+  a transactional outbox and event store, keyset pagination, typed
+  errors keyed on the numbers people know (1062, 1213, 1205, 1451),
+  and CTEs, subqueries, window functions, JSON, strings, math and
+  dates. MySQL has no transactional DDL, so a failed migration leaves
+  the schema half changed — that is the documented contract, and
+  `Push` reports how far it got.
 - **`drops/mirror`** — one Postgres table, mirrored into ClickHouse for
   analytics and Qdrant for search. The ClickHouse schema is *derived*
   from the pg one rather than declared twice, and changes flow through
@@ -77,8 +100,9 @@ Early. Two dialects ship today:
   the analytics-aggregate library (`uniq`, `uniqExact`, `quantile`,
   `argMax`, `groupArray`, `quantileTiming`, …).
 
-Both dialects share the root `drops` package (driver interface,
-`Expression`, `Builder`, `Hook`, transactions).
+Every dialect shares the root `drops` package (driver interface,
+`Expression`, `Builder`, `Hook`, transactions, and the generic
+`All[T]` / `One[T]` result scanners).
 
 ## Install
 
@@ -625,9 +649,23 @@ re-sorts each parent's slice into the target query's order (the default,
 without `OrderBy`, follows junction-row order). `WithRel` and `With` merge
 when they name the same edge, so it is still fetched once.
 
-> Per-parent `LIMIT`/`OFFSET` (drizzle's `with: { posts: { limit } }`) is
-> not yet supported — a single `LIMIT` would cap the whole batched result,
-> not each parent's slice, which needs a window-function rewrite.
+`RelConfig.Limit` and `.Offset` cap the rows attached **per parent**,
+which is drizzle's `with: { posts: { limit: 5 } }`. A plain `LIMIT`
+would cap the whole batched result rather than each parent's slice, so
+it compiles to a `ROW_NUMBER() OVER (PARTITION BY <fk> ORDER BY ...)`
+window and filters on the rank:
+
+```go
+var users []User
+db.Find(Users).
+    WithRel("posts", func(p *pg.RelConfig) {
+        p.OrderBy(PostCreatedAt.Desc()).Limit(5) // five newest, per user
+    }).
+    All(ctx, &users)
+```
+
+It applies to `HasMany`, `MorphMany` and `ManyToMany`; the single-row
+relations already cap at one.
 
 ### Migrations
 
@@ -905,7 +943,9 @@ db.ExecExpr(ctx, pg.AlterEnumAddValue("user_status", "archived", "", "banned"))
 | Control flow | `Case().When(...).When(...).Else(...).End()`, `CaseOn(value).When(...).End()`, `Coalesce` |
 
 If something isn't covered, fall back to `pg.Func("any_pg_function", args...)`
-or `drops.Raw{SQL: "...", Args: ...}`.
+or `drops.Raw("...")` — but note that `Raw` is a bare string and carries
+no arguments, so a fragment with a value in it needs `drops.Param` or an
+`ExprFunc` that calls `Builder.AddArg`.
 
 ### Query constructs
 
@@ -1133,10 +1173,58 @@ drops/_examples/postgres/    full DB demo via pgx (excluded from build)
 
 ## What's not here
 
-- Other dialects (MySQL, MSSQL)
-- Indexes, composite primary keys, composite uniques, check constraints, enums, sequences, views, RLS in the snapshot/diff generator
-- Per-parent `LIMIT`/`OFFSET` on eager loads (drizzle's `with: { posts: { limit } }`) — `WithRel` supports per-relation `Where`/`OrderBy` and dot-path nesting, but a per-parent row cap needs a window-function rewrite
-- Down-migration generation from the diff (only Go-native `pg.Migrator` supports `Down`, and only when the user writes the down SQL themselves)
+Kept honest deliberately — an evaluator should be able to trust this
+list, and each line says what it costs you.
 
-The structure leaves room to add these later without churning the
-existing surface.
+**In the migration loop**
+
+- Postgres introspection does not read back enums, sequences, views,
+  RLS or policies. `pg/diff.go` can *write* all of them, so a schema
+  declaring one enum makes `Push` re-emit its `CREATE TYPE` for ever
+  and `DetectDrift` permanently noisy. `pg/introspect.go`'s doc
+  comment states the rule this breaks.
+- The CLI is `diagram` and `version`. Every step of the migration loop
+  — generate, push, migrate, drift, pull — exists as a library
+  function and has no operator-facing front end.
+- No rename detection. A structural diff cannot tell `RENAME COLUMN`
+  from a drop plus an add, so drops generates the destructive pair.
+  `pg.AnalyzeMigration` flags it, which is a backstop, not a fix.
+- ClickHouse has no `Introspect`, `Snapshot`, `Diff` or `Push`. The
+  mirror's `Evolver` reads the live ClickHouse side for its own
+  purposes; the dialect itself cannot.
+
+**In the type system**
+
+- Nullability is not in the type. `Col[T]` is compile-checked in every
+  respect except the one that causes the most bugs, and a nullable
+  column has no typed way to write NULL.
+- `drops.Raw` is a bare string and carries no arguments. A fragment
+  with a value in it has to go through `drops.Param` or an `ExprFunc`
+  calling `Builder.AddArg` — so the escape hatch and the
+  parameterisation are two different decisions when they should be one.
+- An unloaded relation is indistinguishable from an empty one. Forget
+  `With("posts")` and `user.Posts` is `nil`, which reads exactly like
+  "this user has no posts".
+
+**Around the edges**
+
+- No test double. Unit-testing a repository function needs a live
+  database — `pg.TestTx` and `pg.NewFactory` both connect, and the
+  pure-Go SQLite driver lives in `integration/go.mod` where a user's
+  build cannot reach it.
+- No isolation level, read-only transaction or savepoint in the
+  `Driver` interface, so `pg/retry.go` documents behaviour under
+  `SERIALIZABLE` that the API cannot ask for.
+- MySQL relations are declaration-only — no eager loading — and it has
+  no saga, audit, tenancy, authz or cache. SQLite has sentinel errors
+  but no driver-error classifier, where pg and MySQL have one.
+
+**Deliberately absent, and staying that way**
+
+- Unit of work, identity map, change tracking. Go has value semantics:
+  a `User` copied into a slice is a different object, so "one instance
+  per primary key" is not enforceable. The honest substitute is
+  explicit dirty-field tracking, which is what `pg/patch.go` is.
+- Lazy loading, and entity lifecycle callbacks tied to implicit
+  persistence. Both presuppose a `SaveChanges` to hook.
+- More dialects. Five is already more than one author keeps at parity.

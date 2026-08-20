@@ -11,14 +11,23 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Drift check | ✅ | ✅ | ✅ | ✅ | n/a |
 | Composite keys | ✅ | ✅ | ✅ | n/a | n/a |
 | Relations, eager loading | ✅ | partial | declaration only | — | — |
-| Keyset pagination | ✅ | ✅ | — | ✅ (via mirror) | ✅ (via vector) |
-| Migrations, diff, snapshot | ✅ | ✅ | — | ✅ | — |
-| Outbox, saga, event store | ✅ | ✅ | — | event store | — |
+| Keyset pagination | ✅ | ✅ | ✅ | ✅ (via mirror) | ✅ (via vector) |
+| Migrations, diff, snapshot | ✅ | ✅ | ✅ | — | — |
+| Introspection reads back | most¹ | ✅ | ✅ | — | — |
+| Outbox, saga, event store | ✅ | ✅ | outbox, event store | event store | — |
+| Typed driver errors, retry | ✅ | sentinels only | ✅ | — | — |
 | Audit, tenancy, authz, cache | ✅ | ✅ | — | — | — |
 | Vector search | ✅ pgvector | — | — | ✅ built-in | ✅ native |
 
+¹ PostgreSQL introspection does not yet read back enums, sequences,
+views, RLS or policies, though the diff generator can write all of
+them. A schema declaring one enum therefore makes `Push` re-emit its
+`CREATE TYPE` on every run and `DetectDrift` permanently noisy. See
+`pg/introspect.go`.
+
 Where a cell is empty the feature is not there yet, not disabled. The
-package doc for each dialect says what it covers.
+package doc for each dialect says what it covers, and `## What's not
+here` in the readme says what none of them do.
 
 ## PostgreSQL
 
@@ -89,10 +98,13 @@ dependent object, rebuild, and re-create it.
 
 ## MySQL / MariaDB
 
-The schema and query surface, plus entity CRUD with the drift check
-and composite keys. None of the cross-cutting packages yet.
+The schema and query surface, entity CRUD with the drift check and
+composite keys, migrations against `information_schema`, a
+transactional outbox and event store, keyset pagination, typed driver
+errors and the expression library. Not audit, tenancy, authz or cache,
+and relations are declaration-only — there is no eager loader.
 
-Three differences shape the API rather than the SQL:
+Four differences shape the API rather than the SQL:
 
 - **No `RETURNING`.** `Entity.Create` issues the INSERT and reads the
   generated key back through the driver's `LastInsertId`. `CreateMany`
@@ -110,6 +122,12 @@ Three differences shape the API rather than the SQL:
   batched delete goes through the un-aliased handle; `Exec` returns
   `ErrAliasedDeleteBounded` rather than posting a statement the server
   is certain to reject.
+- **No transactional DDL.** MySQL commits implicitly on every DDL
+  statement, so a migration that fails half-way leaves the schema half
+  changed — there is nothing to roll back to. That is the contract
+  rather than a surprise: `Push` reports how far it got, and a single
+  `ALTER TABLE` carrying several actions is atomic even though the
+  migration around it is not.
 
 Smaller things worth knowing before you port a schema: `TEXT` cannot be
 indexed without a prefix length (`Index.Prefix`), so a column you mean

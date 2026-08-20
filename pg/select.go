@@ -29,6 +29,25 @@ type SelectBuilder struct {
 	setOps       []setOp // UNION / INTERSECT / EXCEPT continuations
 	unscoped     bool
 	err          error // deferred error (e.g. cursor decode failure) surfaced at Rows()
+
+	// ctxFrom and ctxJoins carry the resolved context filters of the
+	// FROM table and of the joined tables that place theirs in the
+	// WHERE clause. They are set by resolveCtx on a per-execution copy
+	// and read by writeCore, which is what lets the FROM table's
+	// predicates land in an ON clause when the join shape requires it
+	// — see fromFilterJoin. Keeping them out of s.wheres also keeps
+	// the rendered clause ordered scoping-last, so a query log shows
+	// the caller's intent and the guard that was added to it apart.
+	ctxFrom  []drops.Expression
+	ctxJoins []drops.Expression
+
+	// resolved marks a builder that resolveCtx has already produced.
+	// Resolution is not idempotent — the FROM table still has its
+	// context filters, so resolving twice binds the tenant twice — and
+	// a resolved statement is reachable a second time whenever it is
+	// embedded in another one, which the per-parent-limit rewrite in
+	// find.go does deliberately.
+	resolved bool
 }
 
 type setOp struct {
@@ -94,6 +113,10 @@ type joinClause struct {
 // dropped (the LEFT JOIN degeneration). There is no third place, so a
 // FULL JOIN carries nothing automatically — see [SelectBuilder.FullJoin]
 // for what that means for each kind of filter.
+//
+// This decides where the *joined* table's predicates go. Where the FROM
+// table's go is the mirror question, and depends on the kinds of every
+// join in the statement rather than on one of them: see fromFilterJoin.
 func (k joinKind) filterPlacement() joinPlacement {
 	switch k {
 	case leftJoin:
@@ -114,29 +137,49 @@ const (
 )
 
 // ErrFullJoinScoped is returned when a SELECT full-joins a table that
-// carries context filters.
+// carries context filters, and when the FROM table of a statement
+// containing a FULL JOIN carries them.
 //
 // A FULL JOIN has nowhere correct to put them — see
 // joinKind.filterPlacement — and a tenant axis or an authz guard names
 // a row-visibility boundary, so the statement is refused rather than
-// sent with the predicate in a place that either leaks the joined
-// table's unmatched rows or drops the FROM table's. Join a pre-filtered
-// subquery (a CTE, or FromExpr over a scoped SELECT), or say Unscoped()
-// and write the predicates at the query where a reviewer can see them.
-var ErrFullJoinScoped = errors.New("drops/pg: a FULL JOIN cannot carry the joined table's context filters")
+// sent with the predicate in a place that either leaks one side's
+// unmatched rows or drops the other's. The two sides fail for mirrored
+// reasons: the joined table's guard leaks in the ON clause, the FROM
+// table's leaks there instead, and each drops the other side's
+// unmatched rows in the WHERE clause. Join a pre-filtered subquery (a
+// CTE, or FromExpr over a scoped SELECT), or say Unscoped() and write
+// the predicates at the query where a reviewer can see them.
+var ErrFullJoinScoped = errors.New("drops/pg: a FULL JOIN cannot carry a table's context filters")
 
 // andWith returns on AND every predicate in extra, for an ON clause
-// that has to carry a joined table's automatic filters. A nil on — a
-// join written with no condition at all — yields the filters alone
-// rather than a dangling AND.
+// that has to carry a table's automatic filters. A nil on — a join
+// written with no condition at all — yields the filters alone rather
+// than a dangling AND.
+//
+// It renders the conjunction through writeAnd rather than through And
+// because an ON clause is a WHERE clause in a different place: a
+// caller-written join condition whose top level is an OR reassociates
+// the guards that follow it exactly as it would in a WHERE clause, and
+// And joins its operands with a bare " AND ". The bracketing is
+// otherwise identical to And's, so an ON clause that was correct before
+// renders unchanged.
 func andWith(on drops.Expression, extra []drops.Expression) drops.Expression {
 	if len(extra) == 0 {
 		return on
 	}
-	if on == nil {
-		return And(extra...)
+	preds := extra
+	if on != nil {
+		preds = append([]drops.Expression{on}, extra...)
 	}
-	return And(append([]drops.Expression{on}, extra...)...)
+	if len(preds) == 1 {
+		return preds[0]
+	}
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteByte('(')
+		writeAnd(b, preds)
+		b.WriteByte(')')
+	})
 }
 
 // From sets the FROM clause. Required before execution.
@@ -220,12 +263,14 @@ func (s *SelectBuilder) LeftJoin(t *Table, on drops.Expression) *SelectBuilder {
 // NULL left side and the predicate never removes it, which for a tenant
 // axis is a leak rather than an over-filter.
 //
-// The FROM table is the nullable side of this join and its own
-// predicates stay in the WHERE clause, so a scoped FROM table narrows a
-// RIGHT JOIN to the rows that matched. That is a shortfall of rows and
-// never rows that should not have been visible; the alternative —
-// moving the FROM table's guard into the ON clause — is the leak.
-// Write such a query as a LEFT JOIN with the tables swapped.
+// The FROM table is the nullable side of this join, so its own
+// predicates go the other way, into this join's ON clause: in the WHERE
+// clause a guard on the FROM table is false for every unmatched row of
+// t — the FROM table's columns are NULL there — and the RIGHT JOIN
+// silently degenerates into an INNER JOIN, dropping exactly the rows of
+// t it exists to keep. That is the LEFT JOIN failure with the sides
+// exchanged, and it is why the FROM table's placement is a function of
+// the whole statement rather than a constant. See fromFilterJoin.
 func (s *SelectBuilder) RightJoin(t *Table, on drops.Expression) *SelectBuilder {
 	s.joins = append(s.joins, joinClause{kind: rightJoin, table: t, on: on})
 	return s
@@ -252,6 +297,13 @@ func (s *SelectBuilder) RightJoin(t *Table, on drops.Expression) *SelectBuilder 
 //     they are left off this one join shape, which means a FULL JOIN can
 //     reach soft-deleted rows of t. That is the documented gap.
 //
+// The FROM table of a statement containing a FULL JOIN is in the same
+// position, for the mirrored reason — the WHERE clause drops t's
+// unmatched rows, the ON clause lets the FROM table's through
+// unfiltered — so its context filters are refused here too, and its
+// DefaultFilters stay in the WHERE clause. See fromFilterJoin for why
+// that trade lands the other way round on the FROM side.
+//
 // To full-join a scoped table, join it pre-filtered: put the scoped
 // SELECT in a CTE (its body is resolved for the ctx, see
 // [SelectBuilder.With]) and full-join that, or hand-write the exact
@@ -264,6 +316,13 @@ func (s *SelectBuilder) FullJoin(t *Table, on drops.Expression) *SelectBuilder {
 }
 
 // Where appends predicates joined by AND.
+//
+// A predicate that does not parenthesise itself is parenthesised here
+// when it would otherwise reassociate the clause — a [drops.Raw] whose
+// top level is an OR, most of all, since AND binds tighter and the
+// automatic predicates around it would end up on the wrong side of it.
+// See writeAnd for the shapes that get brackets and the one that
+// deliberately does not.
 func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
 	s.wheres = append(s.wheres, preds...)
 	return s
@@ -344,14 +403,110 @@ func (s *SelectBuilder) ExceptAll(other *SelectBuilder) *SelectBuilder {
 // WriteSQL renders the SELECT into a Builder. Wrapped in parentheses so
 // the same builder can be embedded as a subquery.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
-	writeCTEs(b, s.ctes, s.recursiveCTE)
+	ctes, recursive := s.hoistCTEs()
+	writeCTEs(b, ctes, recursive)
+	s.writeSetOps(b)
+}
+
+// writeSetOps renders the statement body and its set-operation
+// continuations, without the WITH prefix hoistCTEs has already gathered.
+//
+// An operand is parenthesised when splicing it in bare would let the
+// statement around it take something of the operand's for its own:
+//
+//   - its own set operations, because set operations are
+//     left-associative and flattening changes what the statement means:
+//     A EXCEPT (B UNION C) written out flat is (A EXCEPT B) UNION C,
+//     which returns rows of C that A never contained. Before this the
+//     operand's continuations were not written at all —
+//     A.Union(B.Union(C)) sent A UNION B and C's rows went missing with
+//     no error anywhere.
+//   - its own row bounds, because SQL reads a trailing ORDER BY or
+//     LIMIT as belonging to the whole set operation: A UNION SELECT ...
+//     LIMIT 5 returns five rows of the union rather than all of A and
+//     five of B, which is the shape the caller wrote.
+func (s *SelectBuilder) writeSetOps(b *drops.Builder) {
 	s.writeCore(b)
 	for _, op := range s.setOps {
 		b.WriteByte(' ')
 		b.WriteString(op.kind)
 		b.WriteByte(' ')
-		op.right.writeCore(b)
+		if len(op.right.setOps) == 0 && !op.right.boundsOwnRows() {
+			op.right.writeCore(b)
+			continue
+		}
+		b.WriteByte('(')
+		op.right.writeSetOps(b)
+		b.WriteByte(')')
 	}
+}
+
+// boundsOwnRows reports whether the statement carries row bounds of its
+// own — an ORDER BY, a LIMIT, an OFFSET — which as a set-operation
+// operand have to stay inside parentheses to keep meaning the operand
+// rather than the set operation.
+//
+// The mirror of this is still open and fails loudly rather than
+// quietly: the *left* operand is the statement itself, so its bounds
+// render before the first continuation and PostgreSQL rejects the
+// statement outright. Which of the two readings a chained
+// A.Union(B).Limit(10) means — bound A, or bound the union — is an API
+// question rather than a rendering one, and is not answered here.
+func (s *SelectBuilder) boundsOwnRows() bool {
+	return s.limit != nil || s.offset != nil || len(s.orderBys) > 0
+}
+
+// fromFilterJoin says where the FROM table's own automatic predicates —
+// its DefaultFilters and its resolved ContextFilters — have to be
+// written, and returns the index of the join whose ON clause has to
+// carry them, or -1 for the WHERE clause.
+//
+// It is joinKind.filterPlacement's mirror. That function reasons about
+// the joined table, whose placement depends on its own join's kind;
+// this one reasons about the FROM table, whose placement depends on the
+// kinds of every join in the statement, because it is the FROM table
+// that every one of them joins against.
+//
+// With no joins, or with only INNER and LEFT joins, the FROM table is
+// either the inner side or the preserved one, and the WHERE clause is
+// where its predicates have always belonged. A RIGHT JOIN inverts that:
+// the FROM table becomes the nullable side, and a predicate on a
+// nullable side is false for every unmatched row, so a tenant guard in
+// the WHERE clause deletes exactly the rows of the joined table the
+// RIGHT JOIN exists to keep — the LEFT JOIN degeneration, mirrored, and
+// the reason the LEFT JOIN half of filterPlacement exists at all.
+//
+// The ON clause that carries them is the first RIGHT JOIN's, and it has
+// to be the first one: that is where the FROM table enters the join
+// tree, so restricting it there restricts it before any preserved side
+// is added, and every later join sees the restricted relation. In a
+// later join's ON clause the same predicate would instead be false for
+// the rows an earlier outer join had already NULL-extended, which
+// silently drops them.
+//
+// A FULL JOIN preserves both sides, so neither placement is right for
+// the FROM table either — the ON clause lets its unmatched rows through
+// unfiltered and the WHERE clause drops the full-joined table's. Its
+// context filters are therefore refused in resolveCtx with
+// [ErrFullJoinScoped], the same answer the joined side gets. Its
+// DefaultFilters stay in the WHERE clause: they are a default scope
+// rather than a boundary, and dropping them would let a FULL JOIN read
+// the FROM table's soft-deleted rows, which is worse than the
+// over-filtering they cause. That is the same trade [SelectBuilder.FullJoin]
+// documents for the joined side, decided the other way because the two
+// failures are not the same failure.
+func (s *SelectBuilder) fromFilterJoin() int {
+	return s.firstJoinOfKind(rightJoin)
+}
+
+// firstJoinOfKind returns the index of the first join of kind k, or -1.
+func (s *SelectBuilder) firstJoinOfKind(k joinKind) int {
+	for i, j := range s.joins {
+		if j.kind == k {
+			return i
+		}
+	}
+	return -1
 }
 
 // writeCore renders the SELECT body without any WITH prefix or set-op
@@ -385,12 +540,22 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 			first = false
 		}
 	}
+	// The FROM table's own automatic predicates, and the join whose ON
+	// clause has to carry them — the WHERE clause when there is none.
+	var fromDefaults, fromCtx []drops.Expression
+	fromOn := -1
+	if !s.unscoped {
+		fromDefaults, fromCtx = s.from.resolveDefaultFilters(), s.ctxFrom
+		if len(fromDefaults) > 0 || len(fromCtx) > 0 {
+			fromOn = s.fromFilterJoin()
+		}
+	}
 	// autoWheres are the automatic predicates that belong in the WHERE
 	// clause. The joined tables' are gathered here, as the joins
 	// render, so that the placement decision lives in one place with
 	// its ON-clause half.
 	var autoWheres []drops.Expression
-	for _, j := range s.joins {
+	for i, j := range s.joins {
 		b.WriteByte(' ')
 		b.WriteString(string(j.kind))
 		b.WriteByte(' ')
@@ -405,20 +570,26 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 				autoWheres = append(autoWheres, dfs...)
 			}
 		}
+		if i == fromOn {
+			on = andWith(on, append(append([]drops.Expression(nil), fromDefaults...), fromCtx...))
+		}
 		b.Append(on)
 	}
 	// The FROM table's go in front of them, and the whole lot in front
-	// of the caller's own predicates — which resolveCtx has already
-	// followed with the ones that needed a ctx. So a statement reads
-	// scoping first, intent second, and a query log shows at a glance
-	// whether a query was scoped at all.
-	wheres := s.wheres
-	if !s.unscoped && s.from.hasDefaultFilters() {
-		autoWheres = append(append([]drops.Expression(nil), s.from.resolveDefaultFilters()...), autoWheres...)
+	// of the caller's own predicates — which the resolved context
+	// filters then follow. So a statement reads scoping first, intent
+	// second, and a query log shows at a glance whether a query was
+	// scoped at all.
+	if fromOn < 0 {
+		autoWheres = append(append([]drops.Expression(nil), fromDefaults...), autoWheres...)
 	}
-	if len(autoWheres) > 0 {
-		wheres = append(autoWheres, wheres...)
+	wheres := make([]drops.Expression, 0, len(autoWheres)+len(s.wheres)+len(fromCtx)+len(s.ctxJoins))
+	wheres = append(wheres, autoWheres...)
+	wheres = append(wheres, s.wheres...)
+	if fromOn < 0 {
+		wheres = append(wheres, fromCtx...)
 	}
+	wheres = append(wheres, s.ctxJoins...)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)
@@ -481,8 +652,8 @@ func (s *SelectBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 }
 
 // resolveCtx returns the builder to render for one execution: this one
-// when the FROM table has no context filters, otherwise a shallow copy
-// whose WHERE list carries the resolved predicates.
+// when there was nothing to resolve, otherwise a shallow copy carrying
+// the resolved predicates and the resolved subqueries.
 //
 // The copy is what keeps a builder reusable. Appending the resolved
 // predicates to s.wheres would make the second execution of the same
@@ -495,32 +666,86 @@ func (s *SelectBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 // in tenant.go is about statements rather than about clauses. A set
 // operation's operands each carry their own FROM table. A joined table
 // carries its own filters into the clause its join kind allows — see
-// joinKind.filterPlacement. A CTE whose body is a *SelectBuilder is
-// resolved as the statement it is, so that
+// joinKind.filterPlacement — and the FROM table's own placement depends
+// on the join kinds present, see fromFilterJoin. A CTE whose body is a
+// *SelectBuilder is resolved as the statement it is, so that
 // WITH recent AS (SELECT ... FROM posts) is scoped the way a bare
-// SELECT from posts would be; a CTE built from a raw drops.Expression
-// cannot be, and stays the caller's to scope.
+// SELECT from posts would be; so is a statement reached as a subquery
+// expression — EXISTS, ANY, a scalar subquery, an aliased FROM source —
+// through the same walk, see resolveExpr.
 //
-// What is still not resolved is a SELECT reached as a subquery
-// expression, since it is rendered by WriteSQL from inside another
-// statement with no ctx in hand. Resolve such a builder yourself — the
-// per-parent-limit rewrite in find.go does exactly that — before
-// embedding it. [SelectBuilder.AsSubquery] says so at the call site.
+// A body drops did not build cannot be: a CTE or a subquery assembled
+// out of raw fragments has nothing to resolve against and stays the
+// caller's to scope. [CTEDef] and [Exists] say so at the call site.
+//
+// Unscoped() does not reach into any of those: a CTE body and a
+// subquery are statements of their own and keep their own scoping,
+// which is also how to unscope one relation of a query and no other.
 func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) {
-	var preds []drops.Expression
+	// Resolution is not idempotent, and a resolved statement is reachable
+	// twice whenever it is embedded in another one — find.go builds the
+	// per-parent-limit rewrite that way. Resolving it again would bind
+	// the tenant a second time, which changes no rows and shows up only
+	// in the argument list.
+	if s.resolved {
+		return s, nil
+	}
+	cp := *s
+	changed := false
+
 	if !s.unscoped && s.from.hasContextFilters() {
-		var err error
-		preds, err = s.from.resolveContextFilters(ctx)
+		if i := s.firstJoinOfKind(fullJoin); i >= 0 {
+			return nil, fmt.Errorf("drops/pg: %w: %q is FULL JOINed to the scoped FROM table %q; join a pre-filtered subquery, or say Unscoped",
+				ErrFullJoinScoped, s.joins[i].table.Name(), s.from.Name())
+		}
+		preds, err := s.from.resolveContextFilters(ctx)
 		if err != nil {
 			return nil, err
+		}
+		if len(preds) > 0 {
+			cp.ctxFrom, changed = preds, true
 		}
 	}
 	joins, joinPreds, err := s.resolveJoins(ctx)
 	if err != nil {
 		return nil, err
 	}
-	preds = append(preds, joinPreds...)
-	var ops []setOp
+	if len(joinPreds) > 0 {
+		cp.ctxJoins, changed = joinPreds, true
+	}
+	joins, err = s.resolveJoinOns(ctx, joins)
+	if err != nil {
+		return nil, err
+	}
+	if joins != nil {
+		cp.joins, changed = joins, true
+	}
+
+	// Every expression list the statement carries, because a subquery is
+	// a statement wherever it is written: a predicate, a select-list
+	// scalar, a FROM source, a GROUP BY or ORDER BY term.
+	lists := []struct {
+		src []drops.Expression
+		dst *[]drops.Expression
+	}{
+		{s.columns, &cp.columns},
+		{s.fromExprs, &cp.fromExprs},
+		{s.wheres, &cp.wheres},
+		{s.groupBys, &cp.groupBys},
+		{s.havings, &cp.havings},
+		{s.orderBys, &cp.orderBys},
+	}
+	for _, l := range lists {
+		resolved, err := resolveExprs(ctx, l.src)
+		if err != nil {
+			return nil, err
+		}
+		if resolved != nil {
+			*l.dst, changed = resolved, true
+		}
+	}
+
+	opsCopied := false
 	for i, op := range s.setOps {
 		right, err := op.right.resolveCtx(ctx)
 		if err != nil {
@@ -529,32 +754,105 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 		if right == op.right {
 			continue
 		}
-		if ops == nil {
-			ops = append([]setOp(nil), s.setOps...)
+		if !opsCopied {
+			cp.setOps, opsCopied, changed = append([]setOp(nil), s.setOps...), true, true
 		}
-		ops[i].right = right
+		cp.setOps[i].right = right
 	}
+
 	ctes, err := resolveCTEs(ctx, s.ctes)
 	if err != nil {
 		return nil, err
 	}
-	if len(preds) == 0 && ops == nil && ctes == nil && joins == nil {
-		return s, nil
-	}
-	cp := *s
-	if len(preds) > 0 {
-		cp.wheres = append(append([]drops.Expression(nil), s.wheres...), preds...)
-	}
-	if ops != nil {
-		cp.setOps = ops
-	}
 	if ctes != nil {
-		cp.ctes = ctes
+		cp.ctes, changed = ctes, true
 	}
-	if joins != nil {
-		cp.joins = joins
+
+	out := s
+	if changed {
+		cp.resolved = true
+		out = &cp
 	}
-	return &cp, nil
+	if err := out.checkCTENames(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// subqueryResolver is implemented by the expressions this package wraps
+// around another statement. It is unexported on purpose: an expression
+// a caller assembled themselves cannot implement it, which is the
+// honest statement of what drops can and cannot reach into.
+type subqueryResolver interface {
+	resolveSubqueries(ctx context.Context) (drops.Expression, bool, error)
+}
+
+// resolveExpr resolves the statements reachable from e against ctx,
+// returning the expression to render and whether it differs from e.
+//
+// It reports the change rather than leaving the caller to compare,
+// because an Expression is not reliably comparable: the closures this
+// package and its callers build are func values, and == on two of those
+// panics at run time.
+func resolveExpr(ctx context.Context, e drops.Expression) (drops.Expression, bool, error) {
+	switch v := e.(type) {
+	case nil:
+		return nil, false, nil
+	case *SelectBuilder:
+		r, err := v.resolveCtx(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		return r, r != v, nil
+	case subqueryResolver:
+		return v.resolveSubqueries(ctx)
+	}
+	return e, false, nil
+}
+
+// resolveExprs resolves every expression in list, returning a rebuilt
+// slice — or nil when nothing needed resolving, so the caller can keep
+// the slice it already had.
+func resolveExprs(ctx context.Context, list []drops.Expression) ([]drops.Expression, error) {
+	var out []drops.Expression
+	for i, e := range list {
+		resolved, changed, err := resolveExpr(ctx, e)
+		if err != nil {
+			return nil, err
+		}
+		if !changed {
+			continue
+		}
+		if out == nil {
+			out = append([]drops.Expression(nil), list...)
+		}
+		out[i] = resolved
+	}
+	return out, nil
+}
+
+// resolveJoinOns resolves the statements reachable from each join's ON
+// condition — a join written against an EXISTS over a scoped table is
+// as much a statement as one written in a WHERE clause.
+//
+// It appends to the list resolveJoins may already have copied rather
+// than copying a second one, so the two resolutions compose into one
+// join list.
+func (s *SelectBuilder) resolveJoinOns(ctx context.Context, joins []joinClause) ([]joinClause, error) {
+	for i, j := range s.joins {
+		resolved, changed, err := resolveExpr(ctx, j.on)
+		if err != nil {
+			return nil, err
+		}
+		if !changed {
+			continue
+		}
+		if joins == nil {
+			joins = append([]joinClause(nil), s.joins...)
+		}
+		joins[i].on = resolved
+	}
+	return joins, nil
 }
 
 // resolveJoins resolves the context filters of every joined table.
@@ -668,27 +966,177 @@ func (s *SelectBuilder) Count(ctx context.Context) (int64, error) {
 
 // writeAnd writes a list of predicates joined by AND, without the outer
 // parentheses Or/And would emit when used as a sub-expression.
+//
+// A conjunct is parenthesised when, and only when, leaving it bare
+// would let it bind something other than itself — see escapesConjunct.
+// The alternative designs are worth writing down, because the obvious
+// one is wrong:
+//
+//   - Bare " AND " between every predicate, which is what this did, is
+//     fail-open in the one feature sold as fail-closed. OR binds looser
+//     than AND, so a predicate whose own top level is an OR
+//     reassociates the whole clause:
+//     "(deletedAt IS NULL) AND a = 1 OR b = 2 AND (tenantId = $1)"
+//     parses as "(D AND a) OR (b AND T)" and returns every row matching
+//     the first half for every tenant. The guard is in the statement,
+//     which is exactly why a review that looks for the predicate finds
+//     it and passes.
+//   - Parenthesising every conjunct unconditionally is correct, but
+//     nearly every predicate this package builds already renders as one
+//     bracketed group — Eq gives ("users"."id" = $1) — so it would
+//     double the parentheses in every statement drops has ever
+//     generated, and make every query log worse forever, to defend
+//     against the one predicate shape that does not self-parenthesise.
+//   - Documenting that a raw predicate must parenthesise itself puts the
+//     burden on the caller least able to know about it, and is the
+//     default that produced this defect.
+//
+// So the conjunct is rendered once to see what it looks like and
+// bracketed only if its shape can reach outside itself. That costs one
+// extra render of each predicate of a multi-predicate clause — the
+// price of a guarantee that does not depend on the caller.
 func writeAnd(b *drops.Builder, preds []drops.Expression) {
+	// A lone conjunct is the whole clause: there is nothing on either
+	// side of it to reassociate, so it is written as the caller wrote it.
+	bracket := len(preds) > 1
 	for i, p := range preds {
 		if i > 0 {
 			b.WriteString(" AND ")
+		}
+		if bracket && escapesConjunct(p) {
+			b.WriteByte('(')
+			b.Append(p)
+			b.WriteByte(')')
+			continue
 		}
 		b.Append(p)
 	}
 }
 
+// escapesConjunct reports whether p, written bare between two " AND "s,
+// could reach past its own position in the clause.
+//
+// Three shapes can, and all three end with a scoping predicate that is
+// present in the SQL and binding nothing:
+//
+//   - a top-level OR, which binds looser than AND and so takes the
+//     conjuncts on either side with it;
+//   - a line or block comment, which swallows whatever follows it —
+//     "a = 1 --" drops every later conjunct, tenant guard included;
+//   - a statement terminator, which ends the statement early and leaves
+//     the guard in a second one nobody executes.
+//
+// The check is on p's rendered text because that is the only thing
+// that can be checked: a predicate arrives as an opaque Expression, and
+// the ones that need bracketing are precisely the ones drops did not
+// build — a [drops.Raw], a caller's own [drops.ExprFunc].
+//
+// A fragment whose parentheses do not balance is the one shape reported
+// as safe without being read, on purpose. It is not an expression, so
+// bracketing cannot repair it — and for the shape that matters,
+// "a = 1) OR (1 = 1", bracketing would close the injected parenthesis
+// and turn a statement PostgreSQL refuses into a working, unscoped OR.
+// Left alone it stays a syntax error, which is the fail-closed answer.
+func escapesConjunct(p drops.Expression) bool {
+	if p == nil {
+		return false
+	}
+	sql, _ := drops.String(p)
+	depth := 0
+	loose := false
+	for i := 0; i < len(sql); i++ {
+		switch c := sql[i]; c {
+		case '\'', '"':
+			// A string literal or a quoted identifier: its content is
+			// text, so a parenthesis or an OR inside it is neither
+			// structure nor an operator. The quote character doubled
+			// inside the literal escapes itself.
+			for i++; i < len(sql); i++ {
+				if sql[i] != c {
+					continue
+				}
+				if i+1 < len(sql) && sql[i+1] == c {
+					i++
+					continue
+				}
+				break
+			}
+			if i >= len(sql) {
+				// The fragment ends inside the literal, so it could
+				// not be read as an expression and nothing about it
+				// has been verified. Bracketing is the safe answer:
+				// the statement is a syntax error either way, and the
+				// alternative is to trust text nobody parsed.
+				return true
+			}
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		case '-':
+			if i+1 < len(sql) && sql[i+1] == '-' {
+				return true
+			}
+		case '/':
+			if i+1 < len(sql) && sql[i+1] == '*' {
+				return true
+			}
+		case ';':
+			return true
+		case 'o', 'O':
+			if depth == 0 && wordAt(sql, i, "OR") {
+				loose = true
+				i++
+			}
+		}
+	}
+	return loose && depth == 0
+}
+
+// wordAt reports whether the ASCII keyword word (given upper-case)
+// starts at sql[i] and stands alone, rather than being part of a longer
+// identifier — "OR" is an operator, the OR in "FOR" and in "ORDER" is
+// not.
+func wordAt(sql string, i int, word string) bool {
+	if i+len(word) > len(sql) {
+		return false
+	}
+	for j := 0; j < len(word); j++ {
+		c := sql[i+j]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != word[j] {
+			return false
+		}
+	}
+	return !identByte(sql, i-1) && !identByte(sql, i+len(word))
+}
+
+// identByte reports whether sql[i] can appear inside an SQL identifier.
+// An index outside the string is not one, which makes a keyword at
+// either end of the fragment stand alone.
+func identByte(sql string, i int) bool {
+	if i < 0 || i >= len(sql) {
+		return false
+	}
+	c := sql[i]
+	return c == '_' || c == '$' || (c >= '0' && c <= '9') ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
+}
+
 // AsSubquery returns a parenthesised, aliased form of the SELECT for use
 // as a subquery in another statement.
 //
-// The result is an Expression, so it renders through WriteSQL and
-// carries the FROM table's DefaultFilters but not its context filters —
-// nothing hands a ctx to an expression. Resolve the inner builder
-// first when it selects from a table with context filters.
+// The result keeps this builder rather than closing over it, so a
+// statement that embeds it resolves it against the executing ctx like
+// any other subquery — see subExpr. Rendered through [SelectBuilder.ToSQL],
+// where there is no ctx to resolve against, it still carries the FROM
+// table's DefaultFilters and none of its context filters; that is what
+// ToSQL means and why ToSQLCtx is the call to assert on.
 func (s *SelectBuilder) AsSubquery(alias string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		s.WriteSQL(b)
-		b.WriteString(") AS ")
-		b.WriteIdent(alias)
-	})
+	return &subExpr{open: "(", inner: s, close: ")", alias: alias}
 }

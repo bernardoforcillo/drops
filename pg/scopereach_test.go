@@ -184,14 +184,22 @@ func TestJoinedTableCarriesItsFilters(t *testing.T) {
 				`WHERE ("j_users"."deletedAt" IS NULL) AND ("j_users"."tenantId" = $2)`,
 		},
 		{
-			// The joined side is the preserved one, so the predicates
+			// The joined side is the preserved one, so its predicates
 			// go back into the WHERE clause — in the ON clause an
 			// unmatched row of another tenant would survive the join.
+			//
+			// The FROM table's own move the other way, and this
+			// expectation used to say they did not: with them in the
+			// WHERE clause, "j_users"."tenantId" is NULL for every
+			// unmatched "j_posts" row and the RIGHT JOIN degenerates
+			// into an INNER JOIN — the LEFT JOIN failure mirrored, on
+			// the side round 2 did not look at. See fromFilterJoin.
 			name: "right join filters in the WHERE clause",
 			join: func(s *pg.SelectBuilder) *pg.SelectBuilder { return s.RightJoin(posts, on) },
-			want: `SELECT * FROM "j_users" RIGHT JOIN "j_posts" ON ("j_users"."id" = "j_posts"."id") ` +
-				`WHERE ("j_users"."deletedAt" IS NULL) AND ("j_posts"."deletedAt" IS NULL) ` +
-				`AND ("j_users"."tenantId" = $1) AND ("j_posts"."tenantId" = $2)`,
+			want: `SELECT * FROM "j_users" RIGHT JOIN "j_posts" ` +
+				`ON (("j_users"."id" = "j_posts"."id") AND ("j_users"."deletedAt" IS NULL) ` +
+				`AND ("j_users"."tenantId" = $1)) ` +
+				`WHERE ("j_posts"."deletedAt" IS NULL) AND ("j_posts"."tenantId" = $2)`,
 		},
 	}
 	for _, tc := range tests {

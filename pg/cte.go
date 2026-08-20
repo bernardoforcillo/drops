@@ -2,6 +2,8 @@ package pg
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -10,11 +12,39 @@ import (
 // SelectBuilder via With / WithRecursive and rendered as the WITH
 // clause prefix when the query is built.
 
+// ErrCTENameConflict is returned when one statement would declare two
+// different CTEs under the same name.
+//
+// A statement gets one WITH clause, so the CTEs of a set operation's
+// operands are hoisted into the leading one — see
+// SelectBuilder.hoistCTEs. Two bodies with one name cannot both be
+// declared there, and picking either would silently answer the other
+// operand with a relation it did not ask for, so the statement is
+// refused. Rename one, or select from a subquery instead of a CTE.
+var ErrCTENameConflict = errors.New("drops/pg: two CTEs in one statement share a name")
+
 // CTE describes one common table expression.
 type CTE struct {
 	name    string
 	columns []string // optional explicit column list
 	query   drops.Expression
+
+	// origin is the CTE this one was copied from when its body was
+	// resolved for a ctx, and nil for a CTE the caller built. It is
+	// what makes one CTE attached to both operands of a set operation
+	// one declaration after resolution rather than two that collide:
+	// resolution copies, so the pointers differ by then and only the
+	// origin still says they are the same definition.
+	origin *CTE
+}
+
+// identity returns the value a CTE was defined as — itself, unless it
+// is a resolved copy.
+func (c *CTE) identity() *CTE {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
 }
 
 // CTEDef returns a CTE definition with optional column aliasing.
@@ -32,8 +62,8 @@ type CTE struct {
 // A CTE built from any other drops.Expression — a Raw fragment, a
 // hand-assembled expression, an INSERT ... RETURNING — cannot be: there
 // is no ctx inside WriteSQL and nothing to resolve against. Its
-// filtering is the caller's, exactly as with
-// [SelectBuilder.AsSubquery].
+// filtering is the caller's, exactly as with a subquery body drops did
+// not build — see [Exists].
 func CTEDef(name string, query drops.Expression, columns ...string) *CTE {
 	return &CTE{name: name, columns: columns, query: query}
 }
@@ -109,6 +139,7 @@ func resolveCTEs(ctx context.Context, ctes []*CTE) ([]*CTE, error) {
 		}
 		cp := *c
 		cp.query = resolved
+		cp.origin = c.identity()
 		out[i] = &cp
 	}
 	return out, nil
@@ -143,4 +174,67 @@ func writeCTEs(b *drops.Builder, ctes []*CTE, recursive bool) {
 		b.WriteByte(')')
 	}
 	b.WriteByte(' ')
+}
+
+// hoistCTEs returns the CTEs the statement declares, gathered from every
+// set-operation operand into the one WITH clause SQL allows a statement,
+// and whether any of them asked for RECURSIVE.
+//
+// The operands' CTEs used to be dropped: WriteSQL rendered a right
+// operand through writeCore, which writes no WITH prefix, so a union
+// whose right operand selected from its own CTE was sent referring to a
+// relation the statement no longer declared — 42P01, undefined table.
+// Hoisting widens where such a CTE is visible and nothing else, which
+// is why it is safe to do; declaring the same name twice would not be,
+// so checkCTENames refuses that.
+//
+// The same CTE value attached to more than one operand is hoisted once.
+// Deduplication is by identity rather than by name so that it stays a
+// deduplication and never quietly resolves a genuine conflict.
+func (s *SelectBuilder) hoistCTEs() ([]*CTE, bool) {
+	if len(s.setOps) == 0 {
+		return s.ctes, s.recursiveCTE
+	}
+	out := append([]*CTE(nil), s.ctes...)
+	recursive := s.recursiveCTE
+	for _, op := range s.setOps {
+		operand, operandRecursive := op.right.hoistCTEs()
+		recursive = recursive || operandRecursive
+		for _, c := range operand {
+			if containsCTE(out, c) {
+				continue
+			}
+			out = append(out, c)
+		}
+	}
+	return out, recursive
+}
+
+// containsCTE reports whether list already declares c.
+func containsCTE(list []*CTE, c *CTE) bool {
+	for _, x := range list {
+		if x.identity() == c.identity() {
+			return true
+		}
+	}
+	return false
+}
+
+// checkCTENames refuses a statement whose single WITH clause would
+// declare one name twice. It is checked at resolution rather than at
+// render because rendering cannot return an error, and resolution is
+// the step every executor goes through.
+func (s *SelectBuilder) checkCTENames() error {
+	ctes, _ := s.hoistCTEs()
+	if len(ctes) < 2 {
+		return nil
+	}
+	seen := make(map[string]*CTE, len(ctes))
+	for _, c := range ctes {
+		if prev, ok := seen[c.name]; ok && prev.identity() != c.identity() {
+			return fmt.Errorf("drops/pg: %w: %q", ErrCTENameConflict, c.name)
+		}
+		seen[c.name] = c
+	}
+	return nil
 }

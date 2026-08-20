@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -507,5 +508,91 @@ func TestScanRefusesIntegerToString(t *testing.T) {
 	var got struct{ Name string }
 	if err := drops.ScanOne(rows, &got); err == nil {
 		t.Errorf("ScanOne got = nil (Name = %q), want a conversion error", got.Name)
+	}
+}
+
+// An answerer replies by statement, which is what introspection-driven
+// code needs: the order of the catalogue reads belongs to the subject,
+// not to the test, so a queue cannot describe them.
+func TestAnswerRepliesByStatement(t *testing.T) {
+	ctx := context.Background()
+	drv := dropstest.New().Answer(func(sql string, _ []any) ([]string, [][]any, bool) {
+		if strings.Contains(sql, "pg_class") {
+			return []string{"relname", "reltuples"}, [][]any{{"users", int64(12)}}, true
+		}
+		return nil, nil, false
+	})
+
+	tests := []struct {
+		name string
+		sql  string
+		want [][]any
+	}{
+		{
+			name: "the statement the answerer claims",
+			sql:  `SELECT c.relname, c.reltuples FROM pg_class c`,
+			want: [][]any{{"users", int64(12)}},
+		},
+		{
+			name: "a statement it does not",
+			sql:  `SELECT "id" FROM "users"`,
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows, err := drv.Query(ctx, tt.sql)
+			if err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			defer rows.Close()
+			var got [][]any
+			for rows.Next() {
+				var name string
+				var est int64
+				if err := rows.Scan(&name, &est); err != nil {
+					t.Fatalf("Scan: %v", err)
+				}
+				got = append(got, []any{name, est})
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The two ways of answering compose: the answerer takes the catalogue
+// read and leaves the queue for the query under test, which is the
+// arrangement a push or migrate test wants.
+func TestAnswerLeavesTheQueueToTheStatementsItDeclines(t *testing.T) {
+	ctx := context.Background()
+	drv := dropstest.New().
+		Rows([]string{"id"}, []any{int64(1)}).
+		Answer(func(sql string, _ []any) ([]string, [][]any, bool) {
+			if strings.Contains(sql, "information_schema") {
+				return []string{"table_name"}, [][]any{{"users"}}, true
+			}
+			return nil, nil, false
+		})
+
+	// The catalogue read must not consume the queued set.
+	rows, err := drv.Query(ctx, `SELECT table_name FROM information_schema.tables`)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	rows.Close()
+
+	rows, err = drv.Query(ctx, `SELECT "id" FROM "users"`)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close()
+	var got []int64
+	if err := drops.ScanAll(rows, &got); err != nil {
+		t.Fatalf("ScanAll: %v", err)
+	}
+	if want := []int64{1}; !reflect.DeepEqual(got, want) {
+		t.Errorf("got = %v, want %v", got, want)
 	}
 }

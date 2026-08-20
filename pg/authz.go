@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"reflect"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -248,18 +249,71 @@ func (g allGuard) Predicate(ctx context.Context) (drops.Expression, error) {
 // to every statement against the table, including a raw
 // db.Select().From(t) and every relation edge that lands on it, and a
 // ctx with no subject makes those fail with ErrSubjectMissing instead
-// of returning rows. Two entities over one table each install their own
-// guard and both are AND-ed, since the conservative reading of "these
-// rows are guarded twice" is the one that cannot leak. An entity that
-// must see everything asks with Unscoped().
+// of returning rows. An entity that must see everything asks with
+// Unscoped().
+//
+// # Two entities over one table
+//
+// A guard is registered under a key built from the entity's row type
+// (see rowScopeFilterKey), and registering under a key that is already
+// taken REPLACES what is there. So two entities over one table compose
+// or collide depending on their row types, and the rule is worth
+// knowing before it decides something:
+//
+//   - Entity[User] and Entity[UserWrite] over "users" hold two keys, so
+//     both guards apply and the rows are visible only to a subject both
+//     of them admit.
+//   - Two Entity[User] values over "users" — the ordinary shape where a
+//     read path and a write path each build their own — hold one key,
+//     and the second AuthorizeWith silently replaces the first's guard.
+//
+// The second is not the conservative outcome, and calling it one would
+// be worse than the behaviour: a reader who believed the two guards
+// were AND-ed would read a narrowing that is not there. The key cannot
+// be made finer without making it too fine — an entity built inside a
+// request handler is a shape ScopeByTenant and AuthorizeWith both
+// document as supported, and keying on anything per-value would stack
+// one guard per request onto a shared table, growing the WHERE clause
+// without bound. Two guards that must both hold go into one
+// AuthorizeWith with AllOf, which says so at the call site.
 func (e *Entity[T]) AuthorizeWith(g Guard) *Entity[T] {
 	e.guard = g
 	// Registered even for a nil g: the closure reads e.guard when it
 	// runs, so clearing a guard clears the predicate, and re-registering
 	// under the same key keeps an entity rebuilt per request from
 	// stacking one filter per construction.
-	e.table.setContextFilter(e.rowScopeKey("guard"), e.guardPredicate)
+	e.table.setContextFilter(rowScopeFilterKey(e.rowType, "guard"), e.guardPredicate)
 	return e
+}
+
+// rowScopeFilterKey names the context filter an entity registers on its
+// table for kind ("tenant" or "guard").
+//
+// The row type is in the key so that two entities over one table with
+// different row types each keep their own filter, while the same entity
+// declared twice — or rebuilt inside a request handler, which is a
+// documented shape — replaces its own rather than stacking a copy per
+// call. What the key cannot do is separate two entities of the *same*
+// row type: registering replaces, and [Entity.AuthorizeWith] says what
+// that costs.
+//
+// The type is spelled with its full import path rather than through
+// reflect.Type.String, which prints the short package name. Two User
+// types from two packages both ending in "app" are "app.User" to
+// String, so they would share one key and one of the two guards would
+// vanish — a row-visibility filter lost to a package-name collision,
+// which is not a failure anybody would think to look for. PkgPath plus
+// Name costs a string concatenation at declaration time. A type with no
+// name — an anonymous struct, which is legal as an entity's row type in
+// a test — has no path either, so those fall back to String.
+func rowScopeFilterKey(rowType reflect.Type, kind string) string {
+	if rowType == nil {
+		return kind + ":"
+	}
+	if rowType.Name() == "" || rowType.PkgPath() == "" {
+		return kind + ":" + rowType.String()
+	}
+	return kind + ":" + rowType.PkgPath() + "." + rowType.Name()
 }
 
 // guardPredicate resolves the active guard's predicate. Returns

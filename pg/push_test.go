@@ -2,12 +2,12 @@ package pg_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/dropstest"
 	"github.com/bernardoforcillo/drops/pg"
 )
 
@@ -42,20 +42,27 @@ func sharedDatabase() []liveTable {
 	}
 }
 
-// pushFake answers the introspection queries for tables, the row
+// pushDriver answers the introspection queries for tables, the row
 // estimate query from estimates, and the emptiness probe from empty.
 // A table missing from estimates is one PostgreSQL has never analysed,
 // which is what reltuples = -1 means and what sends Push to the probe.
-func pushFake(tables []liveTable, estimates map[string]int64, empty map[string]bool) *fakeDriver {
-	return &fakeDriver{handler: func(q string, _ []any) (drops.Rows, error) {
+//
+// It answers by statement rather than by position, because the order
+// of Push's catalogue reads is Push's business: it grew a row-estimate
+// query and an emptiness probe in this phase alone, and a queue of
+// result sets would have had to be rewritten for each. That is what
+// [dropstest.Driver.Answer] is for, and it is why this file no longer
+// carries a driver of its own.
+func pushDriver(tables []liveTable, estimates map[string]int64, empty map[string]bool) *dropstest.Driver {
+	return dropstest.New().Answer(func(q string, _ []any) ([]string, [][]any, bool) {
 		switch {
 		case strings.Contains(q, "SELECT EXISTS"):
 			for name, isEmpty := range empty {
 				if strings.Contains(q, `"`+name+`"`) {
-					return &fakeRows{cols: []string{"exists"}, data: [][]any{{!isEmpty}}}, nil
+					return []string{"exists"}, [][]any{{!isEmpty}}, true
 				}
 			}
-			return &fakeRows{cols: []string{"exists"}, data: [][]any{{true}}}, nil
+			return []string{"exists"}, [][]any{{true}}, true
 		case strings.Contains(q, "reltuples"):
 			data := [][]any{}
 			for _, t := range tables {
@@ -65,13 +72,13 @@ func pushFake(tables []liveTable, estimates map[string]int64, empty map[string]b
 				}
 				data = append(data, []any{t.name, est})
 			}
-			return &fakeRows{cols: []string{"relname", "reltuples"}, data: data}, nil
+			return []string{"relname", "reltuples"}, data, true
 		case strings.Contains(q, "information_schema.tables"):
 			data := [][]any{}
 			for _, t := range tables {
 				data = append(data, []any{"public", t.name})
 			}
-			return &fakeRows{cols: []string{"table_schema", "table_name"}, data: data}, nil
+			return []string{"table_schema", "table_name"}, data, true
 		case strings.Contains(q, "information_schema.columns"):
 			data := [][]any{}
 			for _, t := range tables {
@@ -80,36 +87,34 @@ func pushFake(tables []liveTable, estimates map[string]int64, empty map[string]b
 					if c.notNull {
 						nullable = "NO"
 					}
-					def := sql.NullString{}
-					prec, scale := sql.NullInt64{}, sql.NullInt64{}
+					var def, prec, scale any
 					if c.sequence {
-						def = sql.NullString{String: "nextval('" + t.name + "_id_seq'::regclass)", Valid: true}
-						prec = sql.NullInt64{Int64: 64, Valid: true}
-						scale = sql.NullInt64{Int64: 0, Valid: true}
+						def = "nextval('" + t.name + "_id_seq'::regclass)"
+						prec, scale = int64(64), int64(0)
 					}
 					data = append(data, []any{
 						"public", t.name, c.name, c.udt,
-						sql.NullInt64{}, prec, scale, nullable, def,
+						nil, prec, scale, nullable, def,
 					})
 				}
 			}
-			return &fakeRows{cols: []string{
+			return []string{
 				"table_schema", "table_name", "column_name",
 				"udt_name", "character_maximum_length",
 				"numeric_precision", "numeric_scale",
 				"is_nullable", "column_default",
-			}, data: data}, nil
+			}, data, true
 		case strings.Contains(q, "PRIMARY KEY"):
 			data := [][]any{}
 			for _, t := range tables {
 				data = append(data, []any{"public", t.name, t.name + "_pkey", "id"})
 			}
-			return &fakeRows{cols: []string{
+			return []string{
 				"table_schema", "table_name", "constraint_name", "column_name",
-			}, data: data}, nil
+			}, data, true
 		}
-		return &fakeRows{}, nil
-	}}
+		return nil, nil, false
+	})
 }
 
 // usersSchema is the Go schema under test: the users table alone, so
@@ -131,9 +136,9 @@ func usersSchema(withEmail, retypeAmount bool) *pg.Schema {
 
 // appliedDDL returns the schema statements the driver was asked to run,
 // so a test can prove a withheld statement never reached the server.
-func appliedDDL(fd *fakeDriver) []string {
+func appliedDDL(drv *dropstest.Driver) []string {
 	var out []string
-	for _, q := range fd.queries {
+	for _, q := range drv.SQL() {
 		t := strings.TrimSpace(q)
 		if strings.HasPrefix(t, "DROP TABLE") || strings.HasPrefix(t, "ALTER TABLE") ||
 			strings.HasPrefix(t, "CREATE TABLE") {
@@ -144,8 +149,8 @@ func appliedDDL(fd *fakeDriver) []string {
 }
 
 func TestPushLeavesUndeclaredTablesAlone(t *testing.T) {
-	fd := pushFake(sharedDatabase(), map[string]int64{"users": 0, "audit_log": 0}, nil)
-	db := pg.New(fd)
+	drv := pushDriver(sharedDatabase(), map[string]int64{"users": 0, "audit_log": 0}, nil)
+	db := pg.New(drv)
 
 	res, err := pg.Push(context.Background(), db, usersSchema(true, false))
 	if err != nil {
@@ -154,7 +159,7 @@ func TestPushLeavesUndeclaredTablesAlone(t *testing.T) {
 	if len(res.Statements) != 0 {
 		t.Errorf("Statements = %v, want none — audit_log is not drops's to drop", res.Statements)
 	}
-	if got := appliedDDL(fd); len(got) != 0 {
+	if got := appliedDDL(drv); len(got) != 0 {
 		t.Errorf("executed = %v, want nothing executed", got)
 	}
 	var notice pg.SchemaNotice
@@ -172,8 +177,8 @@ func TestPushLeavesUndeclaredTablesAlone(t *testing.T) {
 }
 
 func TestPushDropsUndeclaredTableWhenAskedAndItIsEmpty(t *testing.T) {
-	fd := pushFake(sharedDatabase(), map[string]int64{"users": 0, "audit_log": 0}, nil)
-	db := pg.New(fd)
+	drv := pushDriver(sharedDatabase(), map[string]int64{"users": 0, "audit_log": 0}, nil)
+	db := pg.New(drv)
 
 	res, err := pg.Push(context.Background(), db, usersSchema(true, false),
 		pg.PushOptions{DropUnmanagedTables: true})
@@ -242,8 +247,8 @@ func TestPushWithholdsDestructiveChangesToTablesWithRows(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fd := pushFake(sharedDatabase(), tc.estimates, tc.empty)
-			db := pg.New(fd)
+			drv := pushDriver(sharedDatabase(), tc.estimates, tc.empty)
+			db := pg.New(drv)
 
 			res, err := pg.Push(context.Background(), db, tc.schema, tc.opts)
 			if !errors.Is(err, pg.ErrDestructivePush) {
@@ -271,7 +276,7 @@ func TestPushWithholdsDestructiveChangesToTablesWithRows(t *testing.T) {
 			if got.SQL == "" || got.Suggestion == "" {
 				t.Errorf("DataLoss = %+v, want the withheld SQL and a way to allow it", got)
 			}
-			if ddl := appliedDDL(fd); len(ddl) != 0 {
+			if ddl := appliedDDL(drv); len(ddl) != 0 {
 				t.Errorf("executed = %v, want nothing executed", ddl)
 			}
 		})
@@ -302,8 +307,8 @@ func TestPushAppliesDestructiveChangeThatWasNamed(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fd := pushFake(sharedDatabase(), map[string]int64{"users": 12, "audit_log": 0}, nil)
-			db := pg.New(fd)
+			drv := pushDriver(sharedDatabase(), map[string]int64{"users": 12, "audit_log": 0}, nil)
+			db := pg.New(drv)
 
 			res, err := pg.Push(context.Background(), db, usersSchema(false, false),
 				pg.PushOptions{Allow: tc.allow})
@@ -327,8 +332,8 @@ func TestPushDropsFromANeverAnalysedTableThatIsEmpty(t *testing.T) {
 	// The development loop: a table pushed a minute ago has no
 	// statistics yet, so the estimate is -1 and only the probe can say
 	// that there is nothing in it.
-	fd := pushFake(sharedDatabase(), map[string]int64{}, map[string]bool{"users": true, "audit_log": true})
-	db := pg.New(fd)
+	drv := pushDriver(sharedDatabase(), map[string]int64{}, map[string]bool{"users": true, "audit_log": true})
+	db := pg.New(drv)
 
 	res, err := pg.Push(context.Background(), db, usersSchema(false, false))
 	if err != nil {
@@ -341,8 +346,8 @@ func TestPushDropsFromANeverAnalysedTableThatIsEmpty(t *testing.T) {
 }
 
 func TestPushDropsFromAnEmptyTableWithoutConsent(t *testing.T) {
-	fd := pushFake(sharedDatabase(), map[string]int64{"users": 0, "audit_log": 0}, nil)
-	db := pg.New(fd)
+	drv := pushDriver(sharedDatabase(), map[string]int64{"users": 0, "audit_log": 0}, nil)
+	db := pg.New(drv)
 
 	res, err := pg.Push(context.Background(), db, usersSchema(false, false))
 	if err != nil {
@@ -358,8 +363,8 @@ func TestPushDropsFromAnEmptyTableWithoutConsent(t *testing.T) {
 }
 
 func TestPushDryRunStillRefusesUnconsentedDataLoss(t *testing.T) {
-	fd := pushFake(sharedDatabase(), map[string]int64{"users": 12, "audit_log": 0}, nil)
-	db := pg.New(fd)
+	drv := pushDriver(sharedDatabase(), map[string]int64{"users": 12, "audit_log": 0}, nil)
+	db := pg.New(drv)
 
 	res, err := pg.Push(context.Background(), db, usersSchema(false, false),
 		pg.PushOptions{DryRun: true})
@@ -368,5 +373,106 @@ func TestPushDryRunStillRefusesUnconsentedDataLoss(t *testing.T) {
 	}
 	if len(res.DataLoss) != 1 {
 		t.Errorf("DataLoss = %+v, want the preview to name what it would destroy", res.DataLoss)
+	}
+}
+
+// A consent that has quietly stopped applying is the more dangerous of
+// the two stale declarations drops can be handed: applyRenames refuses
+// one outright with ErrRenameNotApplicable, while an Allow entry that
+// matches nothing used to be discarded without a word — leaving a call
+// site that reads exactly like one whose DROP is still authorised.
+func TestPushReportsConsentThatAuthorisesNothing(t *testing.T) {
+	// The live users table has 12 rows and the Go schema no longer
+	// declares its email column, so the diff carries exactly one
+	// destructive change: OpDropColumn on users.email.
+	tests := []struct {
+		name      string
+		allow     []pg.Destructive
+		wantStale []string // Table.Object of each stale-consent notice
+		wantErr   bool
+	}{
+		{
+			name:  "consent that names the change",
+			allow: []pg.Destructive{{Op: pg.OpDropColumn, Table: "users", Object: "email"}},
+		},
+		{
+			// Object is empty on a table drop by construction, so this
+			// value can never match anything Push derives.
+			name:      "a table drop written with an object",
+			allow:     []pg.Destructive{{Op: pg.OpDropTable, Table: "users", Object: "users"}},
+			wantStale: []string{"users.users"},
+			wantErr:   true,
+		},
+		{
+			name:      "consent for a table that is no longer there",
+			allow:     []pg.Destructive{{Op: pg.OpDropColumn, Table: "customers", Object: "email"}},
+			wantStale: []string{"customers.email"},
+			wantErr:   true,
+		},
+		{
+			name: "yesterday's consent beside today's",
+			allow: []pg.Destructive{
+				{Op: pg.OpDropColumn, Table: "users", Object: "email"},
+				{Op: pg.OpDropColumn, Table: "users", Object: "nickname"},
+			},
+			wantStale: []string{"users.nickname"},
+		},
+		{
+			name:      "an operation that is not one",
+			allow:     []pg.Destructive{{Op: "drop-database", Table: "users"}},
+			wantStale: []string{"users."},
+			wantErr:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			drv := pushDriver(sharedDatabase(), map[string]int64{"users": 12, "audit_log": 0}, nil)
+			db := pg.New(drv)
+
+			res, err := pg.Push(context.Background(), db, usersSchema(false, false),
+				pg.PushOptions{Allow: tt.allow})
+			if got := errors.Is(err, pg.ErrDestructivePush); got != tt.wantErr {
+				t.Fatalf("ErrDestructivePush: got = %v (%v), want %v", got, err, tt.wantErr)
+			}
+			var stale []string
+			for _, n := range res.Notices {
+				if n.Rule != "stale-consent" {
+					continue
+				}
+				if n.Message == "" {
+					t.Errorf("notice %+v carries no message; the caller has nothing to act on", n)
+				}
+				stale = append(stale, n.Table+"."+n.Object)
+			}
+			if !reflect.DeepEqual(stale, tt.wantStale) {
+				t.Errorf("stale-consent notices: got = %v, want %v", stale, tt.wantStale)
+			}
+		})
+	}
+}
+
+// A push with nothing to do is the likeliest place for a consent to
+// have gone stale — the change it named is the one that has already
+// been applied — so the notice has to survive the empty-diff exit.
+func TestPushReportsStaleConsentWhenThereIsNothingToDo(t *testing.T) {
+	drv := pushDriver(sharedDatabase(), map[string]int64{"users": 12, "audit_log": 0}, nil)
+	db := pg.New(drv)
+
+	res, err := pg.Push(context.Background(), db, usersSchema(true, false),
+		pg.PushOptions{Allow: []pg.Destructive{{Op: pg.OpDropColumn, Table: "users", Object: "email"}}})
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(res.Statements) != 0 {
+		t.Fatalf("Statements = %v, want none", res.Statements)
+	}
+	var stale []pg.SchemaNotice
+	for _, n := range res.Notices {
+		if n.Rule == "stale-consent" {
+			stale = append(stale, n)
+		}
+	}
+	if len(stale) != 1 || stale[0].Object != "email" {
+		t.Errorf("notices = %v, want one stale-consent notice for users.email", res.Notices)
 	}
 }

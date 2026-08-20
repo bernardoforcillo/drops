@@ -105,11 +105,37 @@ func (c *RelConfig) OrderBy(exprs ...drops.Expression) *RelConfig {
 // configured ORDER BY), not the first N rows globally. Mirrors
 // drizzle's with: { posts: { limit: 5 } } shape.
 //
-// Limit applies to HasMany and MorphMany. Single-row relations
-// (HasOne / BelongsTo) already cap at one row per parent, and
-// ManyToMany reads its junction table first, which the rewrite has no
-// window over — a Limit on such an edge is accepted and ignored rather
-// than silently capping the wrong thing. Limit ≤ 0 disables the cap.
+// Limit applies to HasMany, MorphMany and ManyToMany. Single-row
+// relations (HasOne / BelongsTo) already cap at one row per parent, so
+// it has nothing to do there. Limit ≤ 0 disables the cap.
+//
+// # The many-to-many edge caps somewhere else
+//
+// The window rewrite needs one query it can partition by the parent
+// key, and this edge has two: the junction is read first, and the
+// target rows then come back keyed by their own id, with no parent
+// column to partition by. So the cap is applied to each parent's
+// assembled slice, in Go, after the target query has returned — the
+// same rows the query fetched before, minus the ones the caller said
+// they did not want. Nothing got slower, but nothing got narrower
+// either: an edge with a large fan-out still reads the whole fan-out
+// and discards most of it, so Limit here shapes the result and does
+// not bound the query. Where that matters, query the junction
+// yourself.
+//
+// It caps rather than ignoring because the alternative is the one
+// thing this package has already ruled out. drops/mysql's relation
+// declaration API was deleted rather than deprecated in this same
+// phase, on the grounds that an API which silently does nothing is
+// worse than one that is not there, because nothing tells the caller.
+// A Limit honoured on the HasMany edge and dropped on the ManyToMany
+// edge beside it is that failure wearing a coat: the two call sites
+// read identically, the two result sets do not, and nothing in between
+// says so.
+//
+// The ordering is the caller's to pin, on this edge as on the others.
+// Without an OrderBy the cap keeps the first N in the order the
+// junction rows came back, which no server promises to repeat.
 func (c *RelConfig) Limit(n int) *RelConfig {
 	c.node.limit = n
 	return c
@@ -743,12 +769,11 @@ func (f *FindBuilder) loadManyToMany(
 		k := parent.FieldByIndex(rowKeyField).Interface()
 		target := parent.FieldByIndex(relField)
 		remotes := remoteByLocal[k]
-		result := reflect.MakeSlice(relFieldType, 0, len(remotes))
+		kept := make([]any, 0, len(remotes))
 		if ordered {
 			// Keep only this parent's linked targets, in target order. A
 			// Where on the target may have dropped some; targetOrder only
 			// holds rows that survived, so missing keys are skipped.
-			kept := make([]any, 0, len(remotes))
 			seen := map[any]struct{}{}
 			for _, rk := range remotes {
 				if _, ok := targetOrder[rk]; !ok {
@@ -763,20 +788,52 @@ func (f *FindBuilder) loadManyToMany(
 			sort.SliceStable(kept, func(a, b int) bool {
 				return targetOrder[kept[a]] < targetOrder[kept[b]]
 			})
-			for _, rk := range kept {
-				result = appendTarget(result, targetByKey[rk])
-			}
 		} else {
 			// Default: preserve junction-row order.
 			for _, rk := range remotes {
-				if tv, ok := targetByKey[rk]; ok {
-					result = appendTarget(result, tv)
+				if _, ok := targetByKey[rk]; ok {
+					kept = append(kept, rk)
 				}
 			}
+		}
+		kept = perParentWindow(kept, node)
+		result := reflect.MakeSlice(relFieldType, 0, len(kept))
+		for _, rk := range kept {
+			result = appendTarget(result, targetByKey[rk])
 		}
 		target.Set(result)
 	}
 	return collectChildPtrs(parentSlice, parentIsPtr, relField, childStructType, needChildren), childStructType, nil
+}
+
+// perParentWindow applies a many-to-many edge's Limit and Offset to one
+// parent's list of linked keys.
+//
+// This is the same window buildPerParentLimited renders as
+// ROW_NUMBER() OVER (PARTITION BY fk) for the edges that have a column
+// to partition by, applied in Go for the edge that does not — see
+// RelConfig.Limit for why this edge cannot have it in SQL, and for what
+// it costs that the rows are fetched before they are dropped.
+//
+// Offset without a Limit is not a window and is ignored, exactly as it
+// is on the SQL path: RelConfig.Offset says it requires Limit, and
+// "every row past N" is not what a caller who forgot the Limit meant.
+func perParentWindow(keys []any, node *relNode) []any {
+	if node.limit <= 0 {
+		return keys
+	}
+	off := node.offset
+	if off < 0 {
+		off = 0
+	}
+	if off >= len(keys) {
+		return keys[:0]
+	}
+	end := off + node.limit
+	if end > len(keys) {
+		end = len(keys)
+	}
+	return keys[off:end]
 }
 
 func parentValue(v reflect.Value, isPtr bool) reflect.Value {

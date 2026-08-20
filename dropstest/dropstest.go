@@ -34,6 +34,16 @@
 // the whole contract is Exec, Query and Begin, so the double is a file.
 //
 // A *Driver is safe for concurrent use; see [Driver.Statements].
+//
+// What it deliberately does not do is satisfy the optional capability
+// interfaces the dialects declare beside [drops.Driver] — pg.Copier,
+// pg.Listener, pg.PoolStatsProvider. Those are duck-typed extras that a
+// real driver may or may not have, and the tests for them are testing
+// the detection: whether drops takes the capability path or the
+// fallback. A recorder that implemented all three would answer that
+// question the same way for every test that used it, which is why
+// drops/pg keeps small doubles of its own there (listenDriver,
+// copyingDriver, statsDriver) and should go on doing so.
 package dropstest
 
 import (
@@ -107,15 +117,23 @@ type resultSet struct {
 	data [][]any
 }
 
+// Answerer decides what a Query gets back by looking at the statement
+// itself. It returns the columns and rows to answer with, or ok=false
+// to say "not mine" and leave the answer to whatever comes next.
+//
+// See [Driver.Answer] for when a test wants one.
+type Answerer func(sql string, args []any) (cols []string, rows [][]any, ok bool)
+
 // Driver is a drops.Driver that records instead of executing. The zero
 // value is not usable; call [New].
 type Driver struct {
-	mu       sync.Mutex
-	stmts    []Statement
-	queue    []resultSet
-	fallback *resultSet
-	nextErr  error
-	affected int64
+	mu        sync.Mutex
+	stmts     []Statement
+	queue     []resultSet
+	fallback  *resultSet
+	answerers []Answerer
+	nextErr   error
+	affected  int64
 }
 
 // New returns an empty recorder. Queries answer with an empty result set
@@ -152,6 +170,51 @@ func (d *Driver) AlwaysRows(cols []string, rows ...[]any) *Driver {
 	set := copySet(cols, rows)
 	d.mu.Lock()
 	d.fallback = &set
+	d.mu.Unlock()
+	return d
+}
+
+// Answer registers a function that answers a Query by reading the
+// statement, rather than by position in the queue [Driver.Rows] builds.
+//
+// The queue is the right shape for a test that drives a known sequence
+// of queries: it says what the first one gets, then the second. It is
+// the wrong shape for anything introspection-driven, where the subject
+// issues a fixed set of catalogue queries whose order is the subject's
+// business and not the test's — pg.Push alone reads tables, columns,
+// primary keys, uniques, checks, indexes, foreign keys and a row
+// estimate, and a queue describing all of them positionally breaks the
+// moment a reader is added, reordered, or skipped by a version check.
+// Every such test in this tree had answered that by hand-rolling a
+// driver of its own with a switch on the SQL in it, which is this
+// method with the recording, the concurrency safety and the scanning
+// left out.
+//
+//	drv := dropstest.New().Answer(func(sql string, _ []any) ([]string, [][]any, bool) {
+//	    if strings.Contains(sql, "information_schema.tables") {
+//	        return []string{"table_schema", "table_name"},
+//	            [][]any{{"public", "users"}}, true
+//	    }
+//	    return nil, nil, false
+//	})
+//
+// Answerers are consulted in the order they were registered, before the
+// queue, and the first one to return ok=true supplies the answer. One
+// that returns false leaves the queue untouched, so the two compose:
+// answer the catalogue by statement and the query under test by
+// position. With no answerer claiming it, a Query falls through to the
+// queue, then to [Driver.AlwaysRows], then to an empty result — exactly
+// as before.
+//
+// The function is called with the driver's lock released, so it may
+// call back into the driver ([Driver.SQL] to count what has been asked
+// so far, for instance). The values it returns are copied.
+func (d *Driver) Answer(fn Answerer) *Driver {
+	if fn == nil {
+		return d
+	}
+	d.mu.Lock()
+	d.answerers = append(d.answerers, fn)
 	d.mu.Unlock()
 	return d
 }
@@ -202,6 +265,7 @@ func (d *Driver) Reset() *Driver {
 	d.stmts = nil
 	d.queue = nil
 	d.fallback = nil
+	d.answerers = nil
 	d.nextErr = nil
 	d.affected = 1
 	d.mu.Unlock()
@@ -303,6 +367,15 @@ func (d *Driver) Query(ctx context.Context, sqlStr string, args ...any) (drops.R
 		return nil, err
 	}
 	d.mu.Lock()
+	answerers := d.answerers
+	d.mu.Unlock()
+	for _, fn := range answerers {
+		if cols, rows, ok := fn(sqlStr, args); ok {
+			set := copySet(cols, rows)
+			return &cursor{cols: set.cols, data: set.data}, nil
+		}
+	}
+	d.mu.Lock()
 	var set resultSet
 	switch {
 	case len(d.queue) > 0:
@@ -346,7 +419,10 @@ type Tx struct {
 // use-after-commit bug record a tidy statement list and pass.
 var ErrTxDone = errors.New("drops/dropstest: transaction has already been committed or rolled back")
 
-// finish marks the transaction closed, reporting whether it already was.
+// finish closes the transaction and reports whether this call is the
+// one that did it — false means it was already closed, which is what
+// makes `if !t.finish() { return ErrTxDone }` the second Commit's
+// refusal rather than the first one's.
 func (t *Tx) finish() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()

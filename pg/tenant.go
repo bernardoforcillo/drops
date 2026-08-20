@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 
 	"github.com/bernardoforcillo/drops"
@@ -59,10 +60,24 @@ func TenantFrom(ctx context.Context) (any, bool) {
 	return v, v != nil
 }
 
-// ErrTenantMissing is returned when an entity is scoped by tenant
-// but ctx lacks one. Surfacing this error rather than silently
-// running a cross-tenant query is the whole point of the feature.
-var ErrTenantMissing = errors.New("drops/pg: entity is tenant-scoped but ctx has no tenant")
+// ErrTenantMissing is returned when a statement reads or writes a table
+// that is scoped by tenant and the ctx carries no tenant. Surfacing
+// this rather than silently running a cross-tenant query is the whole
+// point of the feature.
+//
+// It names the table rather than the entity, and the difference is not
+// pedantry. While the axis lived on the Entity, an entity was the only
+// thing that could produce this error; since it moved onto the Table
+// the most surprising producer is a bare db.Select().From(Posts) with
+// no Entity anywhere in the call — and "entity is tenant-scoped" sent
+// that caller looking for an entity they never wrote.
+//
+// The producers wrap it with the table and column that refused, because
+// that is the only diagnostic a caller gets: nothing exported asks a
+// *Table which filters it carries, so in a schema where four tables are
+// scoped, an unwrapped sentence would say the same thing whichever one
+// of them stopped the query. Match it with errors.Is.
+var ErrTenantMissing = errors.New("drops/pg: table is tenant-scoped but ctx has no tenant")
 
 // ErrTenantMismatch is returned by Create when r carries a tenant
 // value that disagrees with the ctx tenant. Catches the
@@ -84,15 +99,35 @@ var ErrTenantMismatch = errors.New("drops/pg: row tenant disagrees with ctx tena
 // col is rendered as given, so pass the handle belonging to the table
 // the filter is registered on: an alias handle would qualify with an
 // alias the query has no FROM entry for.
+//
+// The refusal is wrapped as "<table>.<column>", resolved once here
+// rather than per call, so a caller who forgot the tenant on one
+// request is told which table refused. See [ErrTenantMissing] for why
+// that wrapping is the whole diagnostic.
 func TenantFilter(col ColRef) ContextFilterFunc {
 	c := col.col()
+	where := tenantAxisName(c)
 	return func(ctx context.Context) (drops.Expression, error) {
 		t, ok := TenantFrom(ctx)
 		if !ok {
-			return nil, ErrTenantMissing
+			return nil, fmt.Errorf("%w: %s", ErrTenantMissing, where)
 		}
 		return Eq(c, t), nil
 	}
+}
+
+// tenantAxisName renders a tenant column as "table.column" for an error
+// message, or as the bare column name for a handle that has not been
+// added to a table — which is a declaration mistake, and one this
+// message should describe rather than panic over.
+func tenantAxisName(c *Column) string {
+	if c == nil {
+		return "?"
+	}
+	if t := c.Table(); t != nil {
+		return t.Name() + "." + c.Name()
+	}
+	return c.Name()
 }
 
 // ScopeByTenant marks col as the entity's tenant axis. Every
@@ -131,7 +166,7 @@ func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 			// The filter closes over the entity, not over the column,
 			// so there is one source of truth: whatever tenantPredicate
 			// answers is what the statement carries.
-			e.table.setContextFilter(e.rowScopeKey("tenant"), e.tenantPredicate)
+			e.table.setContextFilter(rowScopeFilterKey(e.rowType, "tenant"), e.tenantPredicate)
 			return e
 		}
 	}
@@ -153,7 +188,7 @@ func (e *Entity[T]) tenantPredicate(ctx context.Context) (drops.Expression, erro
 	}
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return nil, ErrTenantMissing
+		return nil, fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(e.tenantCol))
 	}
 	return Eq(e.tenantCol, t), nil
 }
@@ -166,7 +201,7 @@ func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
 	}
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return ErrTenantMissing
+		return fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(e.tenantCol))
 	}
 	fv := reflect.ValueOf(r).Elem().FieldByIndex(e.tenantField)
 	if fv.IsZero() {

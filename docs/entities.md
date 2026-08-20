@@ -215,6 +215,22 @@ UserEntity.Query(db).LoadRel(UserPosts, func(p *pg.RelConfig) {
 })
 ```
 
+`Limit` and `Offset` on an edge cap the rows attached to *each parent*,
+not the query as a whole:
+
+```go
+UserEntity.Query(db).LoadRel(UserPosts, func(p *pg.RelConfig) {
+    p.OrderBy(PostCreatedAt.Desc()).Limit(5)   // five posts per user
+})
+```
+
+On `HasMany` and `MorphMany` that becomes a `ROW_NUMBER()` window and
+the server returns five rows per parent. A many-to-many edge has no
+single query to partition — its junction table is read first — so the
+cap is applied to each parent's slice once the target query has
+returned: the result is the same, the query is not narrower. Neither
+edge accepts a `Limit` and quietly does nothing with it.
+
 ### Catching N+1 anyway
 
 If a query loop slips through, the detector will say so:

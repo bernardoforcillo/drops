@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/dropstest"
 	"github.com/bernardoforcillo/drops/pg"
 )
 
@@ -148,5 +149,61 @@ func TestWithTenantContextRoundTrip(t *testing.T) {
 	v, ok := pg.TenantFrom(ctx)
 	if !ok || v != "tenant-7" {
 		t.Errorf("tenant from ctx: %v, %v", v, ok)
+	}
+}
+
+// ErrTenantMissing is the whole diagnostic a caller gets: nothing
+// exported asks a *Table which filters it carries, so an unwrapped
+// sentence would read the same whichever of a schema's scoped tables
+// refused the statement. Both producers name the axis.
+func TestTenantMissingNamesTheTableThatRefused(t *testing.T) {
+	posts := pg.NewTable("posts")
+	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
+	posts.ContextFilter(pg.TenantFilter(pg.Add(posts, pg.BigInt("tenantId").NotNull())))
+
+	tests := []struct {
+		name string
+		run  func() error
+		want string
+	}{
+		{
+			// The shape with no Entity anywhere in the call, which is
+			// the one the old wording ("entity is tenant-scoped") sent
+			// looking for an entity that was never written.
+			name: "a bare select on a scoped table",
+			run: func() error {
+				_, _, err := pg.New(dropstest.New()).Select().From(posts).ToSQLCtx(context.Background())
+				return err
+			},
+			want: "posts.tenantId",
+		},
+		{
+			name: "an entity scoped through ScopeByTenant",
+			run: func() error {
+				_, err := tenantSchema(t).Get(pg.New(dropstest.New()), context.Background(), int64(1))
+				return err
+			},
+			want: "users.tenantId",
+		},
+		{
+			name: "a write that would have stamped the tenant",
+			run: func() error {
+				row := tenantUser{Name: "Ada"}
+				return tenantSchema(t).Create(pg.New(dropstest.New()), context.Background(), &row)
+			},
+			want: "users.tenantId",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.run()
+			if !errors.Is(err, pg.ErrTenantMissing) {
+				t.Fatalf("got = %v, want %v", err, pg.ErrTenantMissing)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error %q does not name the axis that refused; got = %v, want it to contain %v",
+					err.Error(), err.Error(), tt.want)
+			}
+		})
 	}
 }

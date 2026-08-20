@@ -115,6 +115,29 @@ Three differences shape the API rather than the SQL:
   `ErrAliasedDeleteBounded` rather than posting a statement the server
   is certain to reject.
 
+`Push` is bounded by the same two consents as PostgreSQL's, and for a
+sharper reason. `DropUnmanagedTables` answers "is this table drops's to
+drop"; `Allow` answers "may this table lose its data". A destructive
+change — `DROP TABLE`, `DROP COLUMN`, a `MODIFY COLUMN` that retypes —
+against a table with rows in it is withheld, the whole push is refused
+with `ErrDestructivePush` before a single statement is sent, and
+`PushResult.DataLoss` names what it would have destroyed and the
+`mysql.Destructive` value that would authorise it. An `Allow` entry that
+matches nothing in the diff is reported as a `stale-consent` notice
+rather than discarded, because a consent that has quietly stopped
+applying reads at the call site exactly like one that has not.
+PostgreSQL rolls a failed push back; MySQL has no transactional DDL, so
+the refusal in front of the statement is the whole of the protection.
+
+"Has rows" is read from `information_schema.TABLES.TABLE_ROWS`, which
+for InnoDB is a sampled estimate rather than a count and can report 0
+for a table that is not empty. Since 0 is exactly the value that would
+let a DROP through, both 0 and NULL are settled with
+`SELECT EXISTS (SELECT 1 FROM t LIMIT 1)` — one row read, on the only
+tables in doubt, and only for a change nobody authorised. An
+over-estimate needs no such care: it can only withhold a change that
+did not need withholding.
+
 Smaller things worth knowing before you port a schema: `TEXT` cannot be
 indexed without a prefix length (`Index.Prefix`), so a column you mean
 to index wants `Varchar`; `Timestamp(name, false)` maps to

@@ -65,6 +65,19 @@ type PushOptions struct {
 	// yesterday's consent cannot authorise today's unrelated DROP, and
 	// the consent is a Go value visible in the diff of the pull request
 	// that grants it.
+	//
+	// An entry that names no change in this diff authorises nothing,
+	// and is reported as a "stale-consent" notice rather than passed
+	// over in silence. It is the same argument
+	// [ErrRenameNotApplicable] makes about a rename left behind in the
+	// call after the migration that performed it — with more at stake,
+	// because a consent that has quietly stopped applying reads at the
+	// call site exactly like one that is still doing its job. The
+	// spellings that produce one are a Destructive naming a table or a
+	// column that no longer exists, an Op that no longer matches the
+	// change the diff arrived at, and a table drop written with a
+	// non-empty Object, which matches nothing because Object is empty
+	// on a table drop by construction.
 	Allow []Destructive
 }
 
@@ -170,12 +183,18 @@ type PushResult struct {
 // here rather than being dropped on the floor.
 type SchemaNotice struct {
 	// Rule is a stable identifier for the kind of notice —
-	// "unmanaged-table", "unmanaged-index", "unrepresentable-index",
-	// "check-not-normalised", "index-predicate-not-normalised".
+	// "unmanaged-table", "unmanaged-enum", "unmanaged-sequence",
+	// "unmanaged-view", "unmanaged-index", "unrepresentable-index",
+	// "stale-consent", "check-not-normalised",
+	// "index-predicate-not-normalised".
 	Rule string
-	// Table is the table the notice concerns, unqualified.
+	// Table is the table the notice concerns, unqualified. It is empty
+	// on a notice about an object that belongs to the schema rather
+	// than to a table — an enum, a sequence, a view — which names
+	// itself in Object instead.
 	Table string
-	// Object is the index or constraint name, where one applies.
+	// Object is the index, constraint, enum, sequence, view or column
+	// name, where one applies.
 	Object string
 	// Message says what was seen and what was not done about it.
 	Message string
@@ -206,7 +225,7 @@ func (n SchemaNotice) String() string {
 //     partial-index predicates, so the two sides of the diff are
 //     written in the same dialect of PostgreSQL's own deparser.
 //     See "What the probe costs" below: this happens on a DryRun too.
-//   - Narrows the live side to the tables the Go schema declares,
+//   - Narrows the live side to the objects the Go schema declares,
 //     unless DropUnmanagedTables says otherwise; see ownedBy.
 //   - Diffs the two using DiffOptions{Safe: opts.Safe}.
 //   - Refuses the whole push when the diff would destroy data in a
@@ -263,6 +282,15 @@ func (n SchemaNotice) String() string {
 // to the declared tables before the diff, and the drops it would have
 // emitted come back as "unmanaged-table" notices. DropUnmanagedTables
 // takes the other side of the trade.
+//
+// The same narrowing covers the other three things a snapshot names —
+// enums, sequences and views — because Diff emits DROP TYPE, DROP
+// SEQUENCE and DROP VIEW on exactly the same terms, and the PostGIS
+// installation the paragraph above is about announces itself as two
+// views. Introspect does not read any of the three yet, so today the
+// live side carries none of them and the narrowing has nothing to do;
+// see ownedBy for why it is written now rather than when it starts to
+// matter.
 //
 // # Destroying data on purpose
 //
@@ -323,10 +351,10 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 
 	var notices []SchemaNotice
 	if !opt.DropUnmanagedTables {
-		var withheld []string
+		var withheld unmanagedObjects
 		live := current
 		current, withheld = ownedBy(live, desired)
-		notices = append(notices, unmanagedTableNotices(live, withheld, opt.Safe)...)
+		notices = append(notices, unmanagedNotices(live, withheld, opt.Safe)...)
 	}
 
 	exprNotices, err := renormaliseExpressions(ctx, db, current, desired)
@@ -342,12 +370,20 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		stmts, withheld = withholdUnmanagedIndexDrops(stmts, current, desired, opt.Safe)
 		notices = append(notices, withheld...)
 	}
+
+	// The destructive changes are derived before the empty-diff exit,
+	// because PushOptions.Allow has to be answered either way: consent
+	// for a change that is not in this diff is stale whether or not
+	// there is anything else to do, and a push with nothing to apply is
+	// the likeliest place for it to have gone stale.
+	destructive := destructiveCandidates(stmts, current, desired, opt.Safe)
+	notices = append(notices, staleConsentNotices(opt.Allow, destructive)...)
 	sortNotices(notices)
 
 	if len(stmts) == 0 {
 		return &PushResult{Statements: nil, Applied: false, Notices: notices}, nil
 	}
-	loss, err := withheldDataLoss(ctx, db, schemaName, stmts, current, desired, opt)
+	loss, err := withheldDataLoss(ctx, db, schemaName, destructive, opt.Allow)
 	if err != nil {
 		return nil, err
 	}
@@ -613,26 +649,64 @@ func qualifiedTableSQL(t *TableSnapshot) string {
 // which is the reviewable path anyway — or setting
 // PushOptions.DropUnmanagedTables, which puts the live side back
 // whole.
-func ownedBy(live, declared *Snapshot) (*Snapshot, []string) {
+//
+// # Why all four maps and not just Tables
+//
+// A Snapshot names enums, sequences and views beside its tables, and
+// Diff drops each of them on the same terms: DROP TYPE, DROP SEQUENCE
+// and DROP VIEW for anything the previous side has and the current
+// side does not declare. A narrowing that covered Tables alone was not
+// safe-because-designed, it was safe-because-unreachable — Introspect
+// does not populate those three maps, so the live side never carries
+// one. Its own doc comment calls them "the remaining gaps", which is a
+// promise to fill them, and filling them would have re-opened the
+// destructive push inside the function whose entire job is preventing
+// it, in a commit about reading the catalogue. The PostGIS example
+// this comment opens with is the demonstration: geometry_columns and
+// geography_columns are views, not tables, so the very case the
+// narrowing was written for is one it would have missed the moment
+// Introspect could see it.
+func ownedBy(live, declared *Snapshot) (*Snapshot, unmanagedObjects) {
 	out := *live
-	out.Tables = make(map[string]*TableSnapshot, len(live.Tables))
+	var held unmanagedObjects
+	out.Tables, held.tables = ownedObjects(live.Tables, declared.Tables)
+	out.Enums, held.enums = ownedObjects(live.Enums, declared.Enums)
+	out.Sequences, held.sequences = ownedObjects(live.Sequences, declared.Sequences)
+	out.Views, held.views = ownedObjects(live.Views, declared.Views)
+	return &out, held
+}
+
+// unmanagedObjects is what ownedBy held back, one list of snapshot keys
+// per kind of object a Snapshot carries.
+type unmanagedObjects struct {
+	tables    []string
+	enums     []string
+	sequences []string
+	views     []string
+}
+
+// ownedObjects splits one of a snapshot's maps into the entries the
+// declared side also has and the keys of the entries it does not.
+func ownedObjects[V any](live, declared map[string]V) (map[string]V, []string) {
+	out := make(map[string]V, len(live))
 	var withheld []string
-	for _, key := range sortedKeys(live.Tables) {
-		if _, ok := declared.Tables[key]; ok {
-			out.Tables[key] = live.Tables[key]
+	for _, key := range sortedKeys(live) {
+		if _, ok := declared[key]; ok {
+			out[key] = live[key]
 			continue
 		}
 		withheld = append(withheld, key)
 	}
-	return &out, withheld
+	return out, withheld
 }
 
-// unmanagedTableNotices reports one withheld DROP TABLE per table
-// ownedBy held back, carrying the statement Diff would have emitted so
-// a caller who wants it can run it by hand.
-func unmanagedTableNotices(live *Snapshot, keys []string, safe bool) []SchemaNotice {
-	out := make([]SchemaNotice, 0, len(keys))
-	for _, key := range keys {
+// unmanagedNotices reports one withheld DROP per object ownedBy held
+// back, carrying the statement Diff would have emitted so a caller who
+// wants it can run it by hand.
+func unmanagedNotices(live *Snapshot, held unmanagedObjects, safe bool) []SchemaNotice {
+	out := make([]SchemaNotice, 0,
+		len(held.tables)+len(held.enums)+len(held.sequences)+len(held.views))
+	for _, key := range held.tables {
 		t := live.Tables[key]
 		out = append(out, SchemaNotice{
 			Rule:  "unmanaged-table",
@@ -643,6 +717,39 @@ func unmanagedTableNotices(live *Snapshot, keys []string, safe bool) []SchemaNot
 			SQL: dropTableSQL(t, safe),
 		})
 	}
+	for _, key := range held.enums {
+		e := live.Enums[key]
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-enum",
+			Object: e.Name,
+			Message: fmt.Sprintf(
+				"type %q exists in the database and is declared by no enum in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
+				e.Name),
+			SQL: dropEnumSQL(e.Name, safe),
+		})
+	}
+	for _, key := range held.sequences {
+		s := live.Sequences[key]
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-sequence",
+			Object: s.Name,
+			Message: fmt.Sprintf(
+				"sequence %q exists in the database and is declared by no sequence in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
+				s.Name),
+			SQL: dropSequenceSQL(s.Name, safe),
+		})
+	}
+	for _, key := range held.views {
+		v := live.Views[key]
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-view",
+			Object: v.Name,
+			Message: fmt.Sprintf(
+				"view %q exists in the database and is declared by no view in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
+				v.Name),
+			SQL: dropViewSQL(v, safe),
+		})
+	}
 	return out
 }
 
@@ -650,20 +757,19 @@ func unmanagedTableNotices(live *Snapshot, keys []string, safe bool) []SchemaNot
 // Destructive changes
 // ----------------------------------------------------------------------
 
-// withheldDataLoss returns one DataLoss per statement in stmts that
-// destroys data in a table that is not empty and that PushOptions.Allow
-// does not authorise.
+// destructiveCandidates returns one DataLoss per statement in stmts
+// that destroys data, in the order the diff put them, whether or not
+// PushOptions.Allow authorises it and whether or not the table is
+// empty. It is the list both halves of the rule are answered from:
+// what the push has to withhold, and which entries of Allow named
+// something real.
 //
 // The candidates are derived from the same two snapshots Diff was given
 // and then matched against the statements by text, exactly as
 // withholdUnmanagedIndexDrops does: re-deriving the statement is what
 // keeps a rule from firing on a statement that came from somewhere
 // else, and text is what makes the match total.
-//
-// The row estimates cost one query against pg_class, asked once for the
-// whole schema and only when a destructive statement is actually in the
-// diff — the overwhelmingly common push has none, and pays nothing.
-func withheldDataLoss(ctx context.Context, db *DB, schema string, stmts []string, current, desired *Snapshot, opt PushOptions) ([]DataLoss, error) {
+func destructiveCandidates(stmts []string, current, desired *Snapshot, safe bool) []DataLoss {
 	candidates := map[string]DataLoss{}
 	add := func(sql string, d DataLoss) {
 		d.SQL = sql
@@ -673,13 +779,13 @@ func withheldDataLoss(ctx context.Context, db *DB, schema string, stmts []string
 		ct := current.Tables[key]
 		dt, declared := desired.Tables[key]
 		if !declared {
-			add(dropTableSQL(ct, opt.Safe), DataLoss{Op: OpDropTable, Table: ct.Name})
+			add(dropTableSQL(ct, safe), DataLoss{Op: OpDropTable, Table: ct.Name})
 			continue
 		}
 		for _, name := range sortedKeys(ct.Columns) {
 			dc, kept := dt.Columns[name]
 			if !kept {
-				add(dropColumnSQL(dt.Name, name, opt.Safe),
+				add(dropColumnSQL(dt.Name, name, safe),
 					DataLoss{Op: OpDropColumn, Table: ct.Name, Object: name})
 				continue
 			}
@@ -689,20 +795,115 @@ func withheldDataLoss(ctx context.Context, db *DB, schema string, stmts []string
 			}
 		}
 	}
+	out := make([]DataLoss, 0, len(candidates))
+	for _, s := range stmts {
+		if d, ok := candidates[s]; ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
 
+// staleConsentNotices reports every PushOptions.Allow entry that names
+// no destructive change in this diff.
+//
+// applyRenames refuses a declared rename that matches nothing, and says
+// why in ErrRenameNotApplicable's doc comment: a declaration left in the
+// call after the migration that performed it would sit there for ever,
+// doing nothing, looking exactly like one that still applies. A stale
+// consent is the same declaration with the opposite failure mode, and
+// the more dangerous one — a rename that has stopped applying leaves the
+// schema alone, while a Destructive that has stopped applying leaves the
+// caller believing a DROP is authorised when the next diff to contain
+// one will be refused, or believing they reviewed a change that is no
+// longer the change being made.
+//
+// It is a notice rather than an error because consent is not itself an
+// instruction: an Allow entry that matches nothing has changed nothing,
+// and failing a push whose diff is otherwise fine would punish the
+// caller for the tidy-up they have not done yet. The notice is what
+// tells them to do it.
+func staleConsentNotices(allow []Destructive, found []DataLoss) []SchemaNotice {
+	var out []SchemaNotice
+	for _, a := range allow {
+		matched := false
+		for _, d := range found {
+			if allowsDestructive([]Destructive{a}, d) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		out = append(out, SchemaNotice{
+			Rule:    "stale-consent",
+			Table:   a.Table,
+			Object:  a.Object,
+			Message: staleConsentMessage(a),
+		})
+	}
+	return out
+}
+
+// staleConsentMessage says why one Allow entry authorises nothing. The
+// four malformed shapes are separated from the merely out-of-date one
+// because the fix is different: a Destructive that cannot match any
+// change is a mistake at the call site, and reading "matches nothing in
+// this diff" would send its author looking at the schema instead of at
+// the value they wrote.
+func staleConsentMessage(a Destructive) string {
+	switch {
+	case a.Op != OpDropTable && a.Op != OpDropColumn && a.Op != OpRetypeColumn:
+		return fmt.Sprintf(
+			"PushOptions.Allow names Op %q, which is not one of %q, %q or %q; it authorises nothing",
+			a.Op, OpDropTable, OpDropColumn, OpRetypeColumn)
+	case a.Table == "":
+		return fmt.Sprintf(
+			"PushOptions.Allow names a %q with an empty Table; it authorises nothing", a.Op)
+	case a.Op == OpDropTable && a.Object != "":
+		return fmt.Sprintf(
+			"PushOptions.Allow names a drop of table %q with Object %q; Object is empty on a table drop, so this authorises nothing",
+			a.Table, a.Object)
+	case a.Op != OpDropTable && a.Object == "":
+		return fmt.Sprintf(
+			"PushOptions.Allow names a %q on %q with an empty Object; a column change is authorised by column name, so this authorises nothing",
+			a.Op, a.Table)
+	}
+	return fmt.Sprintf(
+		"PushOptions.Allow names a %q on %q that this push does not contain; the change was already applied, or the object is gone, and the consent now authorises nothing — delete it",
+		a.Op, destructiveObjectName(a))
+}
+
+// destructiveObjectName renders "table" or "table.column" for a message.
+func destructiveObjectName(a Destructive) string {
+	if a.Object == "" {
+		return a.Table
+	}
+	return a.Table + "." + a.Object
+}
+
+// withheldDataLoss returns one DataLoss per destructive change that
+// PushOptions.Allow does not authorise and that would land on a table
+// with rows in it.
+//
+// The row estimates cost one query against pg_class, asked once for the
+// whole schema and only when an unauthorised destructive statement is
+// actually in the diff — the overwhelmingly common push has none, and
+// pays nothing.
+func withheldDataLoss(ctx context.Context, db *DB, schema string, found []DataLoss, allow []Destructive) ([]DataLoss, error) {
 	// Consent first: a caller who has already named every destructive
 	// change in the diff is owed neither an estimate nor a probe, and
 	// the overwhelmingly common push has no destructive change at all.
 	var unconsented []DataLoss
-	for _, s := range stmts {
-		if d, ok := candidates[s]; ok && !allowsDestructive(opt.Allow, d) {
+	for _, d := range found {
+		if !allowsDestructive(allow, d) {
 			unconsented = append(unconsented, d)
 		}
 	}
 	if len(unconsented) == 0 {
 		return nil, nil
 	}
-
 	rows, err := tableRowEstimates(ctx, db, schema)
 	if err != nil {
 		return nil, fmt.Errorf("drops/pg: estimate rows before a destructive push: %w", err)

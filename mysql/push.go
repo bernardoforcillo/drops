@@ -70,7 +70,122 @@ type PushOptions struct {
 	// SplitAlters emits one ALTER TABLE per column change rather than
 	// batching a table's changes. See DiffOptions.SplitAlters.
 	SplitAlters bool
+
+	// Allow names the destructive changes this push is permitted to
+	// make to a table that is not empty. Anything destructive that is
+	// not named here, and not against an empty table, is withheld:
+	// Push applies nothing, returns ErrDestructivePush, and reports
+	// what it withheld in PushResult.DataLoss.
+	//
+	// Naming the object rather than passing a global --force is the
+	// whole point. A flag says "destroy whatever today's diff happens
+	// to contain", which is a decision made before anyone knew what
+	// that was; a Destructive names one table and one column, so
+	// yesterday's consent cannot authorise today's unrelated DROP, and
+	// the consent is a Go value visible in the diff of the pull request
+	// that grants it.
+	//
+	// The rule is drops/pg's, ported unchanged, and it matters more
+	// here: PostgreSQL rolls a failed push back, and MySQL cannot roll
+	// a DROP COLUMN back at all. There is nothing after the fact — no
+	// transaction, no undo — so the refusal in front of it is the only
+	// protection there is.
+	//
+	// An entry that names no change in this diff authorises nothing,
+	// and is reported as a "stale-consent" notice rather than passed
+	// over in silence: a consent that has quietly stopped applying
+	// reads at the call site exactly like one that is still doing its
+	// job.
+	Allow []Destructive
 }
+
+// DestructiveOp names a kind of change that destroys data.
+type DestructiveOp string
+
+// The names carry an Op prefix because mysql.DropTable is already the
+// DDL builder that renders a DROP TABLE statement, and one of the two
+// spellings has to give way to the other.
+const (
+	// OpDropTable is a DROP TABLE: every row goes.
+	OpDropTable DestructiveOp = "drop-table"
+	// OpDropColumn is an ALTER TABLE ... DROP COLUMN: one value per
+	// row goes.
+	OpDropColumn DestructiveOp = "drop-column"
+	// OpRetypeColumn is an ALTER TABLE ... MODIFY COLUMN that changes
+	// the column's type. MySQL casts every existing value on the way,
+	// and a cast can truncate (varchar(20) to varchar(10)), round
+	// (decimal to int) or, in strict mode, fail partway through — after
+	// the table copy has already begun and with no transaction to undo
+	// it.
+	OpRetypeColumn DestructiveOp = "retype-column"
+)
+
+// Destructive names one change Push is authorised to make. Pass them
+// in PushOptions.Allow.
+type Destructive struct {
+	// Op is the kind of change being authorised.
+	Op DestructiveOp
+	// Table is the table name, as the database has it.
+	Table string
+	// Object is the column name; empty for OpDropTable.
+	Object string
+}
+
+// DataLoss is a destructive change Push found, declined to make, and is
+// telling you about.
+//
+// Rows is an ESTIMATE, read from information_schema.TABLES.TABLE_ROWS.
+// Distinguishing "empty" from "not empty" is all the rule needs — an
+// empty table has nothing to lose, so dropping it needs no permission —
+// and a COUNT(*) per candidate table is a full scan bolted onto the
+// operation you most want to finish quickly.
+//
+// It is a far rougher estimate than the reltuples drops/pg reads. For
+// InnoDB the server derives TABLE_ROWS from a handful of random index
+// dives, so it is routinely off by tens of percent, it is NULL for a
+// table the server has no statistics for, and — the part that decides
+// how this is used — it can read 0 for a table that has rows in it. A
+// rule that took 0 for "empty" would therefore hand back exactly the
+// silent destructive push it exists to prevent, so 0 and NULL are both
+// treated as "nobody knows" and settled with
+// SELECT EXISTS (SELECT 1 FROM t LIMIT 1) — one row read, on the only
+// tables whose count is in doubt, and only for a change nobody has
+// authorised. An over-estimate needs no such care: it can only make
+// Push withhold a change it did not have to, which is the direction
+// this rule is allowed to be wrong in.
+//
+// Rows is -1 when the estimate was unusable and the probe found rows,
+// because "some" is all that probe answers.
+type DataLoss struct {
+	// Op is the kind of change.
+	Op DestructiveOp
+	// Table is the table it is against.
+	Table string
+	// Object is the column, empty for a table-level change.
+	Object string
+	// Rows is the server's row-count estimate for Table, or -1 when
+	// the estimate was unusable.
+	Rows int64
+	// SQL is the statement Push withheld. One batched ALTER TABLE can
+	// carry several destructive changes, so two DataLoss entries may
+	// name the same statement.
+	SQL string
+	// Suggestion is the Destructive value that would authorise it.
+	Suggestion string
+}
+
+// ErrDestructivePush is returned when a push would destroy data in a
+// table that is not empty and PushOptions.Allow does not name the
+// change. Nothing is applied: the whole diff is withheld, not just the
+// destructive part of it.
+//
+// Here that is not a preference. drops/pg withholds everything because
+// a half-applied schema is worse than an unapplied one; this package
+// cannot offer even that choice, since a MySQL push has no transaction
+// and stopping partway through is the one outcome it can never take
+// back. So the refusal happens before the first statement is sent, and
+// PushResult.AppliedCount is 0 whenever this error is returned.
+var ErrDestructivePush = errors.New("drops/mysql: push withheld destructive statements; see PushResult.DataLoss")
 
 // PushResult is the outcome of a Push call.
 //
@@ -95,6 +210,11 @@ type PushResult struct {
 	// Statements list with a non-empty Notices list means the database
 	// and the schema disagree about something Push declined to change.
 	Notices []SchemaNotice
+	// DataLoss lists the destructive changes that stopped this push, in
+	// the order the diff put them. It is non-empty exactly when Push
+	// returned ErrDestructivePush; each entry carries the
+	// PushOptions.Allow value that would let it through.
+	DataLoss []DataLoss
 }
 
 // SchemaNotice is a difference Push can see but will not act on.
@@ -105,12 +225,13 @@ type PushResult struct {
 type SchemaNotice struct {
 	// Rule is a stable identifier for the kind of notice —
 	// "unmanaged-table", "unmanaged-index", "unrepresentable-index",
-	// "index-method-ignored", "check-not-normalised",
+	// "index-method-ignored", "stale-consent", "check-not-normalised",
 	// "checks-not-enforced", "table-options".
 	Rule string
 	// Table is the table the notice concerns.
 	Table string
-	// Object is the index or constraint name, where one applies.
+	// Object is the index, constraint or column name, where one
+	// applies.
 	Object string
 	// Message says what was seen and what was not done about it.
 	Message string
@@ -141,8 +262,11 @@ func (n SchemaNotice) String() string {
 //     DropUnmanagedTables says otherwise; see ownedBy.
 //   - Asks the server to respell the declared CHECK expressions, so
 //     both sides of the diff are written in the server's own dialect.
-//   - Diffs the two and, unless DryRun, applies the statements one at a
-//     time in order.
+//   - Diffs the two.
+//   - Refuses the whole push when the diff would destroy data in a
+//     table that is not empty and PushOptions.Allow does not name the
+//     change; see ErrDestructivePush.
+//   - Unless DryRun, applies the statements one at a time in order.
 //
 // # A failed push leaves the schema half-changed
 //
@@ -186,6 +310,24 @@ func (n SchemaNotice) String() string {
 // enough to have needed it. Set DropUnmanagedIndexes to take the other
 // side of that trade; the withheld statements are reported as notices
 // either way.
+//
+// # Destroying data on purpose
+//
+// A change that destroys data — DROP TABLE, DROP COLUMN, a MODIFY
+// COLUMN that retypes — goes through unremarked when the table is
+// empty, because there is nothing to lose, which is what keeps the
+// development loop of pushing a table and reshaping it a minute later
+// unaffected. Against a table with rows in it, Push applies nothing at
+// all and returns ErrDestructivePush with a DataLoss entry per change
+// it withheld; naming each one in PushOptions.Allow is what lets it
+// through. See DataLoss for what "has rows" means here, why the
+// server's estimate is not taken at face value, and what it costs to
+// ask.
+//
+// The two halves belong together, and only one of them shipped first:
+// DropUnmanagedTables answers "whose table is this", and Allow answers
+// "may this table lose its data". A push can be entitled to a table and
+// still have no business emptying it.
 //
 // # What Push cannot see
 //
@@ -269,10 +411,30 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		stmts, withheld = withholdUnmanagedIndexDrops(stmts, current, desired)
 		notices = append(notices, withheld...)
 	}
+
+	// The destructive changes are derived before the empty-diff exit,
+	// because PushOptions.Allow has to be answered either way: consent
+	// for a change that is not in this diff is stale whether or not
+	// there is anything else to do, and a push with nothing to apply is
+	// the likeliest place for it to have gone stale.
+	destructive := destructiveCandidates(stmts, current, desired, server, opt)
+	notices = append(notices, staleConsentNotices(opt.Allow, destructive)...)
 	sortNotices(notices)
 
 	res := &PushResult{Statements: stmts, Notices: notices}
-	if len(stmts) == 0 || opt.DryRun {
+	if len(stmts) == 0 {
+		return res, nil
+	}
+	loss, err := withheldDataLoss(ctx, db, opt.Database, destructive, opt.Allow)
+	if err != nil {
+		return res, err
+	}
+	if len(loss) > 0 {
+		res.DataLoss = loss
+		return res, fmt.Errorf("%w: %d destructive change(s) across %d statements, starting with %q",
+			ErrDestructivePush, len(loss), len(stmts), excerptSQL(loss[0].SQL))
+	}
+	if opt.DryRun {
 		return res, nil
 	}
 	for _, s := range stmts {
@@ -368,6 +530,334 @@ func unmanagedTableNotices(live *Snapshot, names []string, opt PushOptions) []Sc
 		})
 	}
 	return out
+}
+
+// ----------------------------------------------------------------------
+// Destructive changes
+// ----------------------------------------------------------------------
+
+// destructiveChange is one candidate: the loss it would cause, and the
+// text Diff renders for it. A DROP TABLE is a whole statement; a column
+// change is one action inside an ALTER TABLE that may carry several.
+type destructiveChange struct {
+	loss  DataLoss
+	text  string
+	whole bool
+}
+
+// destructiveCandidates returns one DataLoss per destructive change in
+// stmts, in the order the diff put them, whether or not
+// PushOptions.Allow authorises it and whether or not the table is
+// empty. It is the list both halves of the rule are answered from: what
+// the push has to withhold, and which entries of Allow named something
+// real.
+//
+// The candidates are derived from the same two snapshots Diff was given
+// and then matched against the statements by text, exactly as
+// withholdUnmanagedIndexDrops does: re-deriving is what keeps a rule
+// from firing on a statement that came from somewhere else.
+//
+// Matching by text is where this parts company with drops/pg, whose
+// diff emits one statement per change. Here diffColumns folds a table's
+// actions into a single ALTER TABLE unless SplitAlters says otherwise,
+// so the unit that has to be recognised is the action rather than the
+// statement — and a statement carrying a DROP COLUMN beside an ADD
+// COLUMN is destructive for the one and not the other. Each action is
+// re-rendered exactly as diffColumns renders it and looked for inside
+// the statements for its own table, delimited by the comma or the
+// semicolon that always follows it, so an action name can never match
+// the prefix of a longer one.
+func destructiveCandidates(stmts []string, current, desired *Snapshot, server ServerInfo, opt PushOptions) []DataLoss {
+	var want []destructiveChange
+	for _, key := range sortedKeys(current.Tables) {
+		ct := current.Tables[key]
+		dt, declared := desired.Tables[key]
+		if !declared {
+			want = append(want, destructiveChange{
+				loss:  DataLoss{Op: OpDropTable, Table: ct.Name},
+				text:  dropTableSQL(ct, DiffOptions{Safe: opt.Safe}),
+				whole: true,
+			})
+			continue
+		}
+		for _, name := range sortedKeys(ct.Columns) {
+			dc, kept := dt.Columns[name]
+			if !kept {
+				want = append(want, destructiveChange{
+					loss: DataLoss{Op: OpDropColumn, Table: ct.Name, Object: name},
+					text: "DROP COLUMN " + quoteIdent(name),
+				})
+				continue
+			}
+			if !typeEqual(ct.Columns[name].Type, dc.Type, server) {
+				want = append(want, destructiveChange{
+					loss: DataLoss{Op: OpRetypeColumn, Table: ct.Name, Object: name},
+					text: "MODIFY COLUMN " + columnDefSQL(dc),
+				})
+			}
+		}
+	}
+	var out []DataLoss
+	for _, s := range stmts {
+		for _, c := range want {
+			if c.whole && s != c.text {
+				continue
+			}
+			if !c.whole && !statementCarries(s, c.loss.Table, c.text) {
+				continue
+			}
+			d := c.loss
+			d.SQL = s
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// statementCarries reports whether stmt is an ALTER TABLE on table
+// containing action as one of its actions.
+//
+// The table is matched on the whole quoted identifier, so `users` does
+// not match a statement against `users_archive`: the closing backtick
+// is part of the prefix. The action is matched with its trailing
+// delimiter for the same reason — "DROP COLUMN `a`" is a prefix of
+// "DROP COLUMN `ab`" but not of "DROP COLUMN `ab`," .
+func statementCarries(stmt, table, action string) bool {
+	prefix := "ALTER TABLE " + quoteIdent(table)
+	if !strings.HasPrefix(stmt, prefix) {
+		return false
+	}
+	rest := stmt[len(prefix):]
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\n') {
+		return false
+	}
+	return strings.Contains(rest, action+",") || strings.Contains(rest, action+";")
+}
+
+// staleConsentNotices reports every PushOptions.Allow entry that names
+// no destructive change in this diff.
+//
+// A consent that has quietly stopped applying is more dangerous than a
+// declaration that has: it leaves the call site reading exactly as it
+// did when it authorised something, so the next reviewer sees a DROP
+// that someone signed off on and no sign that the signature has come
+// away from it.
+//
+// It is a notice rather than an error because consent is not itself an
+// instruction: an Allow entry that matches nothing has changed nothing,
+// and failing a push whose diff is otherwise fine would punish the
+// caller for the tidy-up they have not done yet.
+func staleConsentNotices(allow []Destructive, found []DataLoss) []SchemaNotice {
+	var out []SchemaNotice
+	for _, a := range allow {
+		matched := false
+		for _, d := range found {
+			if allowsDestructive([]Destructive{a}, d) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+		out = append(out, SchemaNotice{
+			Rule:    "stale-consent",
+			Table:   a.Table,
+			Object:  a.Object,
+			Message: staleConsentMessage(a),
+		})
+	}
+	return out
+}
+
+// staleConsentMessage says why one Allow entry authorises nothing. The
+// malformed shapes are separated from the merely out-of-date one
+// because the fix is different: a Destructive that cannot match any
+// change is a mistake at the call site, and reading "matches nothing in
+// this diff" would send its author looking at the schema instead of at
+// the value they wrote.
+func staleConsentMessage(a Destructive) string {
+	switch {
+	case a.Op != OpDropTable && a.Op != OpDropColumn && a.Op != OpRetypeColumn:
+		return fmt.Sprintf(
+			"PushOptions.Allow names Op %q, which is not one of %q, %q or %q; it authorises nothing",
+			a.Op, OpDropTable, OpDropColumn, OpRetypeColumn)
+	case a.Table == "":
+		return fmt.Sprintf(
+			"PushOptions.Allow names a %q with an empty Table; it authorises nothing", a.Op)
+	case a.Op == OpDropTable && a.Object != "":
+		return fmt.Sprintf(
+			"PushOptions.Allow names a drop of table %q with Object %q; Object is empty on a table drop, so this authorises nothing",
+			a.Table, a.Object)
+	case a.Op != OpDropTable && a.Object == "":
+		return fmt.Sprintf(
+			"PushOptions.Allow names a %q on %q with an empty Object; a column change is authorised by column name, so this authorises nothing",
+			a.Op, a.Table)
+	}
+	name := a.Table
+	if a.Object != "" {
+		name = a.Table + "." + a.Object
+	}
+	return fmt.Sprintf(
+		"PushOptions.Allow names a %q on %q that this push does not contain; the change was already applied, or the object is gone, and the consent now authorises nothing — delete it",
+		a.Op, name)
+}
+
+// withheldDataLoss returns one DataLoss per destructive change that
+// PushOptions.Allow does not authorise and that would land on a table
+// with rows in it.
+//
+// The estimates cost one query against information_schema, asked once
+// for the whole database and only when an unauthorised destructive
+// statement is actually in the diff — the overwhelmingly common push
+// has none, and pays nothing.
+func withheldDataLoss(ctx context.Context, db *DB, database string, found []DataLoss, allow []Destructive) ([]DataLoss, error) {
+	// Consent first: a caller who has already named every destructive
+	// change in the diff is owed neither an estimate nor a probe, and
+	// the overwhelmingly common push has no destructive change at all.
+	var unconsented []DataLoss
+	for _, d := range found {
+		if !allowsDestructive(allow, d) {
+			unconsented = append(unconsented, d)
+		}
+	}
+	if len(unconsented) == 0 {
+		return nil, nil
+	}
+
+	rows, err := tableRowEstimates(ctx, db, database)
+	if err != nil {
+		return nil, fmt.Errorf("drops/mysql: estimate rows before a destructive push: %w", err)
+	}
+	var withheld []DataLoss
+	probed := map[string]bool{}
+	for _, d := range unconsented {
+		est, known := rows[d.Table]
+		if !known {
+			// Not in information_schema under this database at all,
+			// which this connection has no business assuming is empty.
+			est = -1
+		}
+		if est <= 0 {
+			// See DataLoss: TABLE_ROWS reads 0 for tables that have
+			// rows, so 0 is a question rather than an answer.
+			has, seen := probed[d.Table]
+			if !seen {
+				has, err = tableHasRows(ctx, db, d.Table)
+				if err != nil {
+					return nil, fmt.Errorf("drops/mysql: deciding whether %q is empty before destroying data in it: %w", d.Table, err)
+				}
+				probed[d.Table] = has
+			}
+			if !has {
+				continue
+			}
+			est = -1
+		}
+		d.Rows = est
+		d.Suggestion = fmt.Sprintf("allow with mysql.Destructive{Op: mysql.%s, Table: %q, Object: %q}",
+			destructiveOpConst(d.Op), d.Table, d.Object)
+		withheld = append(withheld, d)
+	}
+	return withheld, nil
+}
+
+// allowsDestructive reports whether the caller named this exact change.
+func allowsDestructive(allow []Destructive, d DataLoss) bool {
+	for _, a := range allow {
+		if a.Op == d.Op && a.Table == d.Table && a.Object == d.Object {
+			return true
+		}
+	}
+	return false
+}
+
+// destructiveOpConst renders the Go identifier for an op, so the
+// suggestion can be pasted into the call rather than transcribed.
+func destructiveOpConst(op DestructiveOp) string {
+	switch op {
+	case OpDropTable:
+		return "OpDropTable"
+	case OpDropColumn:
+		return "OpDropColumn"
+	case OpRetypeColumn:
+		return "OpRetypeColumn"
+	}
+	return string(op)
+}
+
+// tableRowEstimates reads the server's row-count estimate for every
+// base table in the database.
+//
+// TABLE_ROWS is what the storage engine last reported, which is why
+// this is one catalogue read rather than a COUNT(*) per table. For
+// InnoDB it is a sampled estimate and not a count, and it is NULL when
+// the server has nothing to go on; both are passed through as -1,
+// because the caller has to distinguish "no rows" from "nobody knows"
+// and only the first of those is a reason to let a DROP through. See
+// tableHasRows for how the second is settled — and see DataLoss for why
+// a reported 0 goes the same way.
+func tableRowEstimates(ctx context.Context, db *DB, database string) (map[string]int64, error) {
+	pred, args := schemaPredicate("TABLE_SCHEMA", database)
+	rows, err := db.Query(ctx, `
+		SELECT TABLE_NAME, TABLE_ROWS
+		FROM information_schema.TABLES
+		WHERE `+pred+` AND TABLE_TYPE = 'BASE TABLE'`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var name string
+		var est sql.NullInt64
+		if err := rows.Scan(&name, &est); err != nil {
+			return nil, err
+		}
+		if !est.Valid {
+			out[name] = -1
+			continue
+		}
+		out[name] = est.Int64
+	}
+	return out, rows.Err()
+}
+
+// tableHasRows answers the one question the estimate could not: is
+// there anything in here at all.
+//
+// LIMIT 1 stops at the first row, so this reads one page of a table of
+// any size — the property COUNT(*) does not have, and the reason a
+// probe is affordable here and a count is not. It runs only for a table
+// whose estimate was 0 or unknown, and only for a destructive change
+// nobody has authorised, so the common push never reaches it.
+//
+// The table is named unqualified, like every other statement this
+// package renders, which is why Push refuses a foreign Database up
+// front: the probe has to read the same table the DDL will write.
+//
+// A probe that fails fails the push. Not being able to tell whether a
+// table holds data is not a reason to go ahead and destroy it, and it
+// is not a reason to report it as data loss either — the caller would
+// be granting consent for a table nobody has looked inside.
+func tableHasRows(ctx context.Context, db *DB, table string) (bool, error) {
+	rows, err := db.Query(ctx, fmt.Sprintf(
+		"SELECT EXISTS (SELECT 1 FROM %s LIMIT 1)", quoteIdent(table)))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+		return false, errors.New("the emptiness probe returned no row")
+	}
+	var has bool
+	if err := rows.Scan(&has); err != nil {
+		return false, err
+	}
+	return has, rows.Err()
 }
 
 // excerptSQL trims a statement to a short single-line form for error

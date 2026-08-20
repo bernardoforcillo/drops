@@ -107,7 +107,10 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 		return nil, err
 	}
 
-	sel := p.db.Select().From(p.e.table)
+	// fastCols is the fast scanner's column list, and empty when no
+	// scanner is registered — so this renders the explicit projection
+	// the positional scan below needs, and a plain "*" otherwise.
+	sel := p.db.Select(p.e.fastCols...).From(p.e.table)
 	for _, w := range p.wheres {
 		sel.Where(w)
 	}

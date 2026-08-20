@@ -36,6 +36,9 @@ var secretPkgPath = reflect.TypeOf(Secret[string]{}).PkgPath()
 //	unique               — UNIQUE
 //	default=<sql>        — raw DEFAULT clause (no parameterisation)
 //	version              — mark as the optimistic-lock version column
+//	alwaysInsert         — bind the column on Create even when the Go
+//	                       field is at its zero value, instead of
+//	                       letting the DEFAULT win (see Col.AlwaysInsert)
 //
 // Use `drop:"-"` to skip a field entirely. Untagged exported fields are
 // also skipped.
@@ -106,6 +109,7 @@ type autoOpts struct {
 	Default string
 	Version bool
 	PII     bool
+	Always  bool
 }
 
 // walkAutoFields applies fn to every exported drop-tagged field on rt,
@@ -158,6 +162,8 @@ func parseAutoTag(raw string) (autoOpts, error) {
 			opts.Version = true
 		case "pii":
 			opts.PII = true
+		case "alwaysInsert":
+			opts.Always = true
 		case "default":
 			if !hasVal {
 				return opts, fmt.Errorf("`default` option requires a value: default=<sql>")
@@ -223,6 +229,13 @@ func applyAutoOpts(c *Column, opts autoOpts) {
 	}
 	if opts.PII {
 		c.pii = true
+	}
+	// Carried through explicitly: a table derived from tags is the
+	// only declaration of its columns, so a `default=` on a bool
+	// would silently swallow every false written to it if the marker
+	// stopped at the manual constructors.
+	if opts.Always {
+		c.alwaysInsert = true
 	}
 }
 

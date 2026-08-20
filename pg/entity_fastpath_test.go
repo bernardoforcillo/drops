@@ -14,6 +14,12 @@ import (
 // bypassed when eager-loaded relations are queued.
 var fastScanCalls int
 
+// entUserCols is the column list fastScanUser was written against —
+// the stand-in for the generated ColsUser(). SetFastScan takes it
+// because the scanner reads by position, so the statement has to
+// choose the positions.
+var entUserCols = []string{"id", "name", "email"}
+
 func fastScanUser(rows pg.Scanner, u *entUser) error {
 	fastScanCalls++
 	return rows.Scan(&u.ID, &u.Name, &u.Email)
@@ -22,7 +28,7 @@ func fastScanUser(rows pg.Scanner, u *entUser) error {
 func TestEntityFastScanUsedByGet(t *testing.T) {
 	fastScanCalls = 0
 	_, ent := entUsersSchema()
-	ent.SetFastScan(fastScanUser)
+	ent.SetFastScan(entUserCols, fastScanUser)
 
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{
@@ -46,7 +52,7 @@ func TestEntityFastScanUsedByGet(t *testing.T) {
 func TestEntityFastScanUsedByQueryAll(t *testing.T) {
 	fastScanCalls = 0
 	_, ent := entUsersSchema()
-	ent.SetFastScan(fastScanUser)
+	ent.SetFastScan(entUserCols, fastScanUser)
 
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{
@@ -74,7 +80,7 @@ func TestEntityFastScanUsedByQueryAll(t *testing.T) {
 func TestEntityFastScanReturnsErrNoRowsOnEmpty(t *testing.T) {
 	fastScanCalls = 0
 	_, ent := entUsersSchema()
-	ent.SetFastScan(fastScanUser)
+	ent.SetFastScan(entUserCols, fastScanUser)
 
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
 		return &fakeRows{cols: []string{"id", "name", "email"}}, nil
@@ -115,7 +121,7 @@ func TestEntityFastScanFallsBackForRelations(t *testing.T) {
 
 	ent := pg.NewEntity[userWithPosts](users)
 	called := 0
-	ent.SetFastScan(func(rows pg.Scanner, u *userWithPosts) error {
+	ent.SetFastScan([]string{"id", "name", "email"}, func(rows pg.Scanner, u *userWithPosts) error {
 		called++
 		return rows.Scan(&u.ID, &u.Name, &u.Email)
 	})
@@ -154,7 +160,7 @@ func TestHasFastScanReportsCorrectly(t *testing.T) {
 	if ent.HasFastScan() {
 		t.Error("HasFastScan should be false initially")
 	}
-	ent.SetFastScan(fastScanUser)
+	ent.SetFastScan(entUserCols, fastScanUser)
 	if !ent.HasFastScan() {
 		t.Error("HasFastScan should be true after SetFastScan")
 	}

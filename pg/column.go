@@ -30,6 +30,12 @@ type Column struct {
 	pii        bool // marked via (*Col[T]).AsPII()
 	managed    bool // drops writes this column, not the application
 
+	// alwaysInsert, set via (*Col[T]).AlwaysInsert, takes this column
+	// out of the zero-value skip rule an INSERT built from a struct
+	// applies. See the method for what the rule costs when it is
+	// wrong.
+	alwaysInsert bool
+
 	// origin is the column this one was copied from by (*Table).As,
 	// and nil on a column as declared. An alias copy is a second
 	// handle on one column of one table, so everything that asks
@@ -83,6 +89,11 @@ func (c *Column) IsManaged() bool { return c.managed }
 // column used for optimistic locking. Marked via
 // (*Col[T]).OptimisticLock().
 func (c *Column) IsOptimisticVersion() bool { return c.version }
+
+// IsAlwaysInsert reports whether Entity.Create binds this column even
+// when the Go field holding it is at the zero value. Marked via
+// (*Col[T]).AlwaysInsert.
+func (c *Column) IsAlwaysInsert() bool { return c.alwaysInsert }
 
 // col returns c. It is the implementation of ColRef for *Column itself;
 // *Col[T] inherits the method via embedding.
@@ -197,6 +208,37 @@ func (c *Col[T]) Unique() *Col[T] {
 func (c *Col[T]) Default(sqlExpr string) *Col[T] {
 	c.Column.hasDefault = true
 	c.Column.defaultSQL = sqlExpr
+	return c
+}
+
+// AlwaysInsert makes Entity.Create bind this column even when the Go
+// field is at its zero value.
+//
+// Without it, a zero-valued field whose column declares a DEFAULT is
+// left out of the INSERT so the server fills it in. That inference is
+// right for createdAt and wrong for anything whose zero value is a
+// value a caller can mean: setting Active to false on a column
+// declared DEFAULT true stores true, an empty string on a column
+// defaulting to 'pending' stores 'pending', and no error is raised
+// anywhere along the way — the row simply is not what was written.
+// It is the single most-cited complaint against GORM, and drops
+// reproduced it exactly.
+//
+// The marker lives on the column rather than on the call so that
+// whoever reads the schema sees which columns are never inferred:
+//
+//	var UserActive = pg.Add(Users, pg.Boolean("active").NotNull().Default("true").AlwaysInsert())
+//
+// A pointer field says the same thing per row instead of per column,
+// and needs no marker: a nil *bool is the zero value and is omitted,
+// a non-nil one is not, so it is bound even when it points at false.
+// That is the convention encoding/json set with omitempty, and it is
+// the right shape when "unset" and "false" are genuinely different
+// states for the same field. [Entity.CreateCols] is the third form,
+// for the single call that wants to say exactly which columns it is
+// writing.
+func (c *Col[T]) AlwaysInsert() *Col[T] {
+	c.Column.alwaysInsert = true
 	return c
 }
 

@@ -23,6 +23,50 @@ res, err = UserEntity.UpsertMany(db, ctx, us)  // INSERT … ON CONFLICT UPDATE
 
 `Get` returns `pg.ErrNoRows` when nothing matches.
 
+## Zero values and DEFAULT columns
+
+`Create` builds the INSERT from the struct, and a column whose field is
+at the Go zero value is left out of the statement when that column has
+a `DEFAULT` or is the primary key — the server fills it in. That is
+what you want for `createdAt` and for a serial key, where the field
+genuinely has no value yet.
+
+It is also the one place drops infers intent, and the inference has a
+cost worth naming: Go cannot tell a field nobody assigned from a field
+assigned its zero value. So `Active: false` on a column declared
+`DEFAULT true` is omitted, and the row comes back `true`. Same for `""`
+on a column defaulting to `'pending'`, and for a zero `time.Time`. No
+error is raised anywhere.
+
+Three ways to say the value is meant. None of them guesses:
+
+```go
+// 1. On the column, when the zero value is always meaningful there.
+var UserActive = pg.Add(Users, pg.Boolean("active").NotNull().Default("true").AlwaysInsert())
+// AutoTable models spell the same marker in the tag:
+//     Active bool `drop:"active,notNull,default=true,alwaysInsert"`
+
+// 2. On the field, when "unset" and "false" are two different states.
+type User struct {
+    Notify *bool `drop:"notify"`   // nil → omitted, &false → written as false
+}
+
+// 3. On the call, when this one write knows exactly what it owns.
+err := UserEntity.CreateCols(db, ctx, &u, UserName, UserEmail, UserActive)
+```
+
+The pointer form is the convention `encoding/json` established, and it
+reads the same way here: a non-nil `*bool` is not the zero value, so a
+pointer to `false` is bound. `CreateCols` binds exactly the columns you
+name, whatever they hold, and consults no rule at all; columns you do
+not name are left out of the statement entirely. It errors — rather
+than writing a partial row — if a column is not on the entity's table,
+has no struct field, or is the tenant column of a scoped entity and
+you left it out.
+
+`Update` is not affected by any of this: it sets every mapped non-key
+column, zero values included.
+
 ## Querying
 
 ```go

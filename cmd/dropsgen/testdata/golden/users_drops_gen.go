@@ -26,10 +26,11 @@ func BindUser(r *User) []any {
 	}
 }
 
-// ScanUser scans one row into dest. The row's column
-// order must match ColsUser(); use a SELECT that lists
-// the columns explicitly via ColsUser() to keep them
-// aligned.
+// ScanUser scans one row into dest by position. The row's
+// column order must match ColsUser(); RegisterUser
+// hands both to the entity together, so every fast-path SELECT it
+// issues lists these columns in this order. A hand-written SELECT
+// feeding this function has to do the same.
 func ScanUser(rows pg.Scanner, dest *User) error {
 	return rows.Scan(
 		&dest.ID,
@@ -38,13 +39,16 @@ func ScanUser(rows pg.Scanner, dest *User) error {
 	)
 }
 
-// RegisterUser wires the zero-reflection scanner into e
-// so Entity.Get / EntityQuery.All / EntityQuery.One take the
-// fastpath. Call once at init():
+// RegisterUser wires the zero-reflection scanner and the
+// column list it was generated for into e, so Entity.Get /
+// EntityQuery.All / EntityQuery.One take the fastpath and render
+// ColsUser() instead of "*". Panics if the schema no
+// longer has one of those columns — re-run go generate. Call once at
+// init():
 //
 //	func init() { RegisterUser(UsersEntity) }
 func RegisterUser(e *pg.Entity[User]) *pg.Entity[User] {
-	return e.SetFastScan(ScanUser)
+	return e.SetFastScan(ColsUser(), ScanUser)
 }
 
 // Post bindings ----------------------------------------------------
@@ -69,10 +73,11 @@ func BindPost(r *Post) []any {
 	}
 }
 
-// ScanPost scans one row into dest. The row's column
-// order must match ColsPost(); use a SELECT that lists
-// the columns explicitly via ColsPost() to keep them
-// aligned.
+// ScanPost scans one row into dest by position. The row's
+// column order must match ColsPost(); RegisterPost
+// hands both to the entity together, so every fast-path SELECT it
+// issues lists these columns in this order. A hand-written SELECT
+// feeding this function has to do the same.
 func ScanPost(rows pg.Scanner, dest *Post) error {
 	return rows.Scan(
 		&dest.ID,
@@ -81,11 +86,14 @@ func ScanPost(rows pg.Scanner, dest *Post) error {
 	)
 }
 
-// RegisterPost wires the zero-reflection scanner into e
-// so Entity.Get / EntityQuery.All / EntityQuery.One take the
-// fastpath. Call once at init():
+// RegisterPost wires the zero-reflection scanner and the
+// column list it was generated for into e, so Entity.Get /
+// EntityQuery.All / EntityQuery.One take the fastpath and render
+// ColsPost() instead of "*". Panics if the schema no
+// longer has one of those columns — re-run go generate. Call once at
+// init():
 //
 //	func init() { RegisterPost(PostsEntity) }
 func RegisterPost(e *pg.Entity[Post]) *pg.Entity[Post] {
-	return e.SetFastScan(ScanPost)
+	return e.SetFastScan(ColsPost(), ScanPost)
 }

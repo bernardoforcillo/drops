@@ -52,6 +52,19 @@ type GenerateOptions struct {
 	// so the migration can be re-run idempotently. See DiffOptions.Safe.
 	Safe bool
 
+	// Renames names the drop/add pairs in this diff that are really one
+	// object under a new name, so the migration renames it instead of
+	// destroying it and creating an empty one beside it. They are
+	// applied to the previous snapshot before the diff runs, in the
+	// order given; see Rename.
+	//
+	// A rename that matches nothing fails the generation with
+	// ErrRenameNotApplicable rather than being ignored. A declaration
+	// left behind after the migration that performed it would otherwise
+	// sit in the call for ever, doing nothing, until the day a column
+	// with the old name comes back and it renames that one instead.
+	Renames []Rename
+
 	// WithDown enables auto-generated rollback SQL. When true, the
 	// generator emits a paired <tag>.down.sql file alongside the
 	// up SQL containing DiffDown(prev, cur). The down direction is
@@ -117,7 +130,19 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	cur := BuildSnapshot(opts.Schema)
 	cur.PrevID = prev.ID
 
-	statements := Diff(prev, cur, DiffOptions{Safe: opts.Safe})
+	// The renames rewrite the previous side before the diff sees it, so
+	// the drop/add pair they describe is never in the diff at all, and
+	// they are recorded in the snapshot this migration writes: the
+	// statements are the migration, and _meta is the record of why they
+	// are renames and not a drop followed by an add.
+	renames, err := applyRenames(prev, cur, opts.Renames)
+	if err != nil {
+		return nil, err
+	}
+	cur.Meta = renames.meta
+
+	statements := append(append([]string{}, renames.up...),
+		Diff(renames.prev, cur, DiffOptions{Safe: opts.Safe})...)
 	if len(statements) == 0 {
 		return &GenerateResult{NoOp: true}, nil
 	}
@@ -155,7 +180,12 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 
 	var downSQL string
 	if opts.WithDown {
-		downStmts := DiffDown(prev, cur, DiffOptions{Safe: opts.Safe})
+		// The renames come last on the way down, after the diff they
+		// enabled has been undone, and in the reverse of the order they
+		// were applied — so each one is taken back while the schema
+		// still wears the names its own rename left.
+		downStmts := append(DiffDown(renames.prev, cur, DiffOptions{Safe: opts.Safe}),
+			renames.down...)
 		if len(downStmts) > 0 {
 			downSQL = strings.Join(downStmts, "\n--> statement-breakpoint\n") + "\n"
 		}

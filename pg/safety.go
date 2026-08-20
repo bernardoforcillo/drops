@@ -1,6 +1,8 @@
 package pg
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -117,6 +119,77 @@ func AnalyzeStatements(stmts []string, opts ...SafetyOptions) []SafetyWarning {
 		}
 	}
 	return out
+}
+
+// ----------------------------------------------------------------------
+// The gate
+// ----------------------------------------------------------------------
+
+// ErrUnsafeMigration is returned by a migrator running under
+// WithSafetyGate when a migration it was about to apply carries a
+// warning at or above the configured severity.
+//
+// Until this existed, every rule above was a report nobody read. The
+// analyser had no caller anywhere in drops outside its own tests: a
+// caller had to know AnalyzeMigration existed, remember to call it,
+// and decide what to do with the result — which is three chances to
+// not notice that the migration about to run rewrites a table with
+// forty million rows in it. The gate makes the decision once, at the
+// migrator, in the code that already knows what is about to be applied.
+var ErrUnsafeMigration = errors.New("drops/pg: migration withheld by the safety gate")
+
+// UnsafeMigrationError says which migration was refused and what the
+// analyser found in it. Match it with errors.As to read the warnings,
+// or errors.Is against ErrUnsafeMigration to recognise the kind.
+type UnsafeMigrationError struct {
+	// Migration identifies the refused migration — a version, a
+	// drizzle tag, a tree node ID, whatever the migrator names its
+	// units.
+	Migration string
+	// Warnings are the findings at or above the gate's severity, in
+	// statement order. Findings below it are not collected.
+	Warnings []SafetyWarning
+}
+
+func (e *UnsafeMigrationError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %s", ErrUnsafeMigration, e.Migration)
+	for _, w := range e.Warnings {
+		fmt.Fprintf(&b, "\n  [%s] %s: %s", w.Severity, w.Rule, w.Message)
+	}
+	return b.String()
+}
+
+func (e *UnsafeMigrationError) Unwrap() error { return ErrUnsafeMigration }
+
+// safetyGate is the per-migrator setting behind WithSafetyGate. The
+// threshold cannot live in a bare SafetySeverity because SeverityInfo
+// is the zero value, and a gate at info — refuse anything the analyser
+// has an opinion about — is a legitimate thing to ask for, most often
+// in CI. So the switch is separate from the level.
+type safetyGate struct {
+	min SafetySeverity
+	on  bool
+}
+
+// check analyses one migration's SQL and refuses it when the analyser
+// finds something at or above the threshold. An empty sql is the case
+// of a migration registered as a Go function rather than as text: there
+// is nothing to read, so there is nothing to refuse.
+func (g safetyGate) check(name, sql string) error {
+	if !g.on || strings.TrimSpace(sql) == "" {
+		return nil
+	}
+	var found []SafetyWarning
+	for _, w := range AnalyzeMigration(sql) {
+		if w.Severity >= g.min {
+			found = append(found, w)
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return &UnsafeMigrationError{Migration: name, Warnings: found}
 }
 
 // splitStatements breaks a migration up at the drizzle-kit

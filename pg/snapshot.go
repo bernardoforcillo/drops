@@ -63,8 +63,23 @@ type PolicySnapshot struct {
 	WithCheck string   `json:"withCheck"`
 }
 
-// SnapshotMeta carries rename-tracking annotations. drops never sets
-// these; the field is present for drizzle-kit compatibility.
+// SnapshotMeta records the renames the migration that wrote this
+// snapshot performed — the one fact about a migration that cannot be
+// recovered by comparing the two snapshots it sits between, because a
+// rename and a drop-plus-add leave the same pair of snapshots behind.
+//
+// GenerateMigration fills it from GenerateOptions.Renames. Each map
+// takes the old name to the new one, in the key shape the snapshot uses
+// elsewhere: "public.users" for a table, "public.users.email" for a
+// column, and the bare name for a schema. The maps are empty, never
+// nil, for a migration that renamed nothing.
+//
+// It is written for the reader, not for drops: nothing reads it back,
+// and a later migration's diff is computed from the snapshots
+// themselves. It exists so the question "was this column dropped or
+// renamed?" has an answer in the repository a year later, and so a
+// snapshot round-trips through drizzle-kit, which stores the same
+// annotations in the same place.
 type SnapshotMeta struct {
 	Columns map[string]any `json:"columns"`
 	Schemas map[string]any `json:"schemas"`
@@ -375,6 +390,15 @@ func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
 	}
 	if s.Tables == nil {
 		s.Tables = map[string]*TableSnapshot{}
+	}
+	if s.Meta.Columns == nil {
+		s.Meta.Columns = map[string]any{}
+	}
+	if s.Meta.Schemas == nil {
+		s.Meta.Schemas = map[string]any{}
+	}
+	if s.Meta.Tables == nil {
+		s.Meta.Tables = map[string]any{}
 	}
 	for _, t := range s.Tables {
 		if t.Columns == nil {

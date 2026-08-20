@@ -473,11 +473,7 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.Columns) {
 		if _, ok := cur.Columns[k]; !ok {
-			if safe {
-				out = append(out, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN IF EXISTS %s;`, quoteIdent(cur.Name), quoteIdent(k)))
-			} else {
-				out = append(out, fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s;`, quoteIdent(cur.Name), quoteIdent(k)))
-			}
+			out = append(out, dropColumnSQL(cur.Name, k, safe))
 		}
 	}
 	for _, k := range sortedKeys(cur.Columns) {
@@ -497,8 +493,7 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 		}
 		curC := cur.Columns[k]
 		if prevC.Type != curC.Type {
-			out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s SET DATA TYPE %s;`,
-				quoteIdent(cur.Name), quoteIdent(k), curC.Type))
+			out = append(out, setColumnTypeSQL(cur.Name, k, curC.Type))
 		}
 		if prevC.NotNull != curC.NotNull {
 			if curC.NotNull {
@@ -517,6 +512,24 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 		}
 	}
 	return out
+}
+
+// dropColumnSQL and setColumnTypeSQL are the two statements the column
+// diff emits that destroy data. They are functions rather than inline
+// Sprintf calls because Push has to recognise its own diff's output
+// exactly — it matches the statements by text to decide which ones need
+// consent (see withheldDataLoss), and a format string maintained in two
+// places is a rule that stops firing the day one of them is edited.
+func dropColumnSQL(table, column string, safe bool) string {
+	if safe {
+		return fmt.Sprintf(`ALTER TABLE %s DROP COLUMN IF EXISTS %s;`, quoteIdent(table), quoteIdent(column))
+	}
+	return fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s;`, quoteIdent(table), quoteIdent(column))
+}
+
+func setColumnTypeSQL(table, column, typ string) string {
+	return fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s SET DATA TYPE %s;`,
+		quoteIdent(table), quoteIdent(column), typ)
 }
 
 func diffUniques(prev, cur *TableSnapshot, safe bool) []string {

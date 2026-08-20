@@ -55,6 +55,18 @@ type PushOptions struct {
 	// default; see Push's doc comment.
 	DropUnmanagedIndexes bool
 
+	// DropUnmanagedTables lets Push drop a table that exists in the
+	// database and appears in no table of the Go schema. Off by
+	// default, for the same reason as DropUnmanagedIndexes and with a
+	// whole table's worth of data at stake; see ownedBy. The withheld
+	// DROPs are reported as "unmanaged-table" notices whether the push
+	// is a DryRun or a real one, ready to run by hand.
+	//
+	// The restriction is Push's alone. It does not apply to Diff or to
+	// GenerateMigration, where both sides are declarations and a table
+	// missing from the newer one really was removed.
+	DropUnmanagedTables bool
+
 	// SplitAlters emits one ALTER TABLE per column change rather than
 	// batching a table's changes. See DiffOptions.SplitAlters.
 	SplitAlters bool
@@ -92,7 +104,7 @@ type PushResult struct {
 // here rather than being dropped on the floor.
 type SchemaNotice struct {
 	// Rule is a stable identifier for the kind of notice —
-	// "unmanaged-index", "unrepresentable-index",
+	// "unmanaged-table", "unmanaged-index", "unrepresentable-index",
 	// "index-method-ignored", "check-not-normalised",
 	// "checks-not-enforced", "table-options".
 	Rule string
@@ -125,8 +137,8 @@ func (n SchemaNotice) String() string {
 // Behaviour:
 //   - Reads the current state of the database via Introspect.
 //   - Builds a target snapshot from schema.
-//   - Narrows the live side to the tables the schema declares; see
-//     ownedBy.
+//   - Narrows the live side to the tables the schema declares, unless
+//     DropUnmanagedTables says otherwise; see ownedBy.
 //   - Asks the server to respell the declared CHECK expressions, so
 //     both sides of the diff are written in the server's own dialect.
 //   - Diffs the two and, unless DryRun, applies the statements one at a
@@ -156,6 +168,13 @@ func (n SchemaNotice) String() string {
 // One ALTER TABLE is atomic in itself, so a batched statement that
 // fails leaves none of its own actions applied. The migration around it
 // is what is not atomic.
+//
+// # A table the schema never declared
+//
+// Push does not drop one either, and here the argument is stronger
+// still: MySQL has no transactional DDL, so a DROP TABLE against
+// another service's data cannot be rolled back by anything. See
+// ownedBy; DropUnmanagedTables takes the other side of the trade.
 //
 // # An index the schema never declared
 //
@@ -223,12 +242,19 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		return nil, fmt.Errorf("drops/mysql: introspect: %w", err)
 	}
 	desired := BuildSnapshot(schema)
-	current := ownedBy(live, desired)
+	current := live
+	var notices []SchemaNotice
+	if !opt.DropUnmanagedTables {
+		var withheld []string
+		current, withheld = ownedBy(live, desired)
+		notices = append(notices, unmanagedTableNotices(live, withheld, opt)...)
+	}
 
-	notices, err := probeCheckExpressions(ctx, db, opt.Database, server, current, desired)
+	exprNotices, err := probeCheckExpressions(ctx, db, opt.Database, server, current, desired)
 	if err != nil {
 		return nil, fmt.Errorf("drops/mysql: normalise declared expressions: %w", err)
 	}
+	notices = append(notices, exprNotices...)
 	notices = append(notices, tableOptionNotices(current, desired)...)
 	notices = append(notices, unrepresentableIndexNotices(current)...)
 	notices = append(notices, indexMethodNotices(current, desired)...)
@@ -285,7 +311,8 @@ func currentDatabase(ctx context.Context, db *DB) (string, error) {
 }
 
 // ownedBy narrows a live introspection to the tables the Schema
-// declares.
+// declares, and returns the names of the ones it held back so Push can
+// report them.
 //
 // A MySQL database is not a namespace a schema gets to itself: it is
 // what the DSN names, so the application's tables sit beside another
@@ -294,14 +321,18 @@ func currentDatabase(ctx context.Context, db *DB) (string, error) {
 // exist and no longer should, and it emits a DROP for it — which here
 // deletes someone else's data with no transaction to undo it.
 //
-// drops/pg takes the opposite line, because a PostgreSQL schema can be
-// given to one application and Push's Schema option points at exactly
-// one. drops/sqlite takes this one, for the same reason as here.
+// drops/pg and drops/sqlite draw the same line, for the same reason: a
+// table the Go schema never names was never drops's to drop, and the
+// Schema is the only statement of ownership either of them has. A list
+// of table names to skip cannot do the job — it would have to grow for
+// ever, and it would say nothing about the table another team added
+// last week.
 //
 // The cost is that dropping a table means writing the DROP into a
 // migration rather than deleting the Go declaration and pushing, which
-// is the reviewable path anyway.
-func ownedBy(live, declared *Snapshot) *Snapshot {
+// is the reviewable path anyway — or setting
+// PushOptions.DropUnmanagedTables, which puts the live side back whole.
+func ownedBy(live, declared *Snapshot) (*Snapshot, []string) {
 	out := &Snapshot{
 		ID:      live.ID,
 		PrevID:  live.PrevID,
@@ -309,10 +340,32 @@ func ownedBy(live, declared *Snapshot) *Snapshot {
 		Dialect: live.Dialect,
 		Tables:  make(map[string]*TableSnapshot, len(live.Tables)),
 	}
-	for name, ts := range live.Tables {
+	var withheld []string
+	for _, name := range sortedKeys(live.Tables) {
 		if _, ok := declared.Tables[name]; ok {
-			out.Tables[name] = ts
+			out.Tables[name] = live.Tables[name]
+			continue
 		}
+		withheld = append(withheld, name)
+	}
+	return out, withheld
+}
+
+// unmanagedTableNotices reports one withheld DROP TABLE per table
+// ownedBy held back, carrying the statement Diff would have emitted so
+// a caller who wants it can run it by hand.
+func unmanagedTableNotices(live *Snapshot, names []string, opt PushOptions) []SchemaNotice {
+	out := make([]SchemaNotice, 0, len(names))
+	for _, name := range names {
+		t := live.Tables[name]
+		out = append(out, SchemaNotice{
+			Rule:  "unmanaged-table",
+			Table: t.Name,
+			Message: fmt.Sprintf(
+				"table %q exists in the database and is declared by no table in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
+				t.Name),
+			SQL: dropTableSQL(t, DiffOptions{Safe: opt.Safe}),
+		})
 	}
 	return out
 }

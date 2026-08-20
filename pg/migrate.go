@@ -23,6 +23,14 @@ type Migration struct {
 	Name    string // human-readable label, used only for status output
 	Up      func(ctx context.Context, db *DB) error
 	Down    func(ctx context.Context, db *DB) error
+
+	// upSQL and downSQL are the raw statements, kept only when the
+	// migration was registered through AddSQL or AddFS. A migration
+	// registered as a Go function has no SQL to read, so the safety
+	// gate has nothing to analyse and lets it through — the same
+	// exemption TreeMigrator makes for tamper checking, and for the
+	// same reason: drops can inspect text, not closures.
+	upSQL, downSQL string
 }
 
 // Status is a single row produced by Migrator.Status.
@@ -86,6 +94,7 @@ type Migrator struct {
 	migrations []Migration
 	before     []MigrationHook
 	after      []MigrationHook
+	gate       safetyGate
 }
 
 // NewMigrator returns a migrator bound to db. Add migrations with Add /
@@ -97,6 +106,28 @@ func NewMigrator(db *DB) *Migrator {
 // WithTable overrides the migrations history table (default
 // DefaultMigrationsTable).
 func (m *Migrator) WithTable(name string) *Migrator { m.table = name; return m }
+
+// WithSafetyGate refuses to apply a migration whose SQL the analyser
+// grades at min or worse, returning an UnsafeMigrationError that names
+// the migration and lists what it found. It wraps ErrUnsafeMigration.
+//
+// Without it, AnalyzeMigration is a report a caller has to remember to
+// ask for; with it, the rules run at the moment the answer can still
+// change anything. SeverityError is the setting for production —
+// full-table rewrites, exclusive locks, unrecoverable loss — and
+// SeverityWarn or SeverityInfo suit CI, where the cost of being told
+// twice is nothing.
+//
+// The whole run is checked before any of it is applied: a set with an
+// unsafe migration in the middle applies none of the safe ones ahead
+// of it, so the fix — an Ignore in the migration, a different shape,
+// a scheduled window — lands against the schema the set was written
+// for. A migration registered as a Go function carries no SQL and is
+// not analysed; see Migration.
+func (m *Migrator) WithSafetyGate(min SafetySeverity) *Migrator {
+	m.gate = safetyGate{min: min, on: true}
+	return m
+}
 
 // Add registers a single migration.
 func (m *Migrator) Add(mig Migration) *Migrator {
@@ -139,7 +170,7 @@ func (m *Migrator) runHooks(ctx context.Context, tx *DB, hooks []MigrationHook, 
 // AddSQL registers a migration whose Up and Down are raw SQL. downSQL may
 // be empty.
 func (m *Migrator) AddSQL(version, name, upSQL, downSQL string) *Migrator {
-	mig := Migration{Version: version, Name: name}
+	mig := Migration{Version: version, Name: name, upSQL: upSQL, downSQL: downSQL}
 	if upSQL != "" {
 		mig.Up = func(ctx context.Context, db *DB) error {
 			_, err := db.Exec(ctx, upSQL)
@@ -296,6 +327,16 @@ func (m *Migrator) Up(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Every pending migration is analysed before the first one runs;
+	// see WithSafetyGate.
+	for _, mig := range migs {
+		if _, ok := applied[mig.Version]; ok {
+			continue
+		}
+		if err := m.gate.check(mig.Version+"_"+mig.Name, mig.upSQL); err != nil {
+			return err
+		}
+	}
 	for _, mig := range migs {
 		if _, ok := applied[mig.Version]; ok {
 			continue
@@ -352,6 +393,11 @@ func (m *Migrator) Down(ctx context.Context) error {
 	}
 	if target.Down == nil {
 		return fmt.Errorf("drops/pg: migration %s_%s is irreversible (no Down)", target.Version, target.Name)
+	}
+	// A rollback is DDL like any other, and the statement that undoes
+	// an ADD COLUMN is a DROP COLUMN.
+	if err := m.gate.check(target.Version+"_"+target.Name, target.downSQL); err != nil {
+		return err
 	}
 	return m.db.InTx(ctx, func(tx *DB) error {
 		if err := m.runHooks(ctx, tx, m.before, *target, DirectionDown); err != nil {

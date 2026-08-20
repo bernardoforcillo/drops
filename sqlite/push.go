@@ -44,6 +44,22 @@ var ErrSchemaRequired = errors.New("drops/sqlite: Push requires a non-nil schema
 // Where a change forces a table rebuild, the indexes and triggers that
 // rebuild destroys are put back — see Diff.
 //
+// # Renames
+//
+// There is no sqlite counterpart to pg.Rename, and the omission is
+// deliberate rather than pending. Renaming a column here is not one
+// statement: ALTER TABLE ... RENAME COLUMN arrived in SQLite 3.25, the
+// file in front of you may predate it, and this dialect's Diff already
+// answers most changes by rebuilding the table — create the new shape,
+// INSERT ... SELECT the rows across, drop the old one. A rename would
+// have to reach into that rebuild and change which source column feeds
+// which destination column, and a pairing that is off by one moves
+// every value into the neighbouring column, silently, with no error and
+// no way to tell afterwards which column the data came from. Until that
+// pairing is proven by a test that reads the generated INSERT ...
+// SELECT, drops declares the rename in a migration you write, where the
+// two column lists are visible to the person writing them.
+//
 // Push is convenient for development but skips migration history; prefer
 // the Migrator for production, so changes are reviewable and reproducible.
 func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*PushResult, error) {

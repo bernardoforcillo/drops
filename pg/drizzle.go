@@ -60,6 +60,7 @@ type DrizzleMigrator struct {
 	table  string
 	before []DrizzleHook
 	after  []DrizzleHook
+	gate   safetyGate
 }
 
 // NewDrizzleMigrator wraps db with a migrator that reads from dir within
@@ -88,6 +89,28 @@ func (d *DrizzleMigrator) WithSchema(schema string) *DrizzleMigrator {
 // drizzle.config.ts's `migrationsTable` to stay interoperable.
 func (d *DrizzleMigrator) WithTable(table string) *DrizzleMigrator {
 	d.table = table
+	return d
+}
+
+// WithSafetyGate refuses to apply a migration file whose SQL the
+// analyser grades at min or worse, returning an UnsafeMigrationError
+// naming the file's tag and listing what it found. It wraps
+// ErrUnsafeMigration.
+//
+// This is the migrator Push tells you to prefer in production, and the
+// files it runs are generated: nobody writes the DROP COLUMN, so nobody
+// reads it either, and it arrives in a directory of files whose
+// contents are only ever reviewed as a diff. The gate is the reader
+// that never skips. SeverityError is the production setting;
+// SeverityWarn or SeverityInfo suit CI.
+//
+// Every pending file is analysed before the first one is applied, so a
+// set with an unsafe file in the middle applies none of the safe ones
+// ahead of it. See AnalyzeMigration for what the rules look at, and
+// SafetyOptions.Ignore for the escape hatch — which, since it takes a
+// rule ID, has to be spelled out per rule rather than granted wholesale.
+func (d *DrizzleMigrator) WithSafetyGate(min SafetySeverity) *DrizzleMigrator {
+	d.gate = safetyGate{min: min, on: true}
 	return d
 }
 
@@ -239,6 +262,16 @@ func (d *DrizzleMigrator) Up(ctx context.Context) error {
 	applied, err := d.appliedHashes(ctx)
 	if err != nil {
 		return err
+	}
+	// Every pending file is analysed before the first one runs; see
+	// WithSafetyGate.
+	for _, e := range entries {
+		if applied[e.Hash] {
+			continue
+		}
+		if err := d.gate.check(e.Tag, e.SQL); err != nil {
+			return err
+		}
 	}
 	for _, e := range entries {
 		if applied[e.Hash] {

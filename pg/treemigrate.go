@@ -94,6 +94,11 @@ type TreeMigration struct {
 	// programmatic migrations (func-only) have an empty string and are
 	// exempt from tamper checking.
 	upSQL string
+
+	// downSQL is the rollback text, kept for the same reason and with
+	// the same exemption: WithSafetyGate reads it before a rollback,
+	// and a node registered as a Go function has nothing to read.
+	downSQL string
 }
 
 // TreeStatus is one row produced by Status.
@@ -130,6 +135,7 @@ type TreeMigrator struct {
 	schema string
 	nodes  map[string]TreeMigration
 	order  []string // insertion order — drives stable topo tie-breaking
+	gate   safetyGate
 }
 
 // Sentinel errors.
@@ -160,6 +166,28 @@ func (m *TreeMigrator) WithSchema(schema string) *TreeMigrator {
 	return m
 }
 
+// WithSafetyGate refuses to apply or roll back a node whose SQL the
+// analyser grades at min or worse, returning an UnsafeMigrationError
+// naming the node and listing what it found. It wraps
+// ErrUnsafeMigration.
+//
+// The check happens in applyOne and rollbackOne, immediately before the
+// node's transaction opens, rather than over a whole run up front: this
+// migrator has five entry points into that pair — Up, UpTo, Checkout,
+// Down, DownTo — and a gate installed at each of them is a gate the
+// sixth one will not have. The consequence is that a refusal behaves
+// like any other failure here: the nodes already applied stay applied,
+// and the refused one is untouched, because each node has its own
+// transaction. Plan reads the run in advance without touching the
+// schema.
+//
+// A node registered as a Go function carries no SQL and is not
+// analysed; see TreeMigration.
+func (m *TreeMigrator) WithSafetyGate(min SafetySeverity) *TreeMigrator {
+	m.gate = safetyGate{min: min, on: true}
+	return m
+}
+
 // Add registers a migration node. Panics on duplicate ID so schema
 // declaration bugs surface immediately at process startup.
 func (m *TreeMigrator) Add(mig TreeMigration) *TreeMigrator {
@@ -183,7 +211,7 @@ func (m *TreeMigrator) Add(mig TreeMigration) *TreeMigrator {
 // AddSQL is a convenience wrapper for SQL-only migrations.
 // downSQL may be empty (irreversible).
 func (m *TreeMigrator) AddSQL(id, name, branch string, parents []string, upSQL, downSQL string) *TreeMigrator {
-	mig := TreeMigration{ID: id, Name: name, Branch: branch, Parents: parents, upSQL: upSQL}
+	mig := TreeMigration{ID: id, Name: name, Branch: branch, Parents: parents, upSQL: upSQL, downSQL: downSQL}
 	if upSQL != "" {
 		u := upSQL
 		mig.Up = func(ctx context.Context, db *DB) error {
@@ -282,6 +310,7 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 			Parents:     e.parents,
 			Description: e.description,
 			upSQL:       e.upSQL,
+			downSQL:     e.downSQL,
 		}
 		if e.upSQL != "" {
 			u := e.upSQL
@@ -797,6 +826,9 @@ func (m *TreeMigrator) applyOne(ctx context.Context, mig TreeMigration) error {
 	if mig.Up == nil {
 		return fmt.Errorf("drops/pg: migration %q has no Up function", mig.ID)
 	}
+	if err := m.gate.check(mig.ID, mig.upSQL); err != nil {
+		return err
+	}
 	return m.db.InTx(ctx, func(tx *DB) error {
 		// Transaction-scoped advisory lock: held until this tx commits or
 		// rolls back, guaranteed to run on the same connection as the DDL.
@@ -831,6 +863,11 @@ func (m *TreeMigrator) applyOne(ctx context.Context, mig TreeMigration) error {
 func (m *TreeMigrator) rollbackOne(ctx context.Context, mig TreeMigration) error {
 	if mig.Down == nil {
 		return fmt.Errorf("%w: %q", ErrTreeIrreversible, mig.ID)
+	}
+	// A rollback is DDL like any other, and the statement that undoes
+	// an ADD COLUMN is a DROP COLUMN.
+	if err := m.gate.check(mig.ID, mig.downSQL); err != nil {
+		return err
 	}
 	return m.db.InTx(ctx, func(tx *DB) error {
 		// Transaction-scoped advisory lock — see applyOne.

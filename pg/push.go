@@ -33,7 +33,115 @@ type PushOptions struct {
 	// database but appears in no table of the Go schema. It is off by
 	// default; see Push's doc comment for why.
 	DropUnmanagedIndexes bool
+
+	// DropUnmanagedTables lets Push drop a table that exists in the
+	// database but appears in no table of the Go schema. It is off by
+	// default, for the same reason as DropUnmanagedIndexes and with
+	// more at stake: Push's "previous" side is a database, and a table
+	// the Go schema does not name most likely was never drops's to
+	// begin with — another service's, a vendor's, an extension's, a
+	// migration history table, something a DBA left. The withheld DROPs
+	// are reported as "unmanaged-table" notices whether the push is a
+	// DryRun or a real one, ready to run by hand.
+	//
+	// The restriction is Push's alone. It does not apply to Diff or to
+	// GenerateMigration, where both sides are declarations and a table
+	// missing from the newer one really was removed.
+	//
+	// Turning it on does not by itself authorise the drop of a table
+	// with rows in it; see Allow.
+	DropUnmanagedTables bool
+
+	// Allow names the destructive changes this push is permitted to
+	// make to a table that is not empty. Anything destructive that is
+	// not named here, and not against an empty table, is withheld:
+	// Push applies nothing, returns ErrDestructivePush, and reports
+	// what it withheld in PushResult.DataLoss.
+	//
+	// Naming the object rather than passing a global --force is the
+	// whole point. A flag says "destroy whatever today's diff happens
+	// to contain", which is a decision made before anyone knew what
+	// that was; a Destructive names one table and one column, so
+	// yesterday's consent cannot authorise today's unrelated DROP, and
+	// the consent is a Go value visible in the diff of the pull request
+	// that grants it.
+	Allow []Destructive
 }
+
+// DestructiveOp names a kind of change that destroys data.
+type DestructiveOp string
+
+// The names carry an Op prefix because pg.DropTable is already the DDL
+// builder that renders a DROP TABLE statement, and one of the two
+// spellings has to give way to the other.
+const (
+	// OpDropTable is a DROP TABLE: every row goes.
+	OpDropTable DestructiveOp = "drop-table"
+	// OpDropColumn is an ALTER TABLE ... DROP COLUMN: one value per
+	// row goes.
+	OpDropColumn DestructiveOp = "drop-column"
+	// OpRetypeColumn is an ALTER TABLE ... SET DATA TYPE. It is here
+	// because PostgreSQL casts every existing value on the way, and a
+	// cast can truncate (varchar(20) to varchar(10)), round (numeric to
+	// integer) or fail halfway through the rewrite.
+	OpRetypeColumn DestructiveOp = "retype-column"
+)
+
+// Destructive names one change Push is authorised to make. Pass them
+// in PushOptions.Allow.
+type Destructive struct {
+	// Op is the kind of change being authorised.
+	Op DestructiveOp
+	// Table is the unqualified table name, as the database has it.
+	Table string
+	// Object is the column name; empty for OpDropTable.
+	Object string
+}
+
+// DataLoss is a destructive change Push found, declined to make, and
+// is telling you about.
+//
+// Rows is an ESTIMATE, read from pg_class.reltuples. Distinguishing
+// "empty" from "not empty" is all the rule needs — an empty table has
+// nothing to lose, so dropping it needs no permission — and a COUNT(*)
+// per candidate table is a sequential scan bolted onto the operation
+// you most want to finish quickly.
+//
+// The estimate is -1 on a table PostgreSQL has never analysed, which is
+// every table created since the last autovacuum ran: exactly the tables
+// a development push creates and reshapes minutes later. Refusing those
+// would make the rule fire hardest where there is nothing to protect,
+// so an unknown estimate is settled with SELECT EXISTS (SELECT 1 FROM
+// t LIMIT 1) — one row read, on the only tables whose count nobody
+// knows, and only for a change nobody has authorised. Rows stays -1
+// afterwards, because "some" is all that probe answers.
+type DataLoss struct {
+	// Op is the kind of change.
+	Op DestructiveOp
+	// Table is the table it is against.
+	Table string
+	// Object is the column, empty for a table-level change.
+	Object string
+	// Rows is the planner's row-count estimate for Table, or -1 when
+	// the table has never been analysed.
+	Rows int64
+	// SQL is the statement Push withheld.
+	SQL string
+	// Suggestion is the Destructive value that would authorise it.
+	Suggestion string
+}
+
+// ErrDestructivePush is returned when a push would destroy data in a
+// table that is not empty and PushOptions.Allow does not name the
+// change. Nothing is applied: the whole diff is withheld, not just the
+// destructive part of it, because a half-applied schema is worse than
+// an unapplied one and the caller is about to re-run this anyway.
+//
+// Unlike every other failure in Push, the PushResult is returned
+// alongside the error rather than instead of it — the statements it
+// planned and the DataLoss list are the answer to the question the
+// error raises.
+var ErrDestructivePush = errors.New("drops/pg: push withheld destructive statements; see PushResult.DataLoss")
 
 // PushResult is the outcome of a Push call.
 type PushResult struct {
@@ -48,6 +156,11 @@ type PushResult struct {
 	// database and the schema disagree about something Push declined
 	// to change.
 	Notices []SchemaNotice
+	// DataLoss lists the destructive changes that stopped this push,
+	// in the order the diff put them. It is non-empty exactly when
+	// Push returned ErrDestructivePush; each entry carries the
+	// PushOptions.Allow value that would let it through.
+	DataLoss []DataLoss
 }
 
 // SchemaNotice is a difference Push can see but will not act on.
@@ -57,7 +170,7 @@ type PushResult struct {
 // here rather than being dropped on the floor.
 type SchemaNotice struct {
 	// Rule is a stable identifier for the kind of notice —
-	// "unmanaged-index", "unrepresentable-index",
+	// "unmanaged-table", "unmanaged-index", "unrepresentable-index",
 	// "check-not-normalised", "index-predicate-not-normalised".
 	Rule string
 	// Table is the table the notice concerns, unqualified.
@@ -93,7 +206,12 @@ func (n SchemaNotice) String() string {
 //     partial-index predicates, so the two sides of the diff are
 //     written in the same dialect of PostgreSQL's own deparser.
 //     See "What the probe costs" below: this happens on a DryRun too.
+//   - Narrows the live side to the tables the Go schema declares,
+//     unless DropUnmanagedTables says otherwise; see ownedBy.
 //   - Diffs the two using DiffOptions{Safe: opts.Safe}.
+//   - Refuses the whole push when the diff would destroy data in a
+//     table that is not empty and PushOptions.Allow does not name the
+//     change; see ErrDestructivePush.
 //   - If DryRun, returns the statements unexecuted.
 //   - Otherwise applies them inside a single transaction; any failure
 //     rolls back the whole push. CREATE INDEX CONCURRENTLY is the one
@@ -133,6 +251,29 @@ func (n SchemaNotice) String() string {
 // Set DropUnmanagedIndexes to take the other side of that trade; the
 // withheld statements are reported as notices either way, ready to run
 // by hand.
+//
+// # A table the schema never declared
+//
+// The same argument, with the whole table's worth of data behind it.
+// Push against a shared database — a Supabase or Neon project, an RDS
+// instance several services point at, anything with PostGIS in it —
+// used to emit DROP TABLE ... CASCADE for every table the Go schema did
+// not declare, which is the fastest way for a tool to be banned from an
+// organisation for good. It no longer does: the live side is narrowed
+// to the declared tables before the diff, and the drops it would have
+// emitted come back as "unmanaged-table" notices. DropUnmanagedTables
+// takes the other side of the trade.
+//
+// # Destroying data on purpose
+//
+// A change that destroys data — DROP TABLE, DROP COLUMN, a SET DATA
+// TYPE whose cast rewrites every value — goes through unremarked when
+// the table is empty, because there is nothing to lose, which is what
+// makes the development loop of pushing a table and reshaping it a
+// minute later unaffected. Against a table with rows in it, Push
+// applies nothing at all and returns ErrDestructivePush with a DataLoss entry per statement it withheld;
+// naming each one in PushOptions.Allow is what lets it through. See
+// DataLoss for what "has rows" means and what it costs to ask.
 //
 // # What Push cannot see
 //
@@ -180,10 +321,19 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}
 	desired := BuildSnapshot(schema)
 
-	notices, err := renormaliseExpressions(ctx, db, current, desired)
+	var notices []SchemaNotice
+	if !opt.DropUnmanagedTables {
+		var withheld []string
+		live := current
+		current, withheld = ownedBy(live, desired)
+		notices = append(notices, unmanagedTableNotices(live, withheld, opt.Safe)...)
+	}
+
+	exprNotices, err := renormaliseExpressions(ctx, db, current, desired)
 	if err != nil {
 		return nil, fmt.Errorf("drops/pg: normalise declared expressions: %w", err)
 	}
+	notices = append(notices, exprNotices...)
 	notices = append(notices, unrepresentableIndexNotices(desired)...)
 
 	stmts := Diff(current, desired, DiffOptions{Safe: opt.Safe})
@@ -196,6 +346,15 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 
 	if len(stmts) == 0 {
 		return &PushResult{Statements: nil, Applied: false, Notices: notices}, nil
+	}
+	loss, err := withheldDataLoss(ctx, db, schemaName, stmts, current, desired, opt)
+	if err != nil {
+		return nil, err
+	}
+	if len(loss) > 0 {
+		return &PushResult{Statements: stmts, Applied: false, Notices: notices, DataLoss: loss},
+			fmt.Errorf("%w: %d of %d statements would destroy data, starting with %q",
+				ErrDestructivePush, len(loss), len(stmts), excerptSQL(loss[0].SQL))
 	}
 	if opt.DryRun {
 		return &PushResult{Statements: stmts, Applied: false, Notices: notices}, nil
@@ -422,6 +581,252 @@ func qualifiedTableSQL(t *TableSnapshot) string {
 		return quoteIdent(t.Name)
 	}
 	return quoteIdent(t.Schema) + "." + quoteIdent(t.Name)
+}
+
+// ----------------------------------------------------------------------
+// Ownership
+// ----------------------------------------------------------------------
+
+// ownedBy narrows a live introspection to the tables the Schema
+// declares, and returns the keys of the ones it held back so Push can
+// report them.
+//
+// A PostgreSQL schema is often not a namespace one application has to
+// itself: a Supabase or Neon project puts extensions, auth tables and
+// storage tables beside yours, an RDS instance serves several services,
+// PostGIS leaves spatial_ref_sys behind, and another migration tool
+// keeps its history table somewhere. To Diff, every one of those looks
+// like a table that used to exist and should no longer, and it emits
+// DROP TABLE ... CASCADE for it — so a push against a database drops
+// did not create alone deletes other people's data, cascading through
+// their foreign keys on the way out.
+//
+// A list of vendor names to skip cannot work; it has to grow for ever,
+// one paper cut at a time, and it says nothing about the table another
+// team added last week. The Go Schema is the only statement of
+// ownership drops has, and it is one the compiler already checks, so a
+// table it never names is left alone. drops/sqlite and drops/mysql
+// draw the same line for the same reason.
+//
+// The cost is that dropping a table means writing the DROP into a
+// migration rather than deleting the Go declaration and pushing —
+// which is the reviewable path anyway — or setting
+// PushOptions.DropUnmanagedTables, which puts the live side back
+// whole.
+func ownedBy(live, declared *Snapshot) (*Snapshot, []string) {
+	out := *live
+	out.Tables = make(map[string]*TableSnapshot, len(live.Tables))
+	var withheld []string
+	for _, key := range sortedKeys(live.Tables) {
+		if _, ok := declared.Tables[key]; ok {
+			out.Tables[key] = live.Tables[key]
+			continue
+		}
+		withheld = append(withheld, key)
+	}
+	return &out, withheld
+}
+
+// unmanagedTableNotices reports one withheld DROP TABLE per table
+// ownedBy held back, carrying the statement Diff would have emitted so
+// a caller who wants it can run it by hand.
+func unmanagedTableNotices(live *Snapshot, keys []string, safe bool) []SchemaNotice {
+	out := make([]SchemaNotice, 0, len(keys))
+	for _, key := range keys {
+		t := live.Tables[key]
+		out = append(out, SchemaNotice{
+			Rule:  "unmanaged-table",
+			Table: t.Name,
+			Message: fmt.Sprintf(
+				"table %q exists in the database and is declared by no table in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
+				t.Name),
+			SQL: dropTableSQL(t, safe),
+		})
+	}
+	return out
+}
+
+// ----------------------------------------------------------------------
+// Destructive changes
+// ----------------------------------------------------------------------
+
+// withheldDataLoss returns one DataLoss per statement in stmts that
+// destroys data in a table that is not empty and that PushOptions.Allow
+// does not authorise.
+//
+// The candidates are derived from the same two snapshots Diff was given
+// and then matched against the statements by text, exactly as
+// withholdUnmanagedIndexDrops does: re-deriving the statement is what
+// keeps a rule from firing on a statement that came from somewhere
+// else, and text is what makes the match total.
+//
+// The row estimates cost one query against pg_class, asked once for the
+// whole schema and only when a destructive statement is actually in the
+// diff — the overwhelmingly common push has none, and pays nothing.
+func withheldDataLoss(ctx context.Context, db *DB, schema string, stmts []string, current, desired *Snapshot, opt PushOptions) ([]DataLoss, error) {
+	candidates := map[string]DataLoss{}
+	add := func(sql string, d DataLoss) {
+		d.SQL = sql
+		candidates[sql] = d
+	}
+	for _, key := range sortedKeys(current.Tables) {
+		ct := current.Tables[key]
+		dt, declared := desired.Tables[key]
+		if !declared {
+			add(dropTableSQL(ct, opt.Safe), DataLoss{Op: OpDropTable, Table: ct.Name})
+			continue
+		}
+		for _, name := range sortedKeys(ct.Columns) {
+			dc, kept := dt.Columns[name]
+			if !kept {
+				add(dropColumnSQL(dt.Name, name, opt.Safe),
+					DataLoss{Op: OpDropColumn, Table: ct.Name, Object: name})
+				continue
+			}
+			if dc.Type != ct.Columns[name].Type {
+				add(setColumnTypeSQL(dt.Name, name, dc.Type),
+					DataLoss{Op: OpRetypeColumn, Table: ct.Name, Object: name})
+			}
+		}
+	}
+
+	// Consent first: a caller who has already named every destructive
+	// change in the diff is owed neither an estimate nor a probe, and
+	// the overwhelmingly common push has no destructive change at all.
+	var unconsented []DataLoss
+	for _, s := range stmts {
+		if d, ok := candidates[s]; ok && !allowsDestructive(opt.Allow, d) {
+			unconsented = append(unconsented, d)
+		}
+	}
+	if len(unconsented) == 0 {
+		return nil, nil
+	}
+
+	rows, err := tableRowEstimates(ctx, db, schema)
+	if err != nil {
+		return nil, fmt.Errorf("drops/pg: estimate rows before a destructive push: %w", err)
+	}
+	var withheld []DataLoss
+	probed := map[string]bool{}
+	for _, d := range unconsented {
+		est, known := rows[d.Table]
+		if !known {
+			// Not in pg_class under this schema at all, which this
+			// connection has no business assuming is empty.
+			est = -1
+		}
+		if est == 0 {
+			continue // nothing to lose
+		}
+		if est < 0 {
+			has, seen := probed[d.Table]
+			if !seen {
+				has, err = tableHasRows(ctx, db, schema, d.Table)
+				if err != nil {
+					return nil, fmt.Errorf("drops/pg: deciding whether %q is empty before destroying data in it: %w", d.Table, err)
+				}
+				probed[d.Table] = has
+			}
+			if !has {
+				continue
+			}
+		}
+		d.Rows = est
+		d.Suggestion = fmt.Sprintf("allow with pg.Destructive{Op: pg.%s, Table: %q, Object: %q}",
+			destructiveOpConst(d.Op), d.Table, d.Object)
+		withheld = append(withheld, d)
+	}
+	return withheld, nil
+}
+
+// allowsDestructive reports whether the caller named this exact change.
+func allowsDestructive(allow []Destructive, d DataLoss) bool {
+	for _, a := range allow {
+		if a.Op == d.Op && a.Table == d.Table && a.Object == d.Object {
+			return true
+		}
+	}
+	return false
+}
+
+// destructiveOpConst renders the Go identifier for an op, so the
+// suggestion can be pasted into the call rather than transcribed.
+func destructiveOpConst(op DestructiveOp) string {
+	switch op {
+	case OpDropTable:
+		return "OpDropTable"
+	case OpDropColumn:
+		return "OpDropColumn"
+	case OpRetypeColumn:
+		return "OpRetypeColumn"
+	}
+	return string(op)
+}
+
+// tableRowEstimates reads the planner's row-count estimate for every
+// table in the schema.
+//
+// reltuples is what the last ANALYZE or autovacuum left behind, which
+// is why this is one cheap catalogue read rather than a COUNT(*) per
+// table. PostgreSQL 14 and later store -1 for a table that has never
+// been analysed, and this passes that through: the caller has to
+// distinguish "no rows" from "nobody has looked", because only the
+// first of those is a reason to let a DROP through. See tableHasRows
+// for how the second is settled.
+func tableRowEstimates(ctx context.Context, db *DB, schema string) (map[string]int64, error) {
+	rows, err := db.Query(ctx, `SELECT c.relname, c.reltuples::bigint
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')`, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var name string
+		var est int64
+		if err := rows.Scan(&name, &est); err != nil {
+			return nil, err
+		}
+		out[name] = est
+	}
+	return out, rows.Err()
+}
+
+// tableHasRows answers the one question the estimate could not: is
+// there anything in here at all.
+//
+// LIMIT 1 stops at the first row, so this reads one page of a table of
+// any size — the property COUNT(*) does not have, and the reason a
+// probe is affordable here and a count is not. It runs only for a table
+// PostgreSQL has never analysed, and only for a destructive change
+// nobody has authorised, so the common push never reaches it.
+//
+// A probe that fails fails the push. Not being able to tell whether a
+// table holds data is not a reason to go ahead and destroy it, and it
+// is not a reason to report it as data loss either — the caller would
+// be granting consent for a table nobody has looked inside.
+func tableHasRows(ctx context.Context, db *DB, schema, table string) (bool, error) {
+	stmt := fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s.%s LIMIT 1)`,
+		quoteIdent(schema), quoteIdent(table))
+	rows, err := db.Query(ctx, stmt)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+		return false, errors.New("the emptiness probe returned no row")
+	}
+	var has bool
+	if err := rows.Scan(&has); err != nil {
+		return false, err
+	}
+	return has, rows.Err()
 }
 
 // ----------------------------------------------------------------------

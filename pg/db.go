@@ -244,11 +244,89 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 	return rows, err
 }
 
-// ExecExpr renders e to SQL and runs it as a statement. Convenience for
-// DDL helpers like CreateTable.
+// ExecExpr renders e to SQL and runs it as a statement. It is the
+// convenience path for the expressions that have no executor of their
+// own — the DDL helpers, CreateTable and CreateIndex and
+// CreateExtensionIfNotExists.
+//
+// The ctx reaches the render, which is the rule this package holds
+// every ctx-taking method to: a method that accepts a context.Context
+// resolves the statement against it, or its doc says why it cannot.
+// This one used to be the counter-example. It rendered through
+// drops.String — the context-free path — and handed the result to Exec
+// together with the ctx it had just discarded. All four builders
+// satisfy drops.Expression, so a caller could pass one and be told
+// nothing was wrong: on a table whose every read carries a tenant
+// predicate, db.ExecExpr(ctx, db.Delete(Posts)) sent DELETE FROM
+// "posts" with no WHERE clause and reported the destruction of every
+// tenant's rows as a success. "Convenience for DDL helpers" described
+// how the method was meant to be called; it did not stop the other
+// call, and a description is not a guard.
+//
+// What the ctx can contribute depends on what e is, and the third case
+// is as deliberate as the first two:
+//
+//   - A statement drops can render per request — the Select, Insert,
+//     Update and Delete builders, or any type carrying the same
+//     ToSQLCtx method — goes through ToSQLCtx, so the context filters
+//     of every table it names are resolved into it, and a filter that
+//     refuses ([ErrTenantMissing]) stops the statement instead of
+//     scoping it.
+//   - An expression with a statement inside it — [Subquery] and the
+//     other operands built on opExpr — is walked to that statement and
+//     resolved there.
+//   - Anything genuinely opaque — a DDL helper, a [drops.Raw], a
+//     caller's own [drops.ExprFunc] — has nothing drops can resolve:
+//     no builder under the closure, no table to ask. It renders exactly
+//     as it did before, byte for byte, and stays the caller's to scope.
+//     That is the documented escape hatch, and it is still open.
 func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, error) {
-	sql, args := drops.String(e)
+	sql, args, err := renderForCtx(ctx, e)
+	if err != nil {
+		return nil, err
+	}
 	return db.Exec(ctx, sql, args...)
+}
+
+// ctxStatement is a statement that renders for one particular request:
+// the four builders in this package, whose ToSQLCtx resolves the
+// context filters of every table the statement names before rendering.
+//
+// It is satisfied structurally rather than declared, which is the point
+// of stating it as an interface at all: a caller's own statement type
+// that exposes the same method is rendered for its ctx on the same
+// terms, instead of being rendered blind because it is not one of ours.
+type ctxStatement interface {
+	drops.Expression
+	ToSQLCtx(ctx context.Context) (sql string, args []any, err error)
+}
+
+// renderForCtx renders e as the statement ctx names, and is where
+// ExecExpr's promise is kept. Split out from ExecExpr so the three
+// cases can be read as three cases.
+func renderForCtx(ctx context.Context, e drops.Expression) (string, []any, error) {
+	// A SELECT can carry a deferred error — a cursor that failed to
+	// decode — which Rows/All/One report and rendering does not.
+	// AfterCursor fails closed by appending a false predicate, so
+	// rendering one anyway sends a statement that matches nothing and
+	// returns no error at all: the caller reads "the page was empty"
+	// where the truth is "the cursor was corrupt".
+	if s, ok := e.(*SelectBuilder); ok && s.err != nil {
+		return "", nil, s.err
+	}
+	if st, ok := e.(ctxStatement); ok {
+		return st.ToSQLCtx(ctx)
+	}
+	// Not a statement, but possibly an expression with one inside:
+	// resolveExpr walks to any statement this package wrapped and
+	// returns e unchanged when there is none, which is what keeps an
+	// opaque expression rendering byte-identically.
+	resolved, _, err := resolveExpr(ctx, e)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args := drops.String(resolved)
+	return sql, args, nil
 }
 
 // emit invokes the hook, if any, with the provided event. Uses

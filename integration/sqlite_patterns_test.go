@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bernardoforcillo/drops/integration"
 	"github.com/bernardoforcillo/drops/sqlite"
 )
 
@@ -170,5 +171,40 @@ func TestScalarResultsScan(t *testing.T) {
 	}
 	if row.ID == 0 || row.Label == "" {
 		t.Errorf("row = %+v", row)
+	}
+}
+
+// Dec built as Inc(-delta) wraps on an unsigned handle, and the
+// statement it renders is a flawless addition of the wrapped value. No
+// engine will complain; the counter simply climbs when it was told to
+// fall. Only the stored number settles it.
+func TestDecLowersAnUnsignedCounter(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	tbl := sqlite.NewTable(integration.UniqueName(t, "seatmaps"))
+	id := sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
+	seats := sqlite.Add(tbl, sqlite.Custom[uint32]("seats", "INTEGER").NotNull())
+	exec(t, db, sqlite.CreateTable(tbl))
+
+	type seatmap struct {
+		ID    int64  `drop:"id"`
+		Seats uint32 `drop:"seats"`
+	}
+	ent := sqlite.NewEntity[seatmap](tbl)
+
+	if _, err := db.Insert(tbl).Values(id.Val(1), seats.Val(100)).Exec(ctx); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := ent.Patch(db, ctx, int64(1), sqlite.Dec(seats, uint32(5))); err != nil {
+		t.Fatalf("Dec: %v", err)
+	}
+
+	var got uint32
+	if err := db.Select(seats).From(tbl).Where(id.Eq(int64(1))).One(ctx, &got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != 95 {
+		t.Fatalf("seats = %d after Dec(5) from 100, want 95", got)
 	}
 }

@@ -115,6 +115,14 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **`Dec` added a negated delta, so an unsigned counter climbed.** In
+  all three dialects. The constraint behind `Inc`/`Dec` admits the
+  unsigned types, and negating an unsigned value wraps, so
+  `Dec(seats, uint32(5))` bound 4294967291 and rendered a flawless
+  addition of it: a counter at 100 asked to fall by five stored
+  4294967391. No engine objects — the statement is correct SQL, it just
+  computes the opposite of the method's name. `Dec` renders a
+  subtraction now.
 - **`pg.Table.As` handed back the table's own columns, so a PostgreSQL
   self-join could not be written.** The copy was one struct assignment
   deep: the alias shared its column slice, its `byName` map and every

@@ -66,23 +66,33 @@ type number interface {
 
 // Inc emits "col = col + delta".
 func Inc[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '+'}
 }
 
-// Dec is shorthand for Inc(col, -delta).
+// Dec emits "col = col - delta".
+//
+// It renders a subtraction rather than adding a negated delta, because
+// [number] admits the unsigned types and negating an unsigned value
+// wraps it: Dec(seats, uint32(5)) built as Inc(seats, -5) binds
+// 4294967291 and renders a perfect addition of it, so a counter at 100
+// asked to fall by five stores 4294967391. Silently — there is nothing
+// wrong with the statement.
 func Dec[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: -delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '-'}
 }
 
 type incOp[T number] struct {
 	col   *Column
 	delta T
+	op    byte // '+' or '-'
 }
 
 func (o *incOp[T]) column() *Column { return o.col }
 func (o *incOp[T]) writeValue(b *drops.Builder) {
 	o.col.WriteSQL(b)
-	b.WriteString(" + ")
+	b.WriteByte(' ')
+	b.WriteByte(o.op)
+	b.WriteByte(' ')
 	b.AddArg(o.delta)
 }
 

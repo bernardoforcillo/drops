@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,16 @@ import (
 // Query entries rely on TTL alone — invalidation across an arbitrary
 // WHERE/JOIN topology is intractable in the general case, and TTL is
 // usually the right trade for read-heavy services.
+//
+// The two namespaces are not equally safe to fill, and the difference
+// is the tenant. A query entry is keyed by the statement the ctx
+// resolved to, so the tenant and the subject are hashed into it and two
+// tenants asking one question get two entries. A primary-key entry has
+// room for the id and nothing else. So an entity whose rows are scoped
+// — by a tenant axis, an authorisation guard, or a context filter on
+// its table — never writes a PK entry and never reads one; it keeps the
+// query cache and loses the PK cache. See (*Entity).hasRowScope for
+// what goes wrong when a scoped row reaches that namespace.
 //
 // A built-in single-flight group dedupes concurrent identical
 // PK-by-cache-miss reads, so a thundering herd of "give me user 42"
@@ -72,14 +84,71 @@ func (e *Entity[T]) pkKey(values []any) string {
 }
 
 // queryKey builds the cache key for a rendered SELECT (sql + args).
-// SHA-256 of the concatenated form keeps the key short and stable.
+// SHA-256 of the encoded form keeps the key one fixed-width token
+// whatever the statement's size.
+//
+// Since P0-1 this key is a tenant-isolation boundary and not only a
+// lookup shortcut, and it is built like one. The tenant predicate is
+// resolved by the executor rather than by the caller, so the *sql* of
+// two tenants asking the same question is byte-identical: the only
+// thing separating their cached result sets is that their tenant
+// values are bound as arguments and hashed in here. What that asks of
+// the encoding, and of the digest, follows — and none of it is
+// optional.
+//
+// Arguments are encoded with their dynamic type. A bare %v erases it,
+// so WithTenant(ctx, "7") and WithTenant(ctx, int64(7)) produced the
+// same key — and an application that reads the tenant off an HTTP
+// header on one path and out of a database column on another has both
+// spellings of the same customer id in the same process. One of them
+// was served the other's rows.
+//
+// Pointer arguments are followed to the value they point at instead of
+// being rendered as an address. An address is not stable across runs
+// (which would only cost hit rate), but it is also *reused*: once the
+// pointee is collected the allocator may hand the same address to a
+// different tenant's value, and the second one inherits the first
+// one's cache entry.
+//
+// Each rendered value is length-prefixed so it cannot spell out its
+// neighbours: without it an argument containing the separator byte can
+// reproduce the encoding of a different argument list.
+//
+// The whole digest goes into the key, where the first 64 bits used to.
+// At 64 bits a collision is expected around 2^32 entries, which is a
+// population a busy cache reaches, and a collision here does not
+// corrupt an entry — it answers one tenant's query with another
+// tenant's rows. Forty-eight more bytes per key is not a price worth
+// arguing about against that.
 func queryKey(table, sql string, args []any) string {
 	h := sha256.New()
-	h.Write([]byte(sql))
+	fmt.Fprintf(h, "%d\x00%s", len(sql), sql)
 	for _, a := range args {
-		fmt.Fprintf(h, "\x00%v", a)
+		hashArg(h, a)
 	}
-	return fmt.Sprintf("drops:%s:q:%s", table, hex.EncodeToString(h.Sum(nil))[:16])
+	return fmt.Sprintf("drops:%s:q:%s", table, hex.EncodeToString(h.Sum(nil)))
+}
+
+// hashArg writes one bound argument into h as
+// "\x00<dynamic type>\x00<len>\x00<value>". See queryKey for why the
+// type and the length are in there and why pointers are dereferenced.
+func hashArg(h io.Writer, a any) {
+	fmt.Fprintf(h, "\x00%T", a)
+	v := reflect.ValueOf(a)
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			break
+		}
+		v = v.Elem()
+	}
+	if !v.IsValid() || (v.Kind() == reflect.Pointer && v.IsNil()) {
+		// A nil argument has no value to render, and its type is
+		// already in the digest.
+		fmt.Fprint(h, "\x00nil")
+		return
+	}
+	rendered := fmt.Sprintf("%v", v.Interface())
+	fmt.Fprintf(h, "\x00%d\x00%s", len(rendered), rendered)
 }
 
 // encodeGob serialises v into a byte slice via encoding/gob.
@@ -129,6 +198,14 @@ func (c *EntityCache) writeKey(ctx context.Context, key string, v any) error {
 
 // invalidatePK deletes the PK entry for id. Safe to call when no
 // cache is attached (no-op).
+//
+// Unlike the writes, this is not gated on (*Entity).hasRowScope. A
+// scoped entity is not supposed to have an entry under that key at
+// all, and deleting one that is not there costs a round trip and
+// cannot leak anything; deleting one that *is* there — left by an
+// older build, or by a sibling entity over the same table that is not
+// scoped — is exactly what should happen. Gates belong on the paths
+// that put rows in, never on the path that takes them out.
 func (e *Entity[T]) invalidatePK(ctx context.Context, values []any) {
 	if e.cache == nil {
 		return

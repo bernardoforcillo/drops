@@ -11,6 +11,7 @@ import (
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/cache"
 	"github.com/bernardoforcillo/drops/cache/memory"
+	"github.com/bernardoforcillo/drops/dropstest"
 	"github.com/bernardoforcillo/drops/pg"
 )
 
@@ -241,5 +242,135 @@ func TestEntityCacheQueryAllCachesByHash(t *testing.T) {
 	}
 	if drv.queries.Load() != 2 {
 		t.Errorf("changing the query must produce a fresh DB call, got %d", drv.queries.Load())
+	}
+}
+
+// ----------------------------------------------------------------------
+// Row scope and the PK cache
+// ----------------------------------------------------------------------
+
+// scopedUser is the fixture for the tenant-scoped half of these tests.
+type scopedUser struct {
+	ID       int64  `drop:"id"`
+	TenantID int64  `drop:"tenantId"`
+	Name     string `drop:"name"`
+}
+
+// scopedUsersSchema declares the tenant axis on the TABLE — the
+// spelling pg/tenant.go recommends and the one every fixture in
+// scoping_test.go uses — rather than through Entity.ScopeByTenant.
+// That is the whole point of the fixture: the entity's tenantCol is
+// nil, so an "is this entity scoped?" test that only asks the Entity
+// answers no for a table nobody may query without a tenant.
+func scopedUsersSchema() *pg.Entity[scopedUser] {
+	tbl := pg.NewTable("users")
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	tenant := pg.Add(tbl, pg.BigInt("tenantId").NotNull())
+	pg.Add(tbl, pg.Text("name").NotNull())
+	tbl.ContextFilter(pg.TenantFilter(tenant))
+	return pg.NewEntity[scopedUser](tbl)
+}
+
+// scopedDriver answers every query with one row of the fixture and
+// records the statements, so a cached read is visible as a statement
+// that never happened.
+func scopedDriver() *dropstest.Driver {
+	return dropstest.New().AlwaysRows(
+		[]string{"id", "tenantId", "name"},
+		[]any{int64(7), int64(1), "Alice"},
+	)
+}
+
+// TestPKCacheNotReadForTableScopedEntity is the read half of the
+// isolation invariant: a Get on a table carrying a context filter must
+// reach the database, because the PK cache key holds the id and
+// nothing else. Answering from it returns the row the previous caller
+// cached — to a different tenant, and to a caller with no tenant at
+// all, without the filter ever running.
+func TestPKCacheNotReadForTableScopedEntity(t *testing.T) {
+	ent := scopedUsersSchema().WithCache(newCountingCache(t), time.Minute)
+	drv := scopedDriver()
+	db := pg.New(drv)
+
+	if _, err := ent.Get(db, pg.WithTenant(context.Background(), int64(1)), int64(7)); err != nil {
+		t.Fatalf("Get for tenant 1: %v", err)
+	}
+	if got, want := len(drv.Statements()), 1; got != want {
+		t.Fatalf("statements after tenant 1's Get: got = %v, want %v", got, want)
+	}
+
+	if _, err := ent.Get(db, pg.WithTenant(context.Background(), int64(2)), int64(7)); err != nil {
+		t.Fatalf("Get for tenant 2: %v", err)
+	}
+	if got, want := len(drv.Statements()), 2; got != want {
+		t.Fatalf("statements after tenant 2 asked for the same id: got = %v, want %v (tenant 2 was served tenant 1's cached row)", got, want)
+	}
+	// args are (id, tenant, limit) — the tenant predicate is appended
+	// by the executor, after the caller's own predicate.
+	if got, want := drv.Last().Args[1], any(int64(2)); got != want {
+		t.Errorf("tenant bound by tenant 2's statement: got = %v, want %v", got, want)
+	}
+
+	if _, err := ent.Get(db, context.Background(), int64(7)); !errors.Is(err, pg.ErrTenantMissing) {
+		t.Errorf("Get with no tenant on ctx: got = %v, want %v", err, pg.ErrTenantMissing)
+	}
+}
+
+// TestPKCacheHoldsNoScopedRow is the write half, and states the
+// invariant the read half depends on: the PK namespace never holds a
+// scoped row in the first place. Gating only the read leaves every
+// Create and Update poisoning it, one refactor away from a leak.
+func TestPKCacheHoldsNoScopedRow(t *testing.T) {
+	tests := []struct {
+		name string
+		op   func(*pg.DB, context.Context, *pg.Entity[scopedUser]) error
+	}{
+		{"create", func(db *pg.DB, ctx context.Context, e *pg.Entity[scopedUser]) error {
+			r := scopedUser{TenantID: 1, Name: "Alice"}
+			return e.Create(db, ctx, &r)
+		}},
+		{"update", func(db *pg.DB, ctx context.Context, e *pg.Entity[scopedUser]) error {
+			r := scopedUser{ID: 7, TenantID: 1, Name: "Alice"}
+			return e.Update(db, ctx, &r)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cc := newCountingCache(t)
+			ent := scopedUsersSchema().WithCache(cc, time.Minute)
+			drv := scopedDriver()
+			db := pg.New(drv)
+
+			if err := tt.op(db, pg.WithTenant(context.Background(), int64(1)), ent); err != nil {
+				t.Fatalf("%s: %v", tt.name, err)
+			}
+			if got, want := atomic.LoadInt64(&cc.sets), int64(0); got != want {
+				t.Errorf("cache writes by %s on a scoped entity: got = %v, want %v", tt.name, got, want)
+			}
+		})
+	}
+}
+
+// TestQueryCacheKeySeparatesTenantsOfDifferentTypes covers the other
+// spelling of the same leak. The query cache key is allowed to hold a
+// scoped result set — the tenant is bound into the statement, so it is
+// part of the key — but only if the key preserves what the argument
+// was. An application reading the tenant off an HTTP header on one
+// path and out of a database column on another holds "7" and int64(7)
+// for the same customer, and a key built with %v cannot tell them
+// apart.
+func TestQueryCacheKeySeparatesTenantsOfDifferentTypes(t *testing.T) {
+	ent := scopedUsersSchema().WithCache(newCountingCache(t), time.Minute)
+	drv := scopedDriver()
+	db := pg.New(drv)
+
+	if _, err := ent.Query(db).All(pg.WithTenant(context.Background(), "7")); err != nil {
+		t.Fatalf(`All for tenant "7": %v`, err)
+	}
+	if _, err := ent.Query(db).All(pg.WithTenant(context.Background(), int64(7))); err != nil {
+		t.Fatalf("All for tenant int64(7): %v", err)
+	}
+	if got, want := len(drv.Statements()), 2; got != want {
+		t.Errorf("statements for two differently typed tenant values: got = %v, want %v", got, want)
 	}
 }

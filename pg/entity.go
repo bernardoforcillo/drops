@@ -128,13 +128,34 @@ func (e *Entity[T]) rowScopeKey(kind string) string {
 	return kind + ":" + e.rowType.String()
 }
 
-// hasRowScope reports whether the entity restricts which rows an
-// operation may touch — a tenant axis, an authorisation guard, or
-// both. Callers use it to stay off the paths that would answer from a
-// key alone: the PK cache is keyed by primary key and nothing else, so
-// serving a scoped Get from it would hand one tenant a row it is not
-// allowed to see, without a statement ever being sent.
-func (e *Entity[T]) hasRowScope() bool { return e.tenantCol != nil || e.guard != nil }
+// hasRowScope reports whether anything restricts which rows an
+// operation on this entity may touch: a tenant axis or an
+// authorisation guard declared through the entity, or any context
+// filter registered straight onto the table.
+//
+// The table half is the half that bites, and it is why this predicate
+// cannot be a field test on the Entity. P0-1 moved the tenant axis off
+// the Entity and onto the Table precisely so it would reach the
+// statements no Entity builds, and the spelling this package
+// recommends — Posts.ContextFilter(pg.TenantFilter(PostTenantID)) —
+// never sets tenantCol at all. An entity over such a table is fully
+// scoped and used to answer "unscoped" to whoever only asked the
+// Entity.
+//
+// The invariant the answer guards is the strong one: the PK cache
+// never *holds* a scoped row, not merely "a scoped Get does not read
+// it". That key is the primary key and nothing else — it has no room
+// for the tenant, the subject, or whatever else a filter consults — so
+// a scoped row sitting in that namespace is a row waiting to be handed
+// to the next caller who asks for that id, whoever they are, without a
+// statement ever being sent and therefore without the filter ever
+// running or ErrTenantMissing ever firing. Gating only the read leaves
+// the namespace poisoned by every write and puts the leak one refactor
+// away; so the read in Get and the writes in insertRow and Update are
+// all gated on this one predicate.
+func (e *Entity[T]) hasRowScope() bool {
+	return e.tenantCol != nil || e.guard != nil || e.table.hasContextFilters()
+}
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
 // need: one Scan call per row. Generated code is written against
@@ -513,10 +534,11 @@ var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock vers
 //
 // When a cache is attached via WithCache, Get serves hits from the
 // cache and dedupes concurrent cache misses via single-flight so a
-// thundering herd resolves to one DB query. A tenant-scoped or guarded
-// entity skips that path entirely: the cache is keyed by primary key
-// alone, so answering from it would hand one caller a row another
-// caller cached, without a statement ever being sent.
+// thundering herd resolves to one DB query. An entity whose rows are
+// scoped — by a tenant axis, a guard, or a context filter on the table
+// — skips that path entirely: the cache is keyed by primary key alone,
+// so answering from it would hand one caller a row another caller
+// cached, without a statement ever being sent. See hasRowScope.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	pred, err := e.pkPredicate(key)
 	if err != nil {
@@ -614,11 +636,27 @@ func (e *Entity[T]) scanAllFast(db *DB, ctx context.Context, sel *SelectBuilder,
 // rows is rarely what callers want), so generated PKs and
 // hook-supplied values do not flow back into rs; use Create when you
 // need the post-INSERT row.
+//
+// The tenant is stamped onto every row first, exactly as Create stamps
+// its one row, and rs is written through: a row whose tenant field is
+// zero comes back carrying the ctx tenant. This is not a convenience.
+// A tenant-scoped entity that skipped the stamp bound tenantId = 0 for
+// the whole batch — a value no tenant predicate matches, so the rows
+// landed outside every tenant including the one that wrote them,
+// invisible to the very next SELECT and reported as a successful
+// insert. Missing the ctx tenant is [ErrTenantMissing] and no
+// statement at all; a row carrying a different tenant than ctx is
+// [ErrTenantMismatch]. Either aborts the whole batch before the first
+// binding is collected, because a partially stamped INSERT is a batch
+// nobody can reason about.
 func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
 	if len(rs) == 0 {
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
+		if err := e.stampTenant(ctx, &rs[i]); err != nil {
+			return nil, err
+		}
 		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
@@ -638,11 +676,44 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 //
 // Useful for idempotent ingestion: the same set of rows can be
 // replayed safely without producing duplicates.
+//
+// The tenant is stamped onto every row before binding, on the same
+// terms as [Entity.CreateMany]: no tenant on ctx is [ErrTenantMissing]
+// and no statement, a disagreeing row is [ErrTenantMismatch].
+//
+// A tenant-scoped entity also changes the shape of the conflict
+// branch, and the reasoning is worth spelling out because the
+// straightforward version is a cross-tenant write. A primary key is
+// unique across the whole table, not per tenant, so the row an INSERT
+// collides with may well belong to somebody else. Setting every non-PK
+// column from EXCLUDED then rewrites that row's data *and* its
+// "tenantId", which is to say tenant A takes ownership of tenant B's
+// row by guessing an id — silently, reported as one row affected.
+// Refusing is the only defensible answer: the tenant column is left
+// out of the SET list, so a row's owner is never rewritten by an
+// upsert, and the update is gated on WHERE <tenant> = EXCLUDED.<tenant>
+// so a collision with another tenant's row updates nothing at all
+// rather than overwriting its data. Moving a row between tenants is a
+// deliberate act and belongs in a statement that says so.
+//
+// The caller sees that refusal as a shortfall in rows-affected, which
+// is the most an ON CONFLICT branch can report — SQL has no way to
+// raise from a WHERE that did not match. Ingestion that must know
+// whether every row landed should compare the count.
+//
+// The gate needs a tenant column to name, so it is only installed for
+// an entity that declared one with [Entity.ScopeByTenant]. A table
+// scoped only by [Table.ContextFilter] keeps the plain conflict
+// branch: the filter is a predicate, and an INSERT has no WHERE for it
+// to reach.
 func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
 	if len(rs) == 0 {
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
+		if err := e.stampTenant(ctx, &rs[i]); err != nil {
+			return nil, err
+		}
 		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
@@ -656,12 +727,26 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 	for i, c := range e.pks {
 		keyCols[i] = c
 	}
-	cu := ins.OnConflictUpdate(keyCols...)
+	sets := make([]ColumnValue, 0, len(e.colFields))
 	for _, cf := range e.colFields {
 		if e.isKeyColumn(cf.col) {
 			continue
 		}
-		cu = cu.Set(&exprBinding{col: cf.col, expr: Excluded(cf.col)})
+		if e.tenantCol != nil && cf.col.key() == e.tenantCol.key() {
+			continue
+		}
+		sets = append(sets, &exprBinding{col: cf.col, expr: Excluded(cf.col)})
+	}
+	if len(sets) == 0 {
+		// Every column is either part of the key or the tenant axis,
+		// so there is nothing a conflict may legally rewrite. DO
+		// NOTHING says that in SQL; "DO UPDATE SET" with an empty list
+		// is a syntax error the server would report instead.
+		return ins.OnConflictDoNothing(keyCols...).Exec(ctx)
+	}
+	cu := ins.OnConflictUpdate(keyCols...).Set(sets...)
+	if e.tenantCol != nil {
+		cu = cu.Where(Eq(e.tenantCol, Excluded(e.tenantCol)))
 	}
 	return cu.Done().Exec(ctx)
 }
@@ -835,9 +920,12 @@ func (e *Entity[T]) insertRow(db *DB, ctx context.Context, r *T, bindings []Colu
 	if err != nil {
 		return err
 	}
-	if e.cache != nil {
+	if e.cache != nil && !e.hasRowScope() {
 		// Populate the PK cache with the freshly-inserted row so the
-		// next Get hits immediately.
+		// next Get hits immediately. A scoped entity writes nothing:
+		// the key carries the primary key and no scope at all, so the
+		// entry would be served to every other tenant and subject that
+		// asks for this id. See hasRowScope for the invariant.
 		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
 	return nil
@@ -918,7 +1006,9 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = doUpdate(db)
 	}
-	if err == nil && e.cache != nil {
+	if err == nil && e.cache != nil && !e.hasRowScope() {
+		// Same gate as insertRow: a scoped row must not enter a
+		// namespace keyed by the primary key alone. See hasRowScope.
 		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
 	return err

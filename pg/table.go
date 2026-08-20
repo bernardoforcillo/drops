@@ -79,6 +79,18 @@ type Table struct {
 	// no writer touches an element a reader may already be holding.
 	ctxFilters   []ctxFilter
 	ctxFiltersMu *sync.RWMutex
+
+	// tenantCol is the column an INSERT into this table stamps from the
+	// ctx tenant — the write-side half of the tenant axis, declared by
+	// Entity.ScopeByTenant or by Table.ScopeWritesByTenant.
+	//
+	// It is a column rather than a predicate because an INSERT has no
+	// WHERE clause for a predicate to reach: see
+	// InsertBuilder.ToSQLCtx. Guarded by ctxFiltersMu, which already
+	// exists to make declaring the axis on a table other goroutines are
+	// querying a supported thing to do — the two halves are registered
+	// by the same call and are read by statements in flight.
+	tenantCol *Column
 }
 
 // ctxFilter pairs a context filter with the key it was registered
@@ -550,6 +562,60 @@ func (t *Table) ContextFilter(fn ContextFilterFunc) *Table {
 	defer t.ctxFiltersMu.Unlock()
 	t.ctxFilters = append(t.copyCtxFilters(), ctxFilter{fn: fn})
 	return t
+}
+
+// ScopeWritesByTenant declares col as the column every INSERT into this
+// table stamps from the ctx tenant, refusing when the ctx carries none.
+//
+// It is the write-side half of what [Table.ContextFilter] does for
+// reads, and it is declared separately because it cannot be derived
+// from the filter. A [ContextFilterFunc] is a closure that answers with
+// a predicate; nothing can ask it which column it names, and guessing
+// one from the predicate it rendered would be drops deciding which
+// column owns a row — so a table scoped with
+// ContextFilter(TenantFilter(col)) and nothing else keeps its guarantee
+// on every read, every UPDATE and every DELETE while its INSERTs stay
+// the caller's to bind. Naming the column here hands them to drops:
+//
+//	Posts.ContextFilter(pg.TenantFilter(PostTenantID)).
+//	    ScopeWritesByTenant(PostTenantID)
+//
+// [Entity.ScopeByTenant] calls this for you, so an entity-declared axis
+// covers both halves at once. Declaring it twice with the same column
+// is idempotent.
+//
+// The consequence worth stating plainly, because it is the same one
+// ScopeByTenant carries: from here on every INSERT into this table
+// needs a tenant on its ctx, including one built straight from
+// db.Insert(). A statement that legitimately writes outside the ctx
+// tenant says so with [InsertBuilder.Unscoped].
+func (t *Table) ScopeWritesByTenant(col ColRef) *Table {
+	if col == nil {
+		return t
+	}
+	t.setTenantAxis(col.col())
+	return t
+}
+
+// setTenantAxis records the table's tenant column. Called by
+// ScopeWritesByTenant and by Entity.ScopeByTenant, which registers the
+// read-side filter in the same breath.
+func (t *Table) setTenantAxis(c *Column) {
+	t.ctxFiltersMu.Lock()
+	defer t.ctxFiltersMu.Unlock()
+	t.tenantCol = c
+}
+
+// tenantAxis returns the column an INSERT into the table stamps, or nil
+// when the table declared none. Nil-safe so a builder can ask without
+// knowing whether it has a table at all.
+func (t *Table) tenantAxis() *Column {
+	if t == nil {
+		return nil
+	}
+	t.ctxFiltersMu.RLock()
+	defer t.ctxFiltersMu.RUnlock()
+	return t.tenantCol
 }
 
 // setContextFilter registers fn under key, replacing any filter

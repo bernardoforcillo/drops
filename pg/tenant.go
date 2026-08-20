@@ -167,6 +167,14 @@ func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 			// so there is one source of truth: whatever tenantPredicate
 			// answers is what the statement carries.
 			e.table.setContextFilter(rowScopeFilterKey(e.rowType, "tenant"), e.tenantPredicate)
+			// The write-side half of the same axis. A predicate scopes
+			// the statements that have a WHERE clause; an INSERT has
+			// none, so what it needs is the column to stamp — see
+			// [Table.ScopeWritesByTenant] and [InsertBuilder.ToSQLCtx].
+			// Declared on the table rather than kept on the entity for
+			// the reason the filter is: db.Insert(e.Table()) has no
+			// entity to ask, and it is the spelling the readme shows.
+			e.table.setTenantAxis(cf.col)
 			return e
 		}
 	}
@@ -193,17 +201,47 @@ func (e *Entity[T]) tenantPredicate(ctx context.Context) (drops.Expression, erro
 	return Eq(e.tenantCol, t), nil
 }
 
+// tenantWriteAxis returns the column and struct field a write stamps
+// the ctx tenant onto, and whether this entity has one.
+//
+// The entity's own axis comes first; failing that the table's, because
+// a tenant column is a property of the table — the same reasoning that
+// moved the read-side predicate off the entity. A schema that scopes
+// its reads with Table.ContextFilter and names its write column with
+// [Table.ScopeWritesByTenant] has an axis this entity never declared,
+// and a Create that ignored it would bind the struct's zero tenant to
+// a column the builder is about to stamp — two answers for one row.
+//
+// A table axis with no matching field on T is not an error and not a
+// gap: the row simply cannot carry a tenant, and the stamping happens
+// on the binding instead, in [InsertBuilder.resolveCtx].
+func (e *Entity[T]) tenantWriteAxis() (*Column, []int, bool) {
+	if e.tenantCol != nil {
+		return e.tenantCol, e.tenantField, true
+	}
+	c := e.table.tenantAxis()
+	if c == nil {
+		return nil, nil, false
+	}
+	if f, ok := e.fieldFor(c); ok {
+		return c, f, true
+	}
+	return nil, nil, false
+}
+
 // stampTenant ensures r's tenant field matches ctx. Called by
-// Create — corrects a zero value, rejects a mismatching one.
+// Create, CreateMany, UpsertMany and CopyFrom — corrects a zero value,
+// rejects a mismatching one.
 func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
-	if e.tenantCol == nil {
+	col, field, ok := e.tenantWriteAxis()
+	if !ok {
 		return nil
 	}
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(e.tenantCol))
+		return fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(col))
 	}
-	fv := reflect.ValueOf(r).Elem().FieldByIndex(e.tenantField)
+	fv := reflect.ValueOf(r).Elem().FieldByIndex(field)
 	if fv.IsZero() {
 		// Assign — set via reflection. Fields must be settable.
 		ctxTenant := reflect.ValueOf(t)

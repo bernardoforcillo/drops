@@ -691,11 +691,21 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 // raise from a WHERE that did not match. Ingestion that must know
 // whether every row landed should compare the count.
 //
-// The gate needs a tenant column to name, so it is only installed for
-// an entity that declared one with [Entity.ScopeByTenant]. A table
-// scoped only by [Table.ContextFilter] keeps the plain conflict
-// branch: the filter is a predicate, and an INSERT has no WHERE for it
-// to reach.
+// That shape is not applied here any more, and the difference is the
+// point rather than a tidy-up: it is applied by the builder, to every
+// INSERT into a table that named a tenant column — see
+// [InsertBuilder.ToSQLCtx]. This method used to be the only place the
+// reasoning existed, so db.Insert(t).OnConflictUpdate(pk).Set(...),
+// the same upsert written by hand, rewrote another tenant's row and
+// its owner. Two places building the same gate would eventually
+// disagree, and the way they disagree is that one of them stops being
+// applied to a path somebody added later.
+//
+// The gate needs a tenant column to name, so it reaches the tables
+// that named one — with [Entity.ScopeByTenant] or with
+// [Table.ScopeWritesByTenant]. A table scoped only by
+// [Table.ContextFilter] keeps the plain conflict branch: the filter is
+// a predicate, and an INSERT has no WHERE for it to reach.
 func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
 	if len(rs) == 0 {
 		return nil, ErrNoRowsToInsert
@@ -722,23 +732,18 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		if e.isKeyColumn(cf.col) {
 			continue
 		}
-		if e.tenantCol != nil && cf.col.key() == e.tenantCol.key() {
-			continue
-		}
 		sets = append(sets, &exprBinding{col: cf.col, expr: Excluded(cf.col)})
 	}
 	if len(sets) == 0 {
-		// Every column is either part of the key or the tenant axis,
-		// so there is nothing a conflict may legally rewrite. DO
-		// NOTHING says that in SQL; "DO UPDATE SET" with an empty list
-		// is a syntax error the server would report instead.
+		// Every column is part of the key, so there is nothing a
+		// conflict could rewrite even before the tenant axis has its
+		// say. DO NOTHING says that in SQL; "DO UPDATE SET" with an
+		// empty list is a syntax error the server would report
+		// instead. The builder makes the same substitution when
+		// dropping the tenant assignment is what empties the list.
 		return ins.OnConflictDoNothing(keyCols...).Exec(ctx)
 	}
-	cu := ins.OnConflictUpdate(keyCols...).Set(sets...)
-	if e.tenantCol != nil {
-		cu = cu.Where(Eq(e.tenantCol, Excluded(e.tenantCol)))
-	}
-	return cu.Done().Exec(ctx)
+	return ins.OnConflictUpdate(keyCols...).Set(sets...).Done().Exec(ctx)
 }
 
 // EntityQuery is the typed counterpart of FindBuilder — same shape,

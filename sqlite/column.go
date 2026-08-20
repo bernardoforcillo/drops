@@ -1,6 +1,10 @@
 package sqlite
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"database/sql"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // ColumnType describes the SQL type of a column as it appears in CREATE
 // TABLE — e.g. "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC".
@@ -17,6 +21,7 @@ type Column struct {
 	table      *Table
 	typ        ColumnType
 	notNull    bool
+	nullStated bool // NotNull, PrimaryKey or Nullable was called
 	primary    bool
 	unique     bool
 	autoInc    bool
@@ -48,6 +53,14 @@ func (c *Column) IsAutoIncrement() bool { return c.autoInc }
 func (c *Column) HasDefault() bool      { return c.hasDefault }
 func (c *Column) DefaultSQL() string    { return c.defaultSQL }
 func (c *Column) ForeignKey() *FK       { return c.ref }
+
+// IsNullable reports whether the column admits NULL. It is the
+// complement of IsNotNull, named for the question that matters at
+// bind and scan time and spelled the same in all four dialects so the
+// shared checker asks exactly one question. A SQLite column admits
+// NULL unless it says otherwise, so one that stated nothing answers
+// true.
+func (c *Column) IsNullable() bool { return !c.notNull }
 
 // col implements ColRef for *Column; *Col[T] inherits it via embedding.
 func (c *Column) col() *Column { return c }
@@ -84,12 +97,23 @@ func newCol[T any](name string, typ ColumnType) *Col[T] {
 }
 
 // NotNull marks the column NOT NULL.
-func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull = true; return c }
+func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull, c.Column.nullStated = true, true; return c }
+
+// Nullable states that the column admits NULL.
+//
+// It changes nothing in the DDL — a SQLite column is nullable unless
+// it says otherwise — and everything in what drops will let you bind
+// it to: NewEntity requires the struct field bound to a nullable
+// column to be one that can receive NULL. It is the counterpart of
+// NotNull, and the two are last-writer-wins.
+func (c *Col[T]) Nullable() *Col[T] { c.Column.notNull, c.Column.nullStated = false, true; return c }
 
 // PrimaryKey marks the column as the (single-column) PRIMARY KEY.
 func (c *Col[T]) PrimaryKey() *Col[T] {
 	c.Column.primary = true
 	c.Column.notNull = true
+	// A primary key states NOT NULL implicitly.
+	c.Column.nullStated = true
 	return c
 }
 
@@ -199,6 +223,44 @@ func (c *Column) As(alias string) drops.Expression {
 
 // Val binds a typed value for INSERT/UPDATE.
 func (c *Col[T]) Val(v T) ColumnValue { return columnValue{col: c.Column, val: v} }
+
+// SetNull binds SQL NULL as the column's value.
+//
+// It is a parameter placeholder bound to nil, not the literal token,
+// so an INSERT that sometimes writes NULL is the same statement as
+// one that writes a value, and the NULL travels through the same
+// binding every other value does — where PII redaction, hooks and
+// tracers can see it. Before this existed there was no way at all to
+// write NULL into a SQLite INSERT through the public API.
+//
+// It does not refuse a NOT NULL column: that violation is one the
+// database reports precisely, and turning it into a panic on a
+// request path would trade a good error for a process failure.
+func (c *Col[T]) SetNull() ColumnValue { return columnValue{col: c.Column, val: nil} }
+
+// ValPtr binds *p, or NULL when p is nil. It is the shape an optional
+// struct field already has, and the one AutoTable reads as "this
+// column is nullable".
+func (c *Col[T]) ValPtr(p *T) ColumnValue {
+	if p == nil {
+		return c.SetNull()
+	}
+	// Binding *p rather than p keeps the bound argument's Go type
+	// identical to what Val would have bound.
+	return c.Val(*p)
+}
+
+// ValNull binds v.V, or NULL when v is not Valid.
+func (c *Col[T]) ValNull(v sql.Null[T]) ColumnValue {
+	if !v.Valid {
+		return c.SetNull()
+	}
+	// Unwrapped rather than handed to the driver: sql.Null[T].Value
+	// did not convert its payload before Go 1.25, so passing the
+	// wrapper through would make the parameter depend on the
+	// toolchain.
+	return c.Val(v.V)
+}
 
 func cmp(c *Column, op string, v any) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {

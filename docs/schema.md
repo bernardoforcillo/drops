@@ -7,8 +7,8 @@ var (
     Users     = pg.NewTable("users")
     UserID    = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
     UserName  = pg.Add(Users, pg.Text("name").NotNull())
-    UserAge   = pg.Add(Users, pg.Integer("age"))
-    UserMeta  = pg.Add(Users, pg.JSONB("meta"))
+    UserAge   = pg.Add(Users, pg.Integer("age").Nullable())
+    UserMeta  = pg.Add(Users, pg.JSONB("meta").NotNull())
 )
 ```
 
@@ -20,6 +20,50 @@ checked at compile time.
 
 `pg.Add` registers the column with the table and hands it back, which
 is what lets the whole declaration be one `var` block.
+
+## Nullability
+
+Say which it is. `NotNull()` and `Nullable()` are counterparts and the
+last one wins; `PrimaryKey()` says `NotNull` implicitly.
+
+`Nullable()` renders nothing in PostgreSQL, SQLite or MySQL DDL — a
+column there admits NULL unless it says otherwise, so saying so
+changes no CREATE TABLE and produces no migration. What it changes is
+what drops will let you bind the column to: `NewEntity` requires the
+struct field behind a nullable column to be one that can receive a
+NULL. In ClickHouse, where nullability is spelled in the type,
+`Nullable()` also rewrites `String` to `Nullable(String)` — same
+statement, different rendering.
+
+The Go type parameter stays the *value* type either way. `Eq`, `In`,
+`Between` and friends compare against a value and never against NULL,
+so a nullable column's comparisons take the same plain `T`:
+
+```go
+UserAge.Gte(18)   // int32, whether or not the column admits NULL
+```
+
+Test for NULL with `IsNull()` / `IsNotNull()`. Write one with the
+typed bindings:
+
+```go
+UserAge.SetNull()      // a bound NULL
+UserAge.ValPtr(p)      // *int32: *p, or NULL when p is nil
+UserAge.ValNull(n)     // sql.Null[int32]: n.V, or NULL when !n.Valid
+
+db.Insert(Users).Row(UserName.Val("Ada"), UserAge.SetNull())
+db.Update(Users).Set(UserAge.ValPtr(p)).Where(UserID.Eq(id))
+```
+
+All three bind a placeholder rather than splicing the literal token,
+so a statement that sometimes writes NULL is the same statement as one
+that writes a value — one plan-cache entry, not two — and the NULL
+travels through the same argument path a value does, where hooks,
+tracers and PII redaction can see it.
+
+Read one into a `*T` or a **named** `sql.Null[T]` field. Never *embed*
+an `sql.Null[T]`: that promotes its `Scan` onto the struct, which then
+claims to be a single-column scan destination.
 
 ## Constraints
 
@@ -84,6 +128,48 @@ timestamps — are exempt automatically.
 
 The same check exists in `sqlite`, `mysql` and `clickhouse`.
 
+### Nullability drift
+
+The second half of the same problem. A column the database will hand
+back as NULL, bound to a field that cannot receive one, is a query
+that works until the first NULL row and then fails inside a scan with
+`converting NULL to string is unsupported` and a column index. Nothing
+in Go connects the two types — a column's `T` is what its comparisons
+take, the destination is a struct field drops reaches by reflection —
+so `NewEntity` is the one place both are in scope, and it refuses:
+
+```
+drops/pg: NewEntity[User]: table "users": column "bio" is not declared
+NOT NULL, so the database will accept NULL, but field Bio is string,
+which cannot receive one — either add .NotNull() to the column (and a
+migration to enforce it) or make the field *string; if NULL is
+genuinely impossible there, say so with pg.AllowNullableColumns("bio")
+```
+
+It fires on whether the column admits NULL, not on whether it said so:
+a bare `pg.Text("bio")` is exactly the shape that has been accepting
+NULLs nobody declared. The rule is one-directional — a NOT NULL column
+bound to a `*T` field is the legitimate "distinguish unset from zero"
+idiom and passes in silence.
+
+Primary-key columns are exempt however the key was declared. A
+composite key written as `Users.PrimaryKey(tenantID, id)` records the
+key on the table and leaves the columns' own flags alone, but the
+server makes every key column NOT NULL, so the check reads the key
+rather than the flag.
+
+A field can receive NULL when `*field` knows how to take a column
+value: `*T`, a named `sql.Null[T]`, the `sql.NullString` family, any
+type with its own `Scan`, `[]byte`, `json.RawMessage`, `any`. It
+cannot when it is a `string`, a number, a `bool`, a `time.Time` or an
+array.
+
+The escape hatches mirror the unmapped-column ones:
+`pg.AllowNullableColumns("bio", "note")` names the exceptions,
+`pg.AllowAnyNullableColumn()` turns the check off wholesale for a
+codebase with too many to fix in one commit. Both exist in all four
+dialects.
+
 ### Generating the declaration instead
 
 The check catches drift. Generating the schema from the struct makes
@@ -111,27 +197,34 @@ var (
     UserID    = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
     UserEmail = pg.Add(Users, pg.Text("email").NotNull().Unique())
     UserName  = pg.Add(Users, pg.Text("name").NotNull())
-    UserAge   = pg.Add(Users, pg.Integer("age"))
+    UserAge   = pg.Add(Users, pg.Integer("age").Nullable())
 )
 ```
 
-Typed handles, derived from the struct. Add `//go:generate` above the
+Typed handles, derived from the struct. Every column states its
+nullability, and the field's type is the statement: `*int32` and
+`sql.Null[int32]` give `Nullable()`, everything else `NotNull()`. The
+`null` tag is the escape hatch for a field whose type cannot say it —
+a named type with its own `Scan` method, which a source-level
+generator cannot recognise. Add `//go:generate` above the
 struct and the two stay in step by construction.
 
 `examples/schemagen` is a working instance, and its test checks both
 halves: the entity builds with no exemptions, and the checked-in
 generated file still matches what the generator produces today.
 
-Two things the generator refuses rather than guesses: a Go type outside
-the mapping needs an explicit `type=` in the tag, and a pointer field
-tagged `notNull` is a contradiction.
+Three things the generator refuses rather than guesses: a Go type
+outside the mapping needs an explicit `type=` in the tag, a pointer
+field tagged `notNull` is a contradiction, and so is `notNull`
+together with `null`.
 
 ### AutoTable
 
 `pg.AutoTable[User]("users")` derives the table from the same tags at
-runtime, with no generation step. Nothing can drift, but you get
-untyped `*pg.Column` handles rather than `*pg.Col[T]`, so comparisons
-are no longer checked. Use it for throwaway code and the generator for
+runtime, with no generation step, and reads nullability off the field
+type by the same rule the generator uses. Nothing can drift, but you
+get untyped `*pg.Column` handles rather than `*pg.Col[T]`, so
+comparisons are no longer checked. Use it for throwaway code and the generator for
 code you will keep.
 
 ## Tags
@@ -141,6 +234,7 @@ code you will keep.
 | `primaryKey` | PRIMARY KEY |
 | `autoIncrement` | serial family / AUTO_INCREMENT |
 | `notNull` | NOT NULL |
+| `null` | the column admits NULL even though the field's type does not say so |
 | `unique` | UNIQUE |
 | `default=<sql>` | raw DEFAULT clause |
 | `version` | optimistic-lock column |

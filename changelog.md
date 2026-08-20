@@ -9,6 +9,48 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Nullability, stated once and enforced from both ends.** Writing a
+  NULL through the builder had no typed spelling: `(*Col[T]).Val`
+  takes a `T`, so callers reached for `drops.Raw("NULL")` — which
+  splices a literal, turns one statement into two for the plan cache,
+  and routes the value around `AddArg`, where PII redaction, hooks and
+  tracers live — or re-declared the column as `Custom[*string]`, which
+  also re-types the operators and makes `Eq(nil)` a predicate that
+  compiles, binds NULL and is unconditionally false. In SQLite there
+  was no spelling at all: `Col[T]` has no `Expr`, the package has no
+  untyped `Bind`, and `ColumnValue`'s methods are unexported, so no
+  caller could put a NULL into an INSERT. `SetNull()`, `ValPtr(*T)`
+  and `ValNull(sql.Null[T])` now exist on `Col[T]` in all four
+  dialects; each binds a parameter, unwrapped to the value type `Val`
+  would have bound, so hooks and drivers see one thing rather than
+  two.
+
+  Reading was the mirror image and worse, because nothing checked it:
+  a nullable column bound to a `string` field was accepted at
+  declaration and failed at the first NULL row, in a scan, with
+  `database/sql`'s "converting NULL to string is unsupported" and a
+  column index. The type system cannot see it — a column's `T` is the
+  *operand* type its comparisons take, and the scan destination is a
+  struct field drops reaches only by reflection — so the check went
+  where both are in scope: `NewEntity` now refuses a column that
+  admits NULL bound to a field that cannot receive one, naming the
+  column, the field, its type and both fixes. It fires on whether the
+  column admits NULL rather than on whether it said so, because a bare
+  `pg.Text("bio")` is exactly the shape that has been accepting NULLs
+  nobody declared. The rule is one-directional: a NOT NULL column
+  bound to a `*T` is the legitimate "distinguish unset from zero"
+  idiom and passes. `AllowNullableColumns(names...)` and
+  `AllowAnyNullableColumn()` are the escape hatches, shaped like the
+  unmapped-column ones.
+
+  `Nullable()` and `IsNullable()` join `NotNull()` / `IsNotNull()` in
+  pg, sqlite and mysql — ClickHouse already had both, and is the
+  dialect that had this right all along: nullability there is an
+  opt-in that changes the column's type, so no existing ClickHouse
+  schema trips the check. `Nullable()` renders nothing in the other
+  three, where a column admits NULL unless it says otherwise, so no
+  snapshot churns and no migration appears.
+
 - **The `drops` CLI** — every step of the migration loop existed as a
   library function and had no front end, so a project that wanted
   drizzle-kit's workflow had to write its own `main` for each of them.
@@ -196,6 +238,36 @@ once a 1.0 is cut.
   `(*Col[T]).Managed` on pg/sqlite/clickhouse.
 
 ### Changed
+- **`NewEntity` now refuses a nullable column bound to a field that
+  cannot hold NULL, and it refuses at package-var init time — so an
+  upgraded program does not start until the schema says what it
+  means.** This is the breaking half of the nullability work above and
+  it will fire on ordinary existing code: a column declared
+  `pg.Text("name")` with neither `.NotNull()` nor `.Nullable()` emits
+  a nullable column, and a `Name string` field cannot receive what
+  that column is allowed to store. The old code was not terser, it was
+  wrong — the database really did accept NULL there — but the upgrade
+  is not silent and it is not lazy. The panic names every column, its
+  field, and both fixes; `AllowNullableColumns(names...)` waives it
+  per column and `AllowAnyNullableColumn()` waives it wholesale, for a
+  schema that is not ready to decide today.
+- **The two schema generators state nullability instead of leaving it
+  implicit.** `pg.AutoTable`'s doc comment claimed pointer types made
+  a column nullable "by default", which asserts that a non-pointer
+  does not — and the code did no such thing, leaving every untagged
+  column nullable. Both `AutoTable` (pg and sqlite) and
+  `dropsgen -schema` now read nullability off the field's type: a
+  pointer or an `sql.Null[T]` declares a nullable column, everything
+  else NOT NULL, with a new `null` tag option as the escape hatch for
+  a field whose type cannot say it. Nothing either generator emits can
+  be the unstated shape `NewEntity` now rejects. This changes the DDL
+  they produce for non-pointer untagged fields, from nullable to NOT
+  NULL: regenerate, read the schema diff, and expect `SET NOT NULL` to
+  fail where the column already holds NULLs — which is the latent bug
+  surfacing in the safest available place.
+- `dropsgen -introspect` gives a nullable column a pointer field, so
+  introspecting a live schema and regenerating its declaration returns
+  the schema it started from.
 - **`NewEntity` now rejects a column bound to no struct field**
   (`drops/pg`, `drops/sqlite`, `drops/clickhouse`). It used to skip it
   silently, so a renamed field or a mistyped `drop:` tag removed the

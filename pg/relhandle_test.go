@@ -24,7 +24,7 @@ type rhPost struct {
 func rhSchema() (users, posts *pg.Table) {
 	users = pg.NewTable("users")
 	uid := pg.Add(users, pg.BigSerial("id").PrimaryKey())
-	pg.Add(users, pg.Text("name"))
+	pg.Add(users, pg.Text("name").NotNull())
 
 	posts = pg.NewTable("posts")
 	pg.Add(posts, pg.BigSerial("id").PrimaryKey())

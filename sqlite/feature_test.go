@@ -196,7 +196,7 @@ type acct struct {
 func TestPatch(t *testing.T) {
 	tbl := sqlite.NewTable("accts")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
-	balance := sqlite.Add(tbl, sqlite.BigInt("balance"))
+	balance := sqlite.Add(tbl, sqlite.BigInt("balance").NotNull())
 	ent := sqlite.NewEntity[acct](tbl)
 
 	drv := &entDriver{}
@@ -227,7 +227,7 @@ func TestPatch(t *testing.T) {
 func TestPatchDecSubtracts(t *testing.T) {
 	tbl := sqlite.NewTable("seatmaps")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
-	seats := sqlite.Add(tbl, sqlite.Custom[uint32]("seats", "INTEGER"))
+	seats := sqlite.Add(tbl, sqlite.Custom[uint32]("seats", "INTEGER").NotNull())
 	ent := sqlite.NewEntity[struct {
 		ID    int64  `drop:"id"`
 		Seats uint32 `drop:"seats"`

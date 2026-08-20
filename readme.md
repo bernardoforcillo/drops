@@ -145,7 +145,7 @@ var (
     Users    = pg.NewTable("users")
     UserID   = pg.Add(Users, pg.BigSerial("id").PrimaryKey())  // *Col[int64]
     UserName = pg.Add(Users, pg.Text("name").NotNull())         // *Col[string]
-    UserAge  = pg.Add(Users, pg.Integer("age"))                 // *Col[int32]
+    UserAge  = pg.Add(Users, pg.Integer("age").Nullable())      // *Col[int32]
 )
 
 type User struct {

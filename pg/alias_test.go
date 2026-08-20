@@ -232,7 +232,7 @@ func aliasCompositeSchema() (*pg.Table, *pg.Entity[aliasKeyed]) {
 	tbl := pg.NewTable("composite_alias")
 	a := pg.Add(tbl, pg.BigInt("a").NotNull())
 	b := pg.Add(tbl, pg.BigInt("b").NotNull())
-	pg.Add(tbl, pg.Text("note"))
+	pg.Add(tbl, pg.Text("note").NotNull())
 	tbl.PrimaryKey(a, b)
 	return tbl, nil
 }
@@ -302,7 +302,7 @@ type aliasVersioned struct {
 func TestAliasEntityUpdateAssignsVersionColumnOnce(t *testing.T) {
 	tbl := pg.NewTable("versioned_alias")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	pg.Add(tbl, pg.Text("note"))
+	pg.Add(tbl, pg.Text("note").NotNull())
 	pg.Add(tbl, pg.Integer("ver").NotNull().Default("0").OptimisticLock())
 	ent := pg.NewEntity[aliasVersioned](tbl.As("u"))
 
@@ -347,7 +347,7 @@ func TestAliasScopeByTenantAcceptsAliasHandle(t *testing.T) {
 	tbl := pg.NewTable("tenanted_alias")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
 	pg.Add(tbl, pg.BigInt("orgId").NotNull())
-	pg.Add(tbl, pg.Text("name"))
+	pg.Add(tbl, pg.Text("name").NotNull())
 	ent := pg.NewEntity[aliasTenanted](tbl)
 
 	defer func() {
@@ -433,7 +433,7 @@ func TestAliasPageCursorAcceptsAliasHandle(t *testing.T) {
 func TestAliasPageCursorAcceptsDeclaredHandleOnAnAliasedEntity(t *testing.T) {
 	tbl := pg.NewTable("paged_alias")
 	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	pg.Add(tbl, pg.Text("name"))
+	pg.Add(tbl, pg.Text("name").NotNull())
 	ent := pg.NewEntity[aliasPaged](tbl.As("u"))
 
 	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
@@ -463,7 +463,7 @@ func TestAliasPageCursorAcceptsDeclaredHandleOnAnAliasedEntity(t *testing.T) {
 func TestAliasPageRejectsAnUnmappedOrderingColumnBeforeQuerying(t *testing.T) {
 	tbl := pg.NewTable("paged_unmapped")
 	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	pg.Add(tbl, pg.Text("name"))
+	pg.Add(tbl, pg.Text("name").NotNull())
 	spare := pg.Add(tbl, pg.Text("spare"))
 	ent := pg.NewEntity[aliasPaged](tbl, pg.AllowUnmappedColumns("spare"))
 
@@ -590,7 +590,7 @@ type aliasNatural struct {
 func TestKeyDeclaredThroughAnAliasHandleIsOmittedFromCreate(t *testing.T) {
 	tbl := pg.NewTable("natural_via_alias")
 	pg.Add(tbl, pg.Text("code").NotNull())
-	pg.Add(tbl, pg.Text("note"))
+	pg.Add(tbl, pg.Text("note").NotNull())
 	tbl.PrimaryKey(tbl.As("x").Col("code"))
 	ent := pg.NewEntity[aliasNatural](tbl)
 

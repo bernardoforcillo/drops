@@ -1,6 +1,10 @@
 package pg
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"database/sql"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // ColumnType describes the SQL type of a column.
 type ColumnType interface {
@@ -21,6 +25,7 @@ type Column struct {
 	table      *Table
 	typ        ColumnType
 	notNull    bool
+	nullStated bool // NotNull, PrimaryKey or Nullable was called
 	primary    bool
 	unique     bool
 	defaultSQL string
@@ -57,6 +62,15 @@ func (c *Column) Type() ColumnType { return c.typ }
 
 // IsNotNull reports whether the column was declared NOT NULL.
 func (c *Column) IsNotNull() bool { return c.notNull }
+
+// IsNullable reports whether the column admits NULL.
+//
+// It is the complement of IsNotNull, named for the question that
+// matters at bind and scan time rather than for the DDL keyword, and
+// spelled the same in all four dialects so the shared checker asks
+// exactly one question. A PostgreSQL column admits NULL unless it
+// says otherwise, so a column that stated nothing answers true.
+func (c *Column) IsNullable() bool { return !c.notNull }
 
 // IsPrimaryKey reports whether the column was declared PRIMARY KEY.
 func (c *Column) IsPrimaryKey() bool { return c.primary }
@@ -178,12 +192,31 @@ func newCol[T any](name string, typ ColumnType) *Col[T] {
 
 func (c *Col[T]) NotNull() *Col[T] {
 	c.Column.notNull = true
+	c.Column.nullStated = true
+	return c
+}
+
+// Nullable states that the column admits NULL.
+//
+// It changes nothing in the DDL — a PostgreSQL column is nullable
+// unless it says otherwise — and everything in what drops will let
+// you bind it to: NewEntity requires the struct field bound to a
+// nullable column to be one that can receive NULL, so writing this is
+// how a schema says the field must be a *T or an sql.Null[T]. It is
+// the counterpart of NotNull, and the two are last-writer-wins.
+func (c *Col[T]) Nullable() *Col[T] {
+	c.Column.notNull = false
+	c.Column.nullStated = true
 	return c
 }
 
 func (c *Col[T]) PrimaryKey() *Col[T] {
 	c.Column.primary = true
 	c.Column.notNull = true
+	// A primary key states NOT NULL implicitly, and a schema that
+	// said PrimaryKey has decided about NULL as much as one that
+	// spelled it out.
+	c.Column.nullStated = true
 	return c
 }
 
@@ -288,6 +321,48 @@ func (c *Col[T]) Between(lo, hi T) drops.Expression { return Between(c.Column, l
 // Val binds a typed value as the column's payload in an INSERT row or
 // UPDATE assignment.
 func (c *Col[T]) Val(v T) ColumnValue { return &valueBinding[T]{col: c.Column, val: v} }
+
+// SetNull binds SQL NULL as the column's value.
+//
+// It is the typed counterpart of SetDefault: a parameter placeholder
+// bound to nil, not the literal token, so an INSERT that sometimes
+// writes NULL is the same statement as one that writes a value — one
+// entry in the server's plan cache rather than two — and the NULL
+// travels through AddArg like every other bound value, where hooks,
+// tracers and PII redaction can see it.
+//
+// It does not refuse a NOT NULL column. This is called on a request
+// path, and the database reports that violation precisely; turning it
+// into a panic would trade a FieldError that names the column for a
+// process failure.
+func (c *Col[T]) SetNull() ColumnValue {
+	return &valueBinding[any]{col: c.Column, val: nil}
+}
+
+// ValPtr binds *p, or NULL when p is nil. It is the shape an optional
+// struct field already has, and the one AutoTable and dropsgen read
+// as "this column is nullable".
+func (c *Col[T]) ValPtr(p *T) ColumnValue {
+	if p == nil {
+		return c.SetNull()
+	}
+	// Binding *p rather than p keeps the bound argument's Go type
+	// identical to what Val would have bound, so a hook, tracer or
+	// PII formatter sees one thing rather than two.
+	return c.Val(*p)
+}
+
+// ValNull binds v.V, or NULL when v is not Valid.
+func (c *Col[T]) ValNull(v sql.Null[T]) ColumnValue {
+	if !v.Valid {
+		return c.SetNull()
+	}
+	// The wrapper is unwrapped rather than handed to the driver:
+	// sql.Null[T].Value did not convert its payload before Go 1.25,
+	// so passing one through would make the parameter's fate depend
+	// on the toolchain.
+	return c.Val(v.V)
+}
 
 // Expr binds an arbitrary expression to the column.
 func (c *Col[T]) Expr(e drops.Expression) ColumnValue {

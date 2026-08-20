@@ -15,7 +15,7 @@ func TestAuthzGuard(t *testing.T) {
 	tbl := sqlite.NewTable("posts")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
 	owner := sqlite.Add(tbl, sqlite.BigInt("authorId").NotNull())
-	sqlite.Add(tbl, sqlite.Text("body"))
+	sqlite.Add(tbl, sqlite.Text("body").NotNull())
 	ent := sqlite.NewEntity[postRow](tbl).
 		AuthorizeWith(sqlite.OwnerGuard{Owner: owner.Column})
 

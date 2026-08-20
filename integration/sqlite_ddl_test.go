@@ -153,7 +153,7 @@ func TestEntityCRUDAgainstTheEngine(t *testing.T) {
 	tbl := sqlite.NewTable("users")
 	id := sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey().AutoIncrement())
 	name := sqlite.Add(tbl, sqlite.Text("name").NotNull())
-	sqlite.Add(tbl, sqlite.Integer("age"))
+	sqlite.Add(tbl, sqlite.Integer("age").NotNull())
 	exec(t, db, sqlite.CreateTable(tbl))
 
 	type user struct {

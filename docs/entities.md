@@ -7,7 +7,12 @@ var UserEntity = pg.NewEntity[User](Users)
 ```
 
 It precomputes the column-to-field mapping once, at startup, and checks
-it — see [schema.md](schema.md#drift).
+it — see [schema.md](schema.md#drift). Two things make it panic there:
+a column no field binds to, and a column that admits NULL bound to a
+field that cannot receive one. Both name the column, the likely cause
+and the escape hatch —
+[`AllowUnmappedColumns`](schema.md#drift) and
+[`AllowNullableColumns`](schema.md#nullability-drift).
 
 ## The operations
 

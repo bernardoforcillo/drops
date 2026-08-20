@@ -102,8 +102,8 @@ func TestPGConstraintViolationNamesTheField(t *testing.T) {
 	accounts := pg.NewTable(integration.UniqueName(t, "acct"))
 	pg.Add(accounts, pg.BigSerial("id").PrimaryKey())
 	pg.Add(accounts, pg.Text("email").NotNull().Unique())
-	nick := pg.Add(accounts, pg.Text("nick"))
-	pg.Add(accounts, pg.BigInt("team_id").References(teamID))
+	nick := pg.Add(accounts, pg.Text("nick").NotNull())
+	pg.Add(accounts, pg.BigInt("team_id").NotNull().References(teamID))
 	pg.Add(accounts, pg.Integer("balance").NotNull().Default("0"))
 	accounts.AddCheck(accounts.Name()+"_balance_check", `"balance" >= 0`)
 	// A unique index created by name: PostgreSQL calls the constraint
@@ -296,8 +296,8 @@ func TestMySQLConstraintViolationNamesTheField(t *testing.T) {
 	accounts := mysql.NewTable(integration.UniqueName(t, "acct"))
 	mysql.Add(accounts, mysql.BigSerial("id").PrimaryKey())
 	mysql.Add(accounts, mysql.Varchar("email", 191).NotNull().Unique())
-	nick := mysql.Add(accounts, mysql.Varchar("nick", 191))
-	mysql.Add(accounts, mysql.BigInt("team_id").References(teamID))
+	nick := mysql.Add(accounts, mysql.Varchar("nick", 191).NotNull())
+	mysql.Add(accounts, mysql.BigInt("team_id").NotNull().References(teamID))
 	mysql.Add(accounts, mysql.Integer("balance").NotNull().Default("0"))
 	nickIdx := mysql.NewIndex(integration.UniqueName(t, "nick_idx"), accounts, nick).Unique()
 	// Declared on the table as well as executed, so the name is
@@ -411,7 +411,11 @@ func TestMySQLConstraintViolationNamesTheField(t *testing.T) {
 	}
 
 	t.Run("not null", func(t *testing.T) {
-		_, err := db.Exec(ctx, "INSERT INTO `"+accounts.Name()+"` (email, balance) VALUES (NULL, 1)")
+		// Every other column is NOT NULL and has no default, so they
+		// are supplied: the point of the row is that `email` is the
+		// only thing wrong with it.
+		_, err := db.Exec(ctx, "INSERT INTO `"+accounts.Name()+
+			"` (email, nick, team_id, balance) VALUES (NULL, 'nn', ?, 1)", home.ID)
 		fe, ok := drops.AsFieldError(accountEntity.FieldError(err))
 		if !ok {
 			t.Fatalf("err = %v (%T), want a *drops.FieldError", err, err)

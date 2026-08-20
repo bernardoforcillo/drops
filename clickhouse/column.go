@@ -1,6 +1,10 @@
 package clickhouse
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"database/sql"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // Column is the type-erased AST node for a column reference. Most user
 // code holds a *Col[T] (returned by every type constructor) which
@@ -232,6 +236,42 @@ func (c *Col[T]) ILike(pattern string) drops.Expression { return ILike(c.Column,
 
 // Val binds a typed value as the column's payload in an INSERT row.
 func (c *Col[T]) Val(v T) ColumnValue { return &valueBinding[T]{col: c.Column, val: v} }
+
+// SetNull binds SQL NULL as the column's value.
+//
+// It is a parameter placeholder bound to nil, not the literal token,
+// so an INSERT that sometimes writes NULL is the same statement as
+// one that writes a value, and the NULL travels through the same
+// binding every other value does.
+//
+// It does not refuse a column that was never declared Nullable: that
+// violation is one the server reports precisely, and turning it into
+// a panic on a request path would trade a good error for a process
+// failure.
+func (c *Col[T]) SetNull() ColumnValue {
+	return &valueBinding[any]{col: c.Column, val: nil}
+}
+
+// ValPtr binds *p, or NULL when p is nil. It is the shape an optional
+// struct field already has.
+func (c *Col[T]) ValPtr(p *T) ColumnValue {
+	if p == nil {
+		return c.SetNull()
+	}
+	// Binding *p rather than p keeps the bound argument's Go type
+	// identical to what Val would have bound.
+	return c.Val(*p)
+}
+
+// ValNull binds v.V, or NULL when v is not Valid.
+func (c *Col[T]) ValNull(v sql.Null[T]) ColumnValue {
+	if !v.Valid {
+		return c.SetNull()
+	}
+	// Unwrapped rather than handed to the driver: sql.Null[T].Value
+	// did not convert its payload before Go 1.25.
+	return c.Val(v.V)
+}
 
 // Expr binds an arbitrary SQL expression to the column in an INSERT.
 func (c *Col[T]) Expr(e drops.Expression) ColumnValue {

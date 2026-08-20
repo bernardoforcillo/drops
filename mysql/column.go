@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/bernardoforcillo/drops"
@@ -22,6 +23,7 @@ type Column struct {
 	table      *Table
 	typ        ColumnType
 	notNull    bool
+	nullStated bool // NotNull, PrimaryKey or Nullable was called
 	primary    bool
 	unique     bool
 	autoInc    bool
@@ -63,6 +65,14 @@ func (c *Column) HasDefault() bool      { return c.hasDefault }
 func (c *Column) DefaultSQL() string    { return c.defaultSQL }
 func (c *Column) ForeignKey() *FK       { return c.ref }
 func (c *Column) Comment() string       { return c.comment }
+
+// IsNullable reports whether the column admits NULL. It is the
+// complement of IsNotNull, named for the question that matters at
+// bind and scan time and spelled the same in all four dialects so the
+// shared checker asks exactly one question. A MySQL column admits
+// NULL unless it says otherwise, so one that stated nothing answers
+// true.
+func (c *Column) IsNullable() bool { return !c.notNull }
 
 // KeyPrefixLength returns the prefix length the column carries into a
 // PRIMARY KEY or UNIQUE KEY, or zero when it has none.
@@ -128,7 +138,16 @@ func newCol[T any](name string, typ ColumnType) *Col[T] {
 }
 
 // NotNull marks the column NOT NULL.
-func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull = true; return c }
+func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull, c.Column.nullStated = true, true; return c }
+
+// Nullable states that the column admits NULL.
+//
+// It changes nothing in the DDL — a MySQL column is nullable unless
+// it says otherwise — and everything in what drops will let you bind
+// it to: NewEntity requires the struct field bound to a nullable
+// column to be one that can receive NULL. It is the counterpart of
+// NotNull, and the two are last-writer-wins.
+func (c *Col[T]) Nullable() *Col[T] { c.Column.notNull, c.Column.nullStated = false, true; return c }
 
 // PrimaryKey marks the column part of the PRIMARY KEY. Declaring it on
 // more than one column declares a composite key, which Entity
@@ -136,6 +155,8 @@ func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull = true; return c }
 func (c *Col[T]) PrimaryKey() *Col[T] {
 	c.Column.primary = true
 	c.Column.notNull = true
+	// A primary key states NOT NULL implicitly.
+	c.Column.nullStated = true
 	return c
 }
 
@@ -277,6 +298,40 @@ func (c *Column) As(alias string) drops.Expression {
 
 // Val binds a typed value for INSERT / UPDATE.
 func (c *Col[T]) Val(v T) ColumnValue { return columnValue{col: c.Column, val: v} }
+
+// SetNull binds SQL NULL as the column's value.
+//
+// It is the typed counterpart of Expr(drops.Raw("NULL")) and differs
+// where it matters: a parameter placeholder bound to nil, so an
+// INSERT that sometimes writes NULL is the same statement as one that
+// writes a value, and the NULL travels through the same binding every
+// other value does.
+//
+// It does not refuse a NOT NULL column: that violation is one the
+// server reports precisely, and turning it into a panic on a request
+// path would trade a good error for a process failure.
+func (c *Col[T]) SetNull() ColumnValue { return columnValue{col: c.Column, val: nil} }
+
+// ValPtr binds *p, or NULL when p is nil. It is the shape an optional
+// struct field already has.
+func (c *Col[T]) ValPtr(p *T) ColumnValue {
+	if p == nil {
+		return c.SetNull()
+	}
+	// Binding *p rather than p keeps the bound argument's Go type
+	// identical to what Val would have bound.
+	return c.Val(*p)
+}
+
+// ValNull binds v.V, or NULL when v is not Valid.
+func (c *Col[T]) ValNull(v sql.Null[T]) ColumnValue {
+	if !v.Valid {
+		return c.SetNull()
+	}
+	// Unwrapped rather than handed to the driver: sql.Null[T].Value
+	// did not convert its payload before Go 1.25.
+	return c.Val(v.V)
+}
 
 // Expr assigns a raw SQL expression to the column instead of a bound
 // value.

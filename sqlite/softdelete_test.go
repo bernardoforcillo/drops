@@ -85,9 +85,16 @@ func TestEntitySoftDeleteAndRestore(t *testing.T) {
 	if _, err := ent.Restore(db, ctx, int64(7), sd); err != nil {
 		t.Fatal(err)
 	}
+	// Restore binds the NULL rather than splicing the token, so the
+	// statement is the same one every other assignment to this column
+	// produces — one entry in a prepared-statement cache, and a value
+	// hooks and tracers can see.
 	last = drv.queries[len(drv.queries)-1]
-	if last != `UPDATE "posts" SET "deletedAt" = NULL WHERE ("posts"."id" = ?)` {
+	if last != `UPDATE "posts" SET "deletedAt" = ? WHERE ("posts"."id" = ?)` {
 		t.Errorf("restore SQL wrong: %s", last)
+	}
+	if args := drv.args[len(drv.args)-1]; len(args) != 2 || args[0] != nil {
+		t.Errorf("restore should bind a NULL parameter, got %#v", args)
 	}
 }
 

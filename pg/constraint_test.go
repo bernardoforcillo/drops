@@ -20,7 +20,7 @@ func ctTable(name string) *pg.Table {
 	t := pg.NewTable(name)
 	pg.Add(t, pg.BigSerial("id").PrimaryKey())
 	pg.Add(t, pg.Text("email").NotNull().Unique())
-	pg.Add(t, pg.Text("alt"))
+	pg.Add(t, pg.Text("alt").NotNull())
 	return t
 }
 

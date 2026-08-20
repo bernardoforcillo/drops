@@ -1844,8 +1844,8 @@ func TestPGWatermarkOpsIgnoreANullColumn(t *testing.T) {
 	tbl := pg.NewTable(integration.UniqueName(t, "nullpeak"))
 	dropPG(t, db, tbl)
 	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
-	high := pg.Add(tbl, pg.BigInt("high"))
-	low := pg.Add(tbl, pg.BigInt("low"))
+	high := pg.Add(tbl, pg.BigInt("high").Nullable())
+	low := pg.Add(tbl, pg.BigInt("low").Nullable())
 	execPG(t, db, pg.CreateTable(tbl))
 	name := drops.StdQuoteIdent(tbl.Name())
 	if _, err := db.Exec(ctx, `INSERT INTO `+name+` (id) VALUES (1)`); err != nil {
@@ -1867,10 +1867,13 @@ func TestPGWatermarkOpsIgnoreANullColumn(t *testing.T) {
 	}
 }
 
+// The columns are the point of the test, so the fields are the shape
+// a nullable column requires: a plain int64 could not receive the
+// NULL the row starts life with.
 type pgPatchNullable struct {
-	ID   int64 `drop:"id"`
-	High int64 `drop:"high"`
-	Low  int64 `drop:"low"`
+	ID   int64  `drop:"id"`
+	High *int64 `drop:"high"`
+	Low  *int64 `drop:"low"`
 }
 
 func pgReadNullableInts(t *testing.T, db *pg.DB, tbl *pg.Table) (sql.NullInt64, sql.NullInt64) {
@@ -1900,7 +1903,7 @@ func TestPGSetIfChangedReachesANullColumn(t *testing.T) {
 	tbl := pg.NewTable(integration.UniqueName(t, "ifchanged_null"))
 	dropPG(t, db, tbl)
 	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
-	note := pg.Add(tbl, pg.Text("note"))
+	note := pg.Add(tbl, pg.Text("note").Nullable())
 	execPG(t, db, pg.CreateTable(tbl))
 	name := drops.StdQuoteIdent(tbl.Name())
 	if _, err := db.Exec(ctx, `INSERT INTO `+name+` (id) VALUES (1)`); err != nil {
@@ -1914,14 +1917,17 @@ func TestPGSetIfChangedReachesANullColumn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Note != "written" {
-		t.Errorf("note = %q, want written — the NULL column was never assigned", got.Note)
+	if got.Note == nil || *got.Note != "written" {
+		t.Errorf("note = %v, want written — the NULL column was never assigned", got.Note)
 	}
 }
 
+// The column is the point of the test, so the field is the shape a
+// nullable column requires: a plain string could not receive the NULL
+// the row starts life with.
 type pgPatchNote struct {
-	ID   int64  `drop:"id"`
-	Note string `drop:"note"`
+	ID   int64   `drop:"id"`
+	Note *string `drop:"note"`
 }
 
 // What SetIfChanged does not do is decide whether the row is written.

@@ -48,7 +48,7 @@ type piiUser struct {
 func TestPIIColumnBinding(t *testing.T) {
 	tbl := sqlite.NewTable("users")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
-	sqlite.Add(tbl, sqlite.Text("email").AsPII())
+	sqlite.Add(tbl, sqlite.Text("email").NotNull().AsPII())
 	ent := sqlite.NewEntity[piiUser](tbl)
 
 	drv := &entDriver{}
@@ -91,16 +91,20 @@ type autoRow struct {
 func TestAutoTableDDL(t *testing.T) {
 	tbl := sqlite.AutoTable[autoRow]("things")
 	sql, _ := sqlite.ToSQL(sqlite.CreateTable(tbl))
+	// Every column states its nullability, and the field's type is
+	// the statement: autoRow has no pointer field, so every column
+	// is NOT NULL. A struct that meant otherwise says so with a
+	// pointer.
 	for _, want := range []string{
 		`"id" INTEGER PRIMARY KEY AUTOINCREMENT`,
 		`"name" TEXT NOT NULL UNIQUE`,
-		`"age" INTEGER`,
-		`"score" REAL DEFAULT 0`,
-		`"active" BOOLEAN`,
-		`"meta" TEXT`,
-		`"blob" BLOB`,
+		`"age" INTEGER NOT NULL`,
+		`"score" REAL NOT NULL DEFAULT 0`,
+		`"active" BOOLEAN NOT NULL`,
+		`"meta" TEXT NOT NULL`,
+		`"blob" BLOB NOT NULL`,
 		`"createdAt" DATETIME NOT NULL`,
-		`"balance" INTEGER`,
+		`"balance" INTEGER NOT NULL`,
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("missing %q in:\n%s", want, sql)

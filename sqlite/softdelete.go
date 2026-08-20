@@ -30,7 +30,7 @@ type SoftDeleteCols struct {
 //	postEntity.SoftDeleteByID(db, ctx, id, sd) // hide the row
 //	postEntity.Restore(db, ctx, id, sd)        // bring it back
 func SoftDelete(t *Table) SoftDeleteCols {
-	col := Add(t, Timestamp("deletedAt", false).Managed())
+	col := Add(t, Timestamp("deletedAt", false).Nullable().Managed())
 	t.DefaultFilter(col.IsNull())
 	return SoftDeleteCols{DeletedAt: col}
 }
@@ -57,8 +57,11 @@ func (e *Entity[T]) Restore(db *DB, ctx context.Context, id any, sd SoftDeleteCo
 	if err != nil {
 		return nil, err
 	}
+	// SetNull rather than the literal token: this is the one
+	// statement in drops that used to have to splice a NULL, because
+	// nothing typed could produce one.
 	return db.Update(e.table).Unscoped().
-		SetExpr(sd.DeletedAt.Column, drops.Raw("NULL")).
+		Set(sd.DeletedAt.SetNull()).
 		Where(pred).
 		Exec(ctx)
 }

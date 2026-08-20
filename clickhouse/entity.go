@@ -92,6 +92,8 @@ type EntityOption func(*entityConfig)
 type entityConfig struct {
 	allowUnmapped map[string]bool
 	allowAny      bool
+	allowNullable map[string]bool
+	allowAnyNull  bool
 }
 
 // AllowUnmappedColumns exempts the named columns from the check that
@@ -113,6 +115,32 @@ func AllowAnyUnmappedColumn() EntityOption {
 	return func(c *entityConfig) { c.allowAny = true }
 }
 
+// AllowNullableColumns exempts the named columns from the check that
+// a column admitting NULL is bound to a field that can receive one.
+//
+// Use it where the database will never actually produce a NULL and
+// the constraint cannot say so — a column another writer keeps
+// populated, a view whose outer join can never miss. Naming the
+// columns leaves the check working everywhere else.
+func AllowNullableColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowNullable == nil {
+			c.allowNullable = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowNullable[n] = true
+		}
+	}
+}
+
+// AllowAnyNullableColumn disables the nullability check entirely, for
+// migrating a codebase with too many mismatches to fix at once;
+// prefer [AllowNullableColumns], which keeps the check working for
+// the columns you have not exempted.
+func AllowAnyNullableColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAnyNull = true }
+}
+
 // checkDrift reports columns bound to no struct field — see
 // [github.com/bernardoforcillo/drops/internal/drift].
 func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
@@ -132,8 +160,47 @@ func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entit
 		}
 		missing = append(missing, c.Name())
 	}
-	return drift.Report("drops/clickhouse", rt.Name(), t.Name(), missing,
-		drift.SpareFields(rt, bound), "clickhouse.AllowUnmappedColumns")
+	if err := drift.Report("drops/clickhouse", rt.Name(), t.Name(), missing,
+		drift.SpareFields(rt, bound), "clickhouse.AllowUnmappedColumns"); err != nil {
+		return err
+	}
+	return checkNullability(rt, t, colFields, cfg)
+}
+
+// checkNullability reports columns that admit NULL bound to a field
+// that cannot receive one.
+//
+// The mismatch is invisible to the compiler — a column's T is the
+// type its comparisons take, and the scan destination is a field
+// drops reaches only by reflection — and invisible at run time too,
+// until the first row that happens to be NULL. NewEntity is the one
+// place both types are in scope.
+//
+// ClickHouse is the dialect that already had this right: nullability
+// is an opt-in that changes the column's type, so only a column that
+// said Nullable can reach this check at all.
+func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAnyNull {
+		return nil
+	}
+	var bad []drift.NullMismatch
+	for _, cf := range colFields {
+		c := cf.col
+		if !c.IsNullable() || cfg.allowNullable[c.Name()] {
+			continue
+		}
+		ft := drift.FieldTypeAt(rt, cf.field)
+		if ft == nil || drift.AcceptsNull(ft) {
+			continue
+		}
+		bad = append(bad, drift.NullMismatch{
+			Column:    c.Name(),
+			Field:     drift.FieldPath(rt, cf.field),
+			FieldType: ft.String(),
+			Stated:    true,
+		})
+	}
+	return drift.ReportNullable("drops/clickhouse", rt.Name(), t.Name(), bad, "clickhouse.AllowNullableColumns")
 }
 
 // Table returns the table the entity is bound to.

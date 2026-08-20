@@ -15,6 +15,6 @@ var (
 	UserID        = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
 	UserEmail     = pg.Add(Users, pg.Text("email").NotNull().Unique())
 	UserName      = pg.Add(Users, pg.Text("name").NotNull())
-	UserAge       = pg.Add(Users, pg.Integer("age"))
+	UserAge       = pg.Add(Users, pg.Integer("age").Nullable())
 	UserCreatedAt = pg.Add(Users, pg.Timestamp("createdAt", true).NotNull().Default("now()"))
 )

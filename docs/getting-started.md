@@ -54,13 +54,20 @@ var (
     UserID    = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
     UserName  = pg.Add(Users, pg.Text("name").NotNull())
     UserEmail = pg.Add(Users, pg.Text("email").NotNull().Unique())
-    UserAge   = pg.Add(Users, pg.Integer("age"))
+    UserAge   = pg.Add(Users, pg.Integer("age").Nullable())
 )
 ```
 
 `pg.Add` returns a `*pg.Col[T]` — a column handle that knows its Go
 type. `UserAge` is a `*pg.Col[int32]`, which is what makes the next
 section work.
+
+Every column says whether it can be NULL, and saying nothing is not an
+option once an entity is declared over the table: `NewEntity` refuses a
+column that admits NULL bound to a field that cannot hold one, because
+that program works until the first NULL row and then fails on the read
+path. `age` is `.Nullable()` above and `Age` is a `*int32` below; they
+agree, so it passes.
 
 Create the table:
 

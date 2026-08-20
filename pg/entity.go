@@ -228,6 +228,8 @@ type EntityOption func(*entityConfig)
 type entityConfig struct {
 	allowUnmapped map[string]bool
 	allowAny      bool
+	allowNullable map[string]bool
+	allowAnyNull  bool
 }
 
 // AllowUnmappedColumns exempts the named columns from the check that
@@ -257,6 +259,33 @@ func AllowAnyUnmappedColumn() EntityOption {
 	return func(c *entityConfig) { c.allowAny = true }
 }
 
+// AllowNullableColumns exempts the named columns from the check that
+// a column admitting NULL is bound to a field that can receive one.
+//
+// Use it where the database will never actually produce a NULL and
+// the constraint cannot say so — a column another writer keeps
+// populated, a view whose outer join can never miss. Naming the
+// columns is the point: the exemption applies to those and leaves the
+// check working everywhere else.
+func AllowNullableColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowNullable == nil {
+			c.allowNullable = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowNullable[n] = true
+		}
+	}
+}
+
+// AllowAnyNullableColumn disables the nullability check entirely. It
+// exists for migrating an existing codebase that has too many
+// mismatches to fix at once; prefer [AllowNullableColumns], which
+// keeps the check working for the columns you have not exempted.
+func AllowAnyNullableColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAnyNull = true }
+}
+
 // checkDrift reports columns that no struct field is bound to.
 //
 // Such a column is dropped from every INSERT and UPDATE the entity
@@ -282,8 +311,58 @@ func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entit
 		}
 		missing = append(missing, c.Name())
 	}
-	return drift.Report("drops/pg", rt.Name(), t.Name(), missing,
-		drift.SpareFields(rt, bound), "pg.AllowUnmappedColumns")
+	if err := drift.Report("drops/pg", rt.Name(), t.Name(), missing,
+		drift.SpareFields(rt, bound), "pg.AllowUnmappedColumns"); err != nil {
+		return err
+	}
+	return checkNullability(rt, t, colFields, cfg)
+}
+
+// checkNullability reports columns that admit NULL bound to a field
+// that cannot receive one.
+//
+// The mismatch is invisible to the compiler — a column's T is the
+// type its comparisons take, and the scan destination is a field
+// drops reaches only by reflection — and invisible at run time too,
+// until the first row that happens to be NULL. NewEntity is the one
+// place both types are in scope.
+//
+// It fires on whether the column admits NULL, not on whether it said
+// so. A bare pg.Text("bio") is exactly the shape that has been
+// accepting NULLs nobody declared, and a check that only questioned
+// columns which had already thought about it would protect nobody.
+func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAnyNull {
+		return nil
+	}
+	// A PRIMARY KEY column does not admit NULL whatever its own flag
+	// says. (*Col[T]).PrimaryKey sets notNull, but the composite
+	// spelling — Table.PrimaryKey(cols...) — records the key on the
+	// table and leaves the columns alone, so a perfectly ordinary join
+	// table would otherwise be refused and its caller told to make the
+	// key fields pointers.
+	inKey := make(map[string]bool)
+	for _, c := range t.primaryKeyColumns() {
+		inKey[c.Name()] = true
+	}
+	var bad []drift.NullMismatch
+	for _, cf := range colFields {
+		c := cf.col
+		if !c.IsNullable() || inKey[c.Name()] || cfg.allowNullable[c.Name()] {
+			continue
+		}
+		ft := drift.FieldTypeAt(rt, cf.field)
+		if ft == nil || drift.AcceptsNull(ft) {
+			continue
+		}
+		bad = append(bad, drift.NullMismatch{
+			Column:    c.Name(),
+			Field:     drift.FieldPath(rt, cf.field),
+			FieldType: ft.String(),
+			Stated:    c.nullStated,
+		})
+	}
+	return drift.ReportNullable("drops/pg", rt.Name(), t.Name(), bad, "pg.AllowNullableColumns")
 }
 
 // Validate registers a validator that runs before Create / Update /

@@ -1,6 +1,10 @@
 package mysql
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"fmt"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // MySQL string functions, ported from drops/pg's strings.go. Arguments
 // may be a drops.Expression or a Go value, which binds as a parameter.
@@ -221,10 +225,18 @@ func FromBase64(e any) drops.Expression { return funcCall("from_base64", []any{e
 
 // Collate renders (<e> COLLATE <collation>) — the way to force a
 // comparison's case sensitivity in a dialect where it is otherwise a
-// property of the schema. The collation name is written verbatim and
-// must be one the server knows, e.g. "utf8mb4_bin".
+// property of the schema. It must name a collation the server knows,
+// e.g. "utf8mb4_bin".
+//
+// A collation name cannot be quoted: the grammar takes a bare word
+// there, so the string is written into the SQL as given. That is why
+// it is checked against the character set MySQL allows in one —
+// letters, digits and underscore — rather than through the identifier
+// check the rest of this package uses. An identifier is safe because
+// it is rendered inside backticks, and this one is not rendered inside
+// anything.
 func Collate(e any, collation string) drops.Expression {
-	mustIdent("collation", collation)
+	mustCollation(collation)
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteByte('(')
 		writeOperand(b, e)
@@ -232,4 +244,22 @@ func Collate(e any, collation string) drops.Expression {
 		b.WriteString(collation)
 		b.WriteByte(')')
 	})
+}
+
+// mustCollation rejects anything that is not shaped like a collation
+// name, since [Collate] interpolates it.
+func mustCollation(name string) {
+	if name == "" {
+		panic("drops/mysql: collation name is empty")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		ok := c == '_' ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9')
+		if !ok {
+			panic(fmt.Sprintf("drops/mysql: %q is not a collation name", name))
+		}
+	}
 }

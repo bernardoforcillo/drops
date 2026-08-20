@@ -54,9 +54,10 @@ func (s *SelectBuilder) From(t *Table) *SelectBuilder { s.from = t; return s }
 // Multiple sources are comma-joined, which is to say cross-joined.
 //
 // MySQL requires every derived table to carry an alias, so pass one
-// through whichever helper produced the expression; the server answers
-// error 1248, "Every derived table must have its own alias", if you do
-// not.
+// through whichever helper produced the expression. Leaving it off
+// fails on both servers and says so differently: MySQL answers error
+// 1248, "Every derived table must have its own alias", while MariaDB
+// answers a bare syntax error, 1064, naming nothing in particular.
 func (s *SelectBuilder) FromExpr(e drops.Expression) *SelectBuilder {
 	s.fromExprs = append(s.fromExprs, e)
 	return s

@@ -106,9 +106,9 @@
 // drift check, composite keys and relations, and schema migrations;
 // plus the outbox, the event store, the idempotency store, keyset
 // pagination, the typed error surface, and the expression library
-// above. The remaining cross-cutting
-// packages that pg and sqlite have grown — saga, audit, tenancy — are
-// not ported yet, and this doc will say so until they are.
+// above. The remaining cross-cutting packages that pg and sqlite have
+// grown — saga, audit, tenancy — are not ported yet, and this doc will
+// say so until they are.
 package mysql
 
 import "github.com/bernardoforcillo/drops"

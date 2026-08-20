@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/mysql"
@@ -157,8 +158,13 @@ func TestOutboxTableDDL(t *testing.T) {
 	}
 	create, _ := sqlOf(stmts[0])
 	for _, want := range []string{
-		"`kind` VARCHAR(255) COLLATE utf8mb4_bin NOT NULL",
-		"`aggregateID` VARCHAR(255) COLLATE utf8mb4_bin",
+		"`kind` VARCHAR(255) NOT NULL",
+		"`aggregateID` VARCHAR(255)",
+		// The binary collation is declared once on the table rather
+		// than on each column: a column-level COLLATE does not come
+		// back out of information_schema the way it went in, so Diff
+		// would MODIFY the column on every push.
+		"COLLATE=utf8mb4_bin",
 		"`createdAt` DATETIME(6) NOT NULL",
 		"`payload` JSON NOT NULL",
 		"PRIMARY KEY (`id`)",
@@ -720,5 +726,58 @@ func TestWorkerRunStopsWithTheContext(t *testing.T) {
 		OnEvent(func(context.Context, mysql.OutboxEvent) error { return nil })
 	if err := w.Run(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// The two drain indexes have to reach the server by whichever route
+// the application uses. OutboxDDL renders them as statements; a
+// Schema-and-Push deployment never calls it, so the table has to carry
+// them itself. That they are the same two is the point — a table
+// pushed and a table created by hand must not differ.
+func TestOutboxTableCarriesItsIndexesForPush(t *testing.T) {
+	tbl := mysql.NewOutboxTable("outbox")
+	registered := tbl.Indexes()
+	if len(registered) != 2 {
+		t.Fatalf("the table registered %d indexes; Push would create that many", len(registered))
+	}
+	fromDDL := mysql.OutboxDDL(tbl)[1:]
+	if len(fromDDL) != len(registered) {
+		t.Fatalf("OutboxDDL renders %d indexes, the table carries %d", len(fromDDL), len(registered))
+	}
+	for i := range registered {
+		want, _ := sqlOf(fromDDL[i])
+		got, _ := sqlOf(registered[i])
+		if want != got {
+			t.Errorf("index %d differs between the two routes:\n%s\n%s", i, want, got)
+		}
+	}
+}
+
+// The fold that keeps a lock name inside MySQL 8's 64-character limit
+// cuts bytes, so an aggregate id of non-ASCII text can be sliced
+// mid-rune. MariaDB accepts the mangled name and MySQL's own limit is
+// stated in characters, so nothing here would notice — hence the
+// check on the name itself.
+func TestAggregateLockNameStaysValidUTF8(t *testing.T) {
+	for n := 1; n <= 80; n++ {
+		id := strings.Repeat("世", n)
+		d := &obDriver{rowsFor: func(sql string) [][]any {
+			if strings.Contains(sql, "GET_LOCK") {
+				return [][]any{{ptr(int64(0))}}
+			}
+			return nil
+		}}
+		ob := mysql.NewOutbox(mysql.New(d), "outbox")
+		if err := ob.DrainAggregate(context.Background(), "cart", id, 1, nil); err != nil {
+			t.Fatal(err)
+		}
+		_, args := d.queryContaining(t, "GET_LOCK")
+		name, _ := args[0].(string)
+		if len(name) > 64 {
+			t.Fatalf("n=%d: lock name is %d bytes", n, len(name))
+		}
+		if !utf8.ValidString(name) {
+			t.Fatalf("n=%d: lock name is not valid UTF-8: %q", n, name)
+		}
 	}
 }

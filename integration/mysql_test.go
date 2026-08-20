@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1553,6 +1554,340 @@ func TestMySQLPushRefusesADatabaseTheConnectionIsNotOn(t *testing.T) {
 	}
 	if len(settled.Statements) != 0 {
 		t.Fatalf("the push did not settle:\n%s", strings.Join(settled.Statements, "\n"))
+	}
+}
+
+// dropCheckSQL picks between DROP CONSTRAINT and DROP CHECK off a
+// version number, and the unit test for it compares the two strings.
+// Which one a server accepts is not a string question: MariaDB has
+// never taken DROP CHECK, MySQL took only it between 8.0.16 and
+// 8.0.18, and both take DROP CONSTRAINT from 8.0.19. This asks.
+func TestMySQLDropCheckSpellingIsTheOneTheServerTakes(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	server, err := mysql.ServerVersion(ctx, db)
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	if !server.SupportsCheckConstraints() {
+		t.Skipf("%s parses CHECK constraints and discards them", server)
+	}
+
+	name := integration.UniqueName(t, "ckdrop")
+	withCheck := mysql.NewTable(name)
+	mysql.Add(withCheck, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(withCheck, mysql.Integer("age"))
+	withCheck.AddCheck(migName(t, "ckdrop"), "age >= 0")
+	dropMySQL(t, db, withCheck)
+	if _, err := mysql.Push(ctx, db, mysql.NewSchema(withCheck)); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	// The spelling drops chose for this server, run against it.
+	without := mysql.NewTable(name)
+	mysql.Add(without, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(without, mysql.Integer("age"))
+	stmts := mysql.Diff(
+		mysql.BuildSnapshot(mysql.NewSchema(withCheck)),
+		mysql.BuildSnapshot(mysql.NewSchema(without)),
+		mysql.DiffOptions{Server: server})
+	if len(stmts) != 1 {
+		t.Fatalf("dropping a check = %v", stmts)
+	}
+	if _, err := db.Exec(ctx, strings.TrimSuffix(stmts[0], ";")); err != nil {
+		t.Fatalf("%s refused the spelling drops picked for it: %v\n%s", server, err, stmts[0])
+	}
+
+	// And the spelling it did not pick. MariaDB rejects DROP CHECK
+	// outright, which is the whole reason for the gate; MySQL 8.0.19+
+	// accepts both, so there is nothing to assert there.
+	if !server.MariaDB {
+		t.Skipf("%s accepts both spellings from 8.0.19; only MariaDB rejects DROP CHECK", server)
+	}
+	if !strings.Contains(stmts[0], "DROP CONSTRAINT") {
+		t.Errorf("MariaDB has no DROP CHECK, so the statement must use DROP CONSTRAINT: %s", stmts[0])
+	}
+	if _, err := db.Exec(ctx, "ALTER TABLE `"+name+"` DROP CHECK `"+migName(t, "ckdrop")+"`"); err == nil {
+		t.Errorf("%s accepted DROP CHECK after all; the version gate is guessing", server)
+	}
+}
+
+// DiffOptions.Safe guards CREATE TABLE and DROP TABLE and nothing else,
+// and the sharp edge is what it leaves unguarded: re-running a
+// migration that adds a column still fails. Both halves are the
+// server's answer, not the statement's shape.
+func TestMySQLSafeGuardsOnlyTheStatementsThatCanBeRerun(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "safe")
+	before := mysql.NewTable(name)
+	mysql.Add(before, mysql.BigSerial("id").PrimaryKey())
+	after := mysql.NewTable(name)
+	mysql.Add(after, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(after, mysql.Integer("n"))
+	dropMySQL(t, db, after)
+
+	safe := mysql.DiffOptions{Safe: true}
+	create := mysql.Diff(nil, mysql.BuildSnapshot(mysql.NewSchema(before)), safe)
+	add := mysql.Diff(
+		mysql.BuildSnapshot(mysql.NewSchema(before)),
+		mysql.BuildSnapshot(mysql.NewSchema(after)), safe)
+	if len(create) != 1 || len(add) != 1 {
+		t.Fatalf("create = %v, add = %v", create, add)
+	}
+
+	run := func(stmt string) error {
+		_, err := db.Exec(ctx, strings.TrimSuffix(stmt, ";"))
+		return err
+	}
+	if err := run(create[0]); err != nil {
+		t.Fatalf("guarded CREATE TABLE: %v", err)
+	}
+	if err := run(create[0]); err != nil {
+		t.Errorf("a guarded CREATE TABLE has to be re-runnable: %v", err)
+	}
+	if err := run(add[0]); err != nil {
+		t.Fatalf("ADD COLUMN: %v", err)
+	}
+	// Unguarded on purpose: MySQL has no IF NOT EXISTS here, so drops
+	// emits none and Push recomputes the diff instead of re-running.
+	if err := run(add[0]); err == nil {
+		t.Errorf("%s let the same ADD COLUMN run twice; Safe is documented as unable to guard it", name)
+	}
+
+	server, err := mysql.ServerVersion(ctx, db)
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	if !server.MariaDB {
+		t.Skipf("%s has no ADD COLUMN IF NOT EXISTS; the divergence being pinned here is MariaDB's", server)
+	}
+	// And the extension drops declines to use, so the reason it
+	// declines is a fact rather than a recollection.
+	if _, err := db.Exec(ctx, "ALTER TABLE `"+name+"` ADD COLUMN IF NOT EXISTS `n` int NULL"); err != nil {
+		t.Errorf("MariaDB is supposed to accept ADD COLUMN IF NOT EXISTS: %v", err)
+	}
+}
+
+// MODIFY COLUMN restates the column in full, and whatever the
+// restatement leaves out is gone — which is why the snapshot has to
+// carry a column's COMMENT and ON UPDATE even though nothing else
+// reads them. The unit test for this compares the rendered string; the
+// thing it is guarding is what the server does with it.
+func TestMySQLModifyColumnDropsWhatItDoesNotRestate(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "restate")
+	before := mysql.NewTable(name)
+	mysql.Add(before, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(before, mysql.Timestamp("updated", false).
+		NotNull().
+		Default("CURRENT_TIMESTAMP(6)").
+		OnUpdateExpr("CURRENT_TIMESTAMP(6)").
+		Comment("last write"))
+	dropMySQL(t, db, before)
+	if _, err := mysql.Push(ctx, db, mysql.NewSchema(before)); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	readBack := func() (comment, extra string) {
+		t.Helper()
+		return mysqlScalar(t, db, `SELECT COLUMN_COMMENT FROM information_schema.COLUMNS
+				WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'updated'`, name),
+			mysqlScalar(t, db, `SELECT EXTRA FROM information_schema.COLUMNS
+				WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'updated'`, name)
+	}
+	if c, e := readBack(); c != "last write" || !strings.Contains(strings.ToLower(e), "on update") {
+		t.Fatalf("the push did not create the column it described: comment=%q extra=%q", c, e)
+	}
+
+	// A restatement that leaves them out is a restatement that removes
+	// them. This is the failure the snapshot fields exist to prevent.
+	if _, err := db.Exec(ctx, "ALTER TABLE `"+name+
+		"` MODIFY COLUMN `updated` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)"); err != nil {
+		t.Fatalf("modify: %v", err)
+	}
+	if c, e := readBack(); c != "" || strings.Contains(strings.ToLower(e), "on update") {
+		t.Fatalf("the server kept attributes the MODIFY left out, so nothing in the snapshot would need to carry them: comment=%q extra=%q", c, e)
+	}
+
+	// And the push puts them back, because its own MODIFY carries
+	// them. Moving DATETIME(6) to TIMESTAMP(6) is what forces a MODIFY
+	// rather than an ALTER COLUMN … SET DEFAULT.
+	after := mysql.NewTable(name)
+	mysql.Add(after, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(after, mysql.Timestamp("updated", true).
+		NotNull().
+		Default("CURRENT_TIMESTAMP(6)").
+		OnUpdateExpr("CURRENT_TIMESTAMP(6)").
+		Comment("last write"))
+	if _, err := mysql.Push(ctx, db, mysql.NewSchema(after)); err != nil {
+		t.Fatalf("push after the hand-made restatement: %v", err)
+	}
+	if c, e := readBack(); c != "last write" || !strings.Contains(strings.ToLower(e), "on update") {
+		t.Errorf("the push's MODIFY dropped the column's comment or ON UPDATE: comment=%q extra=%q", c, e)
+	}
+	settled, err := mysql.Push(ctx, db, mysql.NewSchema(after))
+	if err != nil {
+		t.Fatalf("settling push: %v", err)
+	}
+	if len(settled.Statements) != 0 {
+		t.Fatalf("the restated column did not settle:\n%s", strings.Join(settled.Statements, "\n"))
+	}
+}
+
+// A schema can be created two ways — CreateTable renders it directly,
+// Push renders it from a snapshot — and the two have to agree on every
+// name and every type or a table made by one and evolved by the other
+// grows duplicates: a second unique index beside the first, a column
+// restated on every push. The names are derived in different files
+// (ddl.go and snapshot.go) from the same rule, which is exactly the
+// arrangement that drifts.
+func TestMySQLCreateTableAndPushAgreeOnTheSameSchema(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	parent := mysql.NewTable(integration.UniqueName(t, "agree_parent"))
+	parentID := mysql.Add(parent, mysql.BigSerial("id").PrimaryKey())
+
+	child := mysql.NewTable(integration.UniqueName(t, "agree_child"))
+	mysql.Add(child, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(child, mysql.Varchar("email", 190).NotNull().Unique())
+	mysql.Add(child, mysql.Enum("kind", "Alpha", "Beta").Default("'Alpha'"))
+	mysql.Add(child, mysql.Boolean("flag").Default("TRUE"))
+	mysql.Add(child, mysql.Numeric("price", 10, 2))
+	mysql.Add(child, mysql.BigInt("pid").References(parentID, mysql.OnDelete("CASCADE")))
+	dropMigrationTables(t, db, child, parent)
+
+	// Built by the DDL layer, not by the migration layer.
+	execMySQL(t, db, mysql.CreateTable(parent))
+	execMySQL(t, db, mysql.CreateTable(child))
+
+	res, err := mysql.Push(ctx, db, mysql.NewSchema(parent, child))
+	if err != nil {
+		t.Fatalf("push over a CreateTable-built schema: %v", err)
+	}
+	if len(res.Statements) != 0 {
+		t.Fatalf("the two layers disagree about the same schema:\n%s", strings.Join(res.Statements, "\n"))
+	}
+	for _, n := range res.Notices {
+		t.Errorf("unexpected notice: %s", n)
+	}
+	// One unique index on email, not two under two derived names.
+	if n := mysqlScalar(t, db, `SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'email'`, child.Name()); n != "1" {
+		t.Errorf("email carries %s indexes, want 1", n)
+	}
+}
+
+// Push reports what it declines to do rather than doing it quietly.
+// Two of those decisions can only be provoked with a server: a table
+// whose ENGINE the schema disagrees with, and a CHECK expression the
+// server will not parse.
+func TestMySQLPushReportsTheChangesItDeclinesToMake(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "declined")
+	tbl := mysql.NewTable(name).Engine("InnoDB")
+	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(tbl, mysql.Integer("age"))
+	dropMySQL(t, db, tbl)
+
+	// A table the schema wants on InnoDB and the database has on
+	// something else. Changing it copies every row, so Push says so
+	// and stops.
+	if _, err := db.Exec(ctx, "CREATE TABLE `"+name+
+		"` (`id` bigint NOT NULL AUTO_INCREMENT, `age` int NULL, PRIMARY KEY (`id`)) ENGINE=MyISAM"); err != nil {
+		t.Skipf("this server will not make a MyISAM table: %v", err)
+	}
+	res, err := mysql.Push(ctx, db, mysql.NewSchema(tbl))
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(res.Statements) != 0 {
+		t.Fatalf("Push rewrote the table to change its engine:\n%s", strings.Join(res.Statements, "\n"))
+	}
+	var options *mysql.SchemaNotice
+	for i, n := range res.Notices {
+		if n.Rule == "table-options" && n.Table == name {
+			options = &res.Notices[i]
+		}
+	}
+	if options == nil {
+		t.Fatalf("the engine mismatch was neither changed nor reported: %+v", res.Notices)
+	}
+	if !strings.Contains(options.SQL, "ENGINE=InnoDB") {
+		t.Errorf("the notice does not carry the statement to run by hand: %+v", options)
+	}
+	if got := mysqlScalar(t, db, `SELECT ENGINE FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, name); !strings.EqualFold(got, "MyISAM") {
+		t.Errorf("the engine changed to %q behind the notice", got)
+	}
+}
+
+// An expression the server refuses to parse must not be treated as a
+// change. Push probes the declared spelling before it diffs, and a
+// probe that fails has to be told apart from a probe that could not
+// run — the SQLSTATE the driver carries is the only thing separating
+// "this expression is nonsense" from "the disk is full", and drops
+// reads it off whatever error type the driver returned by reflection,
+// which nothing else here exercises against a real one.
+func TestMySQLARefusedCheckExpressionIsReportedNotChurned(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	server, err := mysql.ServerVersion(ctx, db)
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	if !server.SupportsCheckConstraints() {
+		t.Skipf("%s parses CHECK constraints and discards them", server)
+	}
+
+	name := integration.UniqueName(t, "badexpr")
+	ckName := migName(t, "ckbad")
+	good := mysql.NewTable(name)
+	mysql.Add(good, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(good, mysql.Integer("age"))
+	good.AddCheck(ckName, "age >= 0")
+	dropMySQL(t, db, good)
+	if _, err := mysql.Push(ctx, db, mysql.NewSchema(good)); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	// The same constraint name, now declared with something no server
+	// can parse.
+	bad := mysql.NewTable(name)
+	mysql.Add(bad, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(bad, mysql.Integer("age"))
+	bad.AddCheck(ckName, "drops_no_such_function(age) > 0")
+	res, err := mysql.Push(ctx, db, mysql.NewSchema(bad))
+	if err != nil {
+		t.Fatalf("push over an unparseable expression: %v", err)
+	}
+	if len(res.Statements) != 0 {
+		t.Fatalf("Push acted on an expression the server would not parse:\n%s", strings.Join(res.Statements, "\n"))
+	}
+	var reported bool
+	for _, n := range res.Notices {
+		if n.Rule == "check-not-normalised" && n.Object == ckName {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("the unparseable expression was skipped without a word: %+v", res.Notices)
+	}
+	// The constraint the database has is untouched, and the probe table
+	// is gone.
+	snap, err := mysql.Introspect(ctx, db)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	if _, ok := snap.Tables[name].CheckConstraints[ckName]; !ok {
+		t.Errorf("the live constraint was dropped: %+v", snap.Tables[name].CheckConstraints)
+	}
+	for tn := range snap.Tables {
+		if strings.HasPrefix(tn, "_drops_probe_") {
+			t.Errorf("probe table %q survived a failed probe", tn)
+		}
 	}
 }
 
@@ -3301,6 +3636,77 @@ func TestMySQLKeysetGuardUsesTheIndex(t *testing.T) {
 	} else {
 		t.Logf("MySQL plans the row-constructor guard as %q (key %q)", rowPlan["type"], rowPlan["key"])
 	}
+
+	// The plan is a label; the claim is about work. A sargable guard
+	// descends the index to the cursor and reads a page's worth of
+	// entries, so the rows it steps over must not grow with the table.
+	// Measuring it settles the question on a server whose optimiser
+	// names its plans differently, and it is the number cursor.go's
+	// package comment quotes.
+	pinned, _ := openMySQLPinnedConn(t)
+	guardReads := mysqlIndexStepsFor(t, pinned, query, args...)
+	if guardReads > 200 {
+		t.Errorf("the keyset guard stepped over %d index entries for a 20-row page of a 1000-row table;"+
+			" it is scanning, not seeking\n%s", guardReads, query)
+	}
+	rowReads := mysqlIndexStepsFor(t, pinned, rowForm, int64(9), int64(500))
+	t.Logf("index entries read: %d for the expansion drops emits, %d for the row constructor",
+		guardReads, rowReads)
+	if mariadb && rowReads <= guardReads*4 {
+		t.Errorf("the row constructor read %d entries against the expansion's %d — on MariaDB it is"+
+			" supposed to be far worse, and cursor.go's measurement says so", rowReads, guardReads)
+	}
+}
+
+// mysqlIndexStepsFor runs query on a pinned connection and returns how
+// many index entries the server stepped over to answer it, read from
+// the session's Handler_read_next counter.
+//
+// The counter is per session, so the connection has to be the pinned
+// one; the delta is taken rather than FLUSH STATUS because that needs
+// RELOAD, which a test user has no business holding.
+func mysqlIndexStepsFor(t *testing.T, db *mysql.DB, query string, args ...any) int64 {
+	t.Helper()
+	ctx := context.Background()
+	before := mysqlSessionCounter(t, db, "Handler_read_next")
+	rows, err := db.Query(ctx, query, args...)
+	if err != nil {
+		t.Fatalf("measure: %v\n%s", err, query)
+	}
+	for rows.Next() {
+		// Drained on purpose: the counter only moves as rows are read.
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		t.Fatalf("measure: %v", err)
+	}
+	_ = rows.Close()
+	return mysqlSessionCounter(t, db, "Handler_read_next") - before
+}
+
+// mysqlSessionCounter reads one SHOW SESSION STATUS value. The
+// statement is spelled out rather than read from information_schema
+// because MySQL 8 moved SESSION_STATUS to performance_schema and
+// MariaDB did not.
+func mysqlSessionCounter(t *testing.T, db *mysql.DB, name string) int64 {
+	t.Helper()
+	rows, err := db.Query(context.Background(), "SHOW SESSION STATUS LIKE '"+name+"'")
+	if err != nil {
+		t.Fatalf("SHOW SESSION STATUS %s: %v", name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatalf("SHOW SESSION STATUS returned no row for %s", name)
+	}
+	var variable, value string
+	if err := rows.Scan(&variable, &value); err != nil {
+		t.Fatalf("scan %s: %v", name, err)
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		t.Fatalf("%s = %q: %v", name, value, err)
+	}
+	return n
 }
 
 // mysqlCollationTiesCase reports whether the server's default collation
@@ -4000,6 +4406,50 @@ func TestMySQLJSONTypeVocabularyIsNotPostgreSQLs(t *testing.T) {
 	}
 }
 
+// JSON_QUERY is MariaDB's function, not MySQL's. MySQL took JSON_VALUE
+// and JSON_TABLE from the same standard clause and never implemented
+// JSON_QUERY, so this is the one helper in json.go that does not work
+// on both servers — which is why JSONGet renders JSON_EXTRACT and not
+// this. If it ever starts answering on MySQL, JSONQuery's doc is the
+// thing that needs correcting.
+func TestMySQLJSONQueryIsMariaDBOnly(t *testing.T) {
+	db := openMySQL(t)
+	tbl, _, doc := jsonFixture(t, db)
+	_, _, mariadb := mysqlServerVersion(t, db)
+
+	e := mysql.JSONQuery(doc, "$.d")
+	rows, err := db.Select(e).From(tbl).Rows(context.Background())
+	if err == nil {
+		defer rows.Close()
+	}
+	if !mariadb {
+		if err == nil {
+			t.Fatal("MySQL answered JSON_QUERY; the helper's doc says it cannot, and the doc is what is wrong")
+		}
+		if !strings.Contains(err.Error(), "1305") && !strings.Contains(strings.ToLower(err.Error()), "does not exist") {
+			t.Fatalf("expected \"no such function\" from MySQL, got %v", err)
+		}
+		// The portable spelling has to answer the same thing.
+		if got := jsonValue(t, db, tbl, mysql.JSONExtract(doc, "$.d")); got != "[10, 20]" && got != "[10,20]" {
+			t.Errorf("JSONExtract = %s, want the array JSON_QUERY would have returned", got)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("MariaDB has JSON_QUERY: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatal("no row")
+	}
+	var v any
+	if err := rows.Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if got := mysqlText(v); got != "[10, 20]" && got != "[10,20]" {
+		t.Errorf("JSONQuery = %s, want the array at $.d", got)
+	}
+}
+
 // A JSON path built by JSONPath addresses the key the caller named,
 // even when the key contains the characters a path language uses.
 func TestMySQLJSONPathQuotingReachesAwkwardKeys(t *testing.T) {
@@ -4342,10 +4792,13 @@ func TestMySQLWindowFunctionValues(t *testing.T) {
 		mysql.Over(mysql.LastValue(score), byTeam),
 		mysql.Over(mysql.NthValue(score, 1), byTeam),
 	} {
-		if _, err := db.Select(e).From(tbl).Rows(ctx); err != nil {
+		rows, err := db.Select(e).From(tbl).Rows(ctx)
+		if err != nil {
 			text, args := drops.StringWithDialect(mysql.Dialect, e)
 			t.Errorf("rejected: %v\n%s\nargs: %v", err, text, args)
+			continue
 		}
+		rows.Close()
 	}
 }
 
@@ -4365,7 +4818,10 @@ func TestMySQLLagDefaultArgumentIsNotPortable(t *testing.T) {
 	ctx := context.Background()
 	win := mysql.WindowSpec().OrderBy(score.Asc())
 
-	_, err = db.Select(mysql.Over(mysql.Lag(score, 1, 0), win)).From(tbl).Rows(ctx)
+	lagRows, err := db.Select(mysql.Over(mysql.Lag(score, 1, 0), win)).From(tbl).Rows(ctx)
+	if err == nil {
+		lagRows.Close()
+	}
 	if info.MariaDB {
 		if err == nil {
 			t.Error("MariaDB is documented to reject the three-argument LAG")
@@ -4494,10 +4950,17 @@ func TestMySQLSumIfIsNullWhenNothingMatches(t *testing.T) {
 func TestMySQLGroupConcatOrdersAndSeparates(t *testing.T) {
 	db := openMySQL(t)
 	tbl, _, player, _ := scoresFixture(t, db)
-	if got := jsonValue(t, db, tbl, mysql.GroupConcat(player, "|")); len(got) != len("ada|bob|cy") {
-		t.Errorf("GroupConcat = %q", got)
+	// GROUP_CONCAT with no ORDER BY leaves the order to the plan, so
+	// the claim is about the parts and the separator, not the string.
+	// (Asserting only its length would pass for any three characters
+	// and two pipes, separator included.)
+	got := jsonValue(t, db, tbl, mysql.GroupConcat(player, "|"))
+	parts := strings.Split(got, "|")
+	sort.Strings(parts)
+	if strings.Join(parts, ",") != "ada,bob,cy" {
+		t.Errorf("GroupConcat = %q, want the three players separated by |", got)
 	}
-	got := jsonValue(t, db, tbl,
+	got = jsonValue(t, db, tbl,
 		mysql.GroupConcatDistinct(player, []drops.Expression{player.Asc()}, "|"))
 	if got != "ada|bob|cy" {
 		t.Errorf("GroupConcatDistinct = %q, want ada|bob|cy", got)
@@ -4507,6 +4970,18 @@ func TestMySQLGroupConcatOrdersAndSeparates(t *testing.T) {
 func TestMySQLExistenceChecksReadTheCatalogue(t *testing.T) {
 	db := openMySQL(t)
 	ctx := context.Background()
+
+	// The database name is whatever the DSN connected to, not a
+	// constant: the helpers take one because MySQL's "schema" is a
+	// database, and the test has to ask the server which one that is
+	// rather than assume the compose file's.
+	var here []struct {
+		DB string `drop:"db"`
+	}
+	if err := db.Select(mysql.As(drops.Raw("DATABASE()"), "db")).All(ctx, &here); err != nil {
+		t.Fatal(err)
+	}
+	current := here[0].DB
 
 	tbl := mysql.NewTable(integration.UniqueName(t, "exists"))
 	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
@@ -4528,10 +5003,10 @@ func TestMySQLExistenceChecksReadTheCatalogue(t *testing.T) {
 		fn   func() (bool, error)
 		want bool
 	}{
-		{"the connection's own database", func() (bool, error) { return mysql.DatabaseExists(ctx, db, "drops") }, true},
+		{"the connection's own database", func() (bool, error) { return mysql.DatabaseExists(ctx, db, current) }, true},
 		{"a database that is not there", func() (bool, error) { return mysql.DatabaseExists(ctx, db, "no_such_db") }, false},
 		{"the table, default database", func() (bool, error) { return mysql.TableExists(ctx, db, "", tbl.Name()) }, true},
-		{"the table, named database", func() (bool, error) { return mysql.TableExists(ctx, db, "drops", tbl.Name()) }, true},
+		{"the table, named database", func() (bool, error) { return mysql.TableExists(ctx, db, current, tbl.Name()) }, true},
 		{"a table that is not there", func() (bool, error) { return mysql.TableExists(ctx, db, "", "no_such_table") }, false},
 		{"a column", func() (bool, error) { return mysql.ColumnExists(ctx, db, "", tbl.Name(), "email") }, true},
 		{"a column that is not there", func() (bool, error) { return mysql.ColumnExists(ctx, db, "", tbl.Name(), "nope") }, false},
@@ -4744,5 +5219,482 @@ func TestMySQLSetIfChangedReachesANullColumn(t *testing.T) {
 	}
 	if n, _ := res.RowsAffected(); n != 0 {
 		t.Errorf("rows affected for an unchanged value = %d, want 0", n)
+	}
+}
+
+// Inc on an UNSIGNED column raises rather than clamping, whatever the
+// sql_mode — the arithmetic fails before a value reaches the column,
+// so strict mode never enters into it. Dec's doc turns on this, and it
+// is a claim about what the server does with a statement rather than
+// about the statement, so it is made here.
+func TestMySQLDecOnAnUnsignedColumnRaisesRatherThanClamping(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+
+	type row struct {
+		ID    int64  `drop:"id"`
+		Seats uint64 `drop:"seats"`
+	}
+	tbl := mysql.NewTable(integration.UniqueName(t, "unsigned"))
+	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	seats := mysql.Add(tbl, mysql.Custom[uint64]("seats", "BIGINT UNSIGNED").NotNull().Default("0"))
+	dropMySQL(t, db, tbl)
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	ent := mysql.NewEntity[row](tbl)
+	if _, err := db.Insert(tbl).Row(seats.Val(1)).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Under the default strict mode, and then with strict mode off on
+	// the same connection: the answer has to be the same both times,
+	// which is the part the doc used to get wrong.
+	pinned, sqlDB := openMySQLPinnedConn(t)
+	_ = sqlDB
+	for _, mode := range []string{"", "''"} {
+		name := "strict"
+		if mode != "" {
+			name = "non-strict"
+			if _, err := pinned.Exec(ctx, "SET SESSION sql_mode = "+mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Run(name, func(t *testing.T) {
+			_, err := ent.Patch(pinned, ctx, int64(1), mysql.Dec(seats, uint64(5)))
+			if err == nil {
+				t.Fatal("an unsigned counter taken below zero is documented to raise, not to clamp")
+			}
+			if !strings.Contains(err.Error(), "1690") && !strings.Contains(err.Error(), "out of range") {
+				t.Fatalf("want the out-of-range error, got %v", err)
+			}
+			var got []struct {
+				N uint64 `drop:"seats"`
+			}
+			if err := pinned.Select(seats).From(tbl).All(ctx, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got[0].N != 1 {
+				t.Errorf("seats = %d; the failed statement stored something", got[0].N)
+			}
+		})
+	}
+}
+
+// JSON_CONTAINS with a candidate that is not JSON is the divergence
+// that is worst to discover in production: MySQL fails the statement,
+// MariaDB answers NULL, so the same predicate is a loud error on one
+// server and a silently unmatched row on the other.
+func TestMySQLJSONContainsRejectsNonJSONDifferently(t *testing.T) {
+	db := openMySQL(t)
+	tbl, _, doc := jsonFixture(t, db)
+	_, _, mariadb := mysqlServerVersion(t, db)
+
+	e := mysql.JSONContains(doc, "notjson")
+	rows, err := db.Select(e).From(tbl).Rows(context.Background())
+	if err == nil {
+		defer rows.Close()
+	}
+	if mariadb {
+		if err != nil {
+			t.Fatalf("MariaDB is documented to answer NULL rather than to fail: %v", err)
+		}
+		if !rows.Next() {
+			t.Fatal("no row")
+		}
+		var v any
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		if got := mysqlText(v); got != "<nil>" {
+			t.Errorf("JSON_CONTAINS with a non-JSON candidate = %s, want NULL", got)
+		}
+	} else {
+		if err == nil {
+			t.Fatal("MySQL is documented to raise error 3141 for a candidate that is not JSON")
+		}
+		if !strings.Contains(err.Error(), "3141") && !strings.Contains(strings.ToLower(err.Error()), "invalid json") {
+			t.Fatalf("want the invalid-JSON error, got %v", err)
+		}
+	}
+
+	// The quoted form is what the doc tells callers to pass, and it
+	// answers the same on both.
+	if got := jsonValue(t, db, tbl, mysql.JSONContains(mysql.JSONGet(doc, "b"), `{"c": "x"}`)); got != "1" {
+		t.Errorf("a properly quoted candidate = %s, want 1", got)
+	}
+}
+
+// The half of SetIfChanged that the NULL test does not reach: <=> is
+// null-safe but not collation-blind. PostgreSQL's IS DISTINCT FROM
+// compares text under a deterministic collation, so 'ada' and 'ADA'
+// are distinct and the row is written. MySQL compares under the
+// column's collation, which is case- and accent-insensitive by
+// default, so the same patch writes nothing at all — and a plain
+// assignment on the same column would have written it.
+//
+// This is a claim about the server's collation, not about the SQL, so
+// it can only be made by patching a row and reading it back.
+func TestMySQLSetIfChangedFollowsTheColumnCollation(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+
+	type row struct {
+		ID    int64  `drop:"id"`
+		Label string `drop:"label"`
+	}
+	build := func(name, collation string) (*mysql.Entity[row], *mysql.Col[string]) {
+		t.Helper()
+		tbl := mysql.NewTable(integration.UniqueName(t, name))
+		if collation != "" {
+			tbl.Charset("utf8mb4").Collate(collation)
+		}
+		mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+		label := mysql.Add(tbl, mysql.Varchar("label", 64).NotNull())
+		dropMySQL(t, db, tbl)
+		execMySQL(t, db, mysql.CreateTable(tbl))
+		if _, err := db.Insert(tbl).Row(label.Val("ada")).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return mysql.NewEntity[row](tbl), label
+	}
+
+	// The server's default collation, whatever the two servers make it
+	// — utf8mb4_general_ci on MariaDB 10.11, utf8mb4_0900_ai_ci on
+	// MySQL 8.4. Both are case- and accent-insensitive, which is the
+	// only property this asserts.
+	ci, ciLabel := build("ifchci", "")
+	if got := mysqlValue(t, db, mysql.Eq(drops.Raw("'ada'"), drops.Raw("'ADA'"))); got != "1" {
+		t.Skipf("this server's default collation is case-sensitive (%q); the divergence needs a case-insensitive one", got)
+	}
+	res, err := ci.Patch(db, ctx, int64(1), mysql.SetIfChanged(ciLabel, "ADA"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := res.RowsAffected(); n != 0 {
+		t.Errorf("rows affected = %d; under a case-insensitive collation <=> calls this unchanged", n)
+	}
+	got, err := ci.Get(db, ctx, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Label != "ada" {
+		t.Errorf("label = %q, want the original %q — SetIfChanged is documented not to write a case-only change", got.Label, "ada")
+	}
+	// A plain assignment does write it, which is what makes the
+	// difference SetIfChanged's own and not the server's.
+	if _, err := ci.Patch(db, ctx, int64(1), mysql.Set(ciLabel, "ADA")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = ci.Get(db, ctx, int64(1)); got.Label != "ADA" {
+		t.Errorf("a plain Set left the label at %q", got.Label)
+	}
+
+	// Under a binary collation the operator is exact, which is the
+	// workaround SetIfChanged's doc points at.
+	bin, binLabel := build("ifchbin", "utf8mb4_bin")
+	if _, err := bin.Patch(db, ctx, int64(1), mysql.SetIfChanged(binLabel, "ADA")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = bin.Get(db, ctx, int64(1)); got.Label != "ADA" {
+		t.Errorf("under utf8mb4_bin the label = %q, want ADA", got.Label)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Outbox: the schema, against the migration layer and the catalogue
+// ----------------------------------------------------------------------
+
+// An application that manages its schema with [mysql.Push] never calls
+// OutboxDDL, so the drain indexes have to be on the table itself — and
+// the push has to settle, because a table that MODIFYs a column on
+// every deploy rebuilds the outbox on every deploy. Both are questions
+// for the catalogue: what the declared type looks like coming back out
+// of information_schema is the whole of it, and a rendered CREATE
+// TABLE cannot say.
+func TestMySQLOutboxTableSurvivesThePushLoop(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewOutboxTable(integration.UniqueName(t, "pushbox"))
+	dropMySQL(t, db, tbl)
+
+	schema := mysql.NewSchema(tbl)
+	first, err := mysql.Push(ctx, db, schema)
+	if err != nil {
+		t.Fatalf("push: %v (applied %d of %d, failed on %q)",
+			err, first.AppliedCount, len(first.Statements), first.Failed)
+	}
+
+	// The two indexes the drain and the per-aggregate drain run on.
+	rows, err := db.Query(ctx, `SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX`, tbl.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	built := map[string][]string{}
+	for rows.Next() {
+		var idx, col string
+		if err := rows.Scan(&idx, &col); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		built[idx] = append(built[idx], col)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	var drain, agg bool
+	for name, cols := range built {
+		joined := strings.Join(cols, ",")
+		if strings.Contains(name, "drain") && joined == "publishedAt,id" {
+			drain = true
+		}
+		if strings.Contains(name, "aggregate") && joined == "publishedAt,aggregateType,aggregateID,id" {
+			agg = true
+		}
+	}
+	if !drain || !agg {
+		t.Errorf("Push built %v; the outbox needs both drain indexes or its hot query is a full scan", built)
+	}
+
+	// And the collation survives the round trip, so the push settles.
+	second, err := mysql.Push(ctx, db, schema)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if len(second.Statements) != 0 {
+		t.Errorf("the outbox does not settle — every deploy rewrites it:\n%s",
+			strings.Join(second.Statements, "\n"))
+	}
+	for _, n := range second.Notices {
+		t.Errorf("unexpected notice: %s", n)
+	}
+
+	// The collation is the point of declaring one at all.
+	coll := mysqlScalar(t, db, `SELECT COLLATION_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'aggregateID'`, tbl.Name())
+	if coll != "utf8mb4_bin" {
+		t.Errorf("aggregateID came back as %s; a pushed outbox folds case", coll)
+	}
+}
+
+// The collation is declared so two aggregates differing only in case
+// stay two aggregates. Only the server can say whether they do.
+func TestMySQLOutboxAggregateKeysAreCaseSensitive(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	ob, _ := mysqlOutboxFixture(t, db)
+
+	for _, id := range []string{"Cart-7", "cart-7"} {
+		if err := db.InTx(ctx, func(tx *mysql.DB) error {
+			return ob.EmitWith(tx, ctx, "e", nil, mysql.EmitOptions{AggregateType: "cart", AggregateID: id})
+		}); err != nil {
+			t.Fatalf("emit %q: %v", id, err)
+		}
+	}
+
+	aggs, err := ob.PendingAggregates(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aggs) != 2 {
+		t.Fatalf("PendingAggregates returned %+v; under a case-insensitive collation the two ids are one ordering scope", aggs)
+	}
+	var drained int
+	if err := ob.DrainAggregate(ctx, "cart", "Cart-7", 10, func(_ *mysql.DB, evs []mysql.OutboxEvent) error {
+		drained = len(evs)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if drained != 1 {
+		t.Errorf("draining Cart-7 took %d events; it should not see cart-7's", drained)
+	}
+}
+
+// The GET_LOCK name is folded to 64 characters by cutting bytes, so a
+// non-ASCII aggregate id lands the cut inside a rune. MariaDB takes
+// the mangled name without complaint, which is exactly why this has to
+// be exercised rather than reasoned about: the fold must produce a
+// name that is valid UTF-8 before the server's tolerance is what is
+// keeping it working.
+func TestMySQLOutboxAggregateLockHandlesAMultibyteID(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	ob, _ := mysqlOutboxFixture(t, db)
+
+	// Long enough that "drops:<table>:<type>:<id>" overruns 64 bytes
+	// several times over.
+	id := strings.Repeat("世", 40)
+	if err := db.InTx(ctx, func(tx *mysql.DB) error {
+		return ob.EmitWith(tx, ctx, "e", nil, mysql.EmitOptions{AggregateType: "カート", AggregateID: id})
+	}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	drained := 0
+	if err := ob.DrainAggregate(ctx, "カート", id, 10, func(_ *mysql.DB, evs []mysql.OutboxEvent) error {
+		drained = len(evs)
+		return nil
+	}); err != nil {
+		t.Fatalf("DrainAggregate on a multibyte aggregate id: %v", err)
+	}
+	if drained != 1 {
+		t.Errorf("drained %d events, want 1", drained)
+	}
+
+	// The lock is free again, which it would not be had the release
+	// gone to a differently-mangled name.
+	second := 0
+	if err := ob.DrainAggregate(ctx, "カート", id, 10, func(_ *mysql.DB, evs []mysql.OutboxEvent) error {
+		second = len(evs)
+		return nil
+	}); err != nil {
+		t.Fatalf("second DrainAggregate: %v", err)
+	}
+	if second != 1 {
+		t.Errorf("the second drain saw %d events; the lock was not released under the same name", second)
+	}
+}
+
+// An index name is the table's name plus a suffix, and MySQL stops at
+// 64 bytes. The unit test checks the name it renders; whether the
+// whole DDL is legal — and whether the two indexes stayed distinct
+// after the fold — is the server's answer.
+func TestMySQLOutboxDDLSurvivesALongTableName(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	// 60 bytes: legal as a table name, illegal once a prefix and a
+	// suffix are added.
+	tbl := mysql.NewOutboxTable(strings.Repeat("o", 60))
+	dropMySQL(t, db, tbl)
+	for _, stmt := range mysql.OutboxDDL(tbl) {
+		execMySQL(t, db, stmt)
+	}
+
+	n := mysqlScalar(t, db, `SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, tbl.Name())
+	if n != "3" {
+		t.Errorf("the table carries %s indexes (PRIMARY + 2 expected); the fold collapsed two names onto one", n)
+	}
+
+	// And it still works as an outbox.
+	ob := mysql.NewOutbox(db, tbl.Name())
+	if err := db.InTx(ctx, func(tx *mysql.DB) error { return ob.Emit(tx, ctx, "e", nil) }); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	events, err := ob.Drain(ctx, 10)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("drain returned %d events, %v", len(events), err)
+	}
+}
+
+// BeforeCursor is the half of the cursor API that only a unit test had
+// ever exercised, and a rendered comparison operator is not evidence
+// that a walk terminates. This runs one backwards over a nullable key,
+// which is where the guard's hand-encoded NULL placement has to be
+// right in the direction it was not written for: paging back through an
+// ascending order means reaching the NULLs at the start, and paging
+// back through a descending one means reaching them at the end.
+func TestMySQLBackwardCursorWalksBackOverTheNullBoundary(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+
+	tbl := mysql.NewTable(integration.UniqueName(t, "backnick"))
+	dropMySQL(t, db, tbl)
+	id := mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	nick := mysql.Add(tbl, mysql.Varchar("nick", 32))
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	execMySQL(t, db, mysql.NewIndex(integration.UniqueName(t, "ixb"), tbl, nick, id))
+
+	ent := mysql.NewEntity[nullableRow](tbl)
+	var rows []nullableRow
+	for i := 0; i < 60; i++ {
+		if i%3 == 0 {
+			rows = append(rows, nullableRow{})
+			continue
+		}
+		v := fmt.Sprintf("nick%02d", i%7)
+		rows = append(rows, nullableRow{Nick: &v})
+	}
+	if _, err := ent.CreateMany(db, ctx, rows); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	for _, desc := range []bool{false, true} {
+		name := "ascending"
+		if desc {
+			name = "descending"
+		}
+		t.Run(name, func(t *testing.T) {
+			spec := mysql.NewCursorSpec(
+				mysql.OrderKey{Col: nick, Desc: desc},
+				mysql.OrderKey{Col: id, Desc: desc},
+			)
+			// Backward paging reads the order upside down: the page
+			// adjacent to the cursor is the FIRST few rows of the
+			// reversed ordering, not the first few of the forward one.
+			reversed := mysql.NewCursorSpec(
+				mysql.OrderKey{Col: nick, Desc: !desc},
+				mysql.OrderKey{Col: id, Desc: !desc},
+			)
+
+			// Start from the last row of the forward order, which is
+			// the first of the reversed one.
+			var tail []nullableRow
+			if err := db.Select(id, nick).From(tbl).OrderByCursor(reversed).Limit(1).All(ctx, &tail); err != nil {
+				t.Fatalf("tail: %v", err)
+			}
+			if len(tail) != 1 {
+				t.Fatalf("the table is empty")
+			}
+			cursor, err := mysql.EncodeCursor(spec, tail[0].Nick, tail[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			seen := map[int64]int{tail[0].ID: 1}
+			nullsCrossed := 0
+			for page := 0; page < 40; page++ {
+				var got []nullableRow
+				q := db.Select(id, nick).From(tbl).
+					BeforeCursor(spec, cursor).
+					OrderByCursor(reversed).
+					Limit(7)
+				if err := q.All(ctx, &got); err != nil {
+					text, args := q.ToSQL()
+					t.Fatalf("backward page %d: %v\n%s\nargs: %v", page, err, text, args)
+				}
+				if len(got) == 0 {
+					break
+				}
+				for _, r := range got {
+					seen[r.ID]++
+					if r.Nick == nil {
+						nullsCrossed++
+					}
+				}
+				last := got[len(got)-1]
+				if cursor, err = mysql.EncodeCursor(spec, last.Nick, last.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if len(seen) != len(rows) {
+				t.Errorf("the backward walk visited %d of %d rows", len(seen), len(rows))
+			}
+			for rowID, count := range seen {
+				if count != 1 {
+					t.Errorf("row %d visited %d times walking backwards", rowID, count)
+				}
+			}
+			// 20 of the 60 rows carry a NULL nick; a walk that stopped
+			// at the boundary instead of crossing it would still visit
+			// some of them, so the count is what makes the assertion
+			// mean something.
+			if nullsCrossed < 19 {
+				t.Errorf("the backward walk reached %d NULL-keyed rows, want the 20 that exist"+
+					" (less the one it started on)", nullsCrossed)
+			}
+		})
 	}
 }

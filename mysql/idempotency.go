@@ -64,14 +64,14 @@ func (s *IdempotencyStore) Table() string { return s.table }
 
 // NewIdempotencyTable declares the canonical idempotency table.
 //
-// The key column is a VARCHAR under the binary collation for a reason
-// that is closer to a security property than a preference: MySQL's
-// default collation is case-insensitive, so under it a request keyed
-// "A1b2" would be served the response stored for "a1b2" — one client's
-// answer handed to another. See [NewOutboxTable] on the collation, and
-// note the one thing it does not fix: every VARCHAR collation on these
-// servers is PAD SPACE, so a key ending in a space is the same key
-// without it. Do not let one.
+// The table carries the binary collation for a reason that is closer
+// to a security property than a preference: MySQL's default collation
+// is case-insensitive, so under it a request keyed "A1b2" would be
+// served the response stored for "a1b2" — one client's answer handed
+// to another. See [NewOutboxTable] on the collation and on why it is
+// declared on the table rather than on the column, and note the one
+// thing it does not fix: utf8mb4_bin is PAD SPACE, so a key ending in
+// a space is the same key without it. Do not let one.
 //
 // The response is a LONGBLOB rather than PostgreSQL's unbounded bytea.
 // A plain BLOB caps at 64KB, and a response that outgrows it is
@@ -80,7 +80,7 @@ func (s *IdempotencyStore) Table() string { return s.table }
 // body is the worst failure this table can have. The remaining limit
 // is the server's max_allowed_packet, which no column type can widen.
 func NewIdempotencyTable(name string) *Table {
-	t := NewTable(name)
+	t := NewTable(name).Collate(streamKeyCollation)
 	// "key" is a reserved word in MySQL; every reference drops emits
 	// is backticked, which is what makes the plain spelling usable.
 	Add(t, streamKeyColumn("key").PrimaryKey())

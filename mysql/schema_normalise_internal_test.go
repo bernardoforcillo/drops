@@ -1,8 +1,10 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -201,16 +203,42 @@ func TestServerSQLState(t *testing.T) {
 // A probe fails for two very different reasons, and only one of them
 // says anything about the expression.
 func TestRefusedExpression(t *testing.T) {
-	syntax := &driverError{SQLState: [5]byte{'4', '2', '0', '0', '0'}, Message: "syntax"}
+	syntax := &driverError{Number: 1064, SQLState: [5]byte{'4', '2', '0', '0', '0'}, Message: "syntax"}
 	if !refusedExpression(syntax) {
 		t.Fatalf("a class-42 error is the server refusing the expression")
 	}
-	disk := &driverError{SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: "disk full"}
-	if refusedExpression(disk) {
-		t.Fatalf("a general error says nothing about the expression and must fail the push")
+	// The case the class list missed: MariaDB rejects a function it
+	// will not allow in a CHECK with 1901, in the catch-all HY000
+	// class, and so do MySQL's check-constraint errors. See
+	// TestMySQLARefusedCheckExpressionIsReportedNotChurned, which
+	// provokes exactly this one on the live server.
+	notAllowed := &driverError{Number: 1901, SQLState: [5]byte{'H', 'Y', '0', '0', '0'},
+		Message: "Function or expression cannot be used in the CHECK clause"}
+	if !refusedExpression(notAllowed) {
+		t.Fatalf("the server answered about the expression; the push must report it, not abort")
 	}
+	// Nothing reached a server that could have an opinion.
 	if refusedExpression(errors.New("connection refused")) {
-		t.Fatalf("an unclassified error must fail the push")
+		t.Fatalf("an error carrying no server answer must fail the push")
+	}
+	if refusedExpression(context.Canceled) {
+		t.Fatalf("a cancelled context is not the server refusing anything")
+	}
+}
+
+func TestServerErrorNumber(t *testing.T) {
+	e := &driverError{Number: 1901, SQLState: [5]byte{'H', 'Y', '0', '0', '0'}, Message: "nope"}
+	if got := serverErrorNumber(e); got != 1901 {
+		t.Fatalf("by field: got %d", got)
+	}
+	if got := serverErrorNumber(fmt.Errorf("wrapped: %w", e)); got != 1901 {
+		t.Fatalf("through a wrapper: got %d", got)
+	}
+	if got := serverErrorNumber(errors.New("Error 1901 (HY000): nope")); got != 1901 {
+		t.Fatalf("by message: got %d", got)
+	}
+	if got := serverErrorNumber(errors.New("connection refused")); got != 0 {
+		t.Fatalf("got %d, want 0 for an error the server never sent", got)
 	}
 }
 

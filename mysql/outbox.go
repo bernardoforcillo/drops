@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -247,18 +248,30 @@ func isSkipLockedRejection(err error) bool {
 	return strings.Contains(msg, "1064") && strings.Contains(msg, "SKIP LOCKED")
 }
 
-// NewOutboxTable declares the canonical outbox table layout. Pair it
-// with [OutboxDDL], which adds the indexes the drain queries need.
+// NewOutboxTable declares the canonical outbox table layout, with the
+// two indexes the drain queries need already registered. [OutboxDDL]
+// renders it as statements; [Push] creates it from a [Schema].
 //
-// Two column choices differ from drops/pg and both are deliberate.
+// Two schema choices differ from drops/pg and both are deliberate.
 //
-// The string columns are VARCHAR under an explicitly binary collation.
-// MySQL's default collation is case-insensitive and PAD SPACE, so
-// under it the aggregates "Cart-7" and "cart-7" are one ordering scope
-// and "cart-7 " is a third name for it; PostgreSQL's text compares
-// byte for byte. utf8mb4_bin restores the case-sensitivity. Trailing
-// whitespace stays insignificant — every VARCHAR collation on these
-// servers pads — so do not let an aggregate id end in a space.
+// The table carries an explicitly binary collation, which every string
+// column in it inherits. MySQL's default collation is
+// case-insensitive, so under it the aggregates "Cart-7" and "cart-7"
+// are one ordering scope, where PostgreSQL's text compares byte for
+// byte; utf8mb4_bin restores the case-sensitivity. It is declared once
+// on the table rather than per column because a column that spells its
+// own COLLATE does not read back out of information_schema the way it
+// was written — the catalogue reports the type and the collation in
+// separate fields — so [Diff] would see a difference that is not one
+// and MODIFY the column on every push, for ever. The table's collation
+// is compared by name and settles.
+//
+// One thing the binary collation does not fix: utf8mb4_bin is PAD
+// SPACE on both servers, so "cart-7 " and "cart-7" remain the same
+// aggregate. (MySQL 8's utf8mb4_0900_* collations are NO PAD, but they
+// are also case-insensitive, so they buy the padding at the price of
+// the property that matters here.) Do not let an aggregate id end in a
+// space.
 //
 // The timestamps are DATETIME(6) that drops always writes from Go and
 // never compares against the server's NOW(). A DATETIME stores the
@@ -277,7 +290,7 @@ func isSkipLockedRejection(err error) bool {
 // and delivery was at-least-once either way. drops/pg, which does
 // compare against now(), has one clock and no such window.
 func NewOutboxTable(name string) *Table {
-	t := NewTable(name)
+	t := NewTable(name).Collate(streamKeyCollation)
 	Add(t, BigSerial("id").PrimaryKey())
 	Add(t, streamKeyColumn("kind").NotNull())
 	Add(t, streamKeyColumn("aggregateType"))
@@ -290,30 +303,40 @@ func NewOutboxTable(name string) *Table {
 	Add(t, Timestamp("failedAt", false))
 	Add(t, Integer("attempts").NotNull().Default("0"))
 	Add(t, Text("lastError"))
+	for _, idx := range outboxIndexes(t) {
+		t.AddIndex(idx)
+	}
 	return t
 }
 
-// streamKeyColumn declares a VARCHAR(255) under the binary collation —
-// the column type every identifier in this file uses. See
-// [NewOutboxTable] for why the collation is spelled out.
+// streamKeyCollation is the binary collation every table in this file
+// declares. See [NewOutboxTable] for why, and for why it sits on the
+// table rather than on the column.
+const streamKeyCollation = "utf8mb4_bin"
+
+// streamKeyColumn declares the VARCHAR(255) that every identifier in
+// this file uses. The collation comes from the table.
 //
 // 255 characters is four bytes each under utf8mb4, so a key part costs
 // 1020 bytes of the 3072 an InnoDB index allows. Three of them do not
 // fit, which is what caps the event store's stream key at two.
 func streamKeyColumn(name string) *Col[string] {
-	return Custom[string](name, "VARCHAR(255) COLLATE utf8mb4_bin")
+	return Varchar(name, 255)
 }
 
 // OutboxDDL returns every statement needed to create t: the table and
-// the two indexes the drain queries run on.
+// the two indexes the drain queries run on. It is the whole schema
+// setup for an application that manages its DDL by hand; one that
+// hands the table to a [Schema] and calls [Push] needs none of it,
+// because [NewOutboxTable] has already registered the same two indexes
+// with the table.
 //
-// The indexes exist as separate statements because MySQL scopes index
-// names to their table and drops/mysql declares them apart from the
-// table, where drops/pg hangs them off the Table itself. Their names
-// go through the same folding rule as the table's other derived
-// constraints: MySQL caps an identifier at 64 bytes, and "the table's
-// name plus a suffix" overruns that on a table name drops otherwise
-// accepts.
+// The indexes are separate statements because MySQL creates a
+// secondary index with its own DDL rather than inside CREATE TABLE.
+// Their names go through the same folding rule as the table's other
+// derived constraints: MySQL caps an identifier at 64 bytes, and "the
+// table's name plus a suffix" overruns that on a table name drops
+// otherwise accepts.
 //
 // Neither is partial, because MySQL has no partial indexes. drops/pg
 // indexes (availableAt, id) WHERE publishedAt IS NULL AND failedAt IS
@@ -327,8 +350,18 @@ func streamKeyColumn(name string) *Col[string] {
 // the partial index would have avoided; Cleanup is what pays that off,
 // and it matters more here than it does on PostgreSQL.
 func OutboxDDL(t *Table) []drops.Expression {
-	return []drops.Expression{
-		CreateTable(t),
+	out := []drops.Expression{CreateTable(t)}
+	for _, idx := range outboxIndexes(t) {
+		out = append(out, idx)
+	}
+	return out
+}
+
+// outboxIndexes builds the two drain indexes over t. Shared so the
+// statements [OutboxDDL] renders and the indexes [NewOutboxTable]
+// registers with the table cannot drift apart.
+func outboxIndexes(t *Table) []*Index {
+	return []*Index{
 		NewIndex(constraintName("idx_", t.Name(), "drain"), t, t.Col("publishedAt"), t.Col("id")),
 		NewIndex(constraintName("idx_", t.Name(), "aggregate"), t,
 			t.Col("publishedAt"), t.Col("aggregateType"), t.Col("aggregateID"), t.Col("id")),
@@ -575,10 +608,17 @@ func releaseNamedLock(tx *DB, ctx context.Context, name string) {
 
 // outboxLockName derives the GET_LOCK name for an aggregate.
 //
-// MySQL 8.0 rejects a lock name longer than 64 characters outright
-// (MariaDB accepts it), so an over-long name is folded back under the
-// limit with a hash of the full derivation — deterministic across
-// processes, which is the only property that matters for a lock.
+// MySQL 8.0 rejects a lock name longer than 64 characters outright;
+// MariaDB 10.11 allows 192 and rejects past that. 64 is the portable
+// ceiling, so an over-long name is folded back under it with a hash of
+// the full derivation — deterministic across processes, which is what
+// a lock needs of its name.
+//
+// The cut backs off to a rune boundary, the way [constraintName] does.
+// An aggregate id of non-ASCII text is otherwise sliced mid-rune and
+// the lock name is no longer valid UTF-8: MariaDB takes it anyway,
+// which is exactly why it would go unnoticed until a server that does
+// not.
 func outboxLockName(table, aggregateType, aggregateID string) string {
 	name := "drops:" + table + ":" + aggregateType + ":" + aggregateID
 	if len(name) <= 64 {
@@ -587,7 +627,11 @@ func outboxLockName(table, aggregateType, aggregateID string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(name))
 	suffix := ":" + strconv.FormatUint(h.Sum64(), 36)
-	return name[:64-len(suffix)] + suffix
+	cut := 64 - len(suffix)
+	for cut > 0 && !utf8.ValidString(name[:cut]) {
+		cut--
+	}
+	return name[:cut] + suffix
 }
 
 // PendingAggregates returns up to limit distinct aggregate keys that

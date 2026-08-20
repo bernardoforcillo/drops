@@ -226,3 +226,26 @@ func TestPageCursorIsTheSameTokenAsEncodeCursor(t *testing.T) {
 		t.Errorf("guard: %s", sql)
 	}
 }
+
+// An ordering column with no struct field can never yield a cursor, so
+// the walk is refused before the query rather than at the first page
+// boundary — where the same bug would look like a healthy first page.
+func TestPageRejectsAnUnmappedOrderColumnBeforeQuerying(t *testing.T) {
+	tbl := mysql.NewTable("users")
+	id := mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 255).NotNull())
+	ent := mysql.NewEntity[struct {
+		ID int64 `drop:"id"`
+	}](tbl, mysql.AllowUnmappedColumns("name"))
+
+	d := &pageDriver{queued: []*pageRows{usersRows(int64(1), "a")}}
+	// One row for a page of ten: the page has no successor, so nothing
+	// would ever ask for a cursor and the fault would stay hidden.
+	_, err := ent.Page(mysql.New(d)).OrderBy(mysql.Asc(name), mysql.Asc(id)).Limit(10).All(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("err = %v, want a refusal naming the column", err)
+	}
+	if len(d.queries) != 0 {
+		t.Errorf("the query ran anyway: %v", d.queries)
+	}
+}

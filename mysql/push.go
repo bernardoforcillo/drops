@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -500,27 +501,82 @@ func probeTableName() string {
 }
 
 // refusedExpression reports whether err is the server refusing the
-// expression, as opposed to refusing to do the work just now.
+// expression, as opposed to the statement never reaching a server that
+// could have an opinion about it.
 //
-// The probe is real DDL, so it fails for reasons that say nothing about
-// the expression: the disk is full, the connection dropped, the account
-// may not create tables. Counting those as "unparseable" would silently
-// downgrade the comparison to whatever the database already held — the
-// tightened CHECK would not ship, the push would report success, and
-// the notice would blame the declared expression. Only the SQLSTATE
-// classes that describe the statement itself qualify: 42 syntax error
-// or access rule violation, 22 data exception, 0A feature not
-// supported. Anything else fails the push.
+// The line is drawn at whether the server answered at all, and not at
+// the SQLSTATE, because SQLSTATE does not separate the two here. A
+// syntax error arrives as 42000 and an unknown column as 42S22, but
+// almost everything a server says specifically about a CHECK arrives
+// as the catch-all HY000: MariaDB 10.11 rejects a function it will not
+// allow in a CHECK with error 1901 HY000, and MySQL's
+// check-constraint errors sit in the same class. Reading only the 42,
+// 22 and 0A classes therefore misses the whole family of rejections
+// this notice exists for, and fails the push on them instead.
+//
+// What makes "the server answered" enough is where the probe runs. It
+// is one ALTER TABLE against a table drops created a moment earlier,
+// under a name nothing else knows, holding no rows — so the reasons a
+// real ALTER fails without saying anything about its expression are
+// gone: no other session can be holding a lock on it, there are no
+// rows to violate the constraint, and an account that could not do DDL
+// would have failed at the CREATE. A failure that never reached the
+// server — a dropped connection, a cancelled context — carries no
+// server error, and that is the case that still fails the push.
+//
+// The cost of being wrong in this direction is bounded: the check is
+// compared as the database already holds it, so a change to it does
+// not ship, and the notice quotes the server's own error rather than
+// blaming the expression on drops's say-so.
 func refusedExpression(err error) bool {
-	state := serverSQLState(err)
-	if len(state) < 2 {
-		return false
+	return serverErrorNumber(err) != 0 || serverSQLState(err) != ""
+}
+
+// reDriverErrorNumber matches the error number in the message
+// go-sql-driver/mysql renders — "Error 1901 (HY000): Function or …".
+var reDriverErrorNumber = regexp.MustCompile(`^Error (\d+) \(`)
+
+// serverErrorNumber digs the MySQL error number out of a driver error,
+// by the same route as serverSQLState and for the same reason: drops
+// has no dependencies, so the driver's error type cannot be named and
+// exposes the number as a struct field rather than through a method.
+func serverErrorNumber(err error) int {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if n := errorNumberByReflection(e); n != 0 {
+			return n
+		}
+		if m := reDriverErrorNumber.FindStringSubmatch(e.Error()); m != nil {
+			n, cerr := strconv.Atoi(m[1])
+			if cerr == nil {
+				return n
+			}
+		}
 	}
-	switch state[:2] {
-	case "42", "22", "0A":
-		return true
+	return 0
+}
+
+func errorNumberByReflection(err error) int {
+	v := reflect.ValueOf(err)
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return 0
+		}
+		v = v.Elem()
 	}
-	return false
+	if v.Kind() != reflect.Struct {
+		return 0
+	}
+	f := v.FieldByName("Number")
+	if !f.IsValid() {
+		return 0
+	}
+	switch f.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return int(f.Uint())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return int(f.Int())
+	}
+	return 0
 }
 
 // reDriverSQLState matches the SQLSTATE in the message

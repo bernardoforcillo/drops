@@ -160,3 +160,17 @@ func attemptsUnder(t *testing.T, db *mysql.DB, err error) int {
 	})
 	return attempts
 }
+
+// An unset Errors slice matches nothing, so a policy that names no
+// sentinel retries nothing — MaxAttempts on its own is not a switch.
+// This is the one place the doc drops/pg carries is wrong about its own
+// code, and the mysql doc says so.
+func TestRetryPolicyWithNoSentinelsRetriesNothing(t *testing.T) {
+	db := mysql.New(&fakeDriver{}).WithRetry(mysql.RetryPolicy{MaxAttempts: 5})
+	if n := attemptsUnder(t, db, mysql.ErrDeadlock); n != 1 {
+		t.Errorf("attempts = %d, want 1: an empty Errors slice matches nothing", n)
+	}
+	if got := db.RetryPolicyValue().MaxAttempts; got != 5 {
+		t.Errorf("the policy was not installed at all: MaxAttempts = %d", got)
+	}
+}

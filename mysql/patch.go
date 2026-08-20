@@ -39,8 +39,10 @@ import (
 // snapshot, so re-read through the same transaction, not a new one.
 //
 // [SetIfChanged] cannot use PostgreSQL's IS DISTINCT FROM, which
-// neither server has. MySQL's null-safe equality operator <=> is the
-// exact equivalent and is what it renders.
+// neither server has. MySQL's <=> is what it renders, and <=> is
+// null-safe but not collation-blind — so on a text column it decides
+// "changed" by the column's collation rather than byte for byte. Read
+// its doc before using it on one.
 
 // PatchOp describes one SET assignment in a Patch. Construct one with
 // [Inc], [Dec], [Set], [SetIfGreater], [SetIfLess] or [SetIfChanged].
@@ -91,29 +93,50 @@ type number interface {
 // Inc emits "col = col + delta".
 //
 // On an UNSIGNED column a delta that would take the value below zero
-// is an error under the strict sql_mode MySQL 8 and MariaDB 10 both
-// default to, and silently clamps to zero without it. [Dec] on an
-// unsigned counter therefore needs a guard in the WHERE clause, or a
-// signed column.
+// is error 1690, "BIGINT UNSIGNED value is out of range", on both
+// servers and under every sql_mode. Strict mode has nothing to do with
+// it: what fails is the unsigned arithmetic, before any value reaches
+// the column, so the statement raises rather than storing anything.
+// (Strict mode governs a different case — assigning a negative
+// *literal*, which raises 1264 under it and clamps to zero without.)
+//
+// So [Dec] on an unsigned counter needs a signed column, or a guard in
+// the WHERE clause that keeps the subtraction from going negative:
+//
+//	ent.PatchKey(db, ctx, key, mysql.Dec(Seats, 1))   // 1690 at zero
+//
+// Wrapping the arithmetic does not help, because the arithmetic is
+// what raises: GREATEST(col - 1, 0) fails at the same point col - 1
+// does.
 func Inc[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '+'}
 }
 
-// Dec is shorthand for Inc(col, -delta). See [Inc] about unsigned
-// columns.
+// Dec emits "col = col - delta". Pass the amount to subtract as a
+// positive number. See [Inc] about unsigned columns.
+//
+// It renders a subtraction rather than negating the delta and adding
+// it, which would be the shorter spelling and is wrong for half of
+// [number]: -delta on an unsigned type wraps instead of going
+// negative, so Dec(col, uint64(5)) would bind 18446744073709551611 and
+// the counter would climb. That renders perfectly and only a server
+// can see it, which is why there is an integration test for it.
 func Dec[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: -delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '-'}
 }
 
 type incOp[T number] struct {
 	col   *Column
 	delta T
+	op    byte // '+' or '-'
 }
 
 func (o *incOp[T]) column() *Column { return o.col }
 func (o *incOp[T]) writeValue(b *drops.Builder) {
 	o.col.WriteSQL(b)
-	b.WriteString(" + ")
+	b.WriteByte(' ')
+	b.WriteByte(o.op)
+	b.WriteByte(' ')
 	b.AddArg(o.delta)
 }
 
@@ -167,6 +190,30 @@ func (o *monotonicOp[T]) writeValue(b *drops.Builder) {
 // Without it a NULL column compared to a non-NULL value yields NULL,
 // the CASE falls to its ELSE, and the assignment quietly never
 // happens.
+//
+// # It is not IS DISTINCT FROM on a text column
+//
+// <=> fixes the null half and inherits the collation half, and there
+// the two dialects part company. PostgreSQL compares text under a
+// deterministic collation, so 'ada' IS DISTINCT FROM 'ADA' is true and
+// the row is written. MySQL compares under the column's collation,
+// which by default is case-insensitive, accent-insensitive, and — on
+// MariaDB's utf8mb4_general_ci — space-padding. Under it 'ada' <=>
+// 'ADA' is true, and so are 'e' <=> 'é' and 'a' <=> 'a  '. So
+// SetIfChanged silently declines to write a change of case, of accent,
+// or of trailing space that PostgreSQL would have written, and a plain
+// assignment on the same column would have written too.
+//
+// Where that matters — normalising a display name, correcting an
+// accent — either assign with [Set] and let the server decide whether
+// the row changed, or compare under a binary collation:
+//
+//	mysql.SetExpr(UserName, drops.Raw(
+//	    "CASE WHEN NOT (`users`.`name` COLLATE utf8mb4_bin <=> ?) THEN ? ELSE `users`.`name` END"))
+//
+// drops does not pick the binary collation for you, because on a
+// numeric, date or binary column there is no collation to pick and the
+// operator is already exact.
 func SetIfChanged[T any](col *Col[T], v T) PatchOp {
 	return &ifChangedOp[T]{col: col.Column, val: v}
 }

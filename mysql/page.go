@@ -119,6 +119,16 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
+	// Resolve the ordering columns to struct fields before the query
+	// rather than at the first page boundary. A cursor is built out of
+	// the last row's field values, so a column with no field could
+	// never produce one — and without this the walk would look healthy
+	// until it grew past one page, which is the point at which nobody
+	// is watching.
+	fields, err := p.fieldIndexes(spec)
+	if err != nil {
+		return nil, err
+	}
 
 	sel := p.db.Select(p.e.selectCols()...).From(p.e.table)
 	for _, w := range p.wheres {
@@ -150,7 +160,7 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 
 	out := &Page[T]{Items: rows, HasMore: hasMore}
 	if hasMore && len(rows) > 0 {
-		cur, err := p.encode(spec, rows[len(rows)-1])
+		cur, err := encodePageCursor(spec, fields, rows[len(rows)-1])
 		if err != nil {
 			return nil, err
 		}
@@ -173,23 +183,32 @@ func (p *PageBuilder[T]) spec() CursorSpec {
 	return spec
 }
 
-// encode extracts the ordering columns' values from the last row of
-// the page and stamps them into a cursor.
-func (p *PageBuilder[T]) encode(spec CursorSpec, row T) (Cursor, error) {
-	v := reflect.ValueOf(&row).Elem()
-	vals := make([]any, len(spec.Keys))
+// fieldIndexes pairs each ordering key with the entity field bound to
+// it. Columns are matched by name rather than by pointer, so a handle
+// reached through an aliased table resolves to the same field.
+func (p *PageBuilder[T]) fieldIndexes(spec CursorSpec) ([][]int, error) {
+	out := make([][]int, len(spec.Keys))
 	for i, k := range spec.Keys {
 		col := k.Col.col()
-		var idx []int
 		for _, cf := range p.e.colFields {
 			if cursorColKey(cf.col) == cursorColKey(col) {
-				idx = cf.field
+				out[i] = cf.field
 				break
 			}
 		}
-		if idx == nil {
-			return "", fmt.Errorf("drops/mysql: Page.OrderBy column %q has no matching struct field", col.Name())
+		if out[i] == nil {
+			return nil, fmt.Errorf("drops/mysql: Page.OrderBy column %q has no matching struct field", col.Name())
 		}
+	}
+	return out, nil
+}
+
+// encodePageCursor extracts the ordering columns' values from the last
+// row of the page and stamps them into a cursor.
+func encodePageCursor[T any](spec CursorSpec, fields [][]int, row T) (Cursor, error) {
+	v := reflect.ValueOf(&row).Elem()
+	vals := make([]any, len(fields))
+	for i, idx := range fields {
 		vals[i] = v.FieldByIndex(idx).Interface()
 	}
 	return EncodeCursor(spec, vals...)

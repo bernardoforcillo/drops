@@ -15,7 +15,13 @@ import (
 // MySQL's default collation is case-insensitive.
 func TestIdempotencyTableDDL(t *testing.T) {
 	create, _ := sqlOf(mysql.CreateTable(mysql.NewIdempotencyTable("idem")))
-	if !strings.Contains(create, "`key` VARCHAR(255) COLLATE utf8mb4_bin NOT NULL") {
+	// The collation is declared once on the table, not per column —
+	// see NewOutboxTable. What it buys is case-sensitive keys, which
+	// only the server can confirm: TestMySQLIdempotencyKeysAreCaseSensitive.
+	if !strings.Contains(create, "`key` VARCHAR(255) NOT NULL") {
+		t.Errorf("key column:\n%s", create)
+	}
+	if !strings.Contains(create, "COLLATE=utf8mb4_bin") {
 		t.Errorf("keys must compare case-sensitively:\n%s", create)
 	}
 	// A plain BLOB stops at 64KB, and a response past that is

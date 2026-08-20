@@ -48,18 +48,38 @@ func TestPatchRendersServerSideAssignments(t *testing.T) {
 	}
 }
 
-func TestDecIsANegativeInc(t *testing.T) {
+// Dec subtracts; it does not negate the delta and add it. Negating is
+// the obvious shorthand and it is wrong for every unsigned type in the
+// number constraint — -uint64(3) is 18446744073709551613, so the
+// counter would climb by that instead of falling by three. The bind
+// has to stay positive.
+func TestDecSubtractsRatherThanAddingANegative(t *testing.T) {
 	tbl, _, likes, _ := counterFixture()
 	ent := mysql.NewEntity[counterRow](tbl)
 	drv := &fakeDriver{}
 	if _, err := ent.Patch(mysql.New(drv), context.Background(), int64(1), mysql.Dec(likes, int64(3))); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(drv.queries[len(drv.queries)-1], "`likes` = `counters`.`likes` + ?") {
+	if !strings.Contains(drv.queries[len(drv.queries)-1], "`likes` = `counters`.`likes` - ?") {
 		t.Errorf("SQL = %s", drv.queries[len(drv.queries)-1])
 	}
-	if drv.args[len(drv.args)-1][0] != int64(-3) {
-		t.Errorf("delta = %v, want -3", drv.args[len(drv.args)-1][0])
+	if drv.args[len(drv.args)-1][0] != int64(3) {
+		t.Errorf("delta = %v, want 3", drv.args[len(drv.args)-1][0])
+	}
+}
+
+// The same claim over an unsigned delta, which is where negating
+// silently wraps instead of failing.
+func TestDecOnAnUnsignedDeltaDoesNotWrap(t *testing.T) {
+	tbl := mysql.NewTable("seats")
+	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	seats := mysql.Add(tbl, mysql.Custom[uint64]("seats", "BIGINT UNSIGNED").NotNull())
+	sql, args := mysql.New(&fakeDriver{}).Update(tbl).Set(mysql.Dec(seats, uint64(3))).ToSQL()
+	if sql != "UPDATE `seats` SET `seats` = `seats`.`seats` - ?" {
+		t.Errorf("SQL = %s", sql)
+	}
+	if len(args) != 1 || args[0] != uint64(3) {
+		t.Fatalf("args = %v, want [3]; a negated uint64 binds 2^64-3", args)
 	}
 }
 

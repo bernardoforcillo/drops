@@ -124,6 +124,15 @@ func (s *EventStore) Table() string { return s.table }
 // [CreateTable] alone is enough to create it — deliberately, since
 // everything Append's contract depends on is in the table definition.
 //
+// [CreateTable] is also the only thing that can create it today.
+// [BuildSnapshot] records a table's PRIMARY KEY and its registered
+// [Table.AddIndex] indexes but not a column's own UNIQUE, and [Diff]
+// emits secondary indexes as statements after the CREATE TABLE — so a
+// pushed CREATE TABLE leaves the AUTO_INCREMENT id with no key of its
+// own and the server refuses it with error 1075. Create this table and
+// [NewSnapshotTable] with CreateTable, and keep them out of the
+// [Schema] handed to [Push].
+//
 // The layout is inverted from drops/pg's, which makes the surrogate id
 // the primary key and (aggregateType, aggregateID, version) a separate
 // unique index. Here the stream key *is* the primary key and the id
@@ -146,12 +155,12 @@ func (s *EventStore) Table() string { return s.table }
 // which carries the wide key. PostgreSQL's heap has no clustering to
 // trade, which is why its layout differs.
 //
-// A stream key is two VARCHAR(255) columns under a binary collation
-// (see [NewOutboxTable] for why the collation is spelled out); with
-// the 8-byte version that is 2048 bytes of InnoDB's 3072-byte index
-// limit.
+// A stream key is two VARCHAR(255) columns under the table's binary
+// collation (see [NewOutboxTable] for why the collation is declared
+// and where); with the 8-byte version that is 2048 bytes of InnoDB's
+// 3072-byte index limit.
 func NewEventStoreTable(name string) *Table {
-	t := NewTable(name)
+	t := NewTable(name).Collate(streamKeyCollation)
 	// The id is the global append offset. It is AUTO_INCREMENT, so
 	// MySQL requires it to lead an index — which the UNIQUE gives it,
 	// while also making it a valid target for a projection's
@@ -228,18 +237,26 @@ func (s *EventStore) Append(tx *DB, ctx context.Context, aggregateType, aggregat
 }
 
 // isDuplicateKeyError reports whether err is MySQL's duplicate-key
-// failure, error 1062.
+// failure — error 1062, or 1586, which is the same failure reported
+// with the key's name.
 //
-// It is a string match because drops has no dependencies and cannot
-// see the driver's error type. Both halves of the driver's message are
-// checked — the number and the text — since either alone could occur
-// in an error about something else.
+// The classification this package already does is what answers first:
+// [DB.Exec] wraps a server error in a [ServerError] carrying the
+// number, so errors.Is against [ErrUniqueViolation] reads the number
+// rather than the prose. The text match behind it is the fallback for
+// an error that never went through Exec — one a caller wrapped itself,
+// or one from a Driver that formats its errors and nothing else. It
+// looks for the message rather than the number, because "1062" occurs
+// inside plenty of strings that are not this error and "duplicate
+// entry" does not.
 func isDuplicateKeyError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "1062") || strings.Contains(msg, "duplicate entry")
+	if errors.Is(err, ErrUniqueViolation) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate entry")
 }
 
 // Load returns events for an aggregate in version order, starting
@@ -360,7 +377,7 @@ type AggregateSnapshot struct {
 // NewEventStoreTable; snapshots live in a separate table so the event
 // log stays append-only.
 func NewSnapshotTable(name string) *Table {
-	t := NewTable(name)
+	t := NewTable(name).Collate(streamKeyCollation)
 	Add(t, streamKeyColumn("aggregateType").PrimaryKey())
 	Add(t, streamKeyColumn("aggregateID").PrimaryKey())
 	Add(t, BigInt("version").NotNull())

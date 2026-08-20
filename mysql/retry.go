@@ -45,9 +45,11 @@ type RetryPolicy struct {
 	MaxAttempts int
 
 	// Errors are sentinel values; a returned error is retried when
-	// errors.Is(err, e) is true for any e in the slice. Nil means
-	// "retry on every error", which is almost always wrong — set this
-	// explicitly.
+	// errors.Is(err, e) is true for any e in the slice. An empty or
+	// nil slice matches nothing, so a policy that leaves it unset
+	// retries no error at all — MaxAttempts on its own does not turn
+	// retrying on. drops/pg's field carries the same rule; its comment
+	// says otherwise and is wrong.
 	//
 	// Only [ErrDeadlock] and [ErrLockWaitTimeout] belong here. The
 	// other classified failures are permanent: a duplicate key, a

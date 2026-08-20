@@ -69,15 +69,22 @@ import (
 // therefore what the guard is built against — see keysetStrict — and
 // [OrderKey] has no Nulls field for PostgreSQL parity to hang on.
 //
-// The tiebreaker is checked rather than merely recommended. MySQL's
-// default collations are case- and accent-insensitive and PAD SPACE:
-// under utf8mb4_general_ci, 'alice' = 'Alice' = 'ALICE', 'cafe' =
-// 'café' and 'a' = 'a '. A walk whose last key is such a column and
+// The tiebreaker is checked rather than merely recommended. Both
+// servers default a text column to a case- and accent-insensitive
+// collation — utf8mb4_general_ci on MariaDB 10.11, utf8mb4_0900_ai_ci
+// on MySQL 8 — under which 'alice', 'Alice' and 'ALICE' are one value,
+// as are 'cafe' and 'café'. A walk whose last key is such a column and
 // nothing else does not just risk skipping duplicates in theory — a
 // strict `name > 'alice'` steps over every casing of the name at
 // once. So a spec whose final key is not backed by a NOT NULL unique
 // constraint is refused; see [CursorSpec.AllowNonUniqueKey] to
 // override that, and the doc on [NewCursorSpec] for the fix.
+//
+// Trailing space is where the two servers part: utf8mb4_general_ci is
+// PAD SPACE, so 'a' = 'a ' on MariaDB, while MySQL 8's default is NO
+// PAD and the two differ. That widens or narrows the group by one more
+// case; it does not change the conclusion, because case alone already
+// makes the group bigger than one row.
 
 // Cursor is an opaque page marker — obtain one from EncodeCursor and
 // pass it to SelectBuilder.AfterCursor / BeforeCursor.

@@ -232,3 +232,21 @@ func TestConcatIsNotThePipesOperator(t *testing.T) {
 		t.Errorf("SQL = %s", sql)
 	}
 }
+
+// A collation name is not an identifier: it cannot be backticked, so
+// it lands in the SQL as written. The identifier check would let
+// "utf8mb4_bin) OR (1=1" through, since it only guards what quoting
+// cannot save.
+func TestCollateRejectsAnythingButACollationName(t *testing.T) {
+	wantSQL(t, mysql.Collate(mysql.Text("s"), "utf8mb4_bin"), "(`s` COLLATE utf8mb4_bin)")
+	for _, bad := range []string{"", "utf8mb4_bin) OR (1=1", "utf8mb4 bin", "utf8mb4-bin", "`utf8mb4_bin`"} {
+		t.Run(bad, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("Collate accepted %q, which is interpolated verbatim", bad)
+				}
+			}()
+			mysql.Collate(mysql.Text("s"), bad)
+		})
+	}
+}

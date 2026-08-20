@@ -33,6 +33,11 @@ import (
 //     which || does not.
 //   - JSONBDelete (-) is [JSONRemove].
 //
+// One function goes the other way. JSON_QUERY is MariaDB's and not
+// MySQL's — see [JSONQuery] — so it is the single helper in this file
+// that does not work on both servers, and its doc says so rather than
+// the file leaving it out, because MariaDB users have a use for it.
+//
 // MySQL's own -> and ->> operators are deliberately not exposed:
 // MariaDB does not implement them at all — 10.11 answers a syntax
 // error even against a JSON column — so [JSONGet] and [JSONGetText]
@@ -146,6 +151,12 @@ func JSONValue(e, path any) drops.Expression { return funcCall("json_value", []a
 
 // JSONQuery renders JSON_QUERY(<e>, <path>) — like JSON_VALUE but for
 // an object or array result rather than a scalar.
+//
+// MariaDB only. MySQL never implemented JSON_QUERY: it took JSON_VALUE
+// from the same standard clause and stopped there, so 8.4 answers
+// error 1305, "FUNCTION json_query does not exist". [JSONExtract] is
+// the spelling that returns the same object or array on both, which is
+// why it — and not this — is what [JSONGet] and [JSONGetPath] render.
 func JSONQuery(e, path any) drops.Expression { return funcCall("json_query", []any{e, path}) }
 
 // JSONUnquote renders JSON_UNQUOTE(<e>).
@@ -160,8 +171,14 @@ func JSONQuote(e any) drops.Expression { return funcCall("json_quote", []any{e})
 //
 // candidate must itself be valid JSON text, so a scalar goes in
 // quoted: JSONContains(Doc, `"active"`) for a string, `1` for a
-// number. Passing a bare Go string that is not JSON gets error 3141
-// from the server rather than a false answer.
+// number.
+//
+// The two servers part company on a candidate that is not JSON at all.
+// MySQL raises error 3141, "Invalid JSON text in argument 2", and the
+// statement fails. MariaDB returns NULL — no error, no warning — so
+// the predicate is neither true nor false and a WHERE clause built on
+// it quietly matches nothing. Do not rely on the argument being
+// checked for you; quote the scalar.
 func JSONContains(target, candidate any, path ...any) drops.Expression {
 	args := []any{target, candidate}
 	if len(path) > 0 {
@@ -294,8 +311,9 @@ func JSONBuildObject(args ...any) drops.Expression { return funcCall("json_objec
 // JSONBuildArray renders JSON_ARRAY(<args...>) — pg's json_build_array.
 func JSONBuildArray(args ...any) drops.Expression { return funcCall("json_array", args) }
 
-// JSONAgg renders JSON_ARRAYAGG(<e>) — pg's json_agg. MySQL 5.7.22+
-// and MariaDB 10.5+.
+// JSONAgg renders JSON_ARRAYAGG(<e>) — pg's json_agg. MySQL 8.0.14+
+// and MariaDB 10.5+. ([JSONObjectAgg] is the older of the pair on
+// MySQL, 5.7.22; the two did not arrive together.)
 //
 // Neither server accepts an ORDER BY inside it, which PostgreSQL does,
 // so the element order is whatever the plan produced. Sort the rows

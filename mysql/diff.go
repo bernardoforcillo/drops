@@ -212,10 +212,18 @@ func dropTableSQL(t *TableSnapshot, opt DiffOptions) string {
 	return fmt.Sprintf("DROP TABLE %s;", quoteIdent(t.Name))
 }
 
-// columnDefSQL renders one column definition. The clause order is the
-// one MySQL's grammar requires, not a preference, and it matches
-// writeColumnDef in ddl.go so a table created by CreateTable and a
-// table created by a migration are the same table.
+// columnDefSQL renders one column definition. The clause order within
+// the definition is the one MySQL's grammar requires, not a preference,
+// and it matches writeColumnDef in ddl.go so the two render the same
+// column.
+//
+// The columns themselves come out in name order rather than
+// declaration order, because a snapshot keys them by name and the
+// order is not in the file. A table built by a migration therefore has
+// the same columns as one built by CreateTable but not in the same
+// positions, which shows up in SELECT * and in an INSERT that names no
+// columns. Diff never compares position, so this costs nothing in the
+// diff — only in what the two tables look like side by side.
 func columnDefSQL(c *ColumnSnapshot) string {
 	var b strings.Builder
 	b.WriteString(quoteIdent(c.Name))

@@ -25,7 +25,14 @@ func TestEventStoreTableEnforcesTheStreamKey(t *testing.T) {
 	if !strings.Contains(create, "AUTO_INCREMENT") || !strings.Contains(create, "UNIQUE KEY `uq_events_id` (`id`)") {
 		t.Errorf("the append offset needs its own unique index:\n%s", create)
 	}
-	if !strings.Contains(create, "`aggregateID` VARCHAR(255) COLLATE utf8mb4_bin NOT NULL") {
+	if !strings.Contains(create, "`aggregateID` VARCHAR(255) NOT NULL") {
+		t.Errorf("stream key column:\n%s", create)
+	}
+	// The collation rides on the table so the declared type and the
+	// one information_schema reports back are the same string; that
+	// the server really compares case-sensitively is pinned by
+	// TestMySQLEventStoreStreamKeysAreCaseSensitive.
+	if !strings.Contains(create, "COLLATE=utf8mb4_bin") {
 		t.Errorf("stream keys must compare case-sensitively:\n%s", create)
 	}
 }

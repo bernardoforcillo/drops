@@ -624,8 +624,24 @@ func (w *OutboxWorker) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-		case <-notify:
+		case _, ok := <-notify:
 			// LISTEN wakeup — proceed immediately to the next tick.
+			//
+			// Unless the subscription has ended, which is what ok=false
+			// reports: the driver closed the channel because the
+			// connection carrying LISTEN dropped. A receive from a
+			// closed channel succeeds immediately and for ever, so
+			// leaving it in the select turns the worker into a spin
+			// loop that re-drains the outbox as fast as the database
+			// can answer — a lost connection becoming a self-inflicted
+			// denial of service, with nothing in the logs but load.
+			// Clearing the variable takes the case out of the select
+			// (a receive on a nil channel blocks) and leaves the ticker
+			// as the wakeup, which is the same behaviour as a worker
+			// that was never given a channel at all.
+			if !ok {
+				notify = nil
+			}
 		}
 	}
 }

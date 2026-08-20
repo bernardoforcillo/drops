@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -75,6 +76,19 @@ func (db *DB) PoolStats() (PoolStats, bool) {
 // cancel function the caller must call to stop the goroutine —
 // usually via defer.
 //
+// The stop function is safe to call more than once and blocks
+// until the goroutine has returned. Both matter to callers that
+// cannot easily tell which is true. Idempotence, because a stop
+// that closes a channel panics on the second call, and the second
+// call is what a shutdown path with both an explicit stop and a
+// deferred one looks like — the panic then lands in the process's
+// last few milliseconds, where it is least diagnosable. Waiting,
+// because the goroutine may be inside sink at the moment stop is
+// called: a metrics registry that is unregistered or a file that
+// is closed immediately after stop returns would otherwise be
+// written to afterwards. The one thing a caller must not do is
+// call stop from inside sink, which would wait for itself.
+//
 // Returns nil (and never starts the goroutine) when the driver
 // does not implement PoolStatsProvider — callers can branch on
 // db.PoolStats's ok return to know in advance.
@@ -90,7 +104,9 @@ func (db *DB) StartPoolMetrics(ctx context.Context, interval time.Duration, sink
 		interval = 5 * time.Second
 	}
 	stopCh := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		// Emit one snapshot immediately so the metric pipeline
 		// shows current state without waiting for the first tick.
 		sink(p.Stats())
@@ -107,7 +123,11 @@ func (db *DB) StartPoolMetrics(ctx context.Context, interval time.Duration, sink
 			}
 		}
 	}()
-	return func() { close(stopCh) }
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(stopCh) })
+		<-done
+	}
 }
 
 // SupportsPoolStats reports whether the underlying driver

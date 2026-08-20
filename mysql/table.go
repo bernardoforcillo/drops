@@ -2,14 +2,11 @@ package mysql
 
 import (
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/bernardoforcillo/drops"
 )
 
-// Table is a MySQL table: a name, its columns, and the relations
-// declared against it.
+// Table is a MySQL table: a name and its columns.
 type Table struct {
 	database  string
 	name      string
@@ -20,7 +17,6 @@ type Table struct {
 	comment   string
 	columns   []*Column
 	byName    map[string]*Column
-	relations map[string]*Relation
 
 	// defaultFilters are AND-ed onto every SELECT from this table
 	// unless the builder opts out with Unscoped.
@@ -41,7 +37,7 @@ type Table struct {
 // NewTable creates a table in the connection's default database.
 func NewTable(name string) *Table {
 	mustIdent("table", name)
-	return &Table{name: name, byName: map[string]*Column{}, relations: map[string]*Relation{}}
+	return &Table{name: name, byName: map[string]*Column{}}
 }
 
 // NewDatabaseTable scopes the table to an explicit database, which is
@@ -50,10 +46,9 @@ func NewDatabaseTable(database, name string) *Table {
 	mustIdent("database", database)
 	mustIdent("table", name)
 	return &Table{
-		database:  database,
-		name:      name,
-		byName:    map[string]*Column{},
-		relations: map[string]*Relation{},
+		database: database,
+		name:     name,
+		byName:   map[string]*Column{},
 	}
 }
 
@@ -89,19 +84,13 @@ func (t *Table) Alias() string    { return t.alias }
 // Unscoped and an explicit predicate built from the alias's own
 // handles.
 //
-// Relations are copied too, with their near side — the column that
-// belongs to this table — rebound to the alias and the far side left
-// alone. On a self-referential relation that is the whole point: the
-// two ends of the edge are two instances of one table, and only one of
-// them is the aliased one.
-//
-// The copy is a snapshot. A column, relation, index, default filter or
-// check added to the base table after As returned does not reach the
-// alias, and none added to the alias reaches the table. That matters
-// because Go initialises package-level variables before it runs init:
-// an alias declared as a var beside its table is taken before any init
-// that declares relations. Take the alias at the query site, or after
-// the schema is complete.
+// The copy is a snapshot. A column, index, default filter or check
+// added to the base table after As returned does not reach the alias,
+// and none added to the alias reaches the table. That matters because
+// Go initialises package-level variables before it runs init: an alias
+// declared as a var beside its table is taken before any init that
+// adds to the schema. Take the alias at the query site, or after the
+// schema is complete.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
@@ -118,29 +107,6 @@ func (t *Table) As(alias string) *Table {
 		aliased.origin = c.key()
 		cp.columns[i] = &aliased
 		cp.byName[aliased.name] = &aliased
-	}
-	// rebind maps a column declared on t to the aliased copy's handle
-	// for it, and leaves any column belonging to another table alone.
-	rebind := func(c *Column) *Column {
-		if c != nil && c.table == t {
-			if aliased := cp.byName[c.name]; aliased != nil {
-				return aliased
-			}
-		}
-		return c
-	}
-	cp.relations = make(map[string]*Relation, len(t.relations))
-	for name, rel := range t.relations {
-		r := *rel
-		r.From = &cp
-		if r.Kind == BelongsToKind {
-			// The inverse edge holds its own key in ChildKey; ParentKey
-			// names the far table.
-			r.ChildKey = rebind(r.ChildKey)
-		} else {
-			r.ParentKey = rebind(r.ParentKey)
-		}
-		cp.relations[name] = &r
 	}
 	if t.checks != nil {
 		cp.checks = make(map[string]string, len(t.checks))
@@ -161,11 +127,6 @@ func (t *Table) As(alias string) *Table {
 // alias copy onto the table it was declared as. It is Column.key for
 // the *Table handles, and for the same reason: an alias is a second
 // handle on one table.
-//
-// It is deliberately not what As's own rebind consults. That one asks
-// which columns belong to the instance being aliased, and collapsing
-// origins there would rebind the far side of a self-referential
-// relation — erasing the distinction the alias exists to draw.
 func (t *Table) key() *Table {
 	if t.origin != nil {
 		return t.origin
@@ -208,31 +169,6 @@ func (t *Table) Col(name string) *Column { return t.byName[name] }
 
 // Columns returns the columns in declaration order.
 func (t *Table) Columns() []*Column { return t.columns }
-
-// Relation returns the named relation, or nil.
-func (t *Table) Relation(name string) *Relation { return t.relations[name] }
-
-// Rel returns the named relation, panicking if it was never declared.
-// It is how a relation becomes a compile-checked Go identifier rather
-// than a string literal at every query site.
-func (t *Table) Rel(name string) *Relation {
-	r := t.relations[name]
-	if r == nil {
-		declared := make([]string, 0, len(t.relations))
-		for n := range t.relations {
-			declared = append(declared, n)
-		}
-		sort.Strings(declared)
-		// An alias carries the relations its table had at the moment As
-		// was called, so a relation declared afterwards reaches the base
-		// handle and not this one. Naming the alias is what separates
-		// that from "the relation was never declared at all" — the two
-		// look identical from the empty list.
-		panic(fmt.Sprintf("drops/mysql: %s has no relation %q; declared: %s",
-			t.subject(), name, strings.Join(declared, ", ")))
-	}
-	return r
-}
 
 // Add registers a column with the table and returns it, so a
 // declaration reads as one expression:

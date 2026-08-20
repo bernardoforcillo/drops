@@ -103,12 +103,18 @@
 //
 // This is the schema, query and migration surface: types, tables, DDL,
 // SELECT / INSERT / UPDATE / DELETE, operators, Entity CRUD with the
-// drift check, composite keys and relations, and schema migrations;
-// plus the outbox, the event store, the idempotency store, keyset
-// pagination, the typed error surface, and the expression library
-// above. The remaining cross-cutting packages that pg and sqlite have
-// grown — saga, audit, tenancy — are not ported yet, and this doc will
-// say so until they are.
+// drift check and composite keys, and schema migrations; plus the
+// outbox, the event store, the idempotency store, keyset pagination,
+// the typed error surface, and the expression library above. The
+// remaining cross-cutting packages that pg and sqlite have grown —
+// saga, audit, tenancy — are not ported yet, and this doc will say so
+// until they are.
+//
+// There are no relations here. The declaration API existed and nothing
+// consumed it: mysql has no eager loader, so a HasMany compiled, ran,
+// and did nothing at all — which is worse than its absence, because a
+// caller who declares one has no way to find out. Join the tables
+// explicitly until there is a loader to declare them for.
 package mysql
 
 import "github.com/bernardoforcillo/drops"

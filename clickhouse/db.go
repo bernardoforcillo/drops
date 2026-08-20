@@ -20,7 +20,14 @@ func (chDialect) Placeholder(int) string { return "?" }
 // QuoteIdent uses standard double quotes. ClickHouse accepts
 // backticks too, but double quotes are what its own dumps emit and
 // what the rest of drops renders.
-func (chDialect) QuoteIdent(name string) string { return drops.StdQuoteIdent(name) }
+//
+// It goes through the package's own quoteIdent rather than
+// drops.StdQuoteIdent because ClickHouse's lexer also honours
+// backslash escapes inside a quoted token, so the standard doubling is
+// not sufficient here — see quoteIdent for what that costs. The DDL
+// helpers and the query builders have to agree on the answer, or a
+// name is one identifier in the CREATE TABLE and two in the SELECT.
+func (chDialect) QuoteIdent(name string) string { return quoteIdent(name) }
 
 // SupportsReturning reports false: ClickHouse has no RETURNING, which
 // is also why [ErrReturningUnsupported] exists.

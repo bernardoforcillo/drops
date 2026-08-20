@@ -373,11 +373,14 @@ func TestMySQLAliasReachesUpdateAndDelete(t *testing.T) {
 	}
 }
 
-// A relation reached through an alias must rebind its near side to that
-// alias. The failure is not a syntax error the server would catch: the
-// un-rebound predicate is still valid SQL, it just compares one
-// instance of the table to itself and quietly returns the wrong rows.
-func TestMySQLRelationThroughAnAliasJoinsTheRightInstance(t *testing.T) {
+// A self-join has to reach two instances of one table, and the alias
+// is what separates them. The failure is not a syntax error the server
+// would catch: a predicate built from the un-aliased handles on both
+// sides is still valid SQL, it just compares one instance of the table
+// to itself and quietly returns the wrong rows.
+//
+// mysql has no relations, so the edge is spelled at the query site.
+func TestMySQLAliasedSelfJoinJoinsTheRightInstance(t *testing.T) {
 	db := openMySQL(t)
 	ctx := context.Background()
 	tbl := mysql.NewTable(integration.UniqueName(t, "staff"))
@@ -386,7 +389,6 @@ func TestMySQLRelationThroughAnAliasJoinsTheRightInstance(t *testing.T) {
 	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
 	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
 	managerID := mysql.Add(tbl, mysql.BigInt("managerId"))
-	mysql.NewRelations(tbl).BelongsTo("manager", tbl, managerID, id)
 	execMySQL(t, db, mysql.CreateTable(tbl))
 
 	for _, r := range []struct {
@@ -404,25 +406,25 @@ func TestMySQLRelationThroughAnAliasJoinsTheRightInstance(t *testing.T) {
 	}
 
 	// The employee is the aliased instance; the manager is reached
-	// through the un-aliased handles, which is what the relation's far
-	// side still names.
+	// through the un-aliased handles. Both ends have to come from the
+	// handle that names the instance meant, which is the whole of what
+	// the alias buys.
 	emp := tbl.As("e")
-	rel := emp.Rel("manager")
 	var rows []struct {
 		Staff   string `drop:"staff"`
 		Manager string `drop:"manager"`
 	}
 	err := db.Select(emp.Col("name").As("staff"), name.As("manager")).
 		From(emp).
-		Join(tbl, mysql.Eq(rel.ChildKey, rel.ParentKey)).
+		Join(tbl, mysql.Eq(emp.Col(managerID.Name()), id)).
 		OrderBy(emp.Col("name").Asc()).
 		All(ctx, &rows)
 	if err != nil {
-		t.Fatalf("relation join: %v", err)
+		t.Fatalf("self join: %v", err)
 	}
 	want := map[string]string{"Alan": "Ada", "Grace": "Ada"}
 	if len(rows) != len(want) {
-		t.Fatalf("relation join returned %d rows, want %d: %+v", len(rows), len(want), rows)
+		t.Fatalf("self join returned %d rows, want %d: %+v", len(rows), len(want), rows)
 	}
 	for _, r := range rows {
 		if want[r.Staff] != r.Manager {

@@ -108,8 +108,31 @@ func Null() Engine      { return engineFamily{name: "Null"} }
 
 // helpers ------------------------------------------------------------
 
+// quoteIdent renders s as a double-quoted ClickHouse identifier.
+//
+// ClickHouse does not read a quoted token the way the SQL standard
+// does. Its lexer runs one routine over every quoted token — string,
+// double-quoted identifier, backticked identifier — and that routine
+// honours a backslash as an escape as well as the doubled quote. So
+// doubling alone is not enough: a name ending in a backslash renders
+// as "a\", the server reads the backslash as escaping the quote, the
+// token never closes, and the remainder of the statement is read as
+// part of the identifier. A name like `a\", x String) ENGINE = Log; --`
+// is accepted by validateIdent and would rewrite the CREATE TABLE it
+// appears in.
+//
+// Backslashes are therefore escaped as well. The output is unchanged
+// for every name that contains none, which is every name in practice.
 func quoteIdent(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	return `"` + escapeQuoted(s, '"') + `"`
+}
+
+// escapeQuoted prepares s for the inside of a q-delimited ClickHouse
+// token: backslashes doubled first (so the doubling below cannot be
+// mistaken for one), then the delimiter doubled.
+func escapeQuoted(s string, q byte) string {
+	esc := strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(esc, string(q), string(q)+string(q))
 }
 
 func quoteIdents(names []string) []string {
@@ -120,6 +143,10 @@ func quoteIdents(names []string) []string {
 	return out
 }
 
+// quoteLiteral renders s as a ClickHouse string literal. It escapes
+// backslashes for the same reason quoteIdent does — the lexer is the
+// same one, and a comment or a ZooKeeper path ending in a backslash
+// would otherwise swallow the rest of the statement.
 func quoteLiteral(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	return "'" + escapeQuoted(s, '\'') + "'"
 }

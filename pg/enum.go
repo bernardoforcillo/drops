@@ -95,8 +95,30 @@ func AlterEnumRenameValue(enumName, oldValue, newValue string) drops.Expression 
 	})
 }
 
-// quoteLiteral wraps a string as a SQL single-quoted literal, doubling
-// any embedded single quotes.
+// quoteLiteral wraps a string as a SQL string literal for the utility
+// statements whose grammar has no placeholder slot — COMMENT ... IS,
+// CREATE TYPE ... AS ENUM, INTERVAL. Values never come through here;
+// schema text does.
+//
+// Doubling the single quote closes the literal in every session. The
+// backslash does not: with standard_conforming_strings off — a session
+// GUC drops does not set, cannot see, and which a connection string or
+// an ALTER DATABASE can turn off under a running process — a backslash
+// begins an escape, so a literal ending in one closes with a
+// backslash-quote pair — which the server reads as an escaped quote
+// rather than as the end of the literal, and the remainder of the
+// statement is swallowed into the string. A table comment naming a
+// Windows path is enough to reach that.
+//
+// So a string containing a backslash is emitted as an E'...' literal
+// with its backslashes doubled, which is read the same way whatever
+// the setting is; a string without one is emitted exactly as before,
+// because the prefix is noise in the ninety-nine per cent case and
+// every generated migration would otherwise change shape.
 func quoteLiteral(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	if !strings.Contains(s, `\`) {
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+	esc := strings.ReplaceAll(s, `\`, `\\`)
+	return "E'" + strings.ReplaceAll(esc, "'", "''") + "'"
 }

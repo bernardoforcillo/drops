@@ -459,25 +459,6 @@ func TestAliasSlicesDoNotShareSpareCapacity(t *testing.T) {
 	}
 }
 
-// The relation rebind still has to leave the far side of a
-// self-referential edge alone — collapsing the two ends is exactly
-// what the alias exists to prevent.
-func TestAliasSelfReferentialRelationRebindsOneEnd(t *testing.T) {
-	tbl := mysql.NewTable("staff")
-	id := mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
-	mgr := mysql.Add(tbl, mysql.BigInt("managerId"))
-	mysql.NewRelations(tbl).BelongsTo("manager", tbl, mgr, id)
-
-	e := tbl.As("e")
-	rel := e.Rel("manager")
-	if got, _ := sqlOf(rel.ChildKey); got != "`e`.`managerId`" {
-		t.Errorf("near side = %s, want the alias", got)
-	}
-	if got, _ := sqlOf(rel.ParentKey); got != "`staff`.`id`" {
-		t.Errorf("far side = %s, want the declared table", got)
-	}
-}
-
 // ----------------------------------------------------------------------
 // ON DUPLICATE KEY UPDATE — the assignment list the inventory missed.
 // ----------------------------------------------------------------------

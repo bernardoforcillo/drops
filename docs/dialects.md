@@ -10,7 +10,7 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Entity CRUD | ✅ | ✅ | ✅ | ✅ | n/a |
 | Drift check | ✅ | ✅ | ✅ | ✅ | n/a |
 | Composite keys | ✅ | ✅ | ✅ | n/a | n/a |
-| Relations, eager loading | ✅ | partial | declaration only | — | — |
+| Relations, eager loading | ✅ | partial | — | — | — |
 | Keyset pagination | ✅ | ✅ | — | ✅ (via mirror) | ✅ (via vector) |
 | Migrations, diff, snapshot | ✅ | ✅ | — | ✅ | — |
 | Outbox, saga, event store | ✅ | ✅ | — | event store | — |
@@ -90,7 +90,11 @@ dependent object, rebuild, and re-create it.
 ## MySQL / MariaDB
 
 The schema and query surface, plus entity CRUD with the drift check
-and composite keys. None of the cross-cutting packages yet.
+and composite keys. None of the cross-cutting packages yet, and no
+relations: `mysql` has no eager loader, so the declaration API that
+used to be here compiled, ran, and loaded nothing. It is gone rather
+than deprecated — an API that silently does nothing is worse than one
+that is not there, because nothing tells the caller. Write the join.
 
 Three differences shape the API rather than the SQL:
 

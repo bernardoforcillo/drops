@@ -374,3 +374,67 @@ func TestQueryCacheKeySeparatesTenantsOfDifferentTypes(t *testing.T) {
 		t.Errorf("statements for two differently typed tenant values: got = %v, want %v", got, want)
 	}
 }
+
+// TestScopedWriteInvalidatesStalePKEntry is the other half of the
+// invariant TestPKCacheHoldsNoScopedRow states. Refusing to *write* the
+// PK entry keeps a scoped row out of a namespace that cannot hold the
+// scope; it does nothing about an entry that is already there, and
+// something always is eventually — left by a build from before the
+// table was scoped, or by a sibling entity over the same table that is
+// not (invalidatePK's doc comment names both).
+//
+// Left alone, that entry is never written and never invalidated by the
+// scoped entity, so it survives every subsequent write to the row and
+// answers with pre-scope values for as long as the backend keeps it:
+// stale for ever, for whoever still reads that namespace. Gates belong
+// on the paths that put rows in, never on the path that takes them out,
+// so a scoped write takes the entry out.
+func TestScopedWriteInvalidatesStalePKEntry(t *testing.T) {
+	// The entry an unscoped writer left behind. Its contents never
+	// matter — nothing decodes it before it is deleted — only that the
+	// key is occupied.
+	const stalePKKey = "drops:users:pk:7"
+
+	tests := []struct {
+		name string
+		op   func(*pg.DB, context.Context, *pg.Entity[scopedUser]) error
+	}{
+		{"create", func(db *pg.DB, ctx context.Context, e *pg.Entity[scopedUser]) error {
+			r := scopedUser{TenantID: 1, Name: "Alice"}
+			return e.Create(db, ctx, &r)
+		}},
+		{"update", func(db *pg.DB, ctx context.Context, e *pg.Entity[scopedUser]) error {
+			r := scopedUser{ID: 7, TenantID: 1, Name: "Alice"}
+			return e.Update(db, ctx, &r)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cc := newCountingCache(t)
+			ent := scopedUsersSchema().WithCache(cc, time.Minute)
+			db := pg.New(scopedDriver())
+			ctx := pg.WithTenant(context.Background(), int64(1))
+
+			if err := cc.Set(ctx, stalePKKey, []byte("row cached before the table was scoped"), time.Minute); err != nil {
+				t.Fatalf("seeding the stale entry: %v", err)
+			}
+			setsBeforeOp := atomic.LoadInt64(&cc.sets)
+			if err := tt.op(db, ctx, ent); err != nil {
+				t.Fatalf("%s: %v", tt.name, err)
+			}
+
+			exists, err := cc.Exists(ctx, stalePKKey)
+			if err != nil {
+				t.Fatalf("Exists(%q): %v", stalePKKey, err)
+			}
+			if got, want := exists, false; got != want {
+				t.Errorf("stale PK entry still present after a scoped %s: got = %v, want %v", tt.name, got, want)
+			}
+			// The gate on the write half still holds: invalidating is
+			// not an excuse to start filling the namespace again.
+			if got, want := atomic.LoadInt64(&cc.sets)-setsBeforeOp, int64(0); got != want {
+				t.Errorf("cache writes by %s on a scoped entity: got = %v, want %v", tt.name, got, want)
+			}
+		})
+	}
+}

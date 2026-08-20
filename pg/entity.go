@@ -116,18 +116,6 @@ type Entity[T any] struct {
 	rowType reflect.Type
 }
 
-// rowScopeKey names the context filter this entity registers on its
-// table for kind ("tenant" or "guard").
-//
-// The row type is in the key so that two entities sharing one table
-// each keep their own filter — the conservative outcome, since both
-// predicates then apply — while the same entity declared twice, or
-// rebuilt inside a request handler, replaces its own rather than
-// stacking a copy per call.
-func (e *Entity[T]) rowScopeKey(kind string) string {
-	return kind + ":" + e.rowType.String()
-}
-
 // hasRowScope reports whether anything restricts which rows an
 // operation on this entity may touch: a tenant axis or an
 // authorisation guard declared through the entity, or any context
@@ -152,7 +140,9 @@ func (e *Entity[T]) rowScopeKey(kind string) string {
 // running or ErrTenantMissing ever firing. Gating only the read leaves
 // the namespace poisoned by every write and puts the leak one refactor
 // away; so the read in Get and the writes in insertRow and Update are
-// all gated on this one predicate.
+// all gated on this one predicate. The writes ask through refreshPK,
+// which also deletes the entry the gate refuses to overwrite — an entry
+// a scoped write leaves in place is an entry nothing will ever correct.
 func (e *Entity[T]) hasRowScope() bool {
 	return e.tenantCol != nil || e.guard != nil || e.table.hasContextFilters()
 }
@@ -920,14 +910,13 @@ func (e *Entity[T]) insertRow(db *DB, ctx context.Context, r *T, bindings []Colu
 	if err != nil {
 		return err
 	}
-	if e.cache != nil && !e.hasRowScope() {
-		// Populate the PK cache with the freshly-inserted row so the
-		// next Get hits immediately. A scoped entity writes nothing:
-		// the key carries the primary key and no scope at all, so the
-		// entry would be served to every other tenant and subject that
-		// asks for this id. See hasRowScope for the invariant.
-		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
-	}
+	// Populate the PK cache with the freshly-inserted row so the next
+	// Get hits immediately. A scoped entity writes nothing and clears
+	// the key instead: it carries the primary key and no scope at all,
+	// so the entry would be served to every other tenant and subject
+	// that asks for this id. See hasRowScope for the invariant and
+	// refreshPK for why the clearing is not optional.
+	e.refreshPK(ctx, e.pkValuesOf(r), *r)
 	return nil
 }
 
@@ -1006,10 +995,12 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = doUpdate(db)
 	}
-	if err == nil && e.cache != nil && !e.hasRowScope() {
-		// Same gate as insertRow: a scoped row must not enter a
-		// namespace keyed by the primary key alone. See hasRowScope.
-		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
+	if err == nil {
+		// Same rule as insertRow: a scoped row must not enter a
+		// namespace keyed by the primary key alone, and an entry a
+		// scoped write leaves in place is an entry nothing will ever
+		// correct. See hasRowScope and refreshPK.
+		e.refreshPK(ctx, e.pkValuesOf(r), *r)
 	}
 	return err
 }

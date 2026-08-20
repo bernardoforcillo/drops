@@ -196,6 +196,34 @@ func (c *EntityCache) writeKey(ctx context.Context, key string, v any) error {
 	return c.backend.Set(ctx, key, b, c.ttl)
 }
 
+// refreshPK reconciles the PK namespace with a row this entity has
+// just written. An unscoped entity stores the row, so the next Get by
+// that id hits; a scoped entity deletes whatever is under the key.
+//
+// The deletion is the half that is easy to leave out, and leaving it
+// out is what "the PK cache never holds a scoped row" degrades into
+// when only the write is gated. Refusing to write keeps this entity
+// from *adding* a scoped row to a namespace with no room for the
+// scope. It says nothing about an entry that is already there, and one
+// eventually is: left by a build from before the table was scoped, or
+// by a sibling entity over the same table that is not scoped — the two
+// cases invalidatePK is written for. That entry is never refreshed by
+// the writes it should have followed and never removed either, so it
+// answers with pre-scope values for as long as the backend keeps it.
+// A row that is wrong for ever is a worse outcome than the one the
+// gate was added to prevent, and both are avoided by the same rule:
+// gate what goes in, never what comes out.
+func (e *Entity[T]) refreshPK(ctx context.Context, values []any, row T) {
+	if e.cache == nil {
+		return
+	}
+	if e.hasRowScope() {
+		e.invalidatePK(ctx, values)
+		return
+	}
+	_ = e.cache.writeKey(ctx, e.pkKey(values), row)
+}
+
 // invalidatePK deletes the PK entry for id. Safe to call when no
 // cache is attached (no-op).
 //

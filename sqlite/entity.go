@@ -44,6 +44,42 @@ type entityColField struct {
 	field []int
 }
 
+// hasRowScope reports whether anything restricts which rows an
+// operation on this entity may touch: a tenant axis or an
+// authorisation guard declared through the entity.
+//
+// The invariant the answer guards is the strong one: the PK cache never
+// *holds* a scoped row, not merely "a scoped Get does not read it".
+// That key is the primary key and nothing else — it has no room for the
+// tenant or the subject — so a scoped row sitting in that namespace is
+// a row waiting to be handed to the next caller who asks for that id,
+// whoever they are, without a statement ever being sent and therefore
+// without the tenant predicate ever running or ErrTenantMissing ever
+// firing. Gating only the read leaves the namespace poisoned by every
+// write and puts the leak one refactor away; so the read in Get and the
+// writes in Create and Update are all gated on this one predicate. The
+// writes ask through refreshPK, which also deletes the entry the gate
+// refuses to overwrite — an entry a scoped write leaves in place is an
+// entry nothing will ever correct.
+//
+// It is a question about the entity's configuration, deliberately, and
+// not about what the predicates resolve to on the ctx at hand. Get used
+// to ask the latter — "did the tenant and the guard produce a predicate
+// this time" — and a guard that returns no predicate for the current
+// subject, which is the ordinary spelling of "this subject is
+// unrestricted", answered no and put a guarded entity back on the
+// cached path.
+//
+// What is missing from the list, and is the difference from drops/pg:
+// this dialect has no table-level context filter, so an axis declared
+// on the Table rather than through the Entity is not a shape that
+// exists here. When sqlite gains one, it belongs in this predicate —
+// pg's equivalent asks e.table.hasContextFilters() as its third term
+// precisely because a table can be scoped with no Entity involved.
+func (e *Entity[T]) hasRowScope() bool {
+	return e.tenantCol != nil || e.guard != nil
+}
+
 // NewEntity builds the entity, panicking on misconfiguration (schemas
 // are declared at startup, so bad config should fail loudly there).
 func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
@@ -234,8 +270,15 @@ func (e *Entity[T]) selectCols() []drops.Expression {
 
 // Get fetches the row whose primary key equals id, returning ErrNoRows
 // if absent. Applies the tenant scope and the authorization guard when
-// configured, and reads through the cache when one is attached and no
-// scope/guard narrows the query.
+// configured.
+//
+// When a cache is attached via WithCache, Get serves hits from the
+// cache and dedupes concurrent cache misses via single-flight so a
+// thundering herd resolves to one DB query. An entity whose rows are
+// scoped — by a tenant axis or a guard — skips that path entirely: the
+// cache is keyed by primary key alone, so answering from it would hand
+// one caller a row another caller cached, without a statement ever
+// being sent. See hasRowScope.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	var out T
 	pred, err := e.pkPredicate(key)
@@ -250,7 +293,7 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	if err != nil {
 		return out, err
 	}
-	if e.cache != nil && tenantPred == nil && guardPred == nil {
+	if e.cache != nil && !e.hasRowScope() {
 		return e.getCached(db, ctx, key, pred)
 	}
 	sel := db.Select(e.selectCols()...).From(e.table).Where(pred)
@@ -291,7 +334,8 @@ func (e *Entity[T]) getCached(db *DB, ctx context.Context, pkValues []any, pred 
 }
 
 // Create inserts r. Stamps the tenant (when scoped), writes an audit row
-// in the same transaction (when audited), and populates the cache.
+// in the same transaction (when audited), and populates the PK cache —
+// or, for a scoped entity, clears it. See hasRowScope.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if err := e.stampTenant(ctx, r); err != nil {
 		return err
@@ -315,8 +359,15 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = do(db)
 	}
-	if err == nil && e.cache != nil {
-		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
+	if err == nil {
+		// Populate the PK cache with the freshly-inserted row so the
+		// next Get hits immediately. A scoped entity writes nothing and
+		// clears the key instead: it carries the primary key and no
+		// scope at all, so the entry would be served to every other
+		// tenant and subject that asks for this id. See hasRowScope for
+		// the invariant and refreshPK for why the clearing is not
+		// optional.
+		e.refreshPK(ctx, e.pkValuesOf(r), *r)
 	}
 	return err
 }
@@ -453,7 +504,8 @@ func rowsMatchColumns(rows [][]ColumnValue, cols []*Column) bool {
 
 // Update writes every non-PK column of r, matched by primary key. Applies
 // the tenant scope and authorization guard, records an audit row in the
-// same transaction (when audited), and refreshes the cache.
+// same transaction (when audited), and refreshes the PK cache — or, for
+// a scoped entity, clears it. See hasRowScope.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	rv := reflect.ValueOf(r).Elem()
 	tenantPred, err := e.tenantPredicate(ctx)
@@ -488,8 +540,12 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = do(db)
 	}
-	if err == nil && e.cache != nil {
-		_ = e.cache.writeKey(ctx, e.pkKey(pkVals), *r)
+	if err == nil {
+		// Same rule as Create: a scoped row must not enter a namespace
+		// keyed by the primary key alone, and an entry a scoped write
+		// leaves in place is an entry nothing will ever correct. See
+		// hasRowScope and refreshPK.
+		e.refreshPK(ctx, pkVals, *r)
 	}
 	return err
 }

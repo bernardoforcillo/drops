@@ -129,16 +129,19 @@ func (j *JSONPath[T]) WriteSQL(b *drops.Builder) { j.writeExpr(b) }
 // Operators
 // ----------------------------------------------------------------------
 
+// cmp builds "(<path> <op> $n)".
+//
+// The accessor is held as an operand rather than closed over — the
+// JSONPath is itself an Expression — for the reason opExpr gives, even
+// though neither side of the comparison can carry a statement here: the
+// leaf is a T, a value the accessor's cast is generated from, and it is
+// bound as a parameter. Holding it costs nothing and leaves no closure
+// for a later helper to be copied out of.
 func (j *JSONPath[T]) cmp(op string, v T) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		j.writeExpr(b)
-		b.WriteByte(' ')
-		b.WriteString(op)
-		b.WriteByte(' ')
-		b.AddArg(v)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " " + op + " ", ")"},
+		operands: []drops.Expression{j, drops.Param{Value: v}},
+	}
 }
 
 func (j *JSONPath[T]) Eq(v T) drops.Expression  { return j.cmp("=", v) }
@@ -150,49 +153,38 @@ func (j *JSONPath[T]) Lte(v T) drops.Expression { return j.cmp("<=", v) }
 
 // In tests whether the path's value is one of values.
 func (j *JSONPath[T]) In(values ...T) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		j.writeExpr(b)
-		b.WriteString(" IN (")
-		for i, v := range values {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.AddArg(v)
+	var o opBuilder
+	o.text("(")
+	o.operand(j)
+	o.text(" IN (")
+	for i, v := range values {
+		if i > 0 {
+			o.text(", ")
 		}
-		b.WriteString("))")
-	})
+		o.operand(drops.Param{Value: v})
+	}
+	o.text("))")
+	return o.done()
 }
 
 // IsNull renders "(path) IS NULL". Useful to filter rows where the
 // key is absent from the json structure entirely.
 func (j *JSONPath[T]) IsNull() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		j.writeExpr(b)
-		b.WriteString(" IS NULL)")
-	})
+	return &opExpr{parts: []string{"(", " IS NULL)"}, operands: []drops.Expression{j}}
 }
 
 // IsNotNull renders "(path) IS NOT NULL".
 func (j *JSONPath[T]) IsNotNull() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		j.writeExpr(b)
-		b.WriteString(" IS NOT NULL)")
-	})
+	return &opExpr{parts: []string{"(", " IS NOT NULL)"}, operands: []drops.Expression{j}}
 }
 
 // Like applies the SQL LIKE operator. Only meaningful when T is a
 // string; the call compiles for any T but won't be useful elsewhere.
 func (j *JSONPath[T]) Like(pattern string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		j.writeExpr(b)
-		b.WriteString(" LIKE ")
-		b.AddArg(pattern)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " LIKE ", ")"},
+		operands: []drops.Expression{j, drops.Param{Value: pattern}},
+	}
 }
 
 // ----------------------------------------------------------------------
@@ -202,6 +194,11 @@ func (j *JSONPath[T]) Like(pattern string) drops.Expression {
 // JSONContains renders "col @> $1" — the jsonb containment
 // operator. Accepts anything that drivers can serialise as jsonb
 // (json.RawMessage, []byte, or a marshaled struct value).
+//
+// A drops.Expression given as the value is rendered as SQL and held as
+// an operand rather than bound, so a statement there is scoped as one —
+// which is also the only way it could have worked, a builder handed to
+// a driver as an argument being nothing the driver can encode.
 func JSONContains(col ColRef, value any) drops.Expression {
 	if reflect.TypeOf(value) == nil {
 		// nil would render as NULL and the operator returns NULL,
@@ -210,46 +207,34 @@ func JSONContains(col ColRef, value any) drops.Expression {
 		// silently emitting AND NULL.
 		return drops.Raw("/* drops/pg: JSONContains called with nil value */ FALSE")
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		col.col().WriteSQL(b)
-		b.WriteString(" @> ")
-		b.AddArg(value)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " @> ", ")"},
+		operands: []drops.Expression{col.col(), operandExpr(value)},
+	}
 }
 
 // JSONHasKey renders "col ? $1" — the jsonb key-existence operator.
 func JSONHasKey(col ColRef, key string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		col.col().WriteSQL(b)
-		b.WriteString(" ? ")
-		b.AddArg(key)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " ? ", ")"},
+		operands: []drops.Expression{col.col(), drops.Param{Value: key}},
+	}
 }
 
 // JSONHasAnyKey renders "col ?| $1" — true when any of keys is
 // present at the jsonb top level.
 func JSONHasAnyKey(col ColRef, keys []string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		col.col().WriteSQL(b)
-		b.WriteString(" ?| ")
-		b.AddArg(keys)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " ?| ", ")"},
+		operands: []drops.Expression{col.col(), drops.Param{Value: keys}},
+	}
 }
 
 // JSONHasAllKeys renders "col ?& $1" — true only when every key in
 // keys is present at the top level.
 func JSONHasAllKeys(col ColRef, keys []string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		col.col().WriteSQL(b)
-		b.WriteString(" ?& ")
-		b.AddArg(keys)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " ?& ", ")"},
+		operands: []drops.Expression{col.col(), drops.Param{Value: keys}},
+	}
 }

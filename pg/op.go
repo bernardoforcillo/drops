@@ -117,10 +117,10 @@ func listOp(open, sep, close string, operands []drops.Expression) *opExpr {
 }
 
 // operandExpr adapts a value accepted as `any` to an Expression, so a
-// helper that takes either can still keep it in a field. It is
-// writeOperand's decision made once, at construction, instead of at
-// every render — which is what lets the operand stay reachable to the
-// resolver walk instead of living inside a closure.
+// helper that takes either can still keep it in a field. It takes the
+// is-this-an-Expression-or-a-value decision once, at construction,
+// instead of at every render — which is what lets the operand stay
+// reachable to the resolver walk instead of living inside a closure.
 func operandExpr(v any) drops.Expression {
 	if e, ok := v.(drops.Expression); ok {
 		return e
@@ -139,30 +139,48 @@ func operandExprs(values []any) []drops.Expression {
 	return out
 }
 
-// writeOperand writes v as either an existing Expression or a bound
-// parameter, at render time.
+// opBuilder assembles the interleaved parts and operands of an opExpr
+// whose text is not a fixed template — an optional clause, a
+// per-argument type cast, a CASE with any number of branches.
 //
-// It is the older half of the bridge operandExpr now replaces, kept for
-// the helpers in this package that still build a drops.ExprFunc —
-// funcCall in strings.go and the ones in cast.go, datetime.go and
-// ddl.go. Every one of those is an operand position a caller can hand a
-// *SelectBuilder to, and every one of them therefore has the leak
-// described on opExpr: the statement is reachable only through a
-// closure, so the resolver walk stops at it and the body renders
-// without its context filters. Converting them is a matter of building
-// an opExpr — see funcExpr, which renders byte-identically to funcCall
-// and holds its arguments.
-func writeOperand(b *drops.Builder, v any) {
-	if e, ok := v.(drops.Expression); ok {
-		e.WriteSQL(b)
-		return
-	}
-	b.AddArg(v)
+// It exists so those shapes can hold their operands as cheaply as the
+// fixed ones do. Without it the obvious way to write "substring(<e> FROM
+// <from> [FOR <count>])" is a drops.ExprFunc that decides the text while
+// rendering, and that closure is exactly what hides a statement from the
+// resolver walk — see opExpr for what the hidden statement then does.
+type opBuilder struct {
+	parts    []string
+	operands []drops.Expression
+	pending  string // literal text written since the last operand
+}
+
+// text appends literal SQL after the operands added so far.
+func (o *opBuilder) text(s string) { o.pending += s }
+
+// operand appends an operand, closing the literal text that precedes it.
+func (o *opBuilder) operand(e drops.Expression) {
+	o.parts = append(o.parts, o.pending)
+	o.pending = ""
+	o.operands = append(o.operands, e)
+}
+
+// value appends an operand given as `any`: an Expression is held as
+// itself, anything else becomes a bound parameter. It is operandExpr's
+// decision, taken here at construction instead of at render time.
+func (o *opBuilder) value(v any) { o.operand(operandExpr(v)) }
+
+// done closes the trailing text and returns the node. The invariant
+// opExpr documents — one part per operand plus a trailing one — holds by
+// construction, since every operand appended exactly one part.
+func (o *opBuilder) done() *opExpr {
+	return &opExpr{parts: append(o.parts, o.pending), operands: o.operands}
 }
 
 // funcExpr renders "<name>(<args>)" with its arguments held rather than
-// closed over. It is funcCall's resolvable twin: identical output, so a
-// helper can move across without changing one byte of rendered SQL.
+// closed over. Nearly every helper in funcs.go, strings.go, math.go,
+// json.go, datetime.go and window.go is one call to it, so the operand
+// position a caller hands a scalar subquery to is walkable in all of
+// them at once.
 func funcExpr(name string, args []any) drops.Expression {
 	return listOp(name+"(", ", ", ")", operandExprs(args))
 }

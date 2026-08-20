@@ -40,11 +40,10 @@ func All(value, array any) drops.Expression {
 
 // Aggregate / constructor / inspection functions ----------------------
 //
-// These render through funcExpr rather than funcCall: identical text,
-// but the arguments are held in a node the resolver walk can reach, so
-// array_agg((SELECT ...)) over a scoped table carries that table's
-// context filters. funcCall — pg/strings.go — still closes over its
-// arguments and every helper built on it has the leak opExpr describes.
+// These render through funcExpr: the arguments are held in a node the
+// resolver walk can reach, so array_agg((SELECT ...)) over a scoped
+// table carries that table's context filters. Every "<name>(<args>)"
+// helper in the package is built from it now — see op.go.
 
 func ArrayAgg(e any) drops.Expression           { return funcExpr("array_agg", []any{e}) }
 func ArrayLength(arr, dim any) drops.Expression { return funcExpr("array_length", []any{arr, dim}) }

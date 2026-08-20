@@ -287,14 +287,16 @@ func CurrVal(name string) drops.Expression {
 }
 
 // SetVal returns setval('"name"', value).
+//
+// Unlike the rest of this file the value is an operand a caller can
+// hand a statement to — setval(seq, (SELECT max(id) FROM t)) is the
+// idiom for re-seeding a sequence after a bulk load — so it is held
+// rather than closed over and a statement in it is scoped as one.
 func SetVal(name string, value any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(`setval(`)
-		b.WriteString(sequenceLiteral(name))
-		b.WriteString(`, `)
-		writeOperand(b, value)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"setval(" + sequenceLiteral(name) + ", ", ")"},
+		operands: []drops.Expression{operandExpr(value)},
+	}
 }
 
 // sequenceLiteral renders a sequence name as the string literal the
@@ -312,24 +314,57 @@ func sequenceLiteral(name string) string {
 
 // --- Views ------------------------------------------------------------
 
-// CreateView returns CREATE VIEW "name" AS <select>.
-func CreateView(name string, query drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CREATE VIEW ")
-		b.WriteIdent(name)
-		b.WriteString(" AS ")
-		b.Append(query)
-	})
+// ddlBody is a DDL statement wrapped around a query the caller wrote:
+// CREATE VIEW, CREATE OR REPLACE VIEW, CREATE MATERIALIZED VIEW.
+//
+// It holds the body in a field rather than closing over it, like every
+// other operand in this package — but unlike them it deliberately does
+// NOT implement subqueryResolver, so the resolver walk does not scope
+// the body for the executing ctx. That is the one place in drops where
+// leaving a statement unresolved is the correct answer, and the reason
+// is that a view outlives the request that created it:
+//
+//   - resolving would write the creating request's tenant predicate
+//     into a persistent object, and every other tenant that then read
+//     through the view would read that tenant's rows;
+//   - views are created in migrations, where ctx carries no tenant at
+//     all, so resolving would refuse the statement outright in the one
+//     place it is actually issued.
+//
+// A view over a scoped table therefore stays the caller's to scope,
+// exactly as a CTE body built from raw fragments does — write the
+// predicate into the body, or make the view a per-tenant one with
+// current_setting. The constructors say so; ExecExpr renders these with
+// drops.String and no ctx, which is what makes the choice visible
+// rather than silent.
+type ddlBody struct {
+	prefix string
+	name   string
+	body   drops.Expression
+	suffix string
 }
 
-// CreateOrReplaceView returns CREATE OR REPLACE VIEW ...
+func (d *ddlBody) WriteSQL(b *drops.Builder) {
+	b.WriteString(d.prefix)
+	b.WriteIdent(d.name)
+	b.WriteString(" AS ")
+	b.Append(d.body)
+	b.WriteString(d.suffix)
+}
+
+// CreateView returns CREATE VIEW "name" AS <select>.
+//
+// The body is not scoped for the executing ctx and stays the caller's
+// to scope — see ddlBody for why a view is the one statement drops
+// leaves alone.
+func CreateView(name string, query drops.Expression) drops.Expression {
+	return &ddlBody{prefix: "CREATE VIEW ", name: name, body: query}
+}
+
+// CreateOrReplaceView returns CREATE OR REPLACE VIEW ... Its body is
+// treated exactly as [CreateView]'s is.
 func CreateOrReplaceView(name string, query drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CREATE OR REPLACE VIEW ")
-		b.WriteIdent(name)
-		b.WriteString(" AS ")
-		b.Append(query)
-	})
+	return &ddlBody{prefix: "CREATE OR REPLACE VIEW ", name: name, body: query}
 }
 
 // DropView returns DROP VIEW "name".
@@ -350,18 +385,16 @@ func DropViewIfExists(name string) drops.Expression {
 
 // CreateMaterializedView returns CREATE MATERIALIZED VIEW. withData=false
 // emits WITH NO DATA so the view is empty until first refreshed.
+//
+// Its body is treated exactly as [CreateView]'s is — more so, if
+// anything: a materialized view holds rows, so a body resolved for one
+// request would store that tenant's data for every reader.
 func CreateMaterializedView(name string, query drops.Expression, withData bool) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CREATE MATERIALIZED VIEW ")
-		b.WriteIdent(name)
-		b.WriteString(" AS ")
-		b.Append(query)
-		if withData {
-			b.WriteString(" WITH DATA")
-		} else {
-			b.WriteString(" WITH NO DATA")
-		}
-	})
+	suffix := " WITH NO DATA"
+	if withData {
+		suffix = " WITH DATA"
+	}
+	return &ddlBody{prefix: "CREATE MATERIALIZED VIEW ", name: name, body: query, suffix: suffix}
 }
 
 // DropMaterializedView returns DROP MATERIALIZED VIEW "name".

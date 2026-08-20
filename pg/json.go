@@ -42,12 +42,12 @@ func JSONBDelete(e, key any) drops.Expression { return binOp(e, "-", key) }
 
 // Function helpers ----------------------------------------------------
 
-func ToJSON(e any) drops.Expression           { return funcCall("to_json", []any{e}) }
-func ToJSONB(e any) drops.Expression          { return funcCall("to_jsonb", []any{e}) }
-func JSONArrayLength(e any) drops.Expression  { return funcCall("json_array_length", []any{e}) }
-func JSONBArrayLength(e any) drops.Expression { return funcCall("jsonb_array_length", []any{e}) }
-func JSONTypeof(e any) drops.Expression       { return funcCall("json_typeof", []any{e}) }
-func JSONBTypeof(e any) drops.Expression      { return funcCall("jsonb_typeof", []any{e}) }
+func ToJSON(e any) drops.Expression           { return funcExpr("to_json", []any{e}) }
+func ToJSONB(e any) drops.Expression          { return funcExpr("to_jsonb", []any{e}) }
+func JSONArrayLength(e any) drops.Expression  { return funcExpr("json_array_length", []any{e}) }
+func JSONBArrayLength(e any) drops.Expression { return funcExpr("jsonb_array_length", []any{e}) }
+func JSONTypeof(e any) drops.Expression       { return funcExpr("json_typeof", []any{e}) }
+func JSONBTypeof(e any) drops.Expression      { return funcExpr("jsonb_typeof", []any{e}) }
 
 // JSONBuildObject renders json_build_object(args...). Pairs are key/value:
 // JSONBuildObject("name", UserName, "age", UserAge).
@@ -74,7 +74,7 @@ func JSONBSet(target, path, value any, createMissing ...bool) drops.Expression {
 	if len(createMissing) > 0 {
 		args = append(args, createMissing[0])
 	}
-	return funcCall("jsonb_set", args)
+	return funcExpr("jsonb_set", args)
 }
 
 // JSONBInsert renders jsonb_insert(<target>, <path>, <newVal>, [<insertAfter>]).
@@ -83,19 +83,19 @@ func JSONBInsert(target, path, newVal any, insertAfter ...bool) drops.Expression
 	if len(insertAfter) > 0 {
 		args = append(args, insertAfter[0])
 	}
-	return funcCall("jsonb_insert", args)
+	return funcExpr("jsonb_insert", args)
 }
 
 // JSONBStripNulls renders jsonb_strip_nulls(<e>).
-func JSONBStripNulls(e any) drops.Expression { return funcCall("jsonb_strip_nulls", []any{e}) }
+func JSONBStripNulls(e any) drops.Expression { return funcExpr("jsonb_strip_nulls", []any{e}) }
 
 // JSONBPretty renders jsonb_pretty(<e>).
-func JSONBPretty(e any) drops.Expression { return funcCall("jsonb_pretty", []any{e}) }
+func JSONBPretty(e any) drops.Expression { return funcExpr("jsonb_pretty", []any{e}) }
 
 // JSONAgg / JSONBAgg are aggregates.
-func JSONAgg(e any) drops.Expression  { return funcCall("json_agg", []any{e}) }
-func JSONBAgg(e any) drops.Expression { return funcCall("jsonb_agg", []any{e}) }
+func JSONAgg(e any) drops.Expression  { return funcExpr("json_agg", []any{e}) }
+func JSONBAgg(e any) drops.Expression { return funcExpr("jsonb_agg", []any{e}) }
 
 // JSONObjectAgg / JSONBObjectAgg.
-func JSONObjectAgg(k, v any) drops.Expression  { return funcCall("json_object_agg", []any{k, v}) }
-func JSONBObjectAgg(k, v any) drops.Expression { return funcCall("jsonb_object_agg", []any{k, v}) }
+func JSONObjectAgg(k, v any) drops.Expression  { return funcExpr("json_object_agg", []any{k, v}) }
+func JSONBObjectAgg(k, v any) drops.Expression { return funcExpr("jsonb_object_agg", []any{k, v}) }

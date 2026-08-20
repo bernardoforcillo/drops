@@ -4,24 +4,25 @@ import "github.com/bernardoforcillo/drops"
 
 // Cast renders <e>::<type> — the PostgreSQL shorthand for explicit type
 // conversion. Equivalent to CAST(<e> AS <type>).
+//
+// e is held rather than closed over, so Cast(Subquery(sel), "bigint")
+// is scoped like the statement it is; typeSQL is raw SQL naming a type,
+// which no statement can appear in.
 func Cast(e any, typeSQL string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, e)
-		b.WriteString(")::")
-		b.WriteString(typeSQL)
-	})
+	return &opExpr{
+		parts:    []string{"(", ")::" + typeSQL},
+		operands: []drops.Expression{operandExpr(e)},
+	}
 }
 
-// CastAs renders CAST(<e> AS <type>) — the standard-SQL form.
+// CastAs renders CAST(<e> AS <type>) — the standard-SQL form. Its
+// operand is held exactly as [Cast]'s is, so the two spellings do not
+// disagree about the tenant axis.
 func CastAs(e any, typeSQL string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CAST(")
-		writeOperand(b, e)
-		b.WriteString(" AS ")
-		b.WriteString(typeSQL)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"CAST(", " AS " + typeSQL + ")"},
+		operands: []drops.Expression{operandExpr(e)},
+	}
 }
 
 // Case begins a CASE expression. Chain When / Else / End to finish.
@@ -68,23 +69,33 @@ func (c *CaseExpr) When(cond, value any) *CaseExpr {
 func (c *CaseExpr) Else(value any) *CaseExpr { c.elseValue = value; c.hasElse = true; return c }
 
 // End finalises the CASE expression.
+//
+// Every branch is an operand and every operand is held, so the subject,
+// a WHEN condition, a THEN result and the ELSE may each be a statement
+// and each is scoped as one. CASE WHEN EXISTS (SELECT ... FROM posts)
+// THEN ... used to render that subquery through WriteSQL, which has no
+// ctx, and so read every tenant's posts to decide this tenant's column.
+//
+// The branches are laid out here rather than while rendering — see
+// opBuilder — because a CASE has a variable number of them and deciding
+// the text at render time is what puts the operands inside a closure.
 func (c *CaseExpr) End() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CASE")
-		if c.hasValue {
-			b.WriteByte(' ')
-			writeOperand(b, c.value)
-		}
-		for _, w := range c.whens {
-			b.WriteString(" WHEN ")
-			writeOperand(b, w.cond)
-			b.WriteString(" THEN ")
-			writeOperand(b, w.value)
-		}
-		if c.hasElse {
-			b.WriteString(" ELSE ")
-			writeOperand(b, c.elseValue)
-		}
-		b.WriteString(" END")
-	})
+	var o opBuilder
+	o.text("CASE")
+	if c.hasValue {
+		o.text(" ")
+		o.value(c.value)
+	}
+	for _, w := range c.whens {
+		o.text(" WHEN ")
+		o.value(w.cond)
+		o.text(" THEN ")
+		o.value(w.value)
+	}
+	if c.hasElse {
+		o.text(" ELSE ")
+		o.value(c.elseValue)
+	}
+	o.text(" END")
+	return o.done()
 }

@@ -6,7 +6,7 @@ import "github.com/bernardoforcillo/drops"
 // that can be used in a SELECT list, GROUP BY, ORDER BY or WHERE clause.
 
 // Count renders count(<e>).
-func Count(e drops.Expression) drops.Expression { return funcCall("count", []any{e}) }
+func Count(e drops.Expression) drops.Expression { return funcExpr("count", []any{e}) }
 
 // CountDistinct renders count(DISTINCT <e>).
 func CountDistinct(e drops.Expression) drops.Expression { return distinctAgg("count", e) }
@@ -23,38 +23,41 @@ func AvgDistinct(e drops.Expression) drops.Expression { return distinctAgg("avg"
 // Filter wraps an aggregate with a FILTER (WHERE ...) clause:
 //
 //	pg.Filter(pg.Count(UserID), pg.Eq(UserStatus, "active"))
+//
+// Both operands are held rather than closed over, so either may be a
+// statement and is scoped as one: count(*) FILTER (WHERE EXISTS (SELECT
+// ... FROM posts)) carries posts' context filters, where it used to
+// render the subquery through WriteSQL and read every tenant's rows.
 func Filter(agg, pred drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(agg)
-		b.WriteString(" FILTER (WHERE ")
-		b.Append(pred)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"", " FILTER (WHERE ", ")"},
+		operands: []drops.Expression{agg, pred},
+	}
 }
 
 // StringAgg renders string_agg(<e>, <sep>).
-func StringAgg(e, sep any) drops.Expression { return funcCall("string_agg", []any{e, sep}) }
+func StringAgg(e, sep any) drops.Expression { return funcExpr("string_agg", []any{e, sep}) }
 
 // BoolAnd / BoolOr aggregates.
-func BoolAnd(e any) drops.Expression { return funcCall("bool_and", []any{e}) }
-func BoolOr(e any) drops.Expression  { return funcCall("bool_or", []any{e}) }
+func BoolAnd(e any) drops.Expression { return funcExpr("bool_and", []any{e}) }
+func BoolOr(e any) drops.Expression  { return funcExpr("bool_or", []any{e}) }
 
 // Every is the standard-SQL alias for bool_and.
-func Every(e any) drops.Expression { return funcCall("every", []any{e}) }
+func Every(e any) drops.Expression { return funcExpr("every", []any{e}) }
 
 // Sum / Avg / Min / Max aggregates.
-func Sum(e drops.Expression) drops.Expression { return funcCall("sum", []any{e}) }
-func Avg(e drops.Expression) drops.Expression { return funcCall("avg", []any{e}) }
-func Min(e drops.Expression) drops.Expression { return funcCall("min", []any{e}) }
-func Max(e drops.Expression) drops.Expression { return funcCall("max", []any{e}) }
+func Sum(e drops.Expression) drops.Expression { return funcExpr("sum", []any{e}) }
+func Avg(e drops.Expression) drops.Expression { return funcExpr("avg", []any{e}) }
+func Min(e drops.Expression) drops.Expression { return funcExpr("min", []any{e}) }
+func Max(e drops.Expression) drops.Expression { return funcExpr("max", []any{e}) }
 
 // Lower / Upper case-folding helpers.
-func Lower(e drops.Expression) drops.Expression { return funcCall("lower", []any{e}) }
-func Upper(e drops.Expression) drops.Expression { return funcCall("upper", []any{e}) }
+func Lower(e drops.Expression) drops.Expression { return funcExpr("lower", []any{e}) }
+func Upper(e drops.Expression) drops.Expression { return funcExpr("upper", []any{e}) }
 
 // Coalesce renders coalesce(<args...>). Arguments may be Expressions or
 // Go values (bound as parameters).
-func Coalesce(args ...any) drops.Expression { return funcCall("coalesce", args) }
+func Coalesce(args ...any) drops.Expression { return funcExpr("coalesce", args) }
 
 // Now renders now().
 func Now() drops.Expression {
@@ -63,23 +66,23 @@ func Now() drops.Expression {
 
 // Func renders an arbitrary function call <name>(<args...>). Use it as
 // an escape hatch when a built-in helper isn't provided.
-func Func(name string, args ...any) drops.Expression { return funcCall(name, args) }
+func Func(name string, args ...any) drops.Expression { return funcExpr(name, args) }
 
 // As renames an arbitrary expression: "<expr> AS <alias>".
+//
+// The expression is held rather than closed over, so As(Subquery(sel),
+// "n") is scoped like the statement it is.
+//
+// An empty alias renders no AS clause at all, which is what
+// [SelectBuilder.AsSubquery] has always done with one: the alternative
+// is `AS ""`, a zero-length delimited identifier PostgreSQL rejects
+// with a syntax error.
 func As(e drops.Expression, alias string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(e)
-		b.WriteString(" AS ")
-		b.WriteIdent(alias)
-	})
+	return &opExpr{parts: []string{"", ""}, operands: []drops.Expression{e}, alias: alias}
 }
 
 // distinctAgg renders <name>(DISTINCT <e>) — used by Count/Sum/AvgDistinct.
+// The operand is held for the reason funcExpr's is.
 func distinctAgg(name string, e drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(name)
-		b.WriteString("(DISTINCT ")
-		b.Append(e)
-		b.WriteByte(')')
-	})
+	return &opExpr{parts: []string{name + "(DISTINCT ", ")"}, operands: []drops.Expression{e}}
 }

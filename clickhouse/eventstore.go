@@ -266,11 +266,13 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 // expectedVersion of -1 reads as a conflict, and the store can never
 // lay down its first event.
 //
-// Naming the -OrNull form outright gets the standard answer without
-// depending on a server setting — and it is stable if that setting is
-// on, because the rewrite skips any function whose name already ends
-// in OrNull. TestCHEventStoreFreshStreamStartsAtMinusOne in the
-// integration suite asserts both halves against a real server.
+// Naming the -OrNull form outright asks for that behaviour directly
+// rather than depending on a server setting nobody here controls,
+// which is the whole point: the setting is what a session or a
+// profile can turn on, the function name is not.
+// TestCHEventStoreFreshStreamStartsAtMinusOne in the integration
+// suite asserts the premise and the consequence separately against a
+// real server.
 func (s *EventStore) LatestVersion(ctx context.Context, aggregateType, aggregateID string) (int64, error) {
 	sql := fmt.Sprintf(`SELECT coalesce(maxOrNull("version"), -1) FROM %s WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
@@ -369,7 +371,9 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 // LoadSnapshot fetches the latest snapshot for an aggregate. The query
 // uses FINAL so it reflects the deduplicated (latest-version) row even
 // before CH background merges have run. Returns ok=false when no
-// snapshot exists — fall back to replaying from version 0.
+// snapshot exists — replay the whole stream instead, which is Load
+// with fromVersion -1. With a snapshot the resume point is
+// snap.Version, since Load is exclusive on it.
 func (s *EventStore) LoadSnapshot(ctx context.Context, table, aggregateType, aggregateID string) (AggregateSnapshot, bool, error) {
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "state", "createdAt"

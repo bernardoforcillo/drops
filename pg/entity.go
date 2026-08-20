@@ -384,9 +384,15 @@ func (e *Entity[T]) pkIsZero(r *T) bool {
 }
 
 // isKeyColumn reports whether c is part of the primary key.
+//
+// Compared by Column.key, not by handle: the entity's pks can come
+// from Table.PrimaryKey(cols...) while colFields come from Columns(),
+// and on an aliased table those are two handles on one column. Missing
+// the overlap puts the key columns into the SET list of every UPDATE
+// and stops Create from letting the database fill a defaulted key.
 func (e *Entity[T]) isKeyColumn(c *Column) bool {
 	for _, k := range e.pks {
-		if k == c {
+		if k.key() == c.key() {
 			return true
 		}
 	}
@@ -729,7 +735,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 			if e.isKeyColumn(cf.col) {
 				continue
 			}
-			if cf.col == e.versionCol {
+			if e.versionCol != nil && cf.col.key() == e.versionCol.key() {
 				continue
 			}
 			val := v.FieldByIndex(cf.field).Interface()

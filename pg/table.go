@@ -108,8 +108,17 @@ func (t *Table) Rel(name string) *Relation {
 			declared = append(declared, n)
 		}
 		sort.Strings(declared)
-		panic(fmt.Sprintf("drops/pg: table %q has no relation %q; declared: %s",
-			t.name, name, strings.Join(declared, ", ")))
+		// An alias carries the relations its table had at the moment
+		// As was called, so one declared afterwards reaches the base
+		// handle and not this one. Naming the alias is what separates
+		// that from "the relation was never declared at all" — the two
+		// look identical from the list.
+		subject := fmt.Sprintf("table %q", t.name)
+		if t.alias != "" {
+			subject = fmt.Sprintf("alias %q of table %q", t.alias, t.name)
+		}
+		panic(fmt.Sprintf("drops/pg: %s has no relation %q; declared: %s",
+			subject, name, strings.Join(declared, ", ")))
 	}
 	return r
 }
@@ -123,10 +132,141 @@ func (t *Table) Schema() string { return t.schema }
 // Alias returns the alias set via As, or "" if none.
 func (t *Table) Alias() string { return t.alias }
 
-// As returns a shallow copy of the table bound to alias.
+// As returns a copy of the table under an alias, for self-joins.
+//
+// The copy carries its own columns, bound to the aliased table, so a
+// reference reached through it — u := Users.As("u"); u.Col("id") —
+// qualifies with the alias while the original package-level handles go
+// on qualifying with the table name. That is what makes both sides of
+// a self-join addressable at once.
+//
+// An aliased handle still *means* the column it was copied from. The
+// INSERT column list, a hook's Has, an Entity's key columns, the
+// tenant axis and a cursor's ordering column all identify a column
+// through Column.key, which collapses the copy back onto the declared
+// column; where such a handle is also rendered — the tenant guard, a
+// page's ORDER BY and cursor guard — it is restated as the handle the
+// entity's own table hands out, so the reference qualifies with the
+// relation the statement names. Aliasing changes how a reference
+// renders and nothing else.
+//
+// What is not rewritten is anything the caller built and drops only
+// re-emits: a predicate, and a Patch operation. Both are closed over
+// the handles they were given. A default filter registered by
+// SoftDeleteMixin, or an authz guard built from the package-level
+// columns, still qualifies with the table name — so against a query
+// whose only FROM entry is the alias PostgreSQL raises 42P01, and in a
+// self-join the guard binds to whichever side is un-aliased rather
+// than to the one you meant. Scope an aliased query with Unscoped and
+// an explicit predicate built from the alias's own handles, and build
+// a Patch for an aliased entity from the alias's handles too.
+//
+// Indexes are shared with the base table for the same reason — an
+// index's column list may hold arbitrary expressions — so Index.Table
+// on an alias's index answers with the un-aliased table. Nothing
+// renders an index through an alias, since CREATE INDEX takes no AS
+// clause.
+//
+// The copy is a snapshot. A column, relation or constraint added to
+// the base table after As returned does not reach the alias, which
+// matters because Go initialises package-level variables before it
+// runs init: an alias declared as a var beside its table is taken
+// before any init that declares relations. Take the alias at the query
+// site, or after the schema is complete.
 func (t *Table) As(alias string) *Table {
+	mustIdent("alias", alias)
 	cp := *t
 	cp.alias = alias
+	cp.columns = make([]*Column, len(t.columns))
+	cp.byName = make(map[string]*Column, len(t.byName))
+	for i, c := range t.columns {
+		aliased := *c
+		aliased.table = &cp
+		// The origin chains to the declared column rather than to c,
+		// so aliasing an alias does not make a stranger of the root.
+		aliased.origin = c.key()
+		cp.columns[i] = &aliased
+		cp.byName[aliased.name] = &aliased
+	}
+	// rebind maps a column declared on t to the aliased copy's handle
+	// for it, and leaves any column belonging to another table alone.
+	rebind := func(c *Column) *Column {
+		if c != nil && c.table == t {
+			if aliased := cp.byName[c.name]; aliased != nil {
+				return aliased
+			}
+		}
+		return c
+	}
+	rebindAll := func(cols []*Column) []*Column {
+		if cols == nil {
+			return nil
+		}
+		out := make([]*Column, len(cols))
+		for i, c := range cols {
+			out[i] = rebind(c)
+		}
+		return out
+	}
+	// Every map on the copy has to be its own, or a relation, check,
+	// unique or policy declared against the alias writes through into
+	// the table it was aliased from.
+	cp.relations = make(map[string]*Relation, len(t.relations))
+	for name, rel := range t.relations {
+		r := *rel
+		r.From = &cp
+		// Only the near side — the end of the edge that belongs to
+		// this table — moves to the alias. On a self-referential
+		// relation both ends name this table and rebinding both would
+		// erase the distinction the alias exists to draw.
+		switch r.Kind {
+		case BelongsToKind, MorphToKind:
+			// The inverse edges hold their own key in ChildKey;
+			// ParentKey (and, for MorphTo, nothing else) names the far
+			// table.
+			r.ChildKey = rebind(r.ChildKey)
+			if r.Kind == MorphToKind {
+				r.MorphTypeCol = rebind(r.MorphTypeCol)
+			}
+		default:
+			r.ParentKey = rebind(r.ParentKey)
+		}
+		cp.relations[name] = &r
+	}
+	cp.compositePK = rebindAll(t.compositePK)
+	if t.compositeUniques != nil {
+		cp.compositeUniques = make(map[string][]*Column, len(t.compositeUniques))
+		for name, cols := range t.compositeUniques {
+			cp.compositeUniques[name] = rebindAll(cols)
+		}
+	}
+	if t.checks != nil {
+		cp.checks = make(map[string]string, len(t.checks))
+		for name, expr := range t.checks {
+			cp.checks[name] = expr
+		}
+	}
+	if t.policies != nil {
+		cp.policies = make(map[string]*Policy, len(t.policies))
+		for name, p := range t.policies {
+			cp.policies[name] = p
+		}
+	}
+	cp.compositeFKs = make([]*CompositeFK, len(t.compositeFKs))
+	for i, fk := range t.compositeFKs {
+		f := *fk
+		f.Columns = rebindAll(fk.Columns)
+		cp.compositeFKs[i] = &f
+	}
+	// The remaining slices are shared by value but not by array: a
+	// copy taken at full capacity would let an append through the
+	// alias land in the base table's spare capacity, and the next
+	// append through the base overwrite it.
+	cp.indexes = append([]*Index(nil), t.indexes...)
+	cp.insertHooks = append([]InsertHook(nil), t.insertHooks...)
+	cp.updateHooks = append([]UpdateHook(nil), t.updateHooks...)
+	cp.deleteHooks = append([]DeleteHook(nil), t.deleteHooks...)
+	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
 	return &cp
 }
 

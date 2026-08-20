@@ -95,7 +95,7 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
 	ctx := &UpdateHookCtx{bound: make(map[*Column]bool, len(u.sets))}
 	for _, s := range u.sets {
-		ctx.bound[s.column()] = true
+		ctx.bound[s.column().key()] = true
 	}
 	for _, h := range u.table.updateHooks {
 		h.BeforeUpdate(ctx)

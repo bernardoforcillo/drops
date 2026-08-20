@@ -33,8 +33,8 @@ import (
 //	})
 //	if errors.Is(err, pg.ErrConcurrencyConflict) { ... }
 //
-//	// Replay
-//	events, _ := store.Load(ctx, "match", "abc-123", 0)
+//	// Replay from the beginning. -1, not 0 — see Load.
+//	events, _ := store.Load(ctx, "match", "abc-123", -1)
 //	state := MatchState{}
 //	for _, ev := range events {
 //	    state.Apply(ev)
@@ -203,7 +203,17 @@ func isUniqueViolation(err error) bool {
 }
 
 // Load returns events for an aggregate in version order, starting
-// after fromVersion. Pass 0 to read from the beginning.
+// strictly after fromVersion — hand it the version of the last event
+// you already applied and it resumes with the next one.
+//
+// Pass -1, not 0, to read a stream from the beginning. Versions start
+// at 0, so 0 is the first event's own version and asking for what
+// comes after it skips it. -1 is the sentinel the rest of the store
+// already means by "no event yet": it is what LatestVersion answers
+// for an empty stream and what Append wants as expectedVersion for a
+// fresh one. One number with one meaning — the version you hold — so
+// Load(LatestVersion(...)) is empty, and feeding the last returned
+// Version straight back in resumes without re-delivering it.
 func (s *EventStore) Load(ctx context.Context, aggregateType, aggregateID string, fromVersion int64) ([]Event, error) {
 	sql := fmt.Sprintf(`
 		SELECT "id", "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
@@ -340,8 +350,10 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 }
 
 // LoadSnapshot fetches the latest snapshot for an aggregate.
-// Returns ok=false when no snapshot exists; callers should fall
-// back to replaying from version 0.
+// Returns ok=false when no snapshot exists; callers should fall back
+// to replaying the whole stream, which is Load with fromVersion -1.
+// With a snapshot in hand the resume point is snap.Version, since
+// Load is exclusive on it.
 func (s *EventStore) LoadSnapshot(ctx context.Context, table, aggregateType, aggregateID string) (AggregateSnapshot, bool, error) {
 	sql := fmt.Sprintf(`SELECT "aggregateType", "aggregateID", "version", "state", "createdAt" FROM %s WHERE "aggregateType" = $1 AND "aggregateID" = $2`, quoteIdent(table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)

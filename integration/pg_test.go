@@ -3,8 +3,10 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -1091,4 +1093,581 @@ func TestPGPushFailsWhenTheProbeCannotTakeItsLock(t *testing.T) {
 	if !strings.Contains(err.Error(), "55P03") {
 		t.Errorf("the lock timeout was not reported as one: %v", err)
 	}
+}
+
+// Load's fromVersion is exclusive, and the number it takes is the same
+// number Append's expectedVersion and LatestVersion speak: the version
+// you already hold, -1 when you hold none. The doc used to say 0 read
+// from the beginning, and 0 is the first event's own version, so every
+// caller who believed it lost event 0 of every stream — silently, since
+// what came back was still an ordered run of real events, just missing
+// the one that created the aggregate.
+//
+// Three events on a fresh stream leave no room for that: each starting
+// value has exactly one right answer and the test names all of them.
+// The predicate is the server's to evaluate, not the renderer's, so
+// this belongs here.
+func TestPGEventStoreLoadIsExclusiveOnFromVersion(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+
+	name := integration.UniqueName(t, "ev")
+	tbl := pg.NewEventStoreTable(name)
+	dropPG(t, db, tbl)
+	execPG(t, db, pg.CreateTable(tbl))
+
+	store := pg.NewEventStore(db, name)
+	if err := db.InTx(ctx, func(tx *pg.DB) error {
+		return store.Append(tx, ctx, "cart", "cart-1", -1,
+			pg.EventInput{Type: "a"},
+			pg.EventInput{Type: "b"},
+			pg.EventInput{Type: "c"})
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	for _, tc := range []struct {
+		from int64
+		want string
+	}{
+		{-1, "a,b,c"},
+		{0, "b,c"},
+		{1, "c"},
+		{2, ""},
+	} {
+		got, err := store.Load(ctx, "cart", "cart-1", tc.from)
+		if err != nil {
+			t.Fatalf("Load(%d): %v", tc.from, err)
+		}
+		var types []string
+		for _, ev := range got {
+			types = append(types, ev.Type)
+		}
+		if list := strings.Join(types, ","); list != tc.want {
+			t.Errorf("Load(%d) = [%s], want [%s]", tc.from, list, tc.want)
+		}
+		// The first row returned has to be the version after
+		// fromVersion, or "exclusive" means something else.
+		if len(got) > 0 && got[0].Version != tc.from+1 {
+			t.Errorf("Load(%d) starts at version %d, want %d", tc.from, got[0].Version, tc.from+1)
+		}
+	}
+
+	// The two ends of the convention: LatestVersion is a resume cursor
+	// that leaves nothing to apply, and it is also the expected version
+	// the next Append wants.
+	head, err := store.LatestVersion(ctx, "cart", "cart-1")
+	if err != nil {
+		t.Fatalf("LatestVersion: %v", err)
+	}
+	if head != 2 {
+		t.Fatalf("LatestVersion after three events = %d, want 2", head)
+	}
+	if rest, err := store.Load(ctx, "cart", "cart-1", head); err != nil || len(rest) != 0 {
+		t.Errorf("Load(LatestVersion) = %+v (err %v), want nothing left to apply", rest, err)
+	}
+	if err := db.InTx(ctx, func(tx *pg.DB) error {
+		return store.Append(tx, ctx, "cart", "cart-1", head, pg.EventInput{Type: "d"})
+	}); err != nil {
+		t.Errorf("Append at LatestVersion: %v", err)
+	}
+	if tail, err := store.Load(ctx, "cart", "cart-1", head); err != nil || len(tail) != 1 || tail[0].Type != "d" {
+		t.Errorf("Load(%d) after appending = %+v (err %v), want only d", head, tail, err)
+	}
+}
+
+// ----------------------------------------------------------------------
+// Table.As — the alias renames a reference and changes nothing else.
+// ----------------------------------------------------------------------
+
+// aliasCol re-wraps a type-erased column as a typed handle. Table.Col
+// answers with *pg.Column, and every value binding lives on *pg.Col[T],
+// so this is the seam a caller goes through to bind a value to a
+// column reached off an alias.
+func aliasCol[T any](c *pg.Column) *pg.Col[T] { return &pg.Col[T]{Column: c} }
+
+// Both sides of a self-join have to be addressable at once. If the
+// alias hands back the un-aliased column handles, the join condition
+// compares the table with itself and PostgreSQL answers with every
+// row's own manager — or with 42P01 when the FROM entry is the alias
+// alone.
+func TestPGSelfJoinResolvesThroughTheAlias(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "staff"))
+	dropPG(t, db, tbl)
+
+	id := pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	managerID := pg.Add(tbl, pg.BigInt("managerId"))
+	execPG(t, db, pg.CreateTable(tbl))
+
+	for _, r := range []struct {
+		id      int64
+		name    string
+		manager int64
+	}{{1, "Ada", 0}, {2, "Grace", 1}, {3, "Alan", 1}} {
+		row := []pg.ColumnValue{id.Val(r.id), name.Val(r.name)}
+		if r.manager != 0 {
+			row = append(row, managerID.Val(r.manager))
+		}
+		if _, err := db.Insert(tbl).Row(row...).Exec(ctx); err != nil {
+			t.Fatalf("seed %s: %v", r.name, err)
+		}
+	}
+
+	mgr := tbl.As("mgr")
+	var rows []struct {
+		Staff   string `drop:"staff"`
+		Manager string `drop:"manager"`
+	}
+	err := db.Select(name.As("staff"), mgr.Col("name").As("manager")).
+		From(tbl).
+		Join(mgr, pg.Eq(managerID, mgr.Col("id"))).
+		OrderBy(name.Asc()).
+		All(ctx, &rows)
+	if err != nil {
+		t.Fatalf("self-join: %v", err)
+	}
+	want := map[string]string{"Alan": "Ada", "Grace": "Ada"}
+	if len(rows) != len(want) {
+		t.Fatalf("self-join returned %d rows, want %d: %+v", len(rows), len(want), rows)
+	}
+	for _, r := range rows {
+		if want[r.Staff] != r.Manager {
+			t.Errorf("%s reports to %q, want %q", r.Staff, r.Manager, want[r.Staff])
+		}
+	}
+}
+
+// The regression the ClickHouse dialect shipped: a value bound through
+// an aliased handle matched no column in the INSERT's list, so the row
+// rendered as all-DEFAULT. PostgreSQL accepts such a statement — on a
+// nullable column with no DEFAULT clause the row lands as NULLs and
+// nothing anywhere says so. The check has to be the stored data.
+func TestPGRowBoundThroughAnAliasStoresItsValues(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_bind"))
+	dropPG(t, db, tbl)
+
+	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	name := pg.Add(tbl, pg.Text("name"))
+	org := pg.Add(tbl, pg.Text("org"))
+	execPG(t, db, pg.CreateTable(tbl))
+
+	u := tbl.As("u")
+	// The first row fixes the column list from the declared handles;
+	// the second binds the same columns through the alias.
+	if _, err := db.Insert(tbl).
+		Row(name.Val("declared"), org.Val("first")).
+		Row(aliasCol[string](u.Col("name")).Val("aliased"),
+			aliasCol[string](u.Col("org")).Val("second")).
+		Exec(ctx); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	var got []struct {
+		Name string `drop:"name"`
+		Org  string `drop:"org"`
+	}
+	if err := db.Select(name, org).From(tbl).OrderBy(id.Asc()).All(ctx, &got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("stored %d rows, want 2: %+v", len(got), got)
+	}
+	if got[1].Name != "aliased" || got[1].Org != "second" {
+		t.Errorf("the aliased row stored %+v, want {aliased second}", got[1])
+	}
+}
+
+// A hook closes over the handle it was declared with — every shipped
+// mixin closes over the package-level one. When the caller binds the
+// same column through an alias the hook has to see it as already
+// bound: PostgreSQL rejects a column named twice in an INSERT with
+// 42701 and a column assigned twice in an UPDATE with 42601, so this
+// one is loud, but it inverts the documented rule that user-supplied
+// values win.
+func TestPGAliasedBindingDoesNotDuplicateAHookColumn(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_hook"))
+	dropPG(t, db, tbl)
+
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	stamps := &pg.TimestampsMixin{}
+	pg.ApplyMixins(tbl, stamps)
+	execPG(t, db, pg.CreateTable(tbl))
+
+	u := tbl.As("u")
+	fixed := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	// The mixin's UPDATE hook wants to bump updatedAt; the caller sets
+	// it explicitly through the alias.
+	if _, err := db.Insert(tbl).Row(name.Val("a")).Exec(ctx); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Update(tbl).
+		Set(name.Val("b")).
+		Set(aliasCol[time.Time](u.Col("updatedAt")).Val(fixed)).
+		Exec(ctx); err != nil {
+		t.Fatalf("update with an aliased updatedAt binding: %v", err)
+	}
+
+	var back []struct {
+		Name      string    `drop:"name"`
+		UpdatedAt time.Time `drop:"updatedAt"`
+	}
+	if err := db.Select(name, stamps.Cols.UpdatedAt).From(tbl).All(ctx, &back); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if len(back) != 1 {
+		t.Fatalf("expected one row, got %d", len(back))
+	}
+	if !back[0].UpdatedAt.Equal(fixed) {
+		t.Errorf("hook overrode the caller's value: updatedAt = %v, want %v",
+			back[0].UpdatedAt, fixed)
+	}
+}
+
+// The key columns and the column definitions come from two different
+// places on the Table, and an alias is what first makes them two
+// different handles. A CREATE TABLE that loses its PRIMARY KEY is
+// accepted by the server and only shows up later, as duplicate rows.
+func TestPGAliasedTableKeepsItsPrimaryKey(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_ddl"))
+	dropPG(t, db, tbl)
+
+	id := pg.Add(tbl, pg.BigInt("id").NotNull())
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	tbl.PrimaryKey(id)
+
+	// The DDL is rendered from the alias; the statement itself names
+	// the un-aliased table, since PostgreSQL takes no AS clause here.
+	execPG(t, db, pg.CreateTable(tbl.As("u")))
+
+	if _, err := db.Insert(tbl).Row(id.Val(1), name.Val("first")).Exec(ctx); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	_, err := db.Insert(tbl).Row(id.Val(1), name.Val("again")).Exec(ctx)
+	if err == nil {
+		t.Fatal("the aliased CREATE TABLE lost its PRIMARY KEY: a duplicate key was accepted")
+	}
+	if !strings.Contains(err.Error(), "23505") {
+		t.Errorf("expected a unique violation (23505), got: %v", err)
+	}
+}
+
+type aliasEmployee struct {
+	TenantID int64  `drop:"tenantId"`
+	ID       int64  `drop:"id"`
+	Name     string `drop:"name"`
+}
+
+// An Entity built on an alias has to keep its key: the key columns are
+// omitted from the SET list, and the predicate qualifies with the
+// alias — the only relation an "UPDATE t AS u" puts in scope.
+func TestPGEntityOnAnAliasRoundTrips(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_entity"))
+	dropPG(t, db, tbl)
+
+	tenantID := pg.Add(tbl, pg.BigInt("tenantId").NotNull())
+	id := pg.Add(tbl, pg.BigInt("id").NotNull())
+	pg.Add(tbl, pg.Text("name").NotNull())
+	tbl.PrimaryKey(tenantID, id)
+	execPG(t, db, pg.CreateTable(tbl))
+
+	ent := pg.NewEntity[aliasEmployee](tbl.As("u"))
+	row := aliasEmployee{TenantID: 7, ID: 1, Name: "Ada"}
+	if err := ent.Create(db, ctx, &row); err != nil {
+		t.Fatalf("Create through the alias: %v", err)
+	}
+	row.Name = "Ada L."
+	if err := ent.Update(db, ctx, &row); err != nil {
+		t.Fatalf("Update through the alias: %v", err)
+	}
+	got, err := ent.Get(db, ctx, int64(7), int64(1))
+	if err != nil {
+		t.Fatalf("Get through the alias: %v", err)
+	}
+	if got.Name != "Ada L." {
+		t.Errorf("Get returned %+v, want the updated name", got)
+	}
+}
+
+// The tenant axis can be named with an alias handle, since
+// ScopeByTenant takes a ColRef. It used to panic at declaration time;
+// the guard it installs still has to qualify with the relation the
+// entity actually queries.
+func TestPGScopeByTenantThroughAnAliasHandle(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_tenant"))
+	dropPG(t, db, tbl)
+
+	tenantID := pg.Add(tbl, pg.BigInt("tenantId").NotNull())
+	id := pg.Add(tbl, pg.BigInt("id").NotNull())
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	tbl.PrimaryKey(tenantID, id)
+	execPG(t, db, pg.CreateTable(tbl))
+
+	if _, err := db.Insert(tbl).
+		Row(tenantID.Val(int64(7)), id.Val(int64(1)), name.Val("mine")).
+		Row(tenantID.Val(int64(8)), id.Val(int64(1)), name.Val("theirs")).
+		Exec(ctx); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ent := pg.NewEntity[aliasEmployee](tbl).
+		ScopeByTenant(tbl.As("u").Col("tenantId"))
+
+	got, err := ent.Get(db, pg.WithTenant(ctx, int64(7)), int64(7), int64(1))
+	if err != nil {
+		t.Fatalf("Get under tenant 7: %v", err)
+	}
+	if got.Name != "mine" {
+		t.Errorf("Get returned %+v, want the tenant-7 row", got)
+	}
+	if _, err := ent.Get(db, pg.WithTenant(ctx, int64(9)), int64(7), int64(1)); err == nil {
+		t.Error("the tenant guard did not exclude another tenant's row")
+	}
+}
+
+// The limitation As's doc comment states, pinned against the server
+// that enforces it. A default filter is an already-built expression
+// closed over the handles it was given, so aliasing the table does not
+// move it: SoftDeleteMixin's guard goes on naming the un-aliased
+// table, and a SELECT whose only FROM entry is the alias cannot
+// resolve it. Rewriting the filter would mean rebuilding arbitrary
+// expressions, so the documented route out is Unscoped plus an
+// explicit predicate — which has to keep working, or the limitation
+// has no exit.
+func TestPGDefaultFilterIsNotRewrittenByAnAlias(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_softdel"))
+	dropPG(t, db, tbl)
+
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	pg.ApplyMixins(tbl, &pg.SoftDeleteMixin{})
+	execPG(t, db, pg.CreateTable(tbl))
+
+	if _, err := db.Insert(tbl).Row(name.Val("live")).Exec(ctx); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	u := tbl.As("u")
+	var rows []struct {
+		Name string `drop:"name"`
+	}
+	err := db.Select(u.Col("name")).From(u).All(ctx, &rows)
+	if err == nil {
+		t.Fatal("a scoped table aliased into a bare SELECT should not resolve its guard")
+	}
+	if !strings.Contains(err.Error(), "42P01") {
+		t.Errorf("expected 42P01 from the un-rewritten guard, got: %v", err)
+	}
+
+	// The documented way through: opt out of the guard and restate it
+	// from the alias's own handles.
+	rows = nil
+	if err := db.Select(u.Col("name")).
+		From(u).
+		Unscoped().
+		Where(pg.IsNull(u.Col("deletedAt"))).
+		All(ctx, &rows); err != nil {
+		t.Fatalf("Unscoped with an explicit predicate: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "live" {
+		t.Errorf("got %+v, want the one live row", rows)
+	}
+}
+
+type aliasBoss struct {
+	ID      int64         `drop:"id"`
+	Name    string        `drop:"name"`
+	Reports []aliasReport `dropRel:"reports"`
+}
+
+type aliasReport struct {
+	ID     int64  `drop:"id"`
+	Name   string `drop:"name"`
+	BossID int64  `drop:"bossId"`
+}
+
+// A relation's near side — the end that belongs to this table — moves
+// to the alias with the columns, so an eager load through the alias
+// joins on the instance the query actually names. The far side stays
+// put: it belongs to the other table, and on a self-referential
+// relation it is the un-aliased half of the edge.
+func TestPGEagerLoadThroughAnAlias(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_tree"))
+	dropPG(t, db, tbl)
+
+	id := pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	bossID := pg.Add(tbl, pg.BigInt("bossId"))
+	execPG(t, db, pg.CreateTable(tbl))
+	pg.NewRelations(tbl).HasMany("reports", tbl, id, bossID)
+
+	for _, r := range []struct {
+		id   int64
+		name string
+		boss int64
+	}{{1, "Ada", 0}, {2, "Grace", 1}, {3, "Alan", 1}} {
+		row := []pg.ColumnValue{id.Val(r.id), name.Val(r.name)}
+		if r.boss != 0 {
+			row = append(row, bossID.Val(r.boss))
+		}
+		if _, err := db.Insert(tbl).Row(row...).Exec(ctx); err != nil {
+			t.Fatalf("seed %s: %v", r.name, err)
+		}
+	}
+
+	// The alias is taken after the relation is declared — As is a
+	// snapshot, so an alias taken beside the table would not carry it.
+	u := tbl.As("u")
+	var bosses []aliasBoss
+	if err := db.Find(u).
+		Where(pg.IsNull(u.Col("bossId"))).
+		Load(u.Rel("reports")).
+		All(ctx, &bosses); err != nil {
+		t.Fatalf("eager load through the alias: %v", err)
+	}
+	if len(bosses) != 1 {
+		t.Fatalf("expected one root, got %d: %+v", len(bosses), bosses)
+	}
+	if len(bosses[0].Reports) != 2 {
+		t.Errorf("%q loaded %d reports, want 2", bosses[0].Name, len(bosses[0].Reports))
+	}
+}
+
+type aliasPaged struct {
+	ID   int64  `drop:"id"`
+	Name string `drop:"name"`
+}
+
+// An ordering column is rendered as well as matched — into the ORDER
+// BY and into the cursor guard's row comparison — so a handle from
+// another instance of the table names a relation the SELECT has no
+// FROM entry for. Nothing in Go objects; the server answers 42P01.
+// Both directions are reachable from ordinary code: an entity on the
+// base table paged by an alias handle, and an entity on an alias paged
+// by the package-level column that is in scope at the call site.
+func TestPGPageOrdersByTheRelationTheQueryNames(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_page"))
+	dropPG(t, db, tbl)
+
+	id := pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	execPG(t, db, pg.CreateTable(tbl))
+
+	for i := int64(1); i <= 4; i++ {
+		if _, err := db.Insert(tbl).
+			Row(id.Val(i), name.Val(fmt.Sprintf("n%d", i))).
+			Exec(ctx); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	u := tbl.As("u")
+
+	// Entity on the base table, paged by the alias's handle.
+	ent := pg.NewEntity[aliasPaged](tbl)
+	first, err := ent.Page(db).OrderBy(pg.Asc(u.Col("id"))).Limit(2).All(ctx)
+	if err != nil {
+		t.Fatalf("page ordered by an alias handle: %v", err)
+	}
+	if len(first.Items) != 2 || first.Items[0].ID != 1 {
+		t.Fatalf("first page is %+v", first.Items)
+	}
+	// The cursor guard renders the same handles, so the second page is
+	// where a mismatch would surface even if the first slipped through.
+	second, err := ent.Page(db).
+		OrderBy(pg.Asc(u.Col("id"))).
+		Limit(2).
+		After(first.NextCursor).
+		All(ctx)
+	if err != nil {
+		t.Fatalf("second page through the cursor guard: %v", err)
+	}
+	if len(second.Items) != 2 || second.Items[0].ID != 3 {
+		t.Errorf("second page is %+v, want ids 3 and 4", second.Items)
+	}
+
+	// Entity on the alias, paged by the declared handle.
+	entU := pg.NewEntity[aliasPaged](u)
+	page, err := entU.Page(db).OrderBy(pg.Desc(id)).Limit(2).All(ctx)
+	if err != nil {
+		t.Fatalf("aliased entity paged by the declared handle: %v", err)
+	}
+	if len(page.Items) != 2 || page.Items[0].ID != 4 {
+		t.Errorf("descending page is %+v, want ids 4 and 3", page.Items)
+	}
+}
+
+// The other half of the same rule, pinned so a change to it is a
+// deliberate one: a Patch operation is built by the caller and only
+// re-emitted by drops, so — like a predicate — it is not restated
+// against the relation the UPDATE names. Built from the alias's own
+// handles it works; built from the package-level column against an
+// aliased entity the server rejects it. Loud, unlike the bindings and
+// key sets that Column.key collapses, but the asymmetry is worth
+// stating.
+func TestPGPatchIsNotRewrittenByAnAlias(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "alias_patch"))
+	dropPG(t, db, tbl)
+
+	id := pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	pg.Add(tbl, pg.Text("name").NotNull())
+	hits := pg.Add(tbl, pg.Integer("hits").NotNull().Default("0"))
+	execPG(t, db, pg.CreateTable(tbl))
+
+	u := tbl.As("u")
+	ent := pg.NewEntity[aliasHit](u)
+	row := aliasHit{ID: 1, Name: "a", Hits: 1}
+	if err := ent.Create(db, ctx, &row); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The alias's own handle: the SET's right-hand side qualifies with
+	// the relation "UPDATE t AS u" puts in scope.
+	uHits := aliasCol[int32](u.Col("hits"))
+	if _, err := ent.Patch(db, ctx, int64(1), pg.Inc(uHits, 10)); err != nil {
+		t.Fatalf("Patch through the alias's handle: %v", err)
+	}
+	got, err := ent.Get(db, ctx, int64(1))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Hits != 11 {
+		t.Errorf("hits = %d, want 11", got.Hits)
+	}
+
+	// The declared handle names a relation the statement does not have.
+	if _, err := ent.Patch(db, ctx, int64(1), pg.Inc(hits, 100)); err == nil {
+		t.Error("a Patch built from the declared handle resolved against an aliased entity")
+	} else if !strings.Contains(err.Error(), "42P01") {
+		t.Errorf("expected 42P01, got: %v", err)
+	}
+	_ = id
+}
+
+type aliasHit struct {
+	ID   int64  `drop:"id"`
+	Name string `drop:"name"`
+	Hits int32  `drop:"hits"`
 }

@@ -561,9 +561,14 @@ func CommentOnColumn(c ColRef, text string) drops.Expression {
 // column render the same clause.
 func writeTableBody(b *drops.Builder, t *Table) {
 	keys := t.primaryKeyColumns()
+	// Keyed by Column.key, because the two sides can be two handles on
+	// one column: primaryKeyColumns answers from compositePK while the
+	// loop walks Columns(). On an aliased table those are different
+	// pointers, and a set that missed them would emit a CREATE TABLE
+	// with no PRIMARY KEY at all — which PostgreSQL accepts.
 	inKey := make(map[*Column]bool, len(keys))
 	for _, c := range keys {
-		inKey[c] = true
+		inKey[c.key()] = true
 	}
 	composite := len(keys) > 1
 
@@ -571,7 +576,8 @@ func writeTableBody(b *drops.Builder, t *Table) {
 		if i > 0 {
 			b.WriteString(",\n  ")
 		}
-		writeColumnDefKey(b, c, inKey[c] && !composite, inKey[c])
+		member := inKey[c.key()]
+		writeColumnDefKey(b, c, member && !composite, member)
 	}
 	if composite {
 		b.WriteString(",\n  PRIMARY KEY (")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -420,6 +421,87 @@ func TestCHEventStoreFreshStreamStartsAtMinusOne(t *testing.T) {
 	}
 	if len(tail) != 1 || tail[0].Type != "playerJoined" {
 		t.Fatalf("Load(0) = %+v, want only the event after version 0", tail)
+	}
+}
+
+// Load's fromVersion is exclusive, and the number it takes is the same
+// number Append's expectedVersion and LatestVersion speak: the version
+// you already hold, -1 when you hold none. Two of the three dialects
+// used to document 0 as "from the beginning", and 0 is the first
+// event's own version, so every caller who believed it lost event 0 of
+// every stream — silently, since what came back was still an ordered
+// run of real events, just missing the one that created the aggregate.
+//
+// Three events on a fresh stream leave no room for that: each starting
+// value has exactly one right answer and the test names all of them.
+// The predicate is the server's to evaluate, and the contract is the
+// same one pg and sqlite assert, so the three tests are deliberately
+// the same test.
+func TestCHEventStoreLoadIsExclusiveOnFromVersion(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+
+	name := integration.UniqueName(t, "ev")
+	tbl := clickhouse.NewEventStoreTable(name)
+	dropCH(t, db, tbl)
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	store := clickhouse.NewEventStore(db, name)
+	if err := store.Append(ctx, "cart", "cart-1", -1,
+		clickhouse.EventInput{Type: "a"},
+		clickhouse.EventInput{Type: "b"},
+		clickhouse.EventInput{Type: "c"},
+	); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	for _, tc := range []struct {
+		from int64
+		want string
+	}{
+		{-1, "a,b,c"},
+		{0, "b,c"},
+		{1, "c"},
+		{2, ""},
+	} {
+		got, err := store.Load(ctx, "cart", "cart-1", tc.from)
+		if err != nil {
+			t.Fatalf("Load(%d): %v", tc.from, err)
+		}
+		var types []string
+		for _, ev := range got {
+			types = append(types, ev.Type)
+		}
+		if list := strings.Join(types, ","); list != tc.want {
+			t.Errorf("Load(%d) = [%s], want [%s]", tc.from, list, tc.want)
+		}
+		// The first row returned has to be the version after
+		// fromVersion, or "exclusive" means something else.
+		if len(got) > 0 && got[0].Version != tc.from+1 {
+			t.Errorf("Load(%d) starts at version %d, want %d", tc.from, got[0].Version, tc.from+1)
+		}
+	}
+
+	// The two ends of the convention: LatestVersion is a resume cursor
+	// that leaves nothing to apply, and it is also the expected version
+	// the next Append wants — which on ClickHouse is load-bearing, since
+	// Append compares it itself rather than leaning on a constraint.
+	head, err := store.LatestVersion(ctx, "cart", "cart-1")
+	if err != nil {
+		t.Fatalf("LatestVersion: %v", err)
+	}
+	if head != 2 {
+		t.Fatalf("LatestVersion after three events = %d, want 2", head)
+	}
+	if rest, err := store.Load(ctx, "cart", "cart-1", head); err != nil || len(rest) != 0 {
+		t.Errorf("Load(LatestVersion) = %+v (err %v), want nothing left to apply", rest, err)
+	}
+	if err := store.Append(ctx, "cart", "cart-1", head,
+		clickhouse.EventInput{Type: "d"}); err != nil {
+		t.Errorf("Append at LatestVersion: %v", err)
+	}
+	if tail, err := store.Load(ctx, "cart", "cart-1", head); err != nil || len(tail) != 1 || tail[0].Type != "d" {
+		t.Errorf("Load(%d) after appending = %+v (err %v), want only d", head, tail, err)
 	}
 }
 

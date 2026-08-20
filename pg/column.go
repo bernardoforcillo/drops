@@ -29,6 +29,13 @@ type Column struct {
 	version    bool // marked via (*Col[T]).OptimisticLock()
 	pii        bool // marked via (*Col[T]).AsPII()
 	managed    bool // drops writes this column, not the application
+
+	// origin is the column this one was copied from by (*Table).As,
+	// and nil on a column as declared. An alias copy is a second
+	// handle on one column of one table, so everything that asks
+	// which column a handle *is* has to see the two as equal — see
+	// key.
+	origin *Column
 }
 
 // FK describes a foreign-key reference.
@@ -80,6 +87,30 @@ func (c *Column) IsOptimisticVersion() bool { return c.version }
 // col returns c. It is the implementation of ColRef for *Column itself;
 // *Col[T] inherits the method via embedding.
 func (c *Column) col() *Column { return c }
+
+// key returns the identity a column is recognised by, collapsing every
+// alias copy onto the column it was declared as.
+//
+// Aliasing is a query-scope rename: it changes how a reference renders
+// and nothing else. So a handle taken off an alias has to answer the
+// same as the declared handle everywhere the question is "which column
+// is this" — the INSERT column list, a hook's Has, an Entity's key
+// columns, the tenant axis, a cursor's ordering column, the CREATE
+// TABLE body's key set. Comparing the two by pointer instead makes
+// them strangers, and most of the resulting failures are silent:
+// the row loses its values to the DEFAULT fill in alignRow, the
+// CREATE TABLE loses its PRIMARY KEY, a snapshot records a key column
+// as nullable.
+//
+// The identity is the declared column rather than the name because two
+// tables can both have a "name" column and they are not the same
+// column.
+func (c *Column) key() *Column {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
+}
 
 // ColRef is implemented by *Column and *Col[T]. It is the type-erased
 // column reference used by APIs that don't depend on the column's Go

@@ -115,6 +115,58 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **`pg.Table.As` handed back the table's own columns, so a PostgreSQL
+  self-join could not be written.** The copy was one struct assignment
+  deep: the alias shared its column slice, its `byName` map and every
+  other map with the table it was aliased from, so `users.As("u").
+  Col("id")` was the package-level handle and still rendered
+  `"users"."id"`. A join whose `FROM` names only the alias was rejected
+  with 42P01; a self-join was accepted and read both sides from the
+  un-aliased instance. The shared maps leaked in the other direction
+  too — a relation, `CHECK`, `UNIQUE` or policy declared against the
+  alias was written into the base table.
+
+  `As` now copies the columns and binds them to the alias, and gives
+  the copy its own maps, with the near side of each relation and the
+  table-level key, unique and foreign-key column lists rebound. So that
+  the copy stays *the same column* everywhere identity is what is being
+  asked, a column carries the one it was copied from (`Column.origin`)
+  and every consumer that matched on the handle now matches on that:
+  the INSERT column list and row alignment, both hook contexts' `Has` /
+  `Set` / `SetExpr`, `Entity`'s key columns, `ScopeByTenant`, `Page`'s
+  ordering columns and cursor, the `CREATE TABLE` body and
+  `BuildSnapshot`. Left unmatched, each of those failed in its own way
+  and most of them quietly: a row bound through an alias rendered as
+  all-`DEFAULT` and stored `NULL`s, a `CREATE TABLE` came out with no
+  `PRIMARY KEY` and the server took it, a snapshot recorded the key
+  column as nullable and fed that to `Diff` and `Push`. `As` also
+  validates its argument now, like every other identifier entry point
+  in the package.
+
+  Two things `As` deliberately does not do, both now in its doc
+  comment. Nothing the caller built and drops only re-emits is
+  rewritten — a predicate, and a `Patch` operation: a default filter
+  installed by `SoftDeleteMixin`, or an `authz` guard built from the
+  package-level columns, is an already-built expression closed over the
+  handles it was given, so an aliased query needs `Unscoped` and an
+  explicit predicate, and an aliased entity needs a `Patch` built from
+  the alias's handles. And the copy is a snapshot — a column or
+  relation declared after `As` returned does not reach the alias, which
+  matters because Go initialises package-level vars before it runs
+  `init`.
+- **`pg.Entity.Page` ordered by the handle it was handed, not by the
+  one the query names.** `Asc` / `Desc` are free functions, so an
+  ordering column arrives as whichever handle the caller held, and it
+  is rendered twice — into the `ORDER BY` and into the cursor guard's
+  row comparison. An entity on an alias paged by the package-level
+  column, or an entity on the base table paged by an alias handle,
+  emitted a statement naming a relation with no `FROM` entry, and
+  PostgreSQL answered 42P01. `Page` now restates each ordering column
+  as the handle its own table hands out, the way `ScopeByTenant`
+  already did with the tenant axis. An ordering column with no struct
+  field is also rejected before the query runs rather than at the first
+  page boundary: a cursor is built out of the row's field values, so
+  such a column could never produce one.
 - **`qdrant.HasID()` with an empty id set matched every point.** The
   field carries `omitempty`, so an empty set left a condition with no
   clauses in it, and Qdrant reads a condition that constrains nothing

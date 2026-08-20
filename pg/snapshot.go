@@ -205,9 +205,14 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 		// in both places is emitted twice, and one it puts in
 		// neither never reaches Diff at all.
 		keys := t.primaryKeyColumns()
+		// Keyed by Column.key: primaryKeyColumns can answer from
+		// compositePK while the column loop below walks Columns(), and
+		// on an aliased table those are two handles on one column. A
+		// snapshot that missed the overlap would record the key column
+		// as an ordinary nullable one and feed that to Diff and Push.
 		inKey := make(map[*Column]bool, len(keys))
 		for _, c := range keys {
-			inKey[c] = true
+			inKey[c.key()] = true
 		}
 		compositeKey := len(keys) > 1
 		if compositeKey {
@@ -267,13 +272,13 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			cs := &ColumnSnapshot{
 				Name:       c.Name(),
 				Type:       c.Type().TypeSQL(),
-				PrimaryKey: inKey[c] && !compositeKey,
+				PrimaryKey: inKey[c.key()] && !compositeKey,
 				// A key column is NOT NULL whether or not the schema
 				// said so — PostgreSQL sets attnotnull when the key is
 				// created and Introspect reads it back that way, so a
 				// snapshot that recorded it nullable would have every
 				// push emit a DROP NOT NULL the next push undoes.
-				NotNull: c.IsNotNull() || inKey[c],
+				NotNull: c.IsNotNull() || inKey[c.key()],
 			}
 			if c.HasDefault() {
 				d := c.DefaultSQL()
@@ -281,7 +286,7 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			}
 			ts.Columns[c.Name()] = cs
 
-			if c.IsUnique() && !inKey[c] {
+			if c.IsUnique() && !inKey[c.key()] {
 				name := uniqueName(t.Name(), []string{c.Name()})
 				ts.UniqueConstraints[name] = &UniqueSnapshot{
 					Name:             name,

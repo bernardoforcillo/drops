@@ -93,18 +93,22 @@ func TestEventStoreAgainstTheEngine(t *testing.T) {
 	exec(t, db, sqlite.CreateTable(evTable))
 	store := sqlite.NewEventStore(db, "events")
 
+	// version is the version this append writes; expectedVersion is
+	// the one before it, so a fresh stream's first event is version 0
+	// written at -1 — which is what a caller who asked LatestVersion
+	// would have in hand.
 	appendOne := func(version int64, kind string) error {
 		return store.Append(db, ctx, "cart", "cart-1", version-1,
 			sqlite.EventInput{Type: kind, Payload: []byte(`{"n":1}`)})
 	}
-	if err := appendOne(1, "added"); err != nil {
+	if err := appendOne(0, "added"); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
-	if err := appendOne(2, "removed"); err != nil {
+	if err := appendOne(1, "removed"); err != nil {
 		t.Fatalf("second append: %v", err)
 	}
 
-	got, err := store.Load(ctx, "cart", "cart-1", 0)
+	got, err := store.Load(ctx, "cart", "cart-1", -1)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -117,8 +121,82 @@ func TestEventStoreAgainstTheEngine(t *testing.T) {
 
 	// Appending at a version already taken must fail: that is the
 	// whole optimistic-concurrency contract.
-	if err := appendOne(2, "duplicate"); err == nil {
+	if err := appendOne(1, "duplicate"); err == nil {
 		t.Error("a stale expected-version was accepted; concurrent writers would interleave silently")
+	}
+}
+
+// Load's fromVersion is exclusive, and the number it takes is the same
+// number Append's expectedVersion and LatestVersion speak: the version
+// you already hold, -1 when you hold none. The doc used to say 0 read
+// from the beginning, and 0 is the first event's own version, so every
+// caller who believed it lost event 0 of every stream — silently, since
+// what came back was still an ordered run of real events, just missing
+// the one that created the aggregate.
+//
+// Three events on a fresh stream leave no room for that: each starting
+// value has exactly one right answer and the test names all of them.
+func TestEventStoreLoadIsExclusiveOnFromVersion(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	exec(t, db, sqlite.CreateTable(sqlite.NewEventStoreTable("events")))
+	store := sqlite.NewEventStore(db, "events")
+
+	if err := store.Append(db, ctx, "cart", "cart-1", -1,
+		sqlite.EventInput{Type: "a"},
+		sqlite.EventInput{Type: "b"},
+		sqlite.EventInput{Type: "c"},
+	); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	for _, tc := range []struct {
+		from int64
+		want string
+	}{
+		{-1, "a,b,c"},
+		{0, "b,c"},
+		{1, "c"},
+		{2, ""},
+	} {
+		got, err := store.Load(ctx, "cart", "cart-1", tc.from)
+		if err != nil {
+			t.Fatalf("Load(%d): %v", tc.from, err)
+		}
+		var types []string
+		for _, ev := range got {
+			types = append(types, ev.Type)
+		}
+		if list := strings.Join(types, ","); list != tc.want {
+			t.Errorf("Load(%d) = [%s], want [%s]", tc.from, list, tc.want)
+		}
+		// The version of the first row returned has to be the one
+		// after fromVersion, or "exclusive" means something else.
+		if len(got) > 0 && got[0].Version != tc.from+1 {
+			t.Errorf("Load(%d) starts at version %d, want %d", tc.from, got[0].Version, tc.from+1)
+		}
+	}
+
+	// The two ends of the convention: LatestVersion is a resume cursor
+	// that returns nothing left to apply, and it is also the expected
+	// version the next Append wants.
+	head, err := store.LatestVersion(ctx, "cart", "cart-1")
+	if err != nil {
+		t.Fatalf("LatestVersion: %v", err)
+	}
+	if head != 2 {
+		t.Fatalf("LatestVersion after three events = %d, want 2", head)
+	}
+	if rest, err := store.Load(ctx, "cart", "cart-1", head); err != nil || len(rest) != 0 {
+		t.Errorf("Load(LatestVersion) = %+v (err %v), want nothing left to apply", rest, err)
+	}
+	if err := store.Append(db, ctx, "cart", "cart-1", head,
+		sqlite.EventInput{Type: "d"}); err != nil {
+		t.Errorf("Append at LatestVersion: %v", err)
+	}
+	if tail, err := store.Load(ctx, "cart", "cart-1", head); err != nil || len(tail) != 1 || tail[0].Type != "d" {
+		t.Errorf("Load(%d) after appending = %+v (err %v), want only d", head, tail, err)
 	}
 }
 

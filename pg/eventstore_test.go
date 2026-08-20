@@ -186,7 +186,13 @@ func TestEventStoreLoadReturnsEventsInVersionOrder(t *testing.T) {
 	}
 	db := pg.New(drv)
 	store := pg.NewEventStore(db, "events")
-	events, err := store.Load(context.Background(), "m", "a", 0)
+	// -1, not 0: 0 is the first event's own version and Load is
+	// exclusive on fromVersion. The fake ignores the argument, so
+	// nothing here would notice — which is exactly why it has to read
+	// the way a caller should write it. The predicate itself is
+	// pinned by TestPGEventStoreLoadIsExclusiveOnFromVersion, against
+	// a server that evaluates it.
+	events, err := store.Load(context.Background(), "m", "a", -1)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

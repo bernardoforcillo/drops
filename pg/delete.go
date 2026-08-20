@@ -204,35 +204,109 @@ func (d *DeleteBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 }
 
 // resolveCtx returns the builder to render for one execution — this one
-// when no table the statement names has a context filter, otherwise a
-// shallow copy whose WHERE list carries the resolved predicates.
+// when there was nothing to resolve, otherwise a shallow copy carrying
+// the resolved predicates and the resolved subqueries.
 //
-// Resolving into the copy's WHERE list rather than at render time is
-// what carries the scope through a soft delete: a DeleteHook rewrites
-// the statement into an UPDATE built from d.Wheres(), and a predicate
-// added after the hook ran would be missing from exactly the statement
-// that mutates rows. The hook sees the copy, so it sees the tenant.
+// Resolving into the copy's clauses rather than at render time is what
+// carries the scope through a soft delete: a DeleteHook rewrites the
+// statement into an UPDATE built from d.Wheres() and
+// d.ReturningClauses(), and anything added after the hook ran would be
+// missing from exactly the statement that mutates rows. The hook sees
+// the copy, so it sees the tenant — the target table's, and the tenant
+// of every statement written inside a predicate it copies over.
 //
-// Every table the statement names is resolved, the USING tables
-// included, because a context filter is a property of the table and the
-// promise in tenant.go is about statements rather than about clauses. A
+// Two kinds of thing are resolved, and the second was missing until
+// this round.
+//
+// Every table the statement names, the USING tables included, because a
+// context filter is a property of the table and the promise in
+// tenant.go is about statements rather than about clauses. A
 // DELETE ... USING joins through its WHERE clause, so an unfiltered
 // USING table does not narrow a result — it lets another tenant's rows
 // choose which of this tenant's rows are removed, and a delete is the
 // one write that cannot be walked back.
 //
+// And every statement written inside this one — a WHERE predicate, a
+// RETURNING term — through resolveExprs, the walk
+// [SelectBuilder.resolveCtx] uses over the same node type, so it
+// reaches an operand at any depth and through any combinator rather
+// than the shapes anybody happened to list. Resolving the tables alone
+// left DELETE FROM "users" WHERE "id" NOT IN (SELECT ... FROM "posts")
+// reading every tenant's posts to decide which of this tenant's rows
+// survived, out of a statement carrying a tenant predicate of its own:
+// the inner statement was reached only through WriteSQL, which has no
+// ctx and so writes the DefaultFilters and none of the ContextFilters.
+//
 // A filter that refuses — [TenantFilter] with no tenant on ctx — aborts
-// the whole resolution, for the USING tables exactly as for the target.
+// the whole resolution: for the USING tables as for the target, and for
+// a subquery as for either.
+//
+// Unscoped skips the statement's own scoping — its DeleteHooks
+// included, so the rewrite does not run — and not the scoping of the
+// statements written inside it, exactly as [SelectBuilder.resolveCtx]
+// does.
+//
+// One thing this does not reach, stated so the next round does not have
+// to find it: what a DeleteHook's replacement statement assigns. The
+// hooks run inside WriteSQL, which has no ctx, so an UpdateHook on the
+// target table that assigned a subquery would have it rendered
+// unresolved on the rewrite path while a direct UPDATE against the same
+// table resolves it — see UpdateBuilder.resolveCtx, which runs its own
+// hooks during resolution for exactly that reason. Closing it means
+// dispatching the DeleteHooks here instead, which is a bigger change to
+// the render path than this round is making; nothing a caller writes
+// lands there, since a DELETE has no SET list of its own.
 func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) {
-	if d.unscoped {
+	cp := *d
+	changed := false
+
+	// Every expression list the statement carries, because a subquery is
+	// a statement wherever it is written.
+	lists := []struct {
+		src []drops.Expression
+		dst *[]drops.Expression
+	}{
+		{d.wheres, &cp.wheres},
+		{d.returning, &cp.returning},
+	}
+	for _, l := range lists {
+		resolved, err := resolveExprs(ctx, l.src)
+		if err != nil {
+			return nil, err
+		}
+		if resolved != nil {
+			*l.dst, changed = resolved, true
+		}
+	}
+
+	if !d.unscoped {
+		preds, err := d.contextPreds(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(preds) > 0 {
+			// After the caller's own predicates and after the resolution
+			// above, so the rendered clause reads the same as it did
+			// before subqueries were walked: defaults, intent, scoping.
+			cp.wheres = append(append([]drops.Expression(nil), cp.wheres...), preds...)
+			changed = true
+		}
+	}
+
+	if !changed {
 		return d, nil
 	}
-	var preds []drops.Expression
-	tp, err := d.table.resolveContextFilters(ctx)
+	return &cp, nil
+}
+
+// contextPreds resolves the context filters of every table the
+// statement names — the target and the USING tables — into the
+// predicates the WHERE clause carries for this ctx.
+func (d *DeleteBuilder) contextPreds(ctx context.Context) ([]drops.Expression, error) {
+	preds, err := d.table.resolveContextFilters(ctx)
 	if err != nil {
 		return nil, err
 	}
-	preds = append(preds, tp...)
 	for _, t := range d.using {
 		up, err := t.resolveContextFilters(ctx)
 		if err != nil {
@@ -240,12 +314,7 @@ func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) 
 		}
 		preds = append(preds, up...)
 	}
-	if len(preds) == 0 {
-		return d, nil
-	}
-	cp := *d
-	cp.wheres = append(append([]drops.Expression(nil), d.wheres...), preds...)
-	return &cp, nil
+	return preds, nil
 }
 
 // Exec runs the DELETE.

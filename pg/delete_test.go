@@ -242,3 +242,258 @@ func TestDeleteToSQLCarriesUsingTableDefaultFilters(t *testing.T) {
 			`("accounts"."archivedAt" IS NULL) AND ("posts"."archivedAt" IS NULL)`,
 	)
 }
+
+// ----------------------------------------------------------------------
+// A statement written inside the DELETE is a statement and is scoped
+// like one
+// ----------------------------------------------------------------------
+
+// DeleteBuilder.resolveCtx used to resolve the context filters of the
+// target table and of the USING tables and stop there, so a statement
+// the caller wrote inside the DELETE was reached only through WriteSQL,
+// which has no ctx:
+//
+//	DELETE FROM "users"
+//	WHERE "users"."id" NOT IN (SELECT "posts"."authorId" FROM "posts")
+//	AND ("users"."tenantId" = $1)
+//
+// — every tenant's posts deciding which of this tenant's rows survive,
+// out of a statement that carries a tenant predicate of its own. A
+// DELETE is the write nothing walks back, and the sub-SELECT is the
+// idiom for "delete the rows nothing references any more", so this is
+// the shape most likely to be written and least likely to be noticed.
+//
+// The two renderings are asserted separately — the DELETE itself and
+// the UPDATE a soft-delete DeleteHook rewrites it into — for the reason
+// TestDeleteUsingSoftDeleteRewriteCarriesUsingTables gives: the rewrite
+// is built from d.Wheres() and d.ReturningClauses(), so it inherits
+// whatever the resolution did or did not put there, and round 3 showed
+// that is exactly where a fix gets left behind.
+func TestDeleteSubqueryOperandsCarryTheTenantAxis(t *testing.T) {
+	db := pg.New(nil)
+	accounts := whard("accounts", nil)
+	posts := whard("posts", func(t *pg.Table) { pg.Add(t, pg.BigInt("accountId")) })
+
+	sub := func() *pg.SelectBuilder { return db.Select(posts.Col("accountId")).From(posts) }
+	subSQL := func(n string) string {
+		return `SELECT "posts"."accountId" FROM "posts" ` +
+			`WHERE ("posts"."archivedAt" IS NULL) AND ("posts"."tenantId" = ` + n + `)`
+	}
+
+	tests := []struct {
+		name string
+		del  func() *pg.DeleteBuilder
+		want string
+		args []any
+	}{
+		{
+			name: "NOT IN a subquery in the WHERE clause",
+			del: func() *pg.DeleteBuilder {
+				return db.Delete(accounts).Where(pg.NotIn(accounts.Col("id"), sub()))
+			},
+			want: `DELETE FROM "accounts" WHERE ` +
+				`("accounts"."archivedAt" IS NULL) AND ` +
+				`("accounts"."id" NOT IN (` + subSQL(`$1`) + `)) AND ` +
+				`("accounts"."tenantId" = $2)`,
+			args: []any{wtenant, wtenant},
+		},
+		{
+			name: "EXISTS in the WHERE clause",
+			del: func() *pg.DeleteBuilder {
+				return db.Delete(accounts).Where(pg.Exists(sub()))
+			},
+			want: `DELETE FROM "accounts" WHERE ` +
+				`("accounts"."archivedAt" IS NULL) AND ` +
+				`EXISTS (` + subSQL(`$1`) + `) AND ` +
+				`("accounts"."tenantId" = $2)`,
+			args: []any{wtenant, wtenant},
+		},
+		{
+			// Three levels down, through combinators nobody named.
+			name: "AND over NOT over EXISTS in the WHERE clause",
+			del: func() *pg.DeleteBuilder {
+				return db.Delete(accounts).Where(
+					pg.And(pg.Not(pg.Exists(sub())), pg.Eq(accounts.Col("id"), int64(5))))
+			},
+			want: `DELETE FROM "accounts" WHERE ` +
+				`("accounts"."archivedAt" IS NULL) AND ` +
+				`((NOT EXISTS (` + subSQL(`$1`) + `)) AND ("accounts"."id" = $2)) AND ` +
+				`("accounts"."tenantId" = $3)`,
+			args: []any{wtenant, int64(5), wtenant},
+		},
+		{
+			name: "a scalar subquery in the RETURNING clause",
+			del: func() *pg.DeleteBuilder {
+				return db.Delete(accounts).Returning(accounts.Col("id"), pg.Subquery(sub()))
+			},
+			want: `DELETE FROM "accounts" WHERE ` +
+				`("accounts"."archivedAt" IS NULL) AND ("accounts"."tenantId" = $1) ` +
+				`RETURNING "accounts"."id", (` + subSQL(`$2`) + `)`,
+			args: []any{wtenant, wtenant},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			checkCtx(t, wctx(), tc.del(), tc.want, tc.args...)
+		})
+	}
+}
+
+// The soft-delete rewrite carries the resolution too.
+//
+// The hook builds its UPDATE out of d.Wheres() and d.ReturningClauses()
+// while the DELETE renders, which is after resolveCtx has run — so the
+// predicates it copies are the resolved ones, and a subquery inside one
+// carries its own tenant axis into the statement that actually mutates
+// rows. Resolving at render time instead of into the copy's WHERE list
+// would leave this path unscoped while the plain DELETE looked fixed.
+func TestDeleteSoftDeleteRewriteCarriesSubqueryScope(t *testing.T) {
+	db := pg.New(nil)
+	accounts := wscoped("accounts", nil)
+	posts := wscoped("posts", func(t *pg.Table) { pg.Add(t, pg.BigInt("accountId")) })
+	sub := func() *pg.SelectBuilder { return db.Select(posts.Col("accountId")).From(posts) }
+	subSQL := func(n string) string {
+		return `SELECT "posts"."accountId" FROM "posts" ` +
+			`WHERE ("posts"."deletedAt" IS NULL) AND ("posts"."tenantId" = ` + n + `)`
+	}
+
+	checkCtx(t, wctx(),
+		db.Delete(accounts).
+			Where(pg.NotIn(accounts.Col("id"), sub())).
+			Returning(pg.Subquery(sub())),
+		`UPDATE "accounts" SET "deletedAt" = now() WHERE `+
+			`("accounts"."deletedAt" IS NULL) AND `+
+			`("accounts"."id" NOT IN (`+subSQL(`$1`)+`)) AND `+
+			`("accounts"."tenantId" = $2) `+
+			`RETURNING (`+subSQL(`$3`)+`)`,
+		wtenant, wtenant, wtenant,
+	)
+}
+
+// A subquery that cannot be resolved aborts the whole DELETE — both
+// renderings of it. Refusing is the only safe answer: the alternative
+// is a delete whose row set was chosen by a read that saw every tenant.
+func TestDeleteSubqueryRefusesWithoutTenant(t *testing.T) {
+	db := pg.New(nil)
+	// Unscoped targets, so only the inner statement can refuse and
+	// neither case can pass by accident.
+	hard := pg.NewTable("accounts")
+	pg.Add(hard, pg.BigSerial("id").PrimaryKey())
+	soft := pg.NewTable("softAccounts")
+	pg.Add(soft, pg.BigSerial("id").PrimaryKey())
+	pg.ApplyMixins(soft, &pg.SoftDeleteMixin{})
+	posts := whard("posts", func(t *pg.Table) { pg.Add(t, pg.BigInt("accountId")) })
+	sub := func() *pg.SelectBuilder { return db.Select(posts.Col("accountId")).From(posts) }
+
+	tests := []struct {
+		name string
+		del  func() *pg.DeleteBuilder
+	}{
+		{
+			name: "WHERE",
+			del: func() *pg.DeleteBuilder {
+				return db.Delete(hard).Where(pg.NotIn(hard.Col("id"), sub()))
+			},
+		},
+		{
+			name: "RETURNING",
+			del: func() *pg.DeleteBuilder {
+				return db.Delete(hard).Returning(pg.Subquery(sub()))
+			},
+		},
+		{
+			// The rewrite must not be the way round the refusal.
+			name: "soft-delete rewrite",
+			del: func() *pg.DeleteBuilder {
+				return db.Delete(soft).Where(pg.NotIn(soft.Col("id"), sub()))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sql, _, err := tc.del().ToSQLCtx(context.Background())
+			if !errors.Is(err, pg.ErrTenantMissing) {
+				t.Errorf("got = %v (sql %q), want %v", err, sql, pg.ErrTenantMissing)
+			}
+			if sql != "" {
+				t.Errorf("got sql = %q, want none", sql)
+			}
+		})
+	}
+}
+
+// Unscoped opts the DELETE out of its own scoping — its DeleteHooks
+// included, so this renders as a hard DELETE — and not out of the
+// scoping of the statement written inside it.
+func TestDeleteUnscopedKeepsSubqueryScope(t *testing.T) {
+	db := pg.New(nil)
+	accounts := wscoped("accounts", nil)
+	posts := wscoped("posts", func(t *pg.Table) { pg.Add(t, pg.BigInt("accountId")) })
+
+	checkCtx(t, wctx(),
+		db.Delete(accounts).
+			Where(pg.NotIn(accounts.Col("id"), db.Select(posts.Col("accountId")).From(posts))).
+			Unscoped(),
+		`DELETE FROM "accounts" WHERE ("accounts"."id" NOT IN (`+
+			`SELECT "posts"."accountId" FROM "posts" `+
+			`WHERE ("posts"."deletedAt" IS NULL) AND ("posts"."tenantId" = $1)))`,
+		wtenant,
+	)
+}
+
+// Rendering the same builder twice must send the same statement twice,
+// subqueries included — asserted on both renderings, since the rewrite
+// builds a fresh UpdateBuilder out of the DELETE's predicates every
+// time it runs and a resolution written back into the DELETE would
+// compound there first.
+func TestDeleteSubqueryResolveIsRepeatable(t *testing.T) {
+	db := pg.New(nil)
+	posts := whard("posts", func(t *pg.Table) { pg.Add(t, pg.BigInt("accountId")) })
+	sub := func() *pg.SelectBuilder { return db.Select(posts.Col("accountId")).From(posts) }
+
+	for _, tc := range []struct {
+		name  string
+		table *pg.Table
+	}{
+		{name: "DELETE", table: whard("accounts", nil)},
+		{name: "soft-delete rewrite", table: wscoped("accounts", nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := db.Delete(tc.table).
+				Where(pg.NotIn(tc.table.Col("id"), sub())).
+				Returning(pg.Subquery(sub()))
+
+			firstSQL, firstArgs, err := q.ToSQLCtx(wctx())
+			if err != nil {
+				t.Fatalf("ToSQLCtx: %v", err)
+			}
+			secondSQL, secondArgs, err := q.ToSQLCtx(wctx())
+			if err != nil {
+				t.Fatalf("ToSQLCtx: %v", err)
+			}
+			if firstSQL != secondSQL {
+				t.Errorf("sql mismatch\n  got  = %v\n  want = %v", secondSQL, firstSQL)
+			}
+			if len(firstArgs) != len(secondArgs) {
+				t.Fatalf("args mismatch\n  got  = %v\n  want = %v", secondArgs, firstArgs)
+			}
+
+			// A second request, with a second tenant: every bound value
+			// is that tenant's, inner statements included.
+			otherSQL, otherArgs, err := q.ToSQLCtx(pg.WithTenant(context.Background(), int64(9)))
+			if err != nil {
+				t.Fatalf("ToSQLCtx: %v", err)
+			}
+			if otherSQL != firstSQL {
+				t.Errorf("sql mismatch\n  got  = %v\n  want = %v", otherSQL, firstSQL)
+			}
+			for i, a := range otherArgs {
+				if a != any(int64(9)) {
+					t.Errorf("args[%d] = %v, want %v (all of %v)", i, a, int64(9), otherArgs)
+				}
+			}
+		})
+	}
+}

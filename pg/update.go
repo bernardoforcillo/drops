@@ -15,6 +15,13 @@ type UpdateBuilder struct {
 	wheres    []drops.Expression
 	returning []drops.Expression
 	unscoped  bool
+
+	// hooked reports that the UpdateHooks have already contributed their
+	// assignments to sets, which resolveCtx does so that what they
+	// assign is walked for subqueries like anything else in the SET
+	// list. WriteSQL runs them itself when it is false — that is the
+	// ToSQL path, which has no ctx to walk against.
+	hooked bool
 }
 
 // Set adds one or more assignments. Use (*Col[T]).Val(v) to bind a typed
@@ -81,7 +88,7 @@ func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
 // WriteSQL renders the UPDATE.
 func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 	sets := u.sets
-	if u.table.hasUpdateHooks() {
+	if !u.hooked && u.table.hasUpdateHooks() {
 		sets = u.applyUpdateHooks()
 	}
 	wheres := u.wheres
@@ -197,33 +204,119 @@ func (u *UpdateBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 }
 
 // resolveCtx returns the builder to render for one execution — this one
-// when no table the statement names has a context filter, otherwise a
-// shallow copy whose WHERE list carries the resolved predicates. The
-// copy is what keeps the same builder executable twice without
-// accumulating a predicate per run; see [SelectBuilder.resolveCtx].
+// when there was nothing to resolve, otherwise a shallow copy carrying
+// the resolved predicates and the resolved subqueries. The copy is what
+// keeps the same builder executable twice without accumulating a
+// predicate per run; see [SelectBuilder.resolveCtx].
 //
-// Every table the statement names is resolved, the FROM tables
-// included, because a context filter is a property of the table and the
-// promise in tenant.go is about statements rather than about clauses.
-// The FROM table of an UPDATE ... FROM is joined through the WHERE
-// clause, so leaving its tenant axis off does not narrow a result set —
-// it lets another tenant's rows select which of this tenant's rows are
-// written, which is the read defect one grade worse.
+// Two kinds of thing are resolved, and the second was missing until
+// this round.
+//
+// Every table the statement names, the FROM tables included, because a
+// context filter is a property of the table and the promise in
+// tenant.go is about statements rather than about clauses. The FROM
+// table of an UPDATE ... FROM is joined through the WHERE clause, so
+// leaving its tenant axis off does not narrow a result set — it lets
+// another tenant's rows select which of this tenant's rows are written,
+// which is the read defect one grade worse.
+//
+// And every statement written inside this one, wherever it is written:
+// a WHERE predicate, an assigned value, a RETURNING term. Resolving the
+// tables alone left an UPDATE whose own tenant predicate was present
+// and whose EXISTS (SELECT ... FROM posts) saw every tenant's posts,
+// because the inner statement was reached only through WriteSQL, which
+// has no ctx and so writes the DefaultFilters and none of the
+// ContextFilters. The walk is resolveExprs — the same one
+// [SelectBuilder.resolveCtx] uses, over the same node type — so it
+// reaches an operand at any depth and through any combinator, not the
+// shapes anybody happened to list.
 //
 // A filter that refuses — [TenantFilter] with no tenant on ctx — aborts
-// the whole resolution, for the FROM tables exactly as for the target.
-// A write that cannot say which tenant's rows it is joining must not be
-// sent unfiltered.
+// the whole resolution: for the FROM tables as for the target, and for
+// a subquery as for either. A write whose row set is chosen by a read
+// that cannot say which tenant it is reading must not be sent.
+//
+// Unscoped skips the statement's own scoping and not the scoping of the
+// statements written inside it, exactly as [SelectBuilder.resolveCtx]
+// does: a subquery is a statement of its own, keeps its own tenant
+// axis, and is how to widen one relation of a write and no other.
+//
+// The UpdateHooks run here rather than at render time so that what they
+// assign goes through the same walk — see the comment on the call, and
+// [UpdateBuilder.WriteSQL], which still runs them itself on the ToSQL
+// path where there is no ctx to walk against.
 func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) {
-	if u.unscoped {
-		return u, nil
+	cp := *u
+	changed := false
+
+	// Every expression list the statement carries, because a subquery is
+	// a statement wherever it is written.
+	lists := []struct {
+		src []drops.Expression
+		dst *[]drops.Expression
+	}{
+		{u.wheres, &cp.wheres},
+		{u.returning, &cp.returning},
 	}
-	var preds []drops.Expression
-	tp, err := u.table.resolveContextFilters(ctx)
+	for _, l := range lists {
+		resolved, err := resolveExprs(ctx, l.src)
+		if err != nil {
+			return nil, err
+		}
+		if resolved != nil {
+			*l.dst, changed = resolved, true
+		}
+	}
+
+	// The hooks run here rather than at render time, so that what they
+	// assign is walked with the rest of the SET list. An UpdateHook is
+	// registered on the table and reaches every UPDATE against it, and
+	// UpdateHookCtx.SetExpr takes any expression — so a hook is an
+	// operand position a *SelectBuilder can be handed to, and one no
+	// call site shows. Applied in WriteSQL, its assignment was reachable
+	// only through a renderer with no ctx, which is the same fail-open
+	// one layer in from the caller's own Set.
+	sets := u.sets
+	if u.table.hasUpdateHooks() {
+		sets, cp.hooked, changed = u.applyUpdateHooks(), true, true
+	}
+	resolvedSets, err := resolveSets(ctx, sets)
 	if err != nil {
 		return nil, err
 	}
-	preds = append(preds, tp...)
+	if resolvedSets != nil {
+		sets, changed = resolvedSets, true
+	}
+	cp.sets = sets
+
+	if !u.unscoped {
+		preds, err := u.contextPreds(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(preds) > 0 {
+			// After the caller's own predicates and after the resolution
+			// above, so the rendered clause reads the same as it did
+			// before subqueries were walked: defaults, intent, scoping.
+			cp.wheres = append(append([]drops.Expression(nil), cp.wheres...), preds...)
+			changed = true
+		}
+	}
+
+	if !changed {
+		return u, nil
+	}
+	return &cp, nil
+}
+
+// contextPreds resolves the context filters of every table the
+// statement names — the target and the FROM tables — into the
+// predicates the WHERE clause carries for this ctx.
+func (u *UpdateBuilder) contextPreds(ctx context.Context) ([]drops.Expression, error) {
+	preds, err := u.table.resolveContextFilters(ctx)
+	if err != nil {
+		return nil, err
+	}
 	for _, t := range u.from {
 		fp, err := t.resolveContextFilters(ctx)
 		if err != nil {
@@ -231,12 +324,54 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 		}
 		preds = append(preds, fp...)
 	}
-	if len(preds) == 0 {
-		return u, nil
+	return preds, nil
+}
+
+// resolveSets resolves the statements reachable from a SET list,
+// returning a rebuilt list — or nil when nothing needed resolving, so
+// the caller keeps the list it already had.
+//
+// The assigned value is an operand position like any other, and the one
+// that decides what gets written rather than which rows do:
+// SET "ownerId" = (SELECT ... FROM "accounts") used to render its body
+// through WriteSQL and so read every tenant's accounts to compute a
+// value stored in this tenant's row. Handing the held expression to
+// resolveExpr is what makes the whole tree under it resolve — a
+// subquery three combinators down as much as one written directly.
+//
+// Only a binding that holds an expression has anything to walk, which
+// is what the type assertion is: [ColumnValue] is closed to this
+// package — its methods are unexported, so no caller can implement it —
+// and every other implementation binds a Go value that becomes a
+// parameter. A binding kind added later that holds a caller-supplied
+// drops.Expression has to be resolved here too, or a statement can hide
+// inside it exactly as it hid inside this one.
+func resolveSets(ctx context.Context, sets []ColumnValue) ([]ColumnValue, error) {
+	var out []ColumnValue
+	for i, s := range sets {
+		eb, ok := s.(*exprBinding)
+		if !ok {
+			continue
+		}
+		resolved, changed, err := resolveExpr(ctx, eb.expr)
+		if err != nil {
+			return nil, err
+		}
+		if !changed {
+			continue
+		}
+		if out == nil {
+			out = append([]ColumnValue(nil), sets...)
+		}
+		// The binding is copied for the reason the builder is: a caller
+		// may hold it and use it in a second statement, and a resolved
+		// body written back into it would pin the first request's tenant
+		// into every later use.
+		cpb := *eb
+		cpb.expr = resolved
+		out[i] = &cpb
 	}
-	cp := *u
-	cp.wheres = append(append([]drops.Expression(nil), u.wheres...), preds...)
-	return &cp, nil
+	return out, nil
 }
 
 // Exec runs the UPDATE.

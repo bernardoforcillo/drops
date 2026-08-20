@@ -1671,3 +1671,376 @@ type aliasHit struct {
 	Name string `drop:"name"`
 	Hits int32  `drop:"hits"`
 }
+
+// --- Patch operations -------------------------------------------------
+
+type pgPatchRow struct {
+	ID    int64  `drop:"id"`
+	Likes int64  `drop:"likes"`
+	Peak  int64  `drop:"peak"`
+	Name  string `drop:"name"`
+}
+
+// patchFixture is one row of counters with a typed handle per column,
+// so each operation can be applied and the stored value read back.
+func pgPatchFixture(t *testing.T) (*pg.DB, *pg.Entity[pgPatchRow], *pg.Col[int64], *pg.Col[int64], *pg.Col[string]) {
+	t.Helper()
+	db := openPG(t)
+	tbl := pg.NewTable(integration.UniqueName(t, "patch"))
+	dropPG(t, db, tbl)
+	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	likes := pg.Add(tbl, pg.BigInt("likes").NotNull().Default("0"))
+	peak := pg.Add(tbl, pg.BigInt("peak").NotNull().Default("0"))
+	name := pg.Add(tbl, pg.Text("name").NotNull())
+	execPG(t, db, pg.CreateTable(tbl))
+	ent := pg.NewEntity[pgPatchRow](tbl)
+	row := pgPatchRow{ID: 1, Name: "start"}
+	if err := ent.Create(db, context.Background(), &row); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	return db, ent, likes, peak, name
+}
+
+// Every named operation, judged by the value the server ends up
+// holding rather than by the SQL that asked for it.
+func TestPGPatchOperationsAgainstTheServer(t *testing.T) {
+	db, ent, likes, peak, name := pgPatchFixture(t)
+	ctx := context.Background()
+
+	if _, err := ent.Patch(db, ctx, int64(1),
+		pg.Inc(likes, int64(5)),
+		pg.SetIfGreater(peak, int64(10)),
+		pg.Set(name, "first"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	row, err := ent.Get(db, ctx, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Likes != 5 || row.Peak != 10 || row.Name != "first" {
+		t.Fatalf("after the first patch: %+v", row)
+	}
+
+	// A high-watermark only rises.
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfGreater(peak, int64(3))); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ = ent.Get(db, ctx, int64(1)); row.Peak != 10 {
+		t.Errorf("SetIfGreater lowered the value to %d", row.Peak)
+	}
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfGreater(peak, int64(42))); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ = ent.Get(db, ctx, int64(1)); row.Peak != 42 {
+		t.Errorf("SetIfGreater did not raise the value: %d", row.Peak)
+	}
+
+	// A low-watermark only falls.
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfLess(peak, int64(100))); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ = ent.Get(db, ctx, int64(1)); row.Peak != 42 {
+		t.Errorf("SetIfLess raised the value to %d", row.Peak)
+	}
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfLess(peak, int64(7))); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ = ent.Get(db, ctx, int64(1)); row.Peak != 7 {
+		t.Errorf("SetIfLess did not lower the value: %d", row.Peak)
+	}
+
+	// Dec subtracts, which is the whole of what its name promises.
+	if _, err := ent.Patch(db, ctx, int64(1), pg.Dec(likes, int64(2))); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ = ent.Get(db, ctx, int64(1)); row.Likes != 3 {
+		t.Errorf("Dec left likes at %d, want 3", row.Likes)
+	}
+
+	// SetIfChanged writes a value that differs and leaves an equal one
+	// alone; either way the stored value is the new one.
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfChanged(name, "second")); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ = ent.Get(db, ctx, int64(1)); row.Name != "second" {
+		t.Errorf("SetIfChanged = %q, want second", row.Name)
+	}
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfChanged(name, "second")); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ = ent.Get(db, ctx, int64(1)); row.Name != "second" {
+		t.Errorf("SetIfChanged on an equal value = %q", row.Name)
+	}
+
+	// A key that matches nothing reports zero rows rather than an
+	// error — the reason Patch hands back the Result.
+	res, err := ent.Patch(db, ctx, int64(999), pg.Inc(likes, int64(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 0 {
+		t.Errorf("rows affected for a missing row = %d, %v; want 0", n, err)
+	}
+}
+
+type pgPatchSeats struct {
+	ID    int64  `drop:"id"`
+	Seats uint32 `drop:"seats"`
+}
+
+// PostgreSQL has no unsigned column type, but the delta's type is the
+// Go handle's, and Custom hands out a Col[uint32] over a bigint column.
+// Negating the delta to reuse the addition wraps there: the statement
+// renders perfectly, the server accepts it without complaint, and the
+// counter climbs by four billion instead of falling by five. Only the
+// stored value shows it.
+func TestPGDecOnAnUnsignedHandleLowersTheCounter(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "unsigned"))
+	dropPG(t, db, tbl)
+	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	seats := pg.Add(tbl, pg.Custom[uint32]("seats", "bigint").NotNull().Default("0"))
+	execPG(t, db, pg.CreateTable(tbl))
+	ent := pg.NewEntity[pgPatchSeats](tbl)
+	row := pgPatchSeats{ID: 1, Seats: 100}
+	if err := ent.Create(db, ctx, &row); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if _, err := ent.Patch(db, ctx, int64(1), pg.Dec(seats, uint32(5))); err != nil {
+		t.Fatalf("Dec on an unsigned handle: %v", err)
+	}
+	// Read the column as text, so a wrapped delta shows as the number
+	// it is rather than as a scan failure into uint32.
+	var stored string
+	rows, err := db.Query(ctx, `SELECT seats::text FROM `+drops.StdQuoteIdent(tbl.Name())+` WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatal("no row")
+	}
+	if err := rows.Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if stored != "95" {
+		t.Errorf("seats = %s after Dec(5) from 100, want 95", stored)
+	}
+}
+
+// GREATEST and LEAST ignore NULL arguments in PostgreSQL, so a
+// watermark op against a NULL column stores the new value. MySQL's
+// return NULL and erase the column instead — the divergence a schema
+// served by both dialects trips over, pinned on the side that is
+// forgiving.
+func TestPGWatermarkOpsIgnoreANullColumn(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "nullpeak"))
+	dropPG(t, db, tbl)
+	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	high := pg.Add(tbl, pg.BigInt("high"))
+	low := pg.Add(tbl, pg.BigInt("low"))
+	execPG(t, db, pg.CreateTable(tbl))
+	name := drops.StdQuoteIdent(tbl.Name())
+	if _, err := db.Exec(ctx, `INSERT INTO `+name+` (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	ent := pg.NewEntity[pgPatchNullable](tbl)
+	if _, err := ent.Patch(db, ctx, int64(1),
+		pg.SetIfGreater(high, int64(10)),
+		pg.SetIfLess(low, int64(10)),
+	); err != nil {
+		t.Fatal(err)
+	}
+	gotHigh, gotLow := pgReadNullableInts(t, db, tbl)
+	if !gotHigh.Valid || gotHigh.Int64 != 10 {
+		t.Errorf("SetIfGreater on a NULL column stored %v, want 10", gotHigh)
+	}
+	if !gotLow.Valid || gotLow.Int64 != 10 {
+		t.Errorf("SetIfLess on a NULL column stored %v, want 10", gotLow)
+	}
+}
+
+type pgPatchNullable struct {
+	ID   int64 `drop:"id"`
+	High int64 `drop:"high"`
+	Low  int64 `drop:"low"`
+}
+
+func pgReadNullableInts(t *testing.T, db *pg.DB, tbl *pg.Table) (sql.NullInt64, sql.NullInt64) {
+	t.Helper()
+	rows, err := db.Query(context.Background(),
+		`SELECT high, low FROM `+drops.StdQuoteIdent(tbl.Name())+` WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("no row")
+	}
+	var high, low sql.NullInt64
+	if err := rows.Scan(&high, &low); err != nil {
+		t.Fatal(err)
+	}
+	return high, low
+}
+
+// IS DISTINCT FROM is null-safe, which is the operator's first job
+// here: a plain <> against a NULL column evaluates to NULL, the CASE
+// falls to its ELSE, and the assignment silently never happens.
+func TestPGSetIfChangedReachesANullColumn(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "ifchanged_null"))
+	dropPG(t, db, tbl)
+	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	note := pg.Add(tbl, pg.Text("note"))
+	execPG(t, db, pg.CreateTable(tbl))
+	name := drops.StdQuoteIdent(tbl.Name())
+	if _, err := db.Exec(ctx, `INSERT INTO `+name+` (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	ent := pg.NewEntity[pgPatchNote](tbl)
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfChanged(note, "written")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ent.Get(db, ctx, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Note != "written" {
+		t.Errorf("note = %q, want written — the NULL column was never assigned", got.Note)
+	}
+}
+
+type pgPatchNote struct {
+	ID   int64  `drop:"id"`
+	Note string `drop:"note"`
+}
+
+// What SetIfChanged does not do is decide whether the row is written.
+// PostgreSQL writes a new row version for every UPDATE whose WHERE
+// matches, so both the CASE and a plain assignment of the identical
+// value touch the row and fire AFTER UPDATE triggers. The doc used to
+// claim the CASE was what made that happen.
+func TestPGSetIfChangedTouchesTheRowNoMoreThanSetDoes(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	tbl := pg.NewTable(integration.UniqueName(t, "ifchanged_trig"))
+	dropPG(t, db, tbl)
+	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	note := pg.Add(tbl, pg.Text("note").NotNull())
+	execPG(t, db, pg.CreateTable(tbl))
+	name := drops.StdQuoteIdent(tbl.Name())
+	logName := drops.StdQuoteIdent(tbl.Name() + "_log")
+	fn := drops.StdQuoteIdent(tbl.Name() + "_fn")
+	for _, stmt := range []string{
+		`CREATE TABLE ` + logName + ` (n bigserial primary key)`,
+		`CREATE FUNCTION ` + fn + `() RETURNS trigger AS $$ BEGIN INSERT INTO ` + logName + ` DEFAULT VALUES; RETURN NEW; END $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER t AFTER UPDATE ON ` + name + ` FOR EACH ROW EXECUTE FUNCTION ` + fn + `()`,
+		`INSERT INTO ` + name + ` VALUES (1, 'a')`,
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DROP TABLE IF EXISTS `+logName)
+		_, _ = db.Exec(context.Background(), `DROP FUNCTION IF EXISTS `+fn+`() CASCADE`)
+	})
+
+	ent := pg.NewEntity[pgPatchNote](tbl)
+	countFires := func() int64 {
+		rows, err := db.Query(ctx, `SELECT count(*) FROM `+logName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			t.Fatal("no count")
+		}
+		var n int64
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	if _, err := ent.Patch(db, ctx, int64(1), pg.SetIfChanged(note, "a")); err != nil {
+		t.Fatal(err)
+	}
+	afterCase := countFires()
+	if _, err := ent.Patch(db, ctx, int64(1), pg.Set(note, "a")); err != nil {
+		t.Fatal(err)
+	}
+	afterSet := countFires()
+	if afterCase != 1 {
+		t.Errorf("SetIfChanged of an equal value fired the trigger %d times, want 1", afterCase)
+	}
+	if afterSet != 2 {
+		t.Errorf("Set of an equal value fired the trigger %d times in total, want 2 — a plain assignment touches the row too", afterSet)
+	}
+}
+
+// The half of IS DISTINCT FROM that is not null-safety: the comparison
+// runs under the column's collation. The default one is deterministic,
+// so 'ada' and 'ADA' differ and the change is written — which is why
+// drops/mysql's <=> version, comparing under a case-insensitive
+// collation, is not the same operation. Declare the column with a
+// nondeterministic collation and PostgreSQL declines the write too.
+func TestPGSetIfChangedFollowsTheColumnCollation(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	coll := drops.StdQuoteIdent(integration.UniqueName(t, "ci"))
+	if _, err := db.Exec(ctx, `CREATE COLLATION `+coll+
+		` (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`); err != nil {
+		t.Skipf("no nondeterministic ICU collation on this server: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(context.Background(), `DROP COLLATION IF EXISTS `+coll) })
+
+	tbl := pg.NewTable(integration.UniqueName(t, "coll"))
+	dropPG(t, db, tbl)
+	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	plain := pg.Add(tbl, pg.Text("plain").NotNull())
+	ci := pg.Add(tbl, pg.Custom[string]("ci", `text COLLATE `+coll).NotNull())
+	execPG(t, db, pg.CreateTable(tbl))
+	name := drops.StdQuoteIdent(tbl.Name())
+	if _, err := db.Exec(ctx, `INSERT INTO `+name+` VALUES (1, 'ada', 'ada')`); err != nil {
+		t.Fatal(err)
+	}
+	ent := pg.NewEntity[pgPatchCollated](tbl)
+
+	if _, err := ent.Patch(db, ctx, int64(1),
+		pg.SetIfChanged(plain, "ADA"),
+		pg.SetIfChanged(ci, "ADA"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ent.Get(db, ctx, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Plain != "ADA" {
+		t.Errorf("plain = %q; under a deterministic collation a change of case is a change", got.Plain)
+	}
+	if got.CI != "ada" {
+		t.Errorf("ci = %q; under a nondeterministic collation IS DISTINCT FROM is false and the write is declined", got.CI)
+	}
+	// Set has no such opinion: it writes what it is given.
+	if _, err := ent.Patch(db, ctx, int64(1), pg.Set(ci, "ADA")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = ent.Get(db, ctx, int64(1)); got.CI != "ADA" {
+		t.Errorf("Set on the collated column = %q, want ADA", got.CI)
+	}
+}
+
+type pgPatchCollated struct {
+	ID    int64  `drop:"id"`
+	Plain string `drop:"plain"`
+	CI    string `drop:"ci"`
+}

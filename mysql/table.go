@@ -32,6 +32,10 @@ type Table struct {
 	// AddIndex / AddCheck, read by BuildSnapshot.
 	indexes []*Index
 	checks  map[string]string
+
+	// origin is the table this one was copied from by As, and nil on
+	// a table as declared — see key.
+	origin *Table
 }
 
 // NewTable creates a table in the connection's default database.
@@ -63,10 +67,27 @@ func (t *Table) Alias() string    { return t.alias }
 // reference reached through it — u := users.As("u"); u.Col("id") —
 // qualifies with the alias while the original package-level handles go
 // on qualifying with the table name. That is what makes both sides of a
-// self-join addressable at once. Default filters are not rewritten:
-// they were built against the un-aliased columns and would resolve
-// against a table the aliased query no longer names, so scope an
-// aliased query with Unscoped and an explicit predicate.
+// self-join addressable at once.
+//
+// An aliased handle still *means* the column it was copied from. The
+// INSERT column list a short row is aligned against, an Entity's key
+// columns and a page's ordering column all identify a column through
+// Column.key, which collapses the copy back onto the declared column.
+// Where such a handle is also rendered — a page's ORDER BY and cursor
+// guard, an UPDATE's assignments, an upsert's — it is restated as the
+// handle that qualifies with the relation the statement names: the
+// alias for an UPDATE or SELECT that carries one, and the table for an
+// INSERT, whose INTO clause has no AS to carry. Aliasing changes how a
+// reference renders and nothing else.
+//
+// What is not rewritten is anything the caller built and drops only
+// re-emits: a predicate, and the expression inside a [SetExpr]. Both
+// are closed over the handles they were given. A default filter
+// registered against the declared columns therefore still qualifies
+// with the table name, and against a query whose only FROM entry is
+// the alias MySQL answers 1054 — so scope an aliased query with
+// Unscoped and an explicit predicate built from the alias's own
+// handles.
 //
 // Relations are copied too, with their near side — the column that
 // belongs to this table — rebound to the alias and the far side left
@@ -74,21 +95,27 @@ func (t *Table) Alias() string    { return t.alias }
 // two ends of the edge are two instances of one table, and only one of
 // them is the aliased one.
 //
-// The copy is a snapshot. A column or relation added to the base table
-// after As returned does not reach the alias, which matters because Go
-// initialises package-level variables before it runs init: an alias
-// declared as a var beside its table is taken before any init that
-// declares relations. Take the alias at the query site, or after the
-// schema is complete.
+// The copy is a snapshot. A column, relation, index, default filter or
+// check added to the base table after As returned does not reach the
+// alias, and none added to the alias reaches the table. That matters
+// because Go initialises package-level variables before it runs init:
+// an alias declared as a var beside its table is taken before any init
+// that declares relations. Take the alias at the query site, or after
+// the schema is complete.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
 	cp.alias = alias
+	// The origin chains to the table this one was declared as rather
+	// than to t, so aliasing an alias does not make a stranger of the
+	// root.
+	cp.origin = t.key()
 	cp.columns = make([]*Column, len(t.columns))
 	cp.byName = make(map[string]*Column, len(t.byName))
 	for i, c := range t.columns {
 		aliased := *c
 		aliased.table = &cp
+		aliased.origin = c.key()
 		cp.columns[i] = &aliased
 		cp.byName[aliased.name] = &aliased
 	}
@@ -115,7 +142,46 @@ func (t *Table) As(alias string) *Table {
 		}
 		cp.relations[name] = &r
 	}
+	if t.checks != nil {
+		cp.checks = make(map[string]string, len(t.checks))
+		for name, expr := range t.checks {
+			cp.checks[name] = expr
+		}
+	}
+	// The remaining slices are shared by value but not by array: a
+	// copy taken at full capacity would let an append through the
+	// alias land in the base table's spare capacity, and the next
+	// append through another handle overwrite it.
+	cp.indexes = append([]*Index(nil), t.indexes...)
+	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
 	return &cp
+}
+
+// key returns the identity a table is recognised by, collapsing every
+// alias copy onto the table it was declared as. It is Column.key for
+// the *Table handles, and for the same reason: an alias is a second
+// handle on one table.
+//
+// It is deliberately not what As's own rebind consults. That one asks
+// which columns belong to the instance being aliased, and collapsing
+// origins there would rebind the far side of a self-referential
+// relation — erasing the distinction the alias exists to draw.
+func (t *Table) key() *Table {
+	if t.origin != nil {
+		return t.origin
+	}
+	return t
+}
+
+// subject names a table handle for a panic message. Both an alias and
+// its table answer the base name from Name, so a message that prints
+// only that reads as "cannot be added to itself" when the two handles
+// are what differ.
+func (t *Table) subject() string {
+	if t.alias != "" {
+		return fmt.Sprintf("alias %q of table %q", t.alias, t.name)
+	}
+	return fmt.Sprintf("table %q", t.name)
 }
 
 // Engine sets the storage engine (InnoDB unless you say otherwise —
@@ -162,12 +228,8 @@ func (t *Table) Rel(name string) *Relation {
 		// handle and not this one. Naming the alias is what separates
 		// that from "the relation was never declared at all" — the two
 		// look identical from the empty list.
-		subject := fmt.Sprintf("table %q", t.name)
-		if t.alias != "" {
-			subject = fmt.Sprintf("alias %q of table %q", t.alias, t.name)
-		}
 		panic(fmt.Sprintf("drops/mysql: %s has no relation %q; declared: %s",
-			subject, name, strings.Join(declared, ", ")))
+			t.subject(), name, strings.Join(declared, ", ")))
 	}
 	return r
 }

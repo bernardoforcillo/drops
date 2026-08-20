@@ -19,15 +19,28 @@ type UpdateBuilder struct {
 }
 
 // Set appends column assignments.
+//
+// Each assignment is restated against the handle this builder's table
+// hands out for the column it names. The left-hand side of a SET is
+// written bare and never needed it, but a [PatchOp] names its column
+// on the right as well — "SET age = age + ?" — and qualified, so an op
+// built from another handle on the same table would name a relation
+// the UPDATE does not: MySQL answers 1054 whichever of the two
+// handles is the odd one out. An assignment naming a column of some
+// *other* table is left alone, being a deliberate cross-table
+// reference rather than a second handle.
 func (u *UpdateBuilder) Set(values ...ColumnValue) *UpdateBuilder {
-	u.sets = append(u.sets, values...)
+	for _, v := range values {
+		u.sets = append(u.sets, rebindValue(u.table, v))
+	}
 	return u
 }
 
-// SetExpr assigns a raw SQL expression to a column.
+// SetExpr assigns a raw SQL expression to a column. The expression is
+// the caller's and is emitted as given — build it from the same handle
+// the statement's table uses.
 func (u *UpdateBuilder) SetExpr(col ColRef, e drops.Expression) *UpdateBuilder {
-	u.sets = append(u.sets, exprValue{col: col.col(), expr: e})
-	return u
+	return u.Set(exprValue{col: col.col(), expr: e})
 }
 
 // Where appends predicates joined by AND.

@@ -27,6 +27,15 @@ import (
 //	//   `maxScore`   = GREATEST(`posts`.`maxScore`, ?)
 //	// WHERE (`posts`.`id` = ?)
 //
+// An op names its column on the right-hand side as well as the left,
+// and qualified, so which handle of the table it was built from
+// matters. It does not have to be the entity's: (*UpdateBuilder).Set
+// restates every assignment against the handle the statement's own
+// table hands out, so an entity on an alias patched with the
+// package-level columns — the natural spelling — renders the alias.
+// The one part that is not restated is the expression inside
+// [SetExpr], which the caller built; see (*Table).As.
+//
 // Ported from drops/pg's patch.go. Two things are genuinely different
 // under MySQL:
 //
@@ -132,6 +141,11 @@ type incOp[T number] struct {
 }
 
 func (o *incOp[T]) column() *Column { return o.col }
+func (o *incOp[T]) rebind(c *Column) ColumnValue {
+	cp := *o
+	cp.col = c
+	return &cp
+}
 func (o *incOp[T]) writeValue(b *drops.Builder) {
 	o.col.WriteSQL(b)
 	b.WriteByte(' ')
@@ -170,6 +184,11 @@ type monotonicOp[T any] struct {
 }
 
 func (o *monotonicOp[T]) column() *Column { return o.col }
+func (o *monotonicOp[T]) rebind(c *Column) ColumnValue {
+	cp := *o
+	cp.col = c
+	return &cp
+}
 func (o *monotonicOp[T]) writeValue(b *drops.Builder) {
 	b.WriteString(o.fn)
 	b.WriteByte('(')
@@ -224,6 +243,11 @@ type ifChangedOp[T any] struct {
 }
 
 func (o *ifChangedOp[T]) column() *Column { return o.col }
+func (o *ifChangedOp[T]) rebind(c *Column) ColumnValue {
+	cp := *o
+	cp.col = c
+	return &cp
+}
 func (o *ifChangedOp[T]) writeValue(b *drops.Builder) {
 	// CASE WHEN NOT (col <=> ?) THEN ? ELSE col END. The value binds
 	// twice; MySQL's placeholders are positional, so there is no way

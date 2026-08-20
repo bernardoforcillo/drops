@@ -32,6 +32,13 @@ type Column struct {
 	keyPrefix  int
 	ref        *FK
 	managed    bool
+
+	// origin is the column this one was copied from by (*Table).As,
+	// and nil on a column as declared. An alias copy is a second
+	// handle on one column of one table, so everything that asks
+	// which column a handle *is* has to see the two as equal — see
+	// key.
+	origin *Column
 }
 
 // FK describes a single-column foreign-key reference.
@@ -67,6 +74,29 @@ func (c *Column) IsManaged() bool { return c.managed }
 
 // col implements ColRef for *Column; *Col[T] inherits it by embedding.
 func (c *Column) col() *Column { return c }
+
+// key returns the identity a column is recognised by, collapsing every
+// alias copy onto the column it was declared as.
+//
+// Aliasing is a query-scope rename: it changes how a reference renders
+// and nothing else. So a handle taken off an alias has to answer the
+// same as the declared handle everywhere the question is "which column
+// is this" — the INSERT column list an aligned row is matched against,
+// an Entity's key columns, a page's ordering column, the column a SET
+// or upsert assignment names. Comparing the two by pointer makes them
+// strangers, and the worst of the resulting failures is silent: the
+// row loses the values it bound to the DEFAULT fill in alignRow, and
+// on a column that has a DEFAULT no server objects.
+//
+// The identity is the declared column rather than the name because two
+// tables can both have a "name" column and they are not the same
+// column.
+func (c *Column) key() *Column {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
+}
 
 // ColRef is implemented by *Column and *Col[T]: a type-erased column
 // reference for APIs that do not depend on the Go value type.
@@ -283,6 +313,13 @@ func nullCheck(c *Column, isNull bool) drops.Expression {
 type ColumnValue interface {
 	column() *Column
 	writeValue(b *drops.Builder)
+
+	// rebind returns the same assignment restated against col, which
+	// names the same column through another handle on its table. Its
+	// callers are (*UpdateBuilder).Set and
+	// (*InsertBuilder).OnDuplicateKeyUpdate, and both pass a handle
+	// the statement's own relation hands out — see rebindValue.
+	rebind(col *Column) ColumnValue
 }
 
 type columnValue struct {
@@ -290,8 +327,9 @@ type columnValue struct {
 	val any
 }
 
-func (v columnValue) column() *Column             { return v.col }
-func (v columnValue) writeValue(b *drops.Builder) { b.AddArg(v.val) }
+func (v columnValue) column() *Column              { return v.col }
+func (v columnValue) writeValue(b *drops.Builder)  { b.AddArg(v.val) }
+func (v columnValue) rebind(c *Column) ColumnValue { v.col = c; return v }
 
 type exprValue struct {
 	col  *Column
@@ -300,6 +338,30 @@ type exprValue struct {
 
 func (v exprValue) column() *Column             { return v.col }
 func (v exprValue) writeValue(b *drops.Builder) { b.Append(v.expr) }
+
+// rebind moves the assignment's target but not its expression: that
+// one was built by the caller out of the handles the caller held, and
+// drops only re-emits it. See (*Table).As.
+func (v exprValue) rebind(c *Column) ColumnValue { v.col = c; return v }
+
+// rebindValue restates an assignment against the handle t hands out
+// for the column it names, so the reference renders qualified by the
+// relation the statement actually names.
+//
+// It moves only a second handle on one of t's own columns: a column
+// belonging to some other table is a deliberate cross-table reference
+// and rewriting it would change what the statement means.
+func rebindValue(t *Table, v ColumnValue) ColumnValue {
+	c := v.column()
+	if t == nil || c == nil {
+		return v
+	}
+	own := t.byName[c.name]
+	if own == nil || own == c || own.key() != c.key() {
+		return v
+	}
+	return v.rebind(own)
+}
 
 // Bind pairs a column with an untyped value, for callers holding a
 // *Column and a value whose Go type is only known at runtime. Prefer

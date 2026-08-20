@@ -113,10 +113,41 @@ func TestPatchDec(t *testing.T) {
 	if _, err := ent.Patch(db, context.Background(), int64(7), pg.Dec(likes, int64(3))); err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
-	args := fd.args[0]
-	if args[0] != int64(-3) {
-		t.Errorf("Dec should send negative delta, got %v", args[0])
+	if !strings.Contains(fd.queries[0], `"likes" = "posts"."likes" - $1`) {
+		t.Errorf("Dec must render a subtraction: %s", fd.queries[0])
 	}
+	if args := fd.args[0]; args[0] != int64(3) {
+		t.Errorf("Dec bound %v, want the delta itself", args[0])
+	}
+}
+
+// The delta's type is the column handle's, and PostgreSQL having no
+// unsigned column type does not stop a handle from being one: Custom
+// takes any Go type over any SQL type, and [number] admits the
+// unsigned half. Negating the delta to reuse the addition wraps there
+// — Dec(seats, uint32(5)) would bind 4294967291 — and the statement
+// renders perfectly either way, so the bound value is where it shows.
+func TestPatchDecOnAnUnsignedHandleSubtracts(t *testing.T) {
+	tbl := pg.NewTable("seatmap")
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	seats := pg.Add(tbl, pg.Custom[uint32]("seats", "bigint").NotNull().Default("0"))
+	ent := pg.NewEntity[seatRow](tbl)
+	fd := &fakeDriver{}
+	db := pg.New(fd)
+	if _, err := ent.Patch(db, context.Background(), int64(7), pg.Dec(seats, uint32(5))); err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if got := fd.args[0][0]; got != uint32(5) {
+		t.Errorf("Dec bound %v, want 5 — a negated unsigned delta wraps", got)
+	}
+	if !strings.Contains(fd.queries[0], `"seats" = "seatmap"."seats" - $1`) {
+		t.Errorf("Dec must render a subtraction: %s", fd.queries[0])
+	}
+}
+
+type seatRow struct {
+	ID    int64  `drop:"id"`
+	Seats uint32 `drop:"seats"`
 }
 
 func TestPatchEmptyOpsErrors(t *testing.T) {

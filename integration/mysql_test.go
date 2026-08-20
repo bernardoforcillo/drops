@@ -5698,3 +5698,511 @@ func TestMySQLBackwardCursorWalksBackOverTheNullBoundary(t *testing.T) {
 		})
 	}
 }
+
+// ----------------------------------------------------------------------
+// Aliasing: an aliased handle means the same column and renders
+// differently. Every test below crosses two handles of one table
+// inside a statement drops itself composes, which is the shape none of
+// the tests above reach.
+// ----------------------------------------------------------------------
+
+type aliasRow struct {
+	ID   int64  `drop:"id"`
+	Name string `drop:"name"`
+	Age  int32  `drop:"age"`
+}
+
+// The flagship. An INSERT aligns every row after the first against the
+// column list the first one fixed, and a value bound through an alias
+// that fails to match falls to the DEFAULT fill: the statement is
+// well-formed, the server accepts it, and the row is wrong. This is
+// the one failure in the package no server can report.
+func TestMySQLInsertRowBoundThroughAnAliasKeepsItsValues(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_ins"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull().Default("'anon'"))
+	age := mysql.Add(tbl, mysql.Integer("age").NotNull().Default("0"))
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	u := tbl.As("u")
+	// The key is bound through the declared handle so it aligns
+	// either way. That is what keeps the failure silent: with the
+	// other two unmatched the row still satisfies every NOT NULL from
+	// its DEFAULTs, so the server has nothing to object to and writes
+	// ("anon", 0).
+	ins := db.Insert(tbl).
+		Row(id.Val(1), name.Val("declared"), age.Val(41)).
+		Row(id.Val(2),
+			mysql.Bind(u.Col("name"), "aliased"),
+			mysql.Bind(u.Col("age"), int32(42)))
+	text, args := ins.ToSQL()
+	// Naming the render as well as the rows is what tells the two
+	// failure modes apart: without it a wrong row reads as a scan bug.
+	if strings.Contains(text, "DEFAULT") {
+		t.Errorf("the aliased row lost its bindings to the DEFAULT fill:\n%s\nargs: %v", text, args)
+	}
+	if _, err := ins.Exec(ctx); err != nil {
+		t.Fatalf("insert: %v\n%s\nargs: %v", err, text, args)
+	}
+
+	var got []aliasRow
+	if err := db.Select(id, name, age).From(tbl).OrderBy(id.Asc()).All(ctx, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []aliasRow{{1, "declared", 41}, {2, "aliased", 42}}
+	if len(got) != len(want) {
+		t.Fatalf("%d rows, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("row %d = %+v, want %+v", i, got[i], w)
+		}
+	}
+}
+
+// The same seam on a NOT NULL column with no DEFAULT, where the server
+// does object. Both branches come from one statement shape, so a
+// schema change is all that separates the silent corruption above from
+// this hard failure — which is why the silent one had to be found by
+// reading rows and not by watching for errors.
+func TestMySQLInsertThroughAnAliasOnAColumnWithNoDefault(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_nd"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	u := tbl.As("u")
+	if _, err := db.Insert(tbl).
+		Row(id.Val(1), name.Val("declared")).
+		Row(mysql.Bind(u.Col("id"), int64(2)), mysql.Bind(u.Col("name"), "aliased")).
+		Exec(ctx); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	var got []struct {
+		Name string `drop:"name"`
+	}
+	if err := db.Select(name).From(tbl).OrderBy(id.Asc()).All(ctx, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Name != "aliased" {
+		t.Errorf("rows = %+v, want the aliased row's own name", got)
+	}
+}
+
+// A row that genuinely omits a column still defaults, so the fix
+// cannot be "bind everything".
+func TestMySQLInsertShortRowThroughAnAliasStillDefaults(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_short"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull().Default("'anon'"))
+	age := mysql.Add(tbl, mysql.Integer("age").NotNull().Default("7"))
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	u := tbl.As("u")
+	if _, err := db.Insert(tbl).
+		Row(id.Val(1), name.Val("declared"), age.Val(41)).
+		Row(mysql.Bind(u.Col("id"), int64(2)), mysql.Bind(u.Col("age"), int32(42))).
+		Exec(ctx); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	var got []aliasRow
+	if err := db.Select(id, name, age).From(tbl).OrderBy(id.Asc()).All(ctx, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []aliasRow{{1, "declared", 41}, {2, "anon", 42}}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("rows = %+v, want %+v", got, want)
+	}
+}
+
+// Asc and Desc are free functions, so a page's ordering column is
+// whichever handle the caller held. Rendered against a FROM that names
+// the other one, MariaDB answers 1054 — in both directions, since once
+// a FROM carries an alias the base name stops being a legal qualifier
+// and without one the alias never was.
+func TestMySQLPageOrderByCrossesHandles(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_page"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	age := mysql.Add(tbl, mysql.Integer("age").NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	for i := 1; i <= 9; i++ {
+		if _, err := db.Insert(tbl).
+			Row(id.Val(int64(i)), name.Val(fmt.Sprintf("n%02d", i)), age.Val(int32(i))).
+			Exec(ctx); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	u := tbl.As("u")
+	// walk pages the entity to exhaustion and returns the ids in
+	// visit order, so the cursor guard is exercised as well as the
+	// ORDER BY — both render the ordering column.
+	walk := func(t *testing.T, page func(cursor string) (*mysql.Page[aliasRow], error)) []int64 {
+		t.Helper()
+		var ids []int64
+		cursor := ""
+		for i := 0; i < 10; i++ {
+			p, err := page(cursor)
+			if err != nil {
+				t.Fatalf("page %d: %v", i, err)
+			}
+			for _, r := range p.Items {
+				ids = append(ids, r.ID)
+			}
+			if !p.HasMore {
+				break
+			}
+			cursor = p.NextCursor
+		}
+		return ids
+	}
+	want := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9}
+
+	t.Run("entity on the table, ordered by the alias's handle", func(t *testing.T) {
+		ent := mysql.NewEntity[aliasRow](tbl)
+		got := walk(t, func(c string) (*mysql.Page[aliasRow], error) {
+			return ent.Page(db).OrderBy(mysql.Asc(u.Col("id"))).Limit(4).After(c).All(ctx)
+		})
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("ids = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("entity on the alias, ordered by the declared handle", func(t *testing.T) {
+		ent := mysql.NewEntity[aliasRow](u)
+		got := walk(t, func(c string) (*mysql.Page[aliasRow], error) {
+			return ent.Page(db).OrderBy(mysql.Asc(id)).Limit(4).After(c).All(ctx)
+		})
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("ids = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a cursor stamped under one handle spends under the other", func(t *testing.T) {
+		ent := mysql.NewEntity[aliasRow](tbl)
+		first, err := ent.Page(db).OrderBy(mysql.Asc(id)).Limit(4).All(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !first.HasMore {
+			t.Fatal("the first page should not have exhausted the table")
+		}
+		// Same walk, alias handle, resuming on the declared handle's
+		// token: the fingerprint is name-based, so tokens already
+		// issued stay valid across the fix.
+		next, err := ent.Page(db).OrderBy(mysql.Asc(u.Col("id"))).Limit(4).After(first.NextCursor).All(ctx)
+		if err != nil {
+			t.Fatalf("resuming under the other handle: %v", err)
+		}
+		if len(next.Items) == 0 || next.Items[0].ID != 5 {
+			t.Errorf("second page starts at %+v, want id 5", next.Items)
+		}
+	})
+}
+
+// A CursorSpec handed straight to SelectBuilder has the same hazard,
+// and the FROM may arrive after the spec does.
+func TestMySQLCursorSpecCrossesHandles(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_spec"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	for i := 1; i <= 5; i++ {
+		if _, err := db.Insert(tbl).Row(id.Val(int64(i))).Exec(ctx); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	u := tbl.As("u")
+	type row struct {
+		ID int64 `drop:"id"`
+	}
+
+	aliasSpec := mysql.NewCursorSpec(mysql.OrderKey{Col: u.Col("id")})
+	declaredSpec := mysql.NewCursorSpec(mysql.OrderKey{Col: id})
+
+	cur, err := mysql.EncodeCursor(aliasSpec, int64(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		q    func() *mysql.SelectBuilder
+	}{
+		{"alias spec over the declared FROM", func() *mysql.SelectBuilder {
+			return db.Select(id).From(tbl).OrderByCursor(aliasSpec).AfterCursor(aliasSpec, cur)
+		}},
+		{"declared spec over the aliased FROM", func() *mysql.SelectBuilder {
+			c, _ := mysql.EncodeCursor(declaredSpec, int64(2))
+			return db.Select(u.Col("id")).From(u).OrderByCursor(declaredSpec).AfterCursor(declaredSpec, c)
+		}},
+		{"FROM arriving after the spec", func() *mysql.SelectBuilder {
+			return db.Select(id).OrderByCursor(aliasSpec).AfterCursor(aliasSpec, cur).From(tbl)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []row
+			q := tc.q()
+			if err := q.All(ctx, &got); err != nil {
+				text, args := q.ToSQL()
+				t.Fatalf("%v\n%s\nargs: %v", err, text, args)
+			}
+			if len(got) != 3 || got[0].ID != 3 {
+				t.Errorf("rows = %+v, want ids 3..5", got)
+			}
+		})
+	}
+}
+
+// A Patch names its column on the right of the assignment, qualified.
+// An entity on an alias patched with the package-level handles — the
+// natural spelling, since (*Table).As hands out untyped columns and
+// Inc wants a typed one — therefore named a relation the UPDATE did
+// not, and MariaDB answered 1054 in the SET.
+func TestMySQLPatchCrossesHandles(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_patch"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	age := mysql.Add(tbl, mysql.Integer("age").NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	if _, err := db.Insert(tbl).Row(id.Val(1), name.Val("ada"), age.Val(10)).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	u := tbl.As("u")
+	ent := mysql.NewEntity[aliasRow](u)
+	if _, err := ent.Patch(db, ctx, int64(1),
+		mysql.Inc(age, 5),
+		mysql.SetIfGreater(age, 12),
+		// A change of case alone is not a change under MariaDB's
+		// default collation — see SetIfChanged — so the new value
+		// differs by more than that.
+		mysql.SetIfChanged(name, "grace"),
+	); err != nil {
+		t.Fatalf("patch through the entity's alias: %v", err)
+	}
+
+	var got []aliasRow
+	if err := db.Select(id, name, age).From(tbl).All(ctx, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Age != 15 || got[0].Name != "grace" {
+		t.Errorf("row = %+v, want age 15 and name grace", got)
+	}
+
+	// And the other direction: a plain UPDATE on the table whose
+	// operation was built from the alias's handle.
+	aliasAge := &mysql.Col[int32]{Column: u.Col("age")}
+	if _, err := db.Update(tbl).Set(mysql.Inc(aliasAge, 1)).
+		Where(mysql.Eq(id, int64(1))).Exec(ctx); err != nil {
+		t.Fatalf("update through the alias's handle: %v", err)
+	}
+	got = nil
+	if err := db.Select(id, name, age).From(tbl).All(ctx, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Age != 16 {
+		t.Errorf("row = %+v, want age 16", got)
+	}
+}
+
+// The whole entity CRUD path through an alias, so the identity fix is
+// checked against the server rather than against a rendered string.
+func TestMySQLEntityCRUDThroughAnAlias(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_crud"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey())
+	mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	mysql.Add(tbl, mysql.Integer("age").NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	ent := mysql.NewEntity[aliasRow](tbl.As("u"))
+	r := aliasRow{Name: "ada", Age: 36}
+	if err := ent.Create(db, ctx, &r); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if r.ID == 0 {
+		t.Fatal("the generated key was not written back")
+	}
+	r.Age = 37
+	if err := ent.Update(db, ctx, &r); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	back, err := ent.Get(db, ctx, r.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if back.Age != 37 || back.Name != "ada" {
+		t.Errorf("row = %+v", back)
+	}
+	if _, err := ent.Delete(db, ctx, r.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	var left []aliasRow
+	if err := db.Select(id).From(tbl).All(ctx, &left); err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Errorf("%d rows left", len(left))
+	}
+}
+
+// An index declared against either handle of one table has to reach
+// the server the same way — CREATE INDEX takes no AS clause, so the
+// statement names the table either way.
+func TestMySQLIndexDeclaredThroughAnAliasHandle(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_idx"))
+	dropMySQL(t, db, tbl)
+
+	mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+
+	u := tbl.As("u")
+	idx := mysql.NewIndex("idx_"+tbl.Name(), u, u.Col("name"))
+	tbl.AddIndex(idx)
+	execMySQL(t, db, idx)
+
+	snap, err := mysql.Introspect(ctx, db)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	ts := snap.Tables[tbl.Name()]
+	if ts == nil {
+		t.Fatalf("table %q is not in the snapshot", tbl.Name())
+	}
+	if _, ok := ts.Indexes["idx_"+tbl.Name()]; !ok {
+		t.Errorf("the index declared through the alias is not on the server: %+v", ts.Indexes)
+	}
+}
+
+// An upsert's assignment list has the same shape as a Patch's, and
+// one difference: INSERT INTO is written by writeName and carries no
+// AS clause, so the declared table is the only legal qualifier even
+// when the insert itself was built through an alias. MariaDB reports
+// the mismatch against the SELECT rather than the SET, which is its
+// own reason to pin it here.
+func TestMySQLUpsertAssignmentCrossesHandles(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_odku"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	age := mysql.Add(tbl, mysql.Integer("age").NotNull())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	if _, err := db.Insert(tbl).Row(id.Val(1), age.Val(10)).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	u := tbl.As("u")
+	aliasAge := &mysql.Col[int32]{Column: u.Col("age")}
+
+	if _, err := db.Insert(tbl).Row(id.Val(1), age.Val(10)).
+		OnDuplicateKeyUpdate(mysql.Inc(aliasAge, 1)).Exec(ctx); err != nil {
+		t.Fatalf("upsert with an op from the alias's handle: %v", err)
+	}
+	// The insert itself on the alias, ops from the alias too: still
+	// the declared name, because the INTO clause never aliases.
+	if _, err := db.Insert(u).
+		Row(mysql.Bind(u.Col("id"), int64(1)), mysql.Bind(u.Col("age"), int32(10))).
+		OnDuplicateKeyUpdate(mysql.Inc(aliasAge, 1)).Exec(ctx); err != nil {
+		t.Fatalf("upsert through the alias: %v", err)
+	}
+
+	var got []struct {
+		Age int32 `drop:"age"`
+	}
+	if err := db.Select(age).From(tbl).All(ctx, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Age != 12 {
+		t.Errorf("rows = %+v, want a single row at age 12", got)
+	}
+}
+
+// A comma join names two instances of one table just as a JOIN does,
+// and drops re-emits a FromExpr source without reading it — so it
+// cannot see the second one. Restating the spec's key against the FROM
+// table then orders and guards on the wrong instance, and MariaDB has
+// nothing to object to: both relations exist, so the statement is
+// valid SQL over the wrong rows. This is the shape that has to be read
+// off the server rather than off the render.
+func TestMySQLCursorSpecOverACommaSelfJoin(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+	tbl := mysql.NewTable(integration.UniqueName(t, "alias_comma"))
+	dropMySQL(t, db, tbl)
+
+	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	for i := 1; i <= 3; i++ {
+		if _, err := db.Insert(tbl).Row(id.Val(int64(i))).Exec(ctx); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+
+	u := tbl.As("u")
+	spec := mysql.NewCursorSpec(mysql.OrderKey{Col: u.Col("id")})
+	cur, err := mysql.EncodeCursor(spec, int64(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := db.Select(u.Col("id")).From(tbl).FromExpr(u).
+		OrderByCursor(spec).AfterCursor(spec, cur)
+	var got []struct {
+		ID int64 `drop:"id"`
+	}
+	if err := q.All(ctx, &got); err != nil {
+		text, args := q.ToSQL()
+		t.Fatalf("%v\n%s\nargs: %v", err, text, args)
+	}
+	ids := make([]int64, len(got))
+	for i, r := range got {
+		ids[i] = r.ID
+	}
+	// The cross join pairs every row with every row. Guarding and
+	// ordering on `u` leaves each of u's two surviving ids three
+	// times, in order; doing either on the un-aliased instance leaves
+	// all three of u's ids twice, and interleaved.
+	want := []int64{2, 2, 2, 3, 3, 3}
+	if fmt.Sprint(ids) != fmt.Sprint(want) {
+		text, args := q.ToSQL()
+		t.Errorf("u.id = %v, want %v — the walk ran on the other instance\n%s\nargs: %v",
+			ids, want, text, args)
+	}
+}

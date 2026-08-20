@@ -115,7 +115,7 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	if len(p.orderBys) == 0 {
 		return nil, errors.New("drops/mysql: Page requires OrderBy(...)")
 	}
-	spec := p.spec()
+	spec := p.rebindSpec(p.spec())
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
@@ -180,6 +180,45 @@ func (p *PageBuilder[T]) spec() CursorSpec {
 	if p.allowNonUnique {
 		spec = spec.AllowNonUniqueKey()
 	}
+	return spec
+}
+
+// rebindSpec restates every ordering key with the handle this
+// entity's own table hands out.
+//
+// [Asc] and [Desc] are free functions, so an ordering column arrives
+// as whichever handle the caller happened to hold, and it is rendered
+// twice — into the ORDER BY and into the cursor guard's comparison. A
+// handle from another instance of the table qualifies with a relation
+// the SELECT does not name, and MySQL answers 1054: an entity on an
+// alias paged by the package-level column, or an entity on the base
+// table paged by an alias handle, both fail. The column meant is the
+// same one either way — Column.key says so — so the fix is to page by
+// the handle the entity queries.
+//
+// A key the entity has no column for is left as it came; fieldIndexes
+// is where that turns into an error, so there is one place that
+// reports it.
+//
+// The restatement cannot change which cursors a walk accepts:
+// CursorSpec.fingerprint identifies a column by name, so a token
+// stamped under one handle stays spendable under the other, and every
+// token already in the wild stays valid.
+func (p *PageBuilder[T]) rebindSpec(spec CursorSpec) CursorSpec {
+	keys := make([]OrderKey, len(spec.Keys))
+	for i, k := range spec.Keys {
+		keys[i] = k
+		if k.Col == nil || k.Col.col() == nil {
+			continue
+		}
+		for _, cf := range p.e.colFields {
+			if cf.col.key() == k.Col.col().key() {
+				keys[i].Col = cf.col
+				break
+			}
+		}
+	}
+	spec.Keys = keys
 	return spec
 }
 

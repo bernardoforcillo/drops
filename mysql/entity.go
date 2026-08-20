@@ -194,9 +194,16 @@ func (e *Entity[T]) pkIsZero(r *T) bool {
 	return true
 }
 
+// isKeyColumn reports whether c is one of the entity's key columns,
+// through Column.key so a handle reached off an alias of the table
+// answers the same as the declared one. Entity builds e.pks and
+// e.colFields off the one *Table, so the two sides cannot disagree
+// today — but Entity.PK and Entity.PKs hand those pointers out, and
+// the first caller to route one back here would otherwise have an
+// UPDATE reassign the primary key.
 func (e *Entity[T]) isKeyColumn(c *Column) bool {
 	for _, k := range e.pks {
-		if k == c {
+		if k.key() == c.key() {
 			return true
 		}
 	}

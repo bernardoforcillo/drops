@@ -61,10 +61,17 @@ func (s *Schema) sortedTables() []*Table {
 // A UNIQUE index is how MySQL spells a unique constraint — there is no
 // separate constraint object, which is why this one method covers both
 // what pg calls an index and what it calls a UNIQUE constraint.
+//
+// "This table" means the table, not the handle: an alias is a second
+// handle on one table, so an index built against either handle is
+// accepted by either. The index still renders the un-aliased name —
+// CREATE INDEX takes no AS clause — and the alias's index list is its
+// own snapshot, so an index added through the alias does not reach the
+// table it was aliased from.
 func (t *Table) AddIndex(idx *Index) *Table {
-	if idx.table != t {
-		panic(fmt.Sprintf("drops/mysql: index %q was built against table %q and cannot be added to %q",
-			idx.name, idx.table.Name(), t.name))
+	if idx.table.key() != t.key() {
+		panic(fmt.Sprintf("drops/mysql: index %q was built against %s and cannot be added to %s",
+			idx.name, idx.table.subject(), t.subject()))
 	}
 	t.indexes = append(t.indexes, idx)
 	return t

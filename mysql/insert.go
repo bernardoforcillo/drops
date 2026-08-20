@@ -73,8 +73,17 @@ func (i *InsertBuilder) Ignore() *InsertBuilder { i.ignore = true; return i }
 // guarantee — the row may differ in exactly the columns nobody
 // assigned — so drops raises rather than guessing. Spell "do nothing
 // on conflict" as [InsertBuilder.Ignore], which says so.
+//
+// An assignment names its column on the right as well as the left —
+// "age = age + ?" — and qualified, so each one is restated against the
+// declared table's handle. The declared table is the only qualifier an
+// INSERT can accept: the INTO clause is written by writeName and
+// carries no AS, so even an insert built entirely from an alias's own
+// handles has to name the table there.
 func (i *InsertBuilder) OnDuplicateKeyUpdate(assignments ...ColumnValue) *InsertBuilder {
-	i.upserts = append(i.upserts, assignments...)
+	for _, a := range assignments {
+		i.upserts = append(i.upserts, rebindValue(i.table.key(), a))
+	}
 	return i
 }
 
@@ -117,14 +126,22 @@ func NewValueOf(col ColRef) drops.Expression {
 
 // alignRow orders a row's values to match cols, leaving DEFAULT where
 // a column has no binding.
+//
+// The column list is fixed by the first Row and the bindings come from
+// whichever handles the caller held, so the two sides are matched on
+// Column.key rather than on the pointer: a value bound through an
+// alias names the same column as the declared handle. Matching by
+// pointer instead drops it, and drops it silently — the column falls
+// to the DEFAULT fill, which is well-formed SQL that writes the wrong
+// row.
 func alignRow(cols []*Column, values []ColumnValue) []drops.Expression {
 	byCol := make(map[*Column]ColumnValue, len(values))
 	for _, v := range values {
-		byCol[v.column()] = v
+		byCol[v.column().key()] = v
 	}
 	out := make([]drops.Expression, len(cols))
 	for i, c := range cols {
-		v, ok := byCol[c]
+		v, ok := byCol[c.key()]
 		if !ok {
 			out[i] = drops.Raw("DEFAULT")
 			continue

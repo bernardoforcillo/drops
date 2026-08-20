@@ -420,7 +420,7 @@ func (s *SelectBuilder) OrderByCursor(spec CursorSpec) *SelectBuilder {
 		return s
 	}
 	for _, k := range spec.Keys {
-		s.orderBys = append(s.orderBys, orderKeyExpr(k))
+		s.orderBys = append(s.orderBys, s.deferredOrderKey(k))
 	}
 	return s
 }
@@ -455,8 +455,69 @@ func (s *SelectBuilder) cursorWhere(spec CursorSpec, c Cursor, forward bool) *Se
 		s.wheres = append(s.wheres, cursorErrExpr(err))
 		return s
 	}
-	s.wheres = append(s.wheres, keysetWhere(spec, values, forward))
+	s.wheres = append(s.wheres, drops.ExprFunc(func(b *drops.Builder) {
+		b.Append(keysetWhere(s.rebindSpec(spec), values, forward))
+	}))
 	return s
+}
+
+// deferredOrderKey renders one ORDER BY fragment, restating the key
+// against the builder's FROM table first.
+//
+// The restatement cannot happen when OrderByCursor is called:
+// [OrderKey.Col] is whichever handle the caller held, and the FROM
+// table it has to agree with may still be several chained calls away.
+// So the expression closes over the builder and asks at WriteSQL time,
+// by which point From has run.
+func (s *SelectBuilder) deferredOrderKey(k OrderKey) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.Append(orderKeyExpr(s.rebindSpec(CursorSpec{Keys: []OrderKey{k}}).Keys[0]))
+	})
+}
+
+// rebindSpec restates each key with the handle the builder's FROM
+// table hands out for that column, so the reference qualifies with the
+// relation the statement names rather than with another instance of
+// the same table — which is error 1054 in either direction.
+//
+// It moves a key only when the statement names one instance of the
+// table. A self-join names two on purpose and the spec picks between
+// them; restating there would erase the distinction the alias exists
+// to draw. A key on some other table's column is left alone for the
+// same reason: it is a deliberate reference, not a second handle.
+//
+// Counting the instances is only possible over the relations drops
+// renders itself — the FROM table and the joins. A source added with
+// FromExpr is an expression drops re-emits without reading, and it can
+// perfectly well be a second instance of the same table: a comma join
+// on the alias, or a derived table carrying the alias's name. Moving a
+// key then picks the wrong instance, and picks it silently — both
+// relations exist, so the ORDER BY and the keyset guard are valid SQL
+// over the wrong rows. So any FromExpr at all makes the count unknown
+// and the spec is left as it came.
+func (s *SelectBuilder) rebindSpec(spec CursorSpec) CursorSpec {
+	if s.from == nil || len(s.fromExprs) > 0 {
+		return spec
+	}
+	for _, j := range s.joins {
+		if j.table != nil && j.table.key() == s.from.key() {
+			return spec
+		}
+	}
+	keys := make([]OrderKey, len(spec.Keys))
+	for i, k := range spec.Keys {
+		keys[i] = k
+		if k.Col == nil || k.Col.col() == nil {
+			continue
+		}
+		c := k.Col.col()
+		own := s.from.byName[c.name]
+		if own != nil && own != c && own.key() == c.key() {
+			keys[i].Col = own
+		}
+	}
+	spec.Keys = keys
+	return spec
 }
 
 // orderKeyExpr renders one ORDER BY fragment. There is no NULLS

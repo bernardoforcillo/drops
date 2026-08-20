@@ -167,6 +167,53 @@ once a 1.0 is cut.
   field is also rejected before the query runs rather than at the first
   page boundary: a cursor is built out of the row's field values, so
   such a column could never produce one.
+- **An aliased `mysql` column was a stranger to the column it names.**
+  `mysql.Table.As` copied its columns and bound them to the alias, so
+  the rendering was right, but nothing recorded that the copy *is* the
+  declared column. Every site that decided by pointer therefore
+  answered wrong, and the worst of them silently: `alignRow` matched a
+  row's bindings against the INSERT column list through a
+  `map[*Column]`, so a row bound through an alias fell to the `DEFAULT`
+  fill — on a defaulted column MariaDB accepts the statement and writes
+  `('anon', 0)`, and on a `NOT NULL` column with no default the same
+  statement is error 1364, which is to say one schema change separates
+  a silent corruption from a hard failure. A column now carries the one
+  it was copied from (`Column.origin`) and a `*Table` carries the same
+  (`Table.origin`), and `alignRow`, `Entity`'s key columns and
+  `Table.AddIndex` match on that — `AddIndex`'s panic also names the
+  alias, having printed the base name on both sides of "cannot be added
+  to".
+
+  Where such a handle is *rendered* rather than looked up, identity is
+  not enough and the reference is restated. `Entity.Page` ordered by
+  the handle it was handed, into both the `ORDER BY` and the cursor
+  guard; a `CursorSpec` driven through `SelectBuilder` did the same,
+  and its `FROM` may arrive after the spec, so that one is restated at
+  render time — and left alone whenever drops cannot be sure the
+  statement names one instance of the table. A self-join names two on
+  purpose. So can a source added with `FromExpr`, which drops re-emits
+  without reading: a comma join on the alias is a second instance it
+  cannot count. Restating there picks the wrong instance and picks it
+  silently, because both relations exist and the statement stays valid
+  SQL over the wrong rows. `Patch` and `(*UpdateBuilder).Set` render an
+  operation's column on the right of the assignment —
+  `SET age = age + ?` — as does `ON DUPLICATE KEY UPDATE`; each is now
+  restated against the relation the statement names, which for an
+  `INSERT` is always the table, its `INTO` clause having no `AS` to
+  carry. Every one of these was error 1054 on the live server, in both
+  directions: once a `FROM` carries an alias the base name stops being
+  a legal qualifier, and without one the alias never was. Cursor tokens
+  are unaffected — the ordering fingerprint identifies a column by
+  name, so a token stamped under one handle still spends under the
+  other.
+
+  `As` also copies what it used to share. The `checks` map was shared
+  by reference, so a check added to either handle appeared on both and
+  the doc's "the copy is a snapshot" was false; `indexes` and
+  `defaultFilters` were copied as slice headers at full capacity, so
+  two aliases of one table appended into the same spare slot and the
+  second overwrote the first.
+
 - **`qdrant.HasID()` with an empty id set matched every point.** The
   field carries `omitempty`, so an empty set left a condition with no
   clauses in it, and Qdrant reads a condition that constrains nothing

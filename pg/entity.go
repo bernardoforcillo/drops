@@ -556,7 +556,12 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 		err := e.scanOneFast(ctx, sel, &out)
 		return out, err
 	}
+	// Get addresses a row by primary key and has no vocabulary for
+	// loading a relation, so the strict-loading check would be an
+	// unconditional refusal rather than a signal about this query.
+	// Query(db) is the strict-checked path — see strict.go.
 	fb := db.Find(e.table).Where(pred)
+	fb.strict = false
 	if tenantPred != nil {
 		fb.Where(tenantPred)
 	}
@@ -588,7 +593,9 @@ func (e *Entity[T]) getCached(db *DB, ctx context.Context, pkValues []any, pred 
 		if e.fastScan != nil {
 			err = e.scanOneFast(ctx, db.Select().From(e.table).Where(pred), &t)
 		} else {
-			err = db.Find(e.table).Where(pred).One(ctx, &t)
+			fb := db.Find(e.table).Where(pred)
+			fb.strict = false // as in Get: no relations to load here
+			err = fb.One(ctx, &t)
 		}
 		if err != nil {
 			return t, err
@@ -712,9 +719,24 @@ type EntityQuery[T any] struct {
 // from fn aborts the iteration and propagates the error to the
 // caller. Eager-loaded relations are not supported in Stream
 // (relation loaders need the populated parent slice).
+//
+// Stream carries the entity's scoping like every other read: the
+// tenant axis and the authorisation guard both narrow what it
+// iterates, and a missing ctx tenant or subject fails the call rather
+// than widening it.
 func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 	if q.fb.HasEagerLoads() {
 		return errors.New("drops/pg: Stream is incompatible with eager-loaded relations; use Query.All instead")
+	}
+	// Stream is a read like any other, so it owes the same scoping.
+	// Reaching straight for the SelectBuilder used to skip both, which
+	// made a batch job or an export the one way to read every tenant's
+	// rows at once without asking.
+	if err := q.applyTenantOnFB(ctx); err != nil {
+		return err
+	}
+	if err := q.applyGuardOnFB(ctx); err != nil {
+		return err
 	}
 	rows, err := q.fb.Select().Rows(ctx)
 	if err != nil {
@@ -1012,6 +1034,12 @@ func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 // applyTenantOnFB injects the tenant predicate on q.fb when the
 // entity is scoped. Helper used by All / One / Stream / Page.
 func (q *EntityQuery[T]) applyTenantOnFB(ctx context.Context) error {
+	// A query that named FilterTenant asked for the cross-tenant read
+	// explicitly, ctx tenant or not — so this must come before
+	// tenantPredicate, which errors when the ctx carries none.
+	if q.fb.ignoresFilter(FilterTenant) {
+		return nil
+	}
 	tenantPred, err := q.e.tenantPredicate(ctx)
 	if err != nil {
 		return err
@@ -1053,6 +1081,34 @@ func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T] { q.fb.Limit(n); return 
 // Offset sets the OFFSET.
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.fb.Offset(n); return q }
 
+// Strict turns the strict-loading check on for this query alone — see
+// [DB.StrictLoading].
+func (q *EntityQuery[T]) Strict() *EntityQuery[T] {
+	q.fb.Strict()
+	return q
+}
+
+// NoLoad declares that this query deliberately does not load rels, so
+// the strict-loading check lets it through — see [FindBuilder.NoLoad].
+func (q *EntityQuery[T]) NoLoad(rels ...*Relation) *EntityQuery[T] {
+	q.fb.NoLoad(rels...)
+	return q
+}
+
+// Without is [EntityQuery.NoLoad] taking relation names (dot paths
+// included) rather than handles.
+func (q *EntityQuery[T]) Without(names ...string) *EntityQuery[T] {
+	q.fb.Without(names...)
+	return q
+}
+
+// checkStrict runs the strict-loading check against T. The fast-scan
+// and cache paths never reach FindBuilder.All, so the check has to be
+// stated here too or it would apply to some queries and not others.
+func (q *EntityQuery[T]) checkStrict() error {
+	return q.fb.checkStrictLoading(reflect.TypeOf((*T)(nil)).Elem())
+}
+
 // With eager-loads the named relations (see FindBuilder.With).
 func (q *EntityQuery[T]) With(names ...string) *EntityQuery[T] {
 	q.fb.With(names...)
@@ -1079,9 +1135,31 @@ func (q *EntityQuery[T]) LoadRel(rel *Relation, fn func(*RelConfig)) *EntityQuer
 	return q
 }
 
-// Unscoped opts out of the table's DefaultFilter predicates.
+// Unscoped opts out of every global filter registered on the table —
+// the blunt instrument; see [SelectBuilder.Unscoped]. The tenant guard
+// [Entity.ScopeByTenant] installs is deliberately out of its reach: it
+// is built from the ctx, not from the table, and losing customer
+// isolation as a side effect of asking for soft-deleted rows is the
+// accident this API exists to prevent. Drop it by naming it —
+// IgnoreFilters(pg.FilterTenant).
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 	q.fb.Unscoped()
+	return q
+}
+
+// IgnoreFilters bypasses the named global filters and leaves every
+// other one standing:
+//
+//	// this tenant's rows, deleted ones included
+//	Posts.Query(db).IgnoreFilters(pg.FilterSoftDelete).All(ctx)
+//
+// Beyond the table's own filters ([Table.AddFilter]) it also accepts
+// [FilterTenant], which drops the isolation predicate
+// [Entity.ScopeByTenant] injects — a cross-tenant admin report is a
+// real need, and one that should read as one at the call site rather
+// than fall out of an unrelated Unscoped.
+func (q *EntityQuery[T]) IgnoreFilters(names ...string) *EntityQuery[T] {
+	q.fb.IgnoreFilters(names...)
 	return q
 }
 
@@ -1091,6 +1169,9 @@ func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 // cache attached and the query has no eager-loaded relations, the
 // result is cached under sha256(SQL+args) with the cache's TTL.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
+	if err := q.checkStrict(); err != nil {
+		return nil, err
+	}
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
 	if err := q.applyTenantOnFB(ctx); err != nil {
@@ -1127,6 +1208,9 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 // ErrNoRows if the query produces no rows. Honours the entity cache
 // the same way All does.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
+	if err := q.checkStrict(); err != nil {
+		return *new(T), err
+	}
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
 	if err := q.applyTenantOnFB(ctx); err != nil {

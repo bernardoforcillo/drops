@@ -21,7 +21,7 @@ type SelectBuilder struct {
 	distinct bool
 	forShare bool
 	forUpd   string
-	unscoped bool
+	scope    filterScope
 
 	// fromExprs are arbitrary FROM sources — a CTE reference, a
 	// derived table, a JSON_TABLE call — comma-joined after the
@@ -135,8 +135,24 @@ func (s *SelectBuilder) ForUpdateSkipLocked() *SelectBuilder {
 // be called second is how a read-modify-write loses a row.
 func (s *SelectBuilder) ForShare() *SelectBuilder { s.forShare = true; return s }
 
-// Unscoped opts out of the FROM table's DefaultFilter predicates.
-func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
+// Unscoped opts out of every global filter on the FROM table — named
+// and anonymous alike. The blunt instrument: it cannot tell a
+// soft-delete guard from a tenancy one. Name what you are stepping
+// around with IgnoreFilters instead.
+func (s *SelectBuilder) Unscoped() *SelectBuilder { s.scope.unscoped = true; return s }
+
+// IgnoreFilters bypasses the named global filters on the FROM table and
+// leaves every other one standing:
+//
+//	db.Select().From(posts).IgnoreFilters(mysql.FilterSoftDelete)
+//
+// Names come from [Table.AddFilter]. A name no filter carries is
+// ignored — a typo that leaves a filter standing returns too few rows,
+// never too many.
+func (s *SelectBuilder) IgnoreFilters(names ...string) *SelectBuilder {
+	s.scope.ignore(names...)
+	return s
+}
 
 // WriteSQL renders the SELECT.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
@@ -173,10 +189,7 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" ON ")
 		b.Append(j.on)
 	}
-	wheres := s.wheres
-	if !s.unscoped && s.from != nil && len(s.from.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), s.from.defaultFilters...), wheres...)
-	}
+	wheres := s.scope.apply(s.from, s.wheres)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)

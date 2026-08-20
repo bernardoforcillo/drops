@@ -218,6 +218,80 @@ outside the mapping needs an explicit `type=` in the tag, a pointer
 field tagged `notNull` is a contradiction, and so is `notNull`
 together with `null`.
 
+### Generating the struct instead
+
+The other direction, for a schema whose tables are the thing you
+maintain. Give the package the `Schema` function the tools already
+read for migrations:
+
+```go
+//go:generate go run github.com/bernardoforcillo/drops/cmd/dropsgen -rows .
+func Schema() *pg.Schema { return pg.NewSchema(Users) }
+```
+
+and every table gets two structs:
+
+```go
+type UsersRow struct {
+    ID        int64     `drop:"id"`
+    Email     string    `drop:"email"`
+    Name      string    `drop:"name"`
+    Age       *int32    `drop:"age"`
+    CreatedAt time.Time `drop:"createdAt"`
+}
+
+type UsersInsert struct {
+    Email string `drop:"email"`
+    Name  string `drop:"name"`
+    Age   *int32 `drop:"age"`
+}
+```
+
+`UsersRow` is what a `SELECT` hands back: one field per column, the Go
+type that column's `*pg.Col[T]` carries, and a pointer wherever the
+column admits NULL. That last part is why this is generated rather
+than written — the pairing `pg.NewEntity` refuses is one the generator
+cannot emit, so `pg.NewEntity[UsersRow](Users)` builds with no
+exemptions by construction.
+
+`UsersInsert` is the same minus the columns a caller must not supply:
+a serial key, a column with a `DEFAULT`, a generated column, and one
+`Managed()` marks as written by drops. The struct's doc comment names
+each omission and why. A pointer field is a column that admits NULL:
+bind it with `ValPtr`, and a nil writes NULL rather than a zero. The
+column is still in the INSERT — a column the database is the one to
+fill is not in the struct at all.
+
+How it reads the table: a CLI cannot read a Go variable, so `dropsgen`
+writes a throwaway program that imports the package, calls `Schema()`
+and prints what it finds as JSON — the same bridge `drops generate`
+and `drops push` use. The real compiler answers, which matters most
+for the Go types: a column's `T` lives in the handle and nothing in
+the source text can be parsed for it.
+
+Two rules worth knowing. A struct whose name the package already
+declares is **skipped**, and the generated file's header says which
+name and which file — two declarations of one name in one package do
+not compile, so a generator that meets a hand-written struct can only
+stand aside. And the output is byte-stable: two runs over one
+declaration produce identical files, including the run that reads the
+previous run's output, so the checked-in file does not churn.
+
+A third rule is about what it declines. A generated file that does not
+compile is worse than none, so a column whose Go type has no spelling
+the generator can write is an error naming that column rather than a
+guess: an instantiated generic over a type from another package
+(`sql.Null[time.Time]` — the type argument arrives by package name,
+with no import path behind it), two imported packages that share a
+name, a map, an anonymous struct. Where a qualifier can be written it
+is the package's own name and not the last element of its path, since
+every module past v1 ends its path in a version element —
+`github.com/gofrs/uuid/v5` is package `uuid`.
+
+`examples/schemagen` runs both directions over one table, and its
+tests close the loop: the struct that generated the table and the
+struct generated from it agree field for field.
+
 ### AutoTable
 
 `pg.AutoTable[User]("users")` derives the table from the same tags at

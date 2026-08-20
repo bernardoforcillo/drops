@@ -19,6 +19,12 @@ type FindBuilder struct {
 	sel    *SelectBuilder
 	roots  []*relNode
 	relErr error // first deferred path-parse error, surfaced from All
+
+	// strict / waived drive the strict-loading check in strict.go:
+	// whether an unloaded relation field refuses the query, and which
+	// root-level relations the caller has said it will not read.
+	strict bool
+	waived []string
 }
 
 // relNode is one node in the parsed eager-load tree. A path such as
@@ -35,6 +41,10 @@ type relNode struct {
 	limit    int
 	offset   int
 	children []*relNode
+	// waived are relations on this edge's target struct that the
+	// caller declared it will not read — the nested half of the
+	// strict-loading waiver. See strict.go.
+	waived []string
 }
 
 // mergeRelPath inserts a dot-separated path into a relNode forest,
@@ -171,7 +181,7 @@ func (c *RelConfig) LoadRel(rel *Relation, fn func(*RelConfig)) *RelConfig {
 // All/One determines what columns are scanned (via the same struct-field
 // mapping rules as Select.All).
 func (db *DB) Find(t *Table) *FindBuilder {
-	return &FindBuilder{db: db, table: t, sel: db.Select().From(t)}
+	return &FindBuilder{db: db, table: t, sel: db.Select().From(t), strict: db.strictLoading}
 }
 
 // Where appends predicates joined by AND.
@@ -192,10 +202,26 @@ func (f *FindBuilder) Limit(n int64) *FindBuilder { f.sel.Limit(n); return f }
 // Offset sets the OFFSET.
 func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
 
-// Unscoped opts out of the table's DefaultFilter predicates for the
-// root SELECT. Eager-loaded relations inherit their own table's
-// scopes independently.
+// Unscoped opts out of every global filter on the table for the root
+// SELECT — the blunt instrument; see [SelectBuilder.Unscoped].
+// Eager-loaded relations inherit their own table's scopes
+// independently.
 func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
+
+// IgnoreFilters bypasses the named global filters on the root table
+// and leaves every other one standing — see
+// [SelectBuilder.IgnoreFilters]. Eager-loaded relations keep their own
+// table's filters either way.
+func (f *FindBuilder) IgnoreFilters(names ...string) *FindBuilder {
+	f.sel.IgnoreFilters(names...)
+	return f
+}
+
+// ignoresFilter reports whether this query named filter in an
+// IgnoreFilters call. Read by the entity layer for the filters it
+// builds per query rather than registering on the table — the tenant
+// guard — which nothing on the table can carry.
+func (f *FindBuilder) ignoresFilter(name string) bool { return f.sel.scope.ignores(name) }
 
 // HasEagerLoads reports whether any relations have been queued for
 // eager loading via With / WithRel. Used by Entity[T] to decide
@@ -301,6 +327,12 @@ func (f *FindBuilder) All(ctx context.Context, dest any) error {
 	// Validate the whole tree up front so a typo in any path — at any
 	// depth — fails fast, before a single query runs.
 	if err := validateRelTree(f.table, f.roots); err != nil {
+		return err
+	}
+	// Likewise the strict-loading check: a relation the destination
+	// struct declares and this query never loads is refused here,
+	// before the SELECT, not discovered as a nil field downstream.
+	if err := f.checkStrictLoading(destStructType(dest)); err != nil {
 		return err
 	}
 	if err := f.sel.All(ctx, dest); err != nil {
@@ -913,6 +945,16 @@ func (f *FindBuilder) buildPerParentLimitedSQL(
 	if rel.Kind == MorphManyKind {
 		b.WriteString(" AND ")
 		Eq(rel.MorphTypeCol, rel.MorphType).WriteSQL(b)
+	}
+	// The child table's global filters, which the uncapped path gets
+	// for free from Select().From(rel.To). This writer builds its SQL
+	// by hand, so it has to spell them out — and without them, adding
+	// a per-parent cap to a load quietly widened it, handing back the
+	// soft-deleted and out-of-tenant children the same load returns
+	// correctly when it is uncapped.
+	for _, w := range rel.To.Filters() {
+		b.WriteString(" AND ")
+		w.WriteSQL(b)
 	}
 	for _, w := range node.wheres {
 		b.WriteString(" AND ")

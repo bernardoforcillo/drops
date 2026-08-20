@@ -24,10 +24,14 @@ type Table struct {
 
 	// Lifecycle hooks (see hooks.go) and default filters. All are
 	// optional; a table with none renders SQL unchanged.
-	insertHooks    []InsertHook
-	updateHooks    []UpdateHook
-	deleteHooks    []DeleteHook
-	defaultFilters []drops.Expression
+	insertHooks []InsertHook
+	updateHooks []UpdateHook
+	deleteHooks []DeleteHook
+
+	// filters are the global-filter predicates. A named one
+	// (AddFilter) can be bypassed on its own with IgnoreFilters; an
+	// anonymous one (DefaultFilter) only by Unscoped. See filters.go.
+	filters []tableFilter
 }
 
 // OnInsert registers an INSERT hook, run before every INSERT renders.
@@ -49,17 +53,55 @@ func (t *Table) OnDelete(h DeleteHook) *Table {
 	return t
 }
 
-// DefaultFilter appends a predicate applied automatically to every
-// Select / Update / Delete against the table, unless the builder opts
-// out with Unscoped(). Used to implement default scopes (soft-delete
-// hiding, tenant guards).
+// DefaultFilter appends an anonymous predicate applied automatically to
+// every Select / Update / Delete against the table.
+//
+// Anonymous means only Unscoped() can bypass it — and Unscoped bypasses
+// every other filter on the table at the same time. Prefer AddFilter,
+// which names the predicate so one query can step around it while the
+// table's remaining scoping stays in force.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.filters = append(t.filters, tableFilter{pred: e})
 	return t
 }
 
-// DefaultFilters returns the table's default-scope predicates.
-func (t *Table) DefaultFilters() []drops.Expression { return t.defaultFilters }
+// AddFilter appends a predicate under name, applied exactly as
+// DefaultFilter's is except that a query can bypass this one alone:
+//
+//	posts.AddFilter(sqlite.FilterSoftDelete, deletedAt.IsNull())
+//	db.Select().From(posts).IgnoreFilters(sqlite.FilterSoftDelete)
+//
+// An empty name panics: it would read as named at the call site and
+// behave as anonymous at the query.
+func (t *Table) AddFilter(name string, e drops.Expression) *Table {
+	if name == "" {
+		panic("drops/sqlite: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
+	}
+	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	return t
+}
+
+// DefaultFilters returns the table's global-filter predicates in
+// registration order, named and anonymous alike.
+func (t *Table) DefaultFilters() []drops.Expression {
+	out := make([]drops.Expression, len(t.filters))
+	for i, f := range t.filters {
+		out[i] = f.pred
+	}
+	return out
+}
+
+// FilterNames returns the names of the table's named filters in
+// registration order. Anonymous filters contribute nothing.
+func (t *Table) FilterNames() []string {
+	var out []string
+	for _, f := range t.filters {
+		if f.name != "" {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
 
 func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
 func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }

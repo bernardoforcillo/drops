@@ -14,7 +14,7 @@ type DeleteBuilder struct {
 	wheres   []drops.Expression
 	orderBys []drops.Expression
 	limit    *int64
-	unscoped bool
+	scope    filterScope
 }
 
 // Where appends predicates joined by AND.
@@ -41,8 +41,16 @@ func (d *DeleteBuilder) OrderBy(exprs ...drops.Expression) *DeleteBuilder {
 
 func (d *DeleteBuilder) Limit(n int64) *DeleteBuilder { d.limit = &n; return d }
 
-// Unscoped opts out of the table's DefaultFilter predicates.
-func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.unscoped = true; return d }
+// Unscoped opts out of every global filter on the table — the blunt
+// instrument; see [SelectBuilder.Unscoped].
+func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.scope.unscoped = true; return d }
+
+// IgnoreFilters bypasses the named global filters on the table and
+// leaves every other one standing — see [SelectBuilder.IgnoreFilters].
+func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
+	d.scope.ignore(names...)
+	return d
+}
 
 // WriteSQL renders the DELETE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
@@ -60,10 +68,7 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString("DELETE FROM ")
 		d.table.writeName(b)
 	}
-	wheres := d.wheres
-	if !d.unscoped && len(d.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), d.table.defaultFilters...), wheres...)
-	}
+	wheres := d.scope.apply(d.table, d.wheres)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)

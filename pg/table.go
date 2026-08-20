@@ -63,11 +63,13 @@ type Table struct {
 	updateHooks []UpdateHook
 	deleteHooks []DeleteHook
 
-	// defaultFilters are predicates applied automatically by
-	// SelectBuilder / UpdateBuilder / DeleteBuilder unless the caller
-	// opts out with Unscoped(). Used to implement default scopes
-	// (e.g. SoftDelete's "deleted_at IS NULL" guard).
-	defaultFilters []drops.Expression
+	// filters are the predicates applied automatically by
+	// SelectBuilder / UpdateBuilder / DeleteBuilder. A named filter
+	// (AddFilter) can be bypassed one at a time with IgnoreFilters;
+	// an anonymous one (DefaultFilter) only by Unscoped. Used to
+	// implement default scopes — SoftDelete's "deletedAt IS NULL"
+	// guard, a tenancy axis. See filters.go.
+	filters []tableFilter
 }
 
 // NewTable creates a table in the default ("public") schema. The name
@@ -156,14 +158,15 @@ func (t *Table) Alias() string { return t.alias }
 //
 // What is not rewritten is anything the caller built and drops only
 // re-emits: a predicate, and a Patch operation. Both are closed over
-// the handles they were given. A default filter registered by
+// the handles they were given. A global filter registered by
 // SoftDeleteMixin, or an authz guard built from the package-level
 // columns, still qualifies with the table name — so against a query
 // whose only FROM entry is the alias PostgreSQL raises 42P01, and in a
 // self-join the guard binds to whichever side is un-aliased rather
-// than to the one you meant. Scope an aliased query with Unscoped and
-// an explicit predicate built from the alias's own handles, and build
-// a Patch for an aliased entity from the alias's handles too.
+// than to the one you meant. Scope an aliased query with Unscoped (or
+// IgnoreFilters, when only one filter is in the way) plus an explicit
+// predicate built from the alias's own handles, and build a Patch for
+// an aliased entity from the alias's handles too.
 //
 // Indexes are shared with the base table for the same reason — an
 // index's column list may hold arbitrary expressions — so Index.Table
@@ -270,7 +273,7 @@ func (t *Table) As(alias string) *Table {
 	cp.insertHooks = append([]InsertHook(nil), t.insertHooks...)
 	cp.updateHooks = append([]UpdateHook(nil), t.updateHooks...)
 	cp.deleteHooks = append([]DeleteHook(nil), t.deleteHooks...)
-	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
+	cp.filters = append([]tableFilter(nil), t.filters...)
 	return &cp
 }
 
@@ -423,12 +426,58 @@ func (t *Table) OnDelete(h DeleteHook) *Table {
 	return t
 }
 
-// DefaultFilter appends a predicate applied to every Select / Update /
-// Delete against the table, unless the builder is marked Unscoped().
-// Filters compose with AND.
+// DefaultFilter appends an anonymous predicate applied to every
+// Select / Update / Delete against the table. Filters compose with AND.
+//
+// Anonymous means nothing can bypass it but Unscoped(), which bypasses
+// every other filter on the table at the same time. Prefer AddFilter,
+// which gives the predicate a name a single query can step around
+// without giving up the rest of the table's scoping.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.filters = append(t.filters, tableFilter{pred: e})
 	return t
+}
+
+// AddFilter appends a predicate under name, applied to every Select /
+// Update / Delete against the table exactly as DefaultFilter's is —
+// except that a query can bypass this one alone, by name:
+//
+//	Posts.AddFilter(pg.FilterSoftDelete, pg.IsNull(deletedAt))
+//	db.Select().From(Posts).IgnoreFilters(pg.FilterSoftDelete)
+//
+// Names are per table and re-registering one appends a second filter
+// rather than replacing the first, so both apply and IgnoreFilters
+// drops both. An empty name panics: it would register a filter that
+// reads as named at the call site and behaves as anonymous at the
+// query, which is the failure this whole mechanism exists to prevent.
+func (t *Table) AddFilter(name string, e drops.Expression) *Table {
+	if name == "" {
+		panic("drops/pg: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
+	}
+	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	return t
+}
+
+// Filters returns the table's global-filter predicates in registration
+// order, named and anonymous alike.
+func (t *Table) Filters() []drops.Expression {
+	out := make([]drops.Expression, len(t.filters))
+	for i, f := range t.filters {
+		out[i] = f.pred
+	}
+	return out
+}
+
+// FilterNames returns the names of the table's named filters in
+// registration order. Anonymous filters contribute nothing.
+func (t *Table) FilterNames() []string {
+	var out []string
+	for _, f := range t.filters {
+		if f.name != "" {
+			out = append(out, f.name)
+		}
+	}
+	return out
 }
 
 // AddIndex registers an index to be created alongside the table. The

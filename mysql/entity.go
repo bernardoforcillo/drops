@@ -329,8 +329,24 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 
-// Unscoped opts out of the table's DefaultFilter predicates.
+// Unscoped opts out of every global filter on the table — named and
+// anonymous alike; the blunt instrument. See [SelectBuilder.Unscoped].
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+
+// IgnoreFilters bypasses the named global filters and leaves every
+// other one standing — see [SelectBuilder.IgnoreFilters]. It is the
+// method to reach for on a table wearing more than one guard, where
+// Unscoped would drop the ones this query still wants.
+//
+//	postEntity.Query(db).IgnoreFilters(mysql.FilterSoftDelete).All(ctx)
+func (q *EntityQuery[T]) IgnoreFilters(names ...string) *EntityQuery[T] {
+	q.sb.IgnoreFilters(names...)
+	return q
+}
+
+// ToSQL renders the query without running it — the same statement All
+// and One would send.
+func (q *EntityQuery[T]) ToSQL() (string, []any) { return q.sb.ToSQL() }
 
 // All returns every matching row.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {

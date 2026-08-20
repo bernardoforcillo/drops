@@ -28,6 +28,11 @@ type DB struct {
 	hook   drops.Hook
 	tracer Tracer
 	retry  *RetryPolicy
+
+	// strictLoading, set by StrictLoading, makes Find and
+	// Entity.Query refuse a query that would leave a declared
+	// relation field unloaded. See strict.go.
+	strictLoading bool
 }
 
 // New wraps a drops.Driver as a DB.
@@ -193,7 +198,12 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 }
 
 // Exec runs a raw SQL statement with positional ($1, $2, ...) placeholders.
+//
+// Query tags on ctx (see [drops.WithQueryTags]) are appended to sql as
+// a trailing comment before anything else looks at it, so the span,
+// the hook and the server all report the same statement text.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	sql = drops.TagStatement(ctx, sql)
 	spanCtx, span := db.startSpan(ctx, "drops.exec")
 	span.SetAttribute(AttrSystem, AttrSystemPG)
 	span.SetAttribute(AttrOperation, "exec")
@@ -219,8 +229,10 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 	return res, err
 }
 
-// Query runs a raw SQL query.
+// Query runs a raw SQL query. Query tags on ctx are appended as a
+// trailing comment, as in [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	sql = drops.TagStatement(ctx, sql)
 	spanCtx, span := db.startSpan(ctx, "drops.query")
 	span.SetAttribute(AttrSystem, AttrSystemPG)
 	span.SetAttribute(AttrOperation, "query")

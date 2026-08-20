@@ -1,10 +1,10 @@
 // dropsgen generates zero-reflection bind / scan helpers for structs
 // tagged as drops entities.
 //
-// It has four modes; this comment covers the bind/scan one, and the
+// It has five modes; this comment covers the bind/scan one, and the
 // others are described where they are implemented: schema mode in
-// schema.go, snapshot introspection in introspect.go, SQL compilation
-// in sqlgen.go.
+// schema.go, row / insert struct generation in rows.go, snapshot
+// introspection in introspect.go, SQL compilation in sqlgen.go.
 //
 // Usage:
 //

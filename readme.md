@@ -547,6 +547,57 @@ Each event is a `drops.QueryEvent{Kind, SQL, Args, Duration, Err}`.
 Prometheus, Datadog, etc. in a few lines. `db.Ping(ctx)` issues
 `SELECT 1` and is the natural shape for a Kubernetes readiness probe.
 
+### Query tagging
+
+A hook can see a statement but cannot change it — it fires after the
+operation and its return value is discarded. Attributing a statement
+back to the code that issued it has to happen *before* it is sent, so
+tagging is plumbed into the render path instead: put tags on the
+context and every dialect appends them to the statement as a trailing
+[SQLCommenter](https://google.github.io/sqlcommenter/) comment.
+
+```go
+ctx = drops.WithQueryTags(ctx,
+    drops.Tag{Key: "controller", Value: "users"},
+    drops.Tag{Key: "action", Value: "show"},
+)
+ctx = drops.WithQueryTag(ctx, "request_id", "7f3a")
+
+rows, err := db.Query(ctx, `SELECT * FROM "users" WHERE "id" = $1`, id)
+// SELECT * FROM "users" WHERE "id" = $1 /*action='show',controller='users',request_id='7f3a'*/
+```
+
+That comment is the only part of a statement that survives into
+`pg_stat_statements`, MySQL's slow log and a proxy's logs, which is
+what turns a slow query there back into a line of application code
+here. Rails and EF Core both ship this; `context.Context` is a better
+carrier for it than the thread-locals Rails uses, because it already
+follows the request across goroutines.
+
+The details that matter:
+
+- **Trailing, not leading.** Too much tooling switches on a
+  statement's first token — MySQL executes `/*!` and reads `/*+` as a
+  hint, proxies split reads from writes by leading keyword.
+- **Percent-encoded.** Tag values are application strings landing
+  inside a comment, so a value containing `*/` would end it and
+  continue as SQL. Everything outside RFC 3986's unreserved set is
+  escaped, which makes that impossible rather than unlikely; there are
+  live-server tests that feed exactly that payload.
+- **Arguments are not taggable.** `Tag` holds two strings — no `any`,
+  no `Stringer` — and the function that renders the comment never
+  receives the argument slice. Bound values are user data and a
+  tracing backend is not where they go.
+- **Free when unused.** No tags on the context means no comment and no
+  work beyond one context lookup.
+- **Cardinality costs.** Tag values are part of the statement text, so
+  a per-request id defeats statement caching for as long as it is set.
+  Controller and action are free; request ids are for the requests
+  worth tracing.
+
+Works in `pg`, `mysql`, `sqlite` and `clickhouse` — a feature present
+in one dialect only would be a footgun in the other three.
+
 ### Sentinel errors
 
 Common failure modes are exported so callers can branch with

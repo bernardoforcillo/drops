@@ -15,7 +15,7 @@ type UpdateBuilder struct {
 	wheres   []drops.Expression
 	orderBys []drops.Expression
 	limit    *int64
-	unscoped bool
+	scope    filterScope
 }
 
 // Set appends column assignments.
@@ -59,8 +59,16 @@ func (u *UpdateBuilder) OrderBy(exprs ...drops.Expression) *UpdateBuilder {
 
 func (u *UpdateBuilder) Limit(n int64) *UpdateBuilder { u.limit = &n; return u }
 
-// Unscoped opts out of the table's DefaultFilter predicates.
-func (u *UpdateBuilder) Unscoped() *UpdateBuilder { u.unscoped = true; return u }
+// Unscoped opts out of every global filter on the table — the blunt
+// instrument; see [SelectBuilder.Unscoped].
+func (u *UpdateBuilder) Unscoped() *UpdateBuilder { u.scope.unscoped = true; return u }
+
+// IgnoreFilters bypasses the named global filters on the table and
+// leaves every other one standing — see [SelectBuilder.IgnoreFilters].
+func (u *UpdateBuilder) IgnoreFilters(names ...string) *UpdateBuilder {
+	u.scope.ignore(names...)
+	return u
+}
 
 // ErrNoAssignments is returned when an UPDATE has nothing to set.
 var ErrNoAssignments = errors.New("drops/mysql: UPDATE has no assignments")
@@ -78,10 +86,7 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" = ")
 		s.writeValue(b)
 	}
-	wheres := u.wheres
-	if !u.unscoped && len(u.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), wheres...)
-	}
+	wheres := u.scope.apply(u.table, u.wheres)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)

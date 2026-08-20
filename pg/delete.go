@@ -13,7 +13,7 @@ type DeleteBuilder struct {
 	using     []*Table
 	wheres    []drops.Expression
 	returning []drops.Expression
-	unscoped  bool
+	scope     filterScope
 }
 
 // Table returns the target table.
@@ -31,8 +31,12 @@ func (d *DeleteBuilder) ReturningClauses() []drops.Expression {
 	return append([]drops.Expression(nil), d.returning...)
 }
 
-// IsUnscoped reports whether the caller opted out of default scopes.
-func (d *DeleteBuilder) IsUnscoped() bool { return d.unscoped }
+// IsUnscoped reports whether the caller opted out of every default
+// scope via Unscoped. A DeleteHook reads it to tell a hard DELETE from
+// the soft one it would otherwise rewrite. IgnoreFilters does not set
+// it: naming a filter drops a predicate, it does not cancel the
+// rewrite that turns DELETE into UPDATE.
+func (d *DeleteBuilder) IsUnscoped() bool { return d.scope.unscoped }
 
 // DB returns the executing DB. Hooks that need to build a replacement
 // statement (an UPDATE for soft-delete, for instance) use it.
@@ -56,11 +60,22 @@ func (d *DeleteBuilder) Returning(cols ...drops.Expression) *DeleteBuilder {
 	return d
 }
 
-// Unscoped opts out of both DeleteHooks and DefaultFilters for this
-// statement. On a soft-deleted table it forces a real, hard DELETE
-// that bypasses the rewrite-to-UPDATE behaviour.
+// Unscoped opts out of both DeleteHooks and every global filter on the
+// table. On a soft-deleted table it forces a real, hard DELETE that
+// bypasses the rewrite-to-UPDATE behaviour — and, being the blunt
+// instrument, drops the table's other scoping with it.
 func (d *DeleteBuilder) Unscoped() *DeleteBuilder {
-	d.unscoped = true
+	d.scope.unscoped = true
+	return d
+}
+
+// IgnoreFilters bypasses the named global filters on the table and
+// leaves every other one in place — see [SelectBuilder.IgnoreFilters].
+// It only drops predicates: the DeleteHooks stay, so on a soft-deleted
+// table the statement is still rewritten into an UPDATE. Use Unscoped
+// when you want the row gone for good.
+func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
+	d.scope.ignore(names...)
 	return d
 }
 
@@ -68,7 +83,7 @@ func (d *DeleteBuilder) Unscoped() *DeleteBuilder {
 // caller has not opted out via Unscoped, hooks may replace the
 // statement entirely — used by SoftDelete to flip DELETE into UPDATE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
-	if !d.unscoped {
+	if !d.scope.unscoped {
 		for _, h := range d.table.deleteHooks {
 			if rep := h.BeforeDelete(d); rep != nil {
 				rep.WriteSQL(b)
@@ -76,10 +91,7 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 			}
 		}
 	}
-	wheres := d.wheres
-	if !d.unscoped && len(d.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), d.table.defaultFilters...), wheres...)
-	}
+	wheres := d.scope.apply(d.table, d.wheres)
 	b.WriteString("DELETE FROM ")
 	d.table.writeFrom(b)
 	if len(d.using) > 0 {

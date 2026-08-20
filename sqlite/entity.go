@@ -649,6 +649,12 @@ func (q *EntityQuery[T]) applyScopes(ctx context.Context) error {
 	if q.scopesApplied {
 		return nil
 	}
+	// A query that named FilterTenant asked for the cross-tenant read
+	// explicitly, so it must skip tenantPredicate entirely — that call
+	// errors when the ctx carries no tenant.
+	if q.sb.scope.ignores(FilterTenant) {
+		return q.applyGuardOnly(ctx)
+	}
 	tenantPred, err := q.e.tenantPredicate(ctx)
 	if err != nil {
 		return err
@@ -680,11 +686,43 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 }
 
 // Limit / Offset bound the result window.
-// Unscoped opts out of the table's DefaultFilter predicates for this
-// query. Without it a soft-deleted row is unreachable through the
-// entity at all, which makes an audit or a restore flow impossible to
-// write.
+// Unscoped opts out of every global filter registered on the table —
+// the blunt instrument; see [SelectBuilder.Unscoped]. The tenant guard
+// [Entity.ScopeByTenant] installs is deliberately out of its reach: it
+// comes from the ctx, not the table, and losing customer isolation as a
+// side effect of asking for soft-deleted rows is the accident this API
+// exists to prevent. Drop it by naming it — IgnoreFilters(FilterTenant).
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+
+// IgnoreFilters bypasses the named global filters and leaves every
+// other one standing:
+//
+//	// this tenant's rows, deleted ones included
+//	posts.Query(db).IgnoreFilters(sqlite.FilterSoftDelete).All(ctx)
+//
+// Beyond the table's own filters it also accepts [FilterTenant], which
+// drops the isolation predicate [Entity.ScopeByTenant] injects — a
+// cross-tenant read is a real need, and one that should read as one at
+// the call site.
+func (q *EntityQuery[T]) IgnoreFilters(names ...string) *EntityQuery[T] {
+	q.sb.IgnoreFilters(names...)
+	return q
+}
+
+// applyGuardOnly applies the authorisation guard without the tenant
+// predicate. Dropping tenancy by name never drops authorisation with
+// it — they are separate scopes and only one was named.
+func (q *EntityQuery[T]) applyGuardOnly(ctx context.Context) error {
+	guardPred, err := q.e.guardPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if guardPred != nil {
+		q.sb.Where(guardPred)
+	}
+	q.scopesApplied = true
+	return nil
+}
 
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }

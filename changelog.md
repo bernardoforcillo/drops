@@ -9,6 +9,63 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Query tagging from context (SQLCommenter).** A slow statement in
+  `pg_stat_statements` or a MySQL slow log says what ran and says
+  nothing about which line of application code ran it; the usual
+  recovery is to eyeball the top-20 and grep the codebase for
+  something shaped like them. `drops.WithQueryTags` puts the answer in
+  the statement. Tags on the context are appended as a trailing
+  comment in the SQLCommenter format Rails and EF Core emit —
+  `SELECT … /*action='show',controller='users',request_id='7f3a'*/` —
+  and the comment is the one part of a statement that survives into
+  every log, view and proxy downstream. `context.Context` is a
+  strictly better carrier for this than the thread-locals Rails uses,
+  because it already follows the request across goroutines.
+
+  This is not a `Hook`, and could not be: a hook fires after the
+  operation and its return value is discarded, so it can observe a
+  statement but never rewrite one. Tagging is therefore plumbed into
+  the statement path itself — `DB.Exec` and `DB.Query` in all four
+  dialects, which is where every builder's rendered SQL passes on its
+  way to the driver — rather than exposed as general SQL-rewriting
+  middleware, which drops deliberately refuses. The grammar is closed:
+  key-sorted encoded pairs in a trailing comment, nothing else.
+
+  Three decisions worth stating. The comment goes at the **end**, per
+  the spec: too much tooling switches on a statement's first token —
+  MySQL executes `/*!` and reads `/*+` as an optimizer hint, proxies
+  route reads and writes by leading keyword — and the usual argument
+  for a leading comment (a trailing one is lost when the statement is
+  wrapped in a subquery) does not apply, because the comment is
+  appended to a finished statement on its way to the driver, with no
+  composition left to happen. Keys and values are **percent-encoded**
+  to RFC 3986's unreserved set: they are application strings landing
+  inside a SQL comment, and a value containing `*/` would close it and
+  hand the rest of itself to the parser, so `*`, `/`, `'`, newline,
+  `!` and `+` all escape and the rendered comment can only ever
+  contain `[A-Za-z0-9-._~%'=,]`. Integration tests feed exactly that
+  payload — aimed at dropping the table the same statement reads — to
+  live PostgreSQL, MariaDB and SQLite, and confirm against
+  `pg_stat_activity` and `information_schema.processlist` that what
+  the server received is the comment that was written.
+
+  Query arguments are **not taggable**, structurally rather than by
+  documentation: a `Tag` holds two strings, with no `any`, `Stringer`
+  or `Valuer` to convert a bound value through, and
+  `drops.TagStatement` is handed the statement text and the context
+  only — the argument slice is not in scope where the comment is
+  built. Bound arguments are user data, and a tracing backend is not
+  where user data goes.
+
+  Cost is one `ctx.Value` lookup on a statement with no tags, which is
+  what the untagged path is: `BenchmarkExecUntagged` is unchanged
+  before and after (pg: ~207ns/2 allocs → ~201ns/2 allocs, within
+  noise). Tag values do become part of the statement text, so a
+  high-cardinality tag like a request id defeats statement caching for
+  as long as it is set — documented rather than forbidden, since
+  matching one logged statement to one trace is exactly what it is
+  for.
+
 - **Nullability, stated once and enforced from both ends.** Writing a
   NULL through the builder had no typed spelling: `(*Col[T]).Val`
   takes a `T`, so callers reached for `drops.Raw("NULL")` — which
@@ -50,6 +107,119 @@ once a 1.0 is cut.
   schema trips the check. `Nullable()` renders nothing in the other
   three, where a column admits NULL unless it says otherwise, so no
   snapshot churns and no migration appears.
+
+- **Row and insert structs, generated from the table declaration**
+  (`dropsgen -rows ./db/schema`). drizzle-orm's most-praised ergonomic
+  feature is `$inferSelect` / `$inferInsert`: the row type is derived
+  from the column table so it cannot drift, and the insert type omits
+  the columns the database will fill. Go cannot infer a struct from a
+  value, so the equivalent has to be generated — `dropsgen -schema`
+  already ran struct to table, and this is the inverse. `UsersRow` has
+  one field per column, the Go type that column's `*pg.Col[T]`
+  carries, and the `drop:` tag that binds it; `UsersInsert` is the
+  same minus a serial key, a column with a `DEFAULT`, a generated
+  column and anything `Managed()` marks as written by drops.
+
+  Nullability landing is what makes this worth generating rather than
+  writing. `pg.NewEntity` now refuses a column that admits NULL bound
+  to a field that cannot receive one, and refuses it at package-var
+  init — so the mistake a hand-written struct earns is a panic at
+  process start, or a scan failure in production on the first row that
+  happens to be NULL. A generator that reads nullability off the
+  declaration cannot emit that pairing: the nullable columns come out
+  as pointers, and the struct is correct by construction.
+
+  It reads the table by compiling one. A CLI cannot read a Go
+  variable, and parsing `pg.Add` calls out of the source would recover
+  the column names but not the Go types — a column's `T` lives in the
+  `*Col[T]` handle and appears in no field of it. So `-rows` reuses
+  the bridge `drops generate` and `drops push` already use: a
+  throwaway program that imports the schema package, calls its
+  `Schema()` function and prints what it finds as JSON, compiled by
+  the real compiler against the real declarations. `(*pg.Column).GoType`
+  is the one thing that had to be added for it, returning the value
+  type the handle carries — nil for an `AutoTable` column, which was
+  derived from a struct that already exists.
+
+  Two decisions the mode had to make. A struct whose name the package
+  already declares is **skipped**, with the name and its file recorded
+  in the generated file's header: two declarations of one name in one
+  package do not compile, so emitting a second one is not an option,
+  and overwriting a struct somebody maintains is not a generator's
+  call. And the output is byte-stable — including across the run that
+  reads the previous run's output, which is why the previous file is
+  moved aside before the bridge compiles the package, a step that also
+  keeps a stale generated file from breaking the run that would have
+  fixed it. A test runs the whole thing twice and compares bytes.
+
+  What it will not write, it refuses to write. A generated file that
+  does not compile is worse than no file, so the two shapes that would
+  produce one are errors naming the column: an instantiated generic
+  over a type from another package (`sql.Null[time.Time]` — reflect
+  reports the argument by package *name*, and there is no path left to
+  import), and two packages that share a name, which cannot both be
+  imported unqualified. Where a qualifier *can* be written it is the
+  package's own name rather than the last element of its import path,
+  and the import carries that name when the two differ — every module
+  past v1 ends its path in a version element, so `github.com/gofrs/`
+  `uuid/v5` is package `uuid`.
+
+  `examples/schemagen` now runs both directions over one table, and
+  its tests close the loop: the struct that generated the table and
+  the struct generated from that table agree field for field.
+
+- **Global filters carry names, and a query bypasses them one at a
+  time.** A table's implicit predicates — the soft-delete guard, a
+  tenancy axis, an authorisation rule — were anonymous, and the only
+  way past any of them was `Unscoped()`, which drops all of them. So a
+  report that legitimately wanted soft-deleted rows silently lost its
+  tenancy predicate: the caller asked to see deleted rows and got
+  another customer's. `Table.AddFilter(name, pred)` registers a filter
+  under a name and `IgnoreFilters(names...)` — on Select, Update,
+  Delete, Find and EntityQuery — drops only what it names. EF Core
+  shipped named query filters in 2025 for the same reason, which is
+  the field conceding that one anonymous global filter was a design
+  error; fixing it now, before there are users, is the cheap moment.
+
+  `SoftDeleteMixin` registers under `FilterSoftDelete` and
+  `ScopeByTenant` under `FilterTenant`, both constants rather than
+  strings a caller retypes. `Unscoped` stays, documented as the blunt
+  instrument: it drops every filter the *table* carries, which is what
+  a migration wants and almost never what a query does. It does not
+  reach the `ScopeByTenant` guard, which is built per query from the
+  ctx and is not a table filter — losing isolation as a side effect of
+  an unrelated `Unscoped` is the accident the feature exists to
+  prevent, so crossing tenants has to be said out loud with
+  `IgnoreFilters(FilterTenant)`. `DefaultFilter` still registers an
+  anonymous filter, and is still only reachable by `Unscoped`.
+  Available in pg, sqlite and mysql.
+
+- **An unloaded relation stops reading as an empty one.** Forget
+  `Load(UserPosts)` and `user.Posts` is `nil`, which is
+  indistinguishable from "this user has no posts" — a silent wrong
+  answer, and the Go ORM bug nobody in Go guards against. SQLAlchemy
+  has `raiseload` and Rails `strict_loading`, but both work by
+  intercepting the attribute read, and nothing in Go can interpose on
+  a struct field. So drops refuses the *query* instead:
+  `db.StrictLoading()` (or `.Strict()` on one query) walks the
+  destination struct against the table's declared relations and fails
+  before the SELECT runs, naming the relation, the struct, and both
+  the call that would have loaded it and the call that waives it.
+
+  The waiver is `NoLoad(rels...)` / `Without(names...)` — SQLAlchemy's
+  `noload`, meaning not "do not load", which is already the default,
+  but "I know it is not loaded and I will not read it". A destination
+  struct with no relation field is never refused; neither is
+  `Entity.Get`, which addresses a row by primary key and has no
+  relation-loading vocabulary, so the check there would be an
+  unconditional refusal rather than a signal about the query. The
+  check is off by default and meant for development and test builds,
+  where the mistake surfaces as a failing test rather than a failing
+  request. It does not overlap `N1Hook`: that counts SQL that already
+  ran, to catch the query a caller *did* write in a loop; this one
+  costs no round trip and catches the query a caller did not write.
+  pg descends the whole nested load tree; sqlite's `Find` loads one
+  level, so the check looks at one level.
 
 - **The `drops` CLI** — every step of the migration loop existed as a
   library function and had no front end, so a project that wanted
@@ -277,6 +447,45 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **A per-parent `Limit` on an eager-loaded relation dropped that
+  relation's global filters.** An edge of a `Load` tree is normally a
+  `Select().From(rel.To)`, so it carries the related table's guards for
+  free. Asking for at most N children per parent takes a different
+  route — `RelConfig.Limit` rewrites the edge into a hand-written
+  `ROW_NUMBER() OVER (PARTITION BY …)` statement — and that writer
+  never spelled the guards out. So adding `.Limit(n)` to a load, a
+  change that reads as "give me fewer of these", silently widened what
+  came back: on a live server, an author whose books table carried a
+  soft-delete guard and a tenancy guard returned the soft-deleted book
+  and the other tenant's book once the cap was added, and neither
+  without it. The rewrite now AND-s in `rel.To`'s filters, so a capped
+  load and an uncapped one scope identically.
+- **`mysql.EntityQuery` had no `IgnoreFilters`.** The builders got it
+  and the entity layer did not, which left an entity query on a
+  doubly-guarded table holding only `Unscoped` — the all-or-nothing the
+  named filters exist to replace.
+- **`pg.EntityQuery.Stream` and `pg.Entity.Page` read every tenant's
+  rows.** `ScopeByTenant` promises that every read on the entity is
+  narrowed to the ctx tenant, and Get / Query.All / Query.One / Update
+  / Delete all honoured it. Stream reached straight for the
+  `SelectBuilder` and Page built its own statement, so both skipped the
+  tenant predicate and the `AuthorizeWith` guard entirely — which made
+  an export or a paginated listing the one way to read across every
+  customer without asking for it, and made a missing ctx tenant a
+  silent full-table read instead of `ErrTenantMissing`. Against a live
+  server with two tenants in the table, both returned all of them.
+  drops/sqlite's Page had this right already.
+- **`sqlite`'s `SoftDeleteByID` and `Restore` wrote past every filter
+  on the table, not just the one they meant to.** Both have to reach a
+  row the soft-delete guard is hiding, and the only tool for that was
+  `Unscoped()` — which also drops the tenancy or authorisation filter
+  that decides *which* row the statement may touch. Against a live
+  engine, soft-deleting id 2 on a table filtered to tenant 7 hid
+  tenant 8's row. They now name the guard they are stepping around,
+  `IgnoreFilters(FilterSoftDelete)`, and stay inside the rest.
+  `SoftDeleteMixin` also stopped registering a second copy of the
+  filter `SoftDelete` had already installed, which had been doubling
+  the predicate in every rendered WHERE.
 - **`clickhouse.Analyze` graded a statement by the text of its column
   comment.** Every keyword the rules match is also an ordinary English
   word, and the matcher read the whole statement including its

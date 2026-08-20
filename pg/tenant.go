@@ -67,6 +67,12 @@ var ErrTenantMismatch = errors.New("drops/pg: row tenant disagrees with ctx tena
 // entity's own handle rather than the one passed in: the predicate has
 // to qualify with the table this entity queries, and an alias handle
 // would qualify with an alias no such query names.
+//
+// The predicate is a named global filter — [FilterTenant] — but not one
+// registered on the table: it is built per query from the ctx tenant,
+// which a table cannot see. That is why [EntityQuery.Unscoped] leaves
+// it alone where it drops every table-level filter, and why the only
+// way past it is to say so: IgnoreFilters(pg.FilterTenant).
 func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 	c := col.col()
 	for _, cf := range e.colFields {

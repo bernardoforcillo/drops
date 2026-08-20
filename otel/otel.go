@@ -21,6 +21,18 @@
 // retroactively with explicit start/end timestamps (start = observed end
 // − event Duration). For live, actively-wrapped spans on PostgreSQL,
 // combine this with pg.WithTracer; the two compose.
+//
+// That after-the-fact position is also why the trace context does not
+// live here. Putting a traceparent into a statement — so a row in
+// pg_stat_statements or a line in a slow-query log can be joined back
+// to the trace that produced it — has to happen before the statement
+// is sent, and by the time this hook runs it is already on the wire.
+// Query tagging is the seam for it; the value comes from wherever the
+// real SDK exposes the span context, since the Tracer interface above
+// deliberately does not:
+//
+//	ctx = drops.WithQueryTags(ctx, drops.Traceparent(tp))
+//	// SELECT ... /*traceparent='00-4bf9…-00f0…-01'*/
 package otel
 
 import (

@@ -24,6 +24,13 @@
 // single contract shared by every dialect. A ready-made structured hook
 // is available via [LoggerHook].
 //
+// [WithQueryTags] attaches application context — controller, action,
+// request id — to every statement as a trailing SQLCommenter comment,
+// which is what lets a slow entry in pg_stat_statements be traced back
+// to the code that issued it. It is plumbed into the statement path
+// rather than built on [Hook], because a hook fires after the
+// operation and cannot change what was sent.
+//
 // # Dialect packages
 //
 //   - [github.com/bernardoforcillo/drops/pg] — PostgreSQL. Full surface:

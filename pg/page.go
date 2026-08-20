@@ -28,6 +28,11 @@ type Page[T any] struct {
 // Cursors are opaque, URL-safe base64 strings whose payload is a
 // gob-encoded slice of the ordering columns' values. Stable as long
 // as the OrderBy spec doesn't change between calls.
+//
+// A page is a read like any other, so it carries the entity's scoping:
+// the [Entity.ScopeByTenant] axis and the [Entity.AuthorizeWith] guard
+// both narrow which rows may appear on it, and a missing ctx tenant or
+// subject fails the page rather than widening it.
 type PageBuilder[T any] struct {
 	e        *Entity[T]
 	db       *DB
@@ -108,6 +113,24 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	}
 
 	sel := p.db.Select().From(p.e.table)
+	// A page is a read like any other, so it owes the entity's scoping
+	// — the tenant axis and the authorisation guard both narrow which
+	// rows may appear on it, and a page that skipped them handed the
+	// caller another tenant's rows with a cursor to walk more of them.
+	tenantPred, err := p.e.tenantPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if tenantPred != nil {
+		sel.Where(tenantPred)
+	}
+	guardPred, err := p.e.guardPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if guardPred != nil {
+		sel.Where(guardPred)
+	}
 	for _, w := range p.wheres {
 		sel.Where(w)
 	}

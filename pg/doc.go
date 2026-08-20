@@ -21,10 +21,12 @@
 // Lifecycle hooks (OnInsert / OnUpdate / OnDelete on Table) let
 // templates extend INSERT / UPDATE / DELETE statements automatically.
 // User-supplied values always win, so hooks are safe to register on
-// shared tables. Default scopes (Table.DefaultFilter) apply a
-// predicate to every SELECT / UPDATE / DELETE against the table
-// unless the caller opts out with the builder's Unscoped() method —
-// the mechanism behind soft-delete-aware queries.
+// shared tables. Global filters (Table.AddFilter) apply a named
+// predicate to every SELECT / UPDATE / DELETE against the table —
+// the mechanism behind soft-delete-aware queries. A query steps
+// around one of them by name, with the builder's IgnoreFilters
+// method, and keeps the rest; Unscoped() drops them all at once and
+// is the blunt instrument. See filters.go.
 //
 // Entity[T] (see entity.go) binds a Go struct to a Table and exposes
 // type-safe CRUD shortcuts: Get / Create / Update / Save / Delete /

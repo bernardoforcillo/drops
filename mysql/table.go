@@ -22,9 +22,10 @@ type Table struct {
 	byName    map[string]*Column
 	relations map[string]*Relation
 
-	// defaultFilters are AND-ed onto every SELECT from this table
-	// unless the builder opts out with Unscoped.
-	defaultFilters []drops.Expression
+	// filters are AND-ed onto every SELECT from this table. A named
+	// one (AddFilter) can be bypassed on its own with IgnoreFilters;
+	// an anonymous one (DefaultFilter) only by Unscoped.
+	filters []tableFilter
 
 	// indexes and checks are what the migration layer needs and the
 	// query layer never looks at: the secondary indexes and CHECK
@@ -153,7 +154,7 @@ func (t *Table) As(alias string) *Table {
 	// alias land in the base table's spare capacity, and the next
 	// append through another handle overwrite it.
 	cp.indexes = append([]*Index(nil), t.indexes...)
-	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
+	cp.filters = append([]tableFilter(nil), t.filters...)
 	return &cp
 }
 
@@ -195,12 +196,54 @@ func (t *Table) Collate(name string) *Table { t.collation = name; return t }
 // Comment attaches a COMMENT to the table.
 func (t *Table) Comment(text string) *Table { t.comment = text; return t }
 
-// DefaultFilter registers a predicate AND-ed onto every SELECT from
-// this table — a soft-delete or tenant guard. Bypass it with
-// (*SelectBuilder).Unscoped.
+// DefaultFilter registers an anonymous predicate AND-ed onto every
+// SELECT from this table — a soft-delete or tenant guard.
+//
+// Anonymous means only (*SelectBuilder).Unscoped can bypass it, and
+// Unscoped bypasses every other filter on the table at the same time.
+// Prefer AddFilter, which names the predicate so one query can step
+// around it and keep the rest.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.filters = append(t.filters, tableFilter{pred: e})
 	return t
+}
+
+// AddFilter registers a predicate under name, applied exactly as
+// DefaultFilter's is except that a query can bypass this one alone:
+//
+//	posts.AddFilter(mysql.FilterSoftDelete, deletedAt.IsNull())
+//	db.Select().From(posts).IgnoreFilters(mysql.FilterSoftDelete)
+//
+// An empty name panics: it would read as named at the call site and
+// behave as anonymous at the query.
+func (t *Table) AddFilter(name string, e drops.Expression) *Table {
+	if name == "" {
+		panic("drops/mysql: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
+	}
+	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	return t
+}
+
+// Filters returns the table's global-filter predicates in registration
+// order, named and anonymous alike.
+func (t *Table) Filters() []drops.Expression {
+	out := make([]drops.Expression, len(t.filters))
+	for i, f := range t.filters {
+		out[i] = f.pred
+	}
+	return out
+}
+
+// FilterNames returns the names of the table's named filters in
+// registration order. Anonymous filters contribute nothing.
+func (t *Table) FilterNames() []string {
+	var out []string
+	for _, f := range t.filters {
+		if f.name != "" {
+			out = append(out, f.name)
+		}
+	}
+	return out
 }
 
 // Col looks a column up by name, returning nil when absent.

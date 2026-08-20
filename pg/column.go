@@ -2,6 +2,7 @@ package pg
 
 import (
 	"database/sql"
+	"reflect"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -35,6 +36,15 @@ type Column struct {
 	pii        bool // marked via (*Col[T]).AsPII()
 	managed    bool // drops writes this column, not the application
 
+	// goType is the Go value type the typed handle carries — the T of
+	// the *Col[T] this Column was created for. It is the one thing a
+	// generator reading a table declaration cannot recover any other
+	// way: T appears in no field of Col[T], so reflection over the
+	// handle cannot see it, and the SQL type is a lossy stand-in
+	// (uuid, citext and a domain type all arrive as text). Nil on a
+	// Column built without a typed handle — see GoType.
+	goType reflect.Type
+
 	// origin is the column this one was copied from by (*Table).As,
 	// and nil on a column as declared. An alias copy is a second
 	// handle on one column of one table, so everything that asks
@@ -59,6 +69,21 @@ func (c *Column) Table() *Table { return c.table }
 
 // Type returns the column's SQL type.
 func (c *Column) Type() ColumnType { return c.typ }
+
+// GoType returns the Go value type the column's typed handle carries
+// — string for a pg.Text column, time.Time for a pg.Timestamp one,
+// whatever T was for pg.Custom[T].
+//
+// It is the companion of [Column.Type], which answers the same
+// question in SQL, and it exists for the generators: reading a table
+// declaration to emit the struct that binds to it means knowing the
+// field types, and the SQL type does not determine them.
+//
+// Nil for a column that was never built from a typed handle — the
+// ones AutoTable derives from a struct, which has the Go types
+// already. A caller that may meet one must say what it does about
+// nil rather than assume.
+func (c *Column) GoType() reflect.Type { return c.goType }
 
 // IsNotNull reports whether the column was declared NOT NULL.
 func (c *Column) IsNotNull() bool { return c.notNull }
@@ -184,7 +209,7 @@ type Col[T any] struct {
 
 func newCol[T any](name string, typ ColumnType) *Col[T] {
 	mustIdent("column", name)
-	return &Col[T]{Column: &Column{name: name, typ: typ}}
+	return &Col[T]{Column: &Column{name: name, typ: typ, goType: reflect.TypeOf((*T)(nil)).Elem()}}
 }
 
 // Builder methods — overridden so the chain returns *Col[T] instead of

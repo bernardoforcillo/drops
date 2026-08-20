@@ -73,8 +73,18 @@ func (s *SelectBuilder) DistinctOn(exprs ...drops.Expression) *SelectBuilder {
 // ForUpdate appends FOR UPDATE row locking.
 func (s *SelectBuilder) ForUpdate() *SelectBuilder { s.forUpdate = true; return s }
 
-// Unscoped opts out of the FROM table's DefaultFilter predicates for
-// this SELECT. Use to bypass a soft-delete or tenant guard.
+// Unscoped opts out of the FROM table's automatic predicates for this
+// SELECT — both its DefaultFilter list and its ContextFilter list. Use
+// to bypass a soft-delete guard, and to run the administrative query
+// that has to see every tenant's rows.
+//
+// It clears the context filters too because a half-scoped statement is
+// the worse of the two answers: a caller who reaches for Unscoped to
+// read soft-deleted rows and instead gets ErrTenantMissing has learned
+// nothing about the row they were after, and one who gets the tenant
+// predicate they did not ask for silently reads a subset. Scope such a
+// query explicitly — Unscoped().Where(pg.Eq(TenantID, id)) — where the
+// intent is on the page.
 func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
 
 // Join appends an INNER JOIN.
@@ -265,10 +275,87 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 }
 
 // ToSQL renders the statement to a SQL string and arg list.
+//
+// It renders what the builder knows without a context, which since
+// [Table.ContextFilter] shipped is no longer necessarily the whole
+// statement: a table's context filters — the tenant axis installed by
+// ScopeByTenant, an authz guard — are resolved by the executors and do
+// not appear here. Use [SelectBuilder.ToSQLCtx] to see the statement a
+// given ctx would send; that is the one to assert on in a test, and the
+// one to log. ToSQL remains the right call where there is no request to
+// speak of and never will be: rendering a CREATE VIEW body, or
+// embedding the SELECT as a subquery in a statement some other executor
+// will run.
 func (s *SelectBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder()
 	s.WriteSQL(b)
 	return b.SQL()
+}
+
+// ToSQLCtx renders the complete statement for ctx, with every context
+// filter on the FROM table resolved into the WHERE clause. A filter
+// that refuses — [TenantFilter] with no tenant on ctx — returns its
+// error and no SQL, because the alternative to refusing is an
+// unfiltered query.
+func (s *SelectBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := s.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution: this one
+// when the FROM table has no context filters, otherwise a shallow copy
+// whose WHERE list carries the resolved predicates.
+//
+// The copy is what keeps a builder reusable. Appending the resolved
+// predicates to s.wheres would make the second execution of the same
+// builder carry two tenant predicates, the third three — with the same
+// value bound repeatedly, so the rows come back right and nothing fails
+// until an argument limit or a query log makes it visible.
+//
+// A set operation's operands each carry their own FROM table, so they
+// are resolved as well; a SELECT reached as a subquery expression is
+// not, since it is rendered by WriteSQL from inside another statement
+// with no ctx in hand. Resolve such a builder yourself — the
+// per-parent-limit rewrite in find.go does exactly that — before
+// embedding it.
+func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) {
+	var preds []drops.Expression
+	if !s.unscoped && s.from.hasContextFilters() {
+		var err error
+		preds, err = s.from.resolveContextFilters(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var ops []setOp
+	for i, op := range s.setOps {
+		right, err := op.right.resolveCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if right == op.right {
+			continue
+		}
+		if ops == nil {
+			ops = append([]setOp(nil), s.setOps...)
+		}
+		ops[i].right = right
+	}
+	if len(preds) == 0 && ops == nil {
+		return s, nil
+	}
+	cp := *s
+	if len(preds) > 0 {
+		cp.wheres = append(append([]drops.Expression(nil), s.wheres...), preds...)
+	}
+	if ops != nil {
+		cp.setOps = ops
+	}
+	return &cp, nil
 }
 
 // Rows executes the SELECT and returns the raw cursor for manual scanning.
@@ -276,7 +363,10 @@ func (s *SelectBuilder) Rows(ctx context.Context) (drops.Rows, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	sql, args := s.ToSQL()
+	sql, args, err := s.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return s.db.Query(ctx, sql, args...)
 }
 
@@ -308,11 +398,14 @@ func (s *SelectBuilder) One(ctx context.Context, dest any) error {
 // For un-paginated counts on simple SELECTs, this is the natural and
 // safe shape — PostgreSQL will optimise the inner query as needed.
 func (s *SelectBuilder) Count(ctx context.Context) (int64, error) {
-	inner, args := s.ToSQL()
-	sql := "SELECT count(*) FROM (" + inner + ") AS _drops_count"
-	rows, err := s.db.Query(ctx, sql, args...)
+	inner, args, err := s.ToSQLCtx(ctx)
 	if err != nil {
 		return 0, err
+	}
+	sql := "SELECT count(*) FROM (" + inner + ") AS _drops_count"
+	rows, qerr := s.db.Query(ctx, sql, args...)
+	if qerr != nil {
+		return 0, qerr
 	}
 	defer rows.Close()
 	if !rows.Next() {
@@ -341,6 +434,11 @@ func writeAnd(b *drops.Builder, preds []drops.Expression) {
 
 // AsSubquery returns a parenthesised, aliased form of the SELECT for use
 // as a subquery in another statement.
+//
+// The result is an Expression, so it renders through WriteSQL and
+// carries the FROM table's DefaultFilters but not its context filters —
+// nothing hands a ctx to an expression. Resolve the inner builder
+// first when it selects from a table with context filters.
 func (s *SelectBuilder) AsSubquery(alias string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteByte('(')

@@ -56,9 +56,14 @@ func (d *DeleteBuilder) Returning(cols ...drops.Expression) *DeleteBuilder {
 	return d
 }
 
-// Unscoped opts out of both DeleteHooks and DefaultFilters for this
-// statement. On a soft-deleted table it forces a real, hard DELETE
-// that bypasses the rewrite-to-UPDATE behaviour.
+// Unscoped opts out of the DeleteHooks, the DefaultFilters and the
+// ContextFilters for this statement. On a soft-deleted table it forces
+// a real, hard DELETE that bypasses the rewrite-to-UPDATE behaviour.
+//
+// It is the widest opt-out drops has: an unscoped DELETE against a
+// tenant-scoped table removes every tenant's rows and cannot be undone
+// by a soft-delete column that is no longer being consulted. Restate
+// the scope you meant in a Where.
 func (d *DeleteBuilder) Unscoped() *DeleteBuilder {
 	d.unscoped = true
 	return d
@@ -102,15 +107,58 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 }
 
 // ToSQL renders the statement.
+//
+// A table's context filters are resolved by the executors and do not
+// appear here — see [SelectBuilder.ToSQL] for why, and use
+// [DeleteBuilder.ToSQLCtx] for the statement a given ctx would send.
 func (d *DeleteBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder()
 	d.WriteSQL(b)
 	return b.SQL()
 }
 
+// ToSQLCtx renders the complete statement for ctx, with every context
+// filter on the target table resolved into the WHERE clause.
+func (d *DeleteBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution — this one
+// when the table has no context filters, otherwise a shallow copy whose
+// WHERE list carries the resolved predicates.
+//
+// Resolving into the copy's WHERE list rather than at render time is
+// what carries the scope through a soft delete: a DeleteHook rewrites
+// the statement into an UPDATE built from d.Wheres(), and a predicate
+// added after the hook ran would be missing from exactly the statement
+// that mutates rows. The hook sees the copy, so it sees the tenant.
+func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) {
+	if d.unscoped || !d.table.hasContextFilters() {
+		return d, nil
+	}
+	preds, err := d.table.resolveContextFilters(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(preds) == 0 {
+		return d, nil
+	}
+	cp := *d
+	cp.wheres = append(append([]drops.Expression(nil), d.wheres...), preds...)
+	return &cp, nil
+}
+
 // Exec runs the DELETE.
 func (d *DeleteBuilder) Exec(ctx context.Context) (drops.Result, error) {
-	sql, args := d.ToSQL()
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return d.db.Exec(ctx, sql, args...)
 }
 
@@ -119,7 +167,10 @@ func (d *DeleteBuilder) All(ctx context.Context, dest any) error {
 	if len(d.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := d.ToSQL()
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := d.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err
@@ -132,7 +183,10 @@ func (d *DeleteBuilder) One(ctx context.Context, dest any) error {
 	if len(d.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := d.ToSQL()
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := d.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err

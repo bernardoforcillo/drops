@@ -42,9 +42,15 @@ func (u *UpdateBuilder) Returning(cols ...drops.Expression) *UpdateBuilder {
 	return u
 }
 
-// Unscoped opts out of the table's DefaultFilter predicates for this
-// UPDATE. Use when an administrative job must bypass a soft-delete or
-// tenant guard registered on the table.
+// Unscoped opts out of the table's automatic predicates for this
+// UPDATE — both its DefaultFilter list and its ContextFilter list. Use
+// when an administrative job must bypass a soft-delete guard, or write
+// across every tenant.
+//
+// On an UPDATE the widening is the dangerous direction: an unscoped
+// statement does not read another tenant's rows, it writes them. Prefer
+// restating the scope you meant — Unscoped().Where(...) — over dropping
+// it wholesale.
 func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
 	u.unscoped = true
 	return u
@@ -109,10 +115,46 @@ func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
 }
 
 // ToSQL renders the statement.
+//
+// A table's context filters are resolved by the executors and do not
+// appear here — see [SelectBuilder.ToSQL] for why, and use
+// [UpdateBuilder.ToSQLCtx] for the statement a given ctx would send.
 func (u *UpdateBuilder) ToSQL() (sql string, args []any) {
 	b := drops.NewBuilder()
 	u.WriteSQL(b)
 	return b.SQL()
+}
+
+// ToSQLCtx renders the complete statement for ctx, with every context
+// filter on the target table resolved into the WHERE clause.
+func (u *UpdateBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := u.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution — this one
+// when the table has no context filters, otherwise a shallow copy whose
+// WHERE list carries the resolved predicates. The copy is what keeps
+// the same builder executable twice without accumulating a predicate
+// per run; see [SelectBuilder.resolveCtx].
+func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) {
+	if u.unscoped || !u.table.hasContextFilters() {
+		return u, nil
+	}
+	preds, err := u.table.resolveContextFilters(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(preds) == 0 {
+		return u, nil
+	}
+	cp := *u
+	cp.wheres = append(append([]drops.Expression(nil), u.wheres...), preds...)
+	return &cp, nil
 }
 
 // Exec runs the UPDATE.
@@ -120,7 +162,10 @@ func (u *UpdateBuilder) Exec(ctx context.Context) (drops.Result, error) {
 	if len(u.sets) == 0 && !u.table.hasUpdateHooks() {
 		return nil, ErrNoUpdateAssignments
 	}
-	sql, args := u.ToSQL()
+	sql, args, err := u.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return u.db.Exec(ctx, sql, args...)
 }
 
@@ -129,7 +174,10 @@ func (u *UpdateBuilder) All(ctx context.Context, dest any) error {
 	if len(u.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := u.ToSQL()
+	sql, args, err := u.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := u.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err
@@ -142,7 +190,10 @@ func (u *UpdateBuilder) One(ctx context.Context, dest any) error {
 	if len(u.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := u.ToSQL()
+	sql, args, err := u.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := u.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err

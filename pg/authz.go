@@ -232,14 +232,42 @@ func (g allGuard) Predicate(ctx context.Context) (drops.Expression, error) {
 // Query / Update / Delete AND the guard's predicate into the
 // WHERE clause; ctx-less subject failures surface as
 // ErrSubjectMissing. Pass nil to clear an existing guard.
+//
+// Like the tenant axis, the guard is delivered as a
+// [Table.ContextFilter] on the entity's table rather than injected by
+// each Entity method, and here the mismatch is worth naming: a guard is
+// declared per Entity while a context filter lives on a Table. It is
+// resolved in favour of the table, because the row visibility a guard
+// describes is a property of the rows — an eager-loaded relation
+// reaches those same rows with no Entity anywhere in the call, and a
+// guard that stopped at the entity's own queries was a straight
+// row-visibility bypass for anybody who loaded the table through a
+// relation instead.
+//
+// What follows from that is worth planning for: the guard now applies
+// to every statement against the table, including a raw
+// db.Select().From(t) and every relation edge that lands on it, and a
+// ctx with no subject makes those fail with ErrSubjectMissing instead
+// of returning rows. Two entities over one table each install their own
+// guard and both are AND-ed, since the conservative reading of "these
+// rows are guarded twice" is the one that cannot leak. An entity that
+// must see everything asks with Unscoped().
 func (e *Entity[T]) AuthorizeWith(g Guard) *Entity[T] {
 	e.guard = g
+	// Registered even for a nil g: the closure reads e.guard when it
+	// runs, so clearing a guard clears the predicate, and re-registering
+	// under the same key keeps an entity rebuilt per request from
+	// stacking one filter per construction.
+	e.table.setContextFilter(e.rowScopeKey("guard"), e.guardPredicate)
 	return e
 }
 
-// guardPredicate is the shared helper Entity methods call to
-// resolve the active guard's predicate. Returns (nil, nil) when
-// no guard is installed.
+// guardPredicate resolves the active guard's predicate. Returns
+// (nil, nil) when no guard is installed.
+//
+// It is registered on the table as a context filter by AuthorizeWith
+// and called by the executors; Entity methods no longer inject it
+// themselves.
 func (e *Entity[T]) guardPredicate(ctx context.Context) (drops.Expression, error) {
 	if e.guard == nil {
 		return nil, nil

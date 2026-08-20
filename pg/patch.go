@@ -53,10 +53,11 @@ type PatchOp interface {
 }
 
 // Patch issues an UPDATE that applies ops to the row whose PK
-// equals id. Honours the entity's tenant scope, authorisation
-// guard, and audit log (the audit row's payload is empty since
-// the post-update state isn't fetched; callers needing post-row
-// snapshots should use Update with a refreshed struct).
+// equals id. Honours the entity's tenant scope and authorisation
+// guard — both reach the statement as context filters on the table,
+// resolved by Exec — and the audit log (the audit row's payload is
+// empty since the post-update state isn't fetched; callers needing
+// post-row snapshots should use Update with a refreshed struct).
 //
 // Returns the result so callers can detect "no row matched"
 // without an additional SELECT.
@@ -78,14 +79,6 @@ func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...Patc
 	if err != nil {
 		return nil, err
 	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var res drops.Result
 	doPatch := func(tx *DB) error {
 		upd := tx.Update(e.table)
@@ -93,12 +86,6 @@ func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...Patc
 			upd.Set(op)
 		}
 		upd.Where(pred)
-		if tenantPred != nil {
-			upd.Where(tenantPred)
-		}
-		if guardPred != nil {
-			upd.Where(guardPred)
-		}
 		r, err := upd.Exec(ctx)
 		if err != nil {
 			return err

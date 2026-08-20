@@ -1,6 +1,7 @@
 package pg
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -64,7 +65,34 @@ type Table struct {
 	// opts out with Unscoped(). Used to implement default scopes
 	// (e.g. SoftDelete's "deleted_at IS NULL" guard).
 	defaultFilters []drops.Expression
+
+	// ctxFilters are the request-scoped twins of defaultFilters:
+	// predicates that cannot be built until a ctx is in hand. They are
+	// resolved by the executors rather than by WriteSQL — see
+	// Table.ContextFilter.
+	ctxFilters []ctxFilter
 }
+
+// ctxFilter pairs a context filter with the key it was registered
+// under. A key makes registration idempotent: ScopeByTenant and
+// AuthorizeWith install their filter every time they are called, and an
+// entity built inside a request handler rather than at package scope
+// would otherwise stack one more predicate onto the shared table per
+// request — a WHERE clause that grows without bound and a slice that is
+// never collected. A filter registered through the exported
+// ContextFilter carries no key and always appends, because two calls
+// there are two deliberate filters.
+type ctxFilter struct {
+	key string
+	fn  ContextFilterFunc
+}
+
+// ContextFilterFunc builds a predicate from the request context. It
+// returns a nil Expression to contribute nothing (an entity whose
+// tenant axis was never declared), and an error to refuse the query
+// outright — which is how [TenantFilter] fails closed instead of
+// running unfiltered.
+type ContextFilterFunc func(context.Context) (drops.Expression, error)
 
 // NewTable creates a table in the default ("public") schema. The name
 // is validated and the constructor panics on invalid identifiers — see
@@ -153,7 +181,8 @@ func (t *Table) Alias() string { return t.alias }
 // What is not rewritten is anything the caller built and drops only
 // re-emits: a predicate, and a Patch operation. Both are closed over
 // the handles they were given. A default filter registered by
-// SoftDeleteMixin, or an authz guard built from the package-level
+// SoftDeleteMixin, a context filter registered by ContextFilter or
+// ScopeByTenant, or an authz guard built from the package-level
 // columns, still qualifies with the table name — so against a query
 // whose only FROM entry is the alias PostgreSQL raises 42P01, and in a
 // self-join the guard binds to whichever side is un-aliased rather
@@ -267,6 +296,7 @@ func (t *Table) As(alias string) *Table {
 	cp.updateHooks = append([]UpdateHook(nil), t.updateHooks...)
 	cp.deleteHooks = append([]DeleteHook(nil), t.deleteHooks...)
 	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
+	cp.ctxFilters = append([]ctxFilter(nil), t.ctxFilters...)
 	return &cp
 }
 
@@ -422,9 +452,80 @@ func (t *Table) OnDelete(h DeleteHook) *Table {
 // DefaultFilter appends a predicate applied to every Select / Update /
 // Delete against the table, unless the builder is marked Unscoped().
 // Filters compose with AND.
+//
+// The predicate is fixed at declaration time. When it depends on the
+// request — the tenant, the acting subject — use [Table.ContextFilter],
+// whose predicate is built per execution from a ctx.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
 	t.defaultFilters = append(t.defaultFilters, e)
 	return t
+}
+
+// ContextFilter registers a predicate resolved at execution time and
+// AND-ed into every SELECT, UPDATE and DELETE against the table, unless
+// the builder is marked Unscoped().
+//
+//	Posts.ContextFilter(pg.TenantFilter(PostTenantID))
+//
+// A DefaultFilter is rendered by WriteSQL, which has no ctx; this is
+// resolved by the executors — Rows / All / One / Count on a SELECT and
+// Exec / All / One on an UPDATE or DELETE. That distinction is the
+// whole point rather than an implementation detail: an eager-loaded
+// relation builds its child query as db.Select().From(rel.To) and runs
+// it through those same executors, so one hook covers the root query,
+// every relation edge (including the per-parent-limit rewrite), UPDATE
+// and DELETE at once. A predicate resolved at render time reaches only
+// the statements somebody remembered to build with it, which is how a
+// tenant guard ends up filtering the parents and loading every tenant's
+// children.
+//
+// The cost is that a rendered statement is no longer complete: see
+// [SelectBuilder.ToSQL], and prefer ToSQLCtx when you need the SQL a
+// given ctx would actually send.
+func (t *Table) ContextFilter(fn ContextFilterFunc) *Table {
+	if fn == nil {
+		return t
+	}
+	t.ctxFilters = append(t.ctxFilters, ctxFilter{fn: fn})
+	return t
+}
+
+// setContextFilter registers fn under key, replacing any filter
+// previously registered under the same key. See ctxFilter for why the
+// entity-owned filters are keyed and the exported ones are not.
+func (t *Table) setContextFilter(key string, fn ContextFilterFunc) {
+	for i := range t.ctxFilters {
+		if t.ctxFilters[i].key == key {
+			t.ctxFilters[i].fn = fn
+			return
+		}
+	}
+	t.ctxFilters = append(t.ctxFilters, ctxFilter{key: key, fn: fn})
+}
+
+// hasContextFilters reports whether the table has any context filter to
+// resolve. Nil-safe so a SELECT with no FROM table can ask.
+func (t *Table) hasContextFilters() bool { return t != nil && len(t.ctxFilters) > 0 }
+
+// resolveContextFilters builds every registered predicate against ctx.
+// The first filter to fail aborts the whole resolution and no statement
+// is sent — a filter that cannot decide what a request may see must not
+// be answered with an unfiltered query.
+func (t *Table) resolveContextFilters(ctx context.Context) ([]drops.Expression, error) {
+	if !t.hasContextFilters() {
+		return nil, nil
+	}
+	out := make([]drops.Expression, 0, len(t.ctxFilters))
+	for _, f := range t.ctxFilters {
+		e, err := f.fn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if e != nil {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // AddIndex registers an index to be created alongside the table. The

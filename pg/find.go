@@ -32,8 +32,11 @@ type relNode struct {
 	// limit / offset are per-parent caps applied via a
 	// ROW_NUMBER() OVER (PARTITION BY <parentKey>) rewrite.
 	// Without them the relation loader fetches every related row.
-	limit    int
-	offset   int
+	limit  int
+	offset int
+	// unscoped drops the target table's DefaultFilters and
+	// ContextFilters from this edge alone — see RelConfig.Unscoped.
+	unscoped bool
 	children []*relNode
 }
 
@@ -102,9 +105,11 @@ func (c *RelConfig) OrderBy(exprs ...drops.Expression) *RelConfig {
 // configured ORDER BY), not the first N rows globally. Mirrors
 // drizzle's with: { posts: { limit: 5 } } shape.
 //
-// Limit only applies to HasMany / MorphMany / ManyToMany —
-// single-row relations (HasOne / BelongsTo) already cap at 1.
-// Limit ≤ 0 disables the cap.
+// Limit applies to HasMany and MorphMany. Single-row relations
+// (HasOne / BelongsTo) already cap at one row per parent, and
+// ManyToMany reads its junction table first, which the rewrite has no
+// window over — a Limit on such an edge is accepted and ignored rather
+// than silently capping the wrong thing. Limit ≤ 0 disables the cap.
 func (c *RelConfig) Limit(n int) *RelConfig {
 	c.node.limit = n
 	return c
@@ -116,6 +121,22 @@ func (c *RelConfig) Limit(n int) *RelConfig {
 // combine Offset with a very large Limit).
 func (c *RelConfig) Offset(n int) *RelConfig {
 	c.node.offset = n
+	return c
+}
+
+// Unscoped drops the target table's automatic predicates — its
+// DefaultFilters and its ContextFilters — for this edge only.
+//
+// The root query's scoping is untouched, and so is every other edge:
+// an Unscoped edge under a filtered parent is a local widening, and a
+// deliberate one. It is how a caller reads the soft-deleted revisions
+// of a document they are already allowed to see, without having to run
+// the parent query unscoped as well and hand-write the scope back.
+//
+// On a many-to-many edge it widens the junction query too, since the
+// junction rows are how the edge is traversed at all.
+func (c *RelConfig) Unscoped() *RelConfig {
+	c.node.unscoped = true
 	return c
 }
 
@@ -192,9 +213,10 @@ func (f *FindBuilder) Limit(n int64) *FindBuilder { f.sel.Limit(n); return f }
 // Offset sets the OFFSET.
 func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
 
-// Unscoped opts out of the table's DefaultFilter predicates for the
-// root SELECT. Eager-loaded relations inherit their own table's
-// scopes independently.
+// Unscoped opts out of the root table's DefaultFilter and
+// ContextFilter predicates for the root SELECT. Eager-loaded relations
+// inherit their own table's scopes independently — widen one of those
+// with [RelConfig.Unscoped].
 func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
 
 // HasEagerLoads reports whether any relations have been queued for
@@ -503,16 +525,15 @@ func (f *FindBuilder) loadRelation(
 	// at most node.limit children — drizzle's
 	// "with: { posts: { limit: N } }" shape.
 	if expectsSlice && node.limit > 0 {
-		sql, args := f.buildPerParentLimitedSQL(rel, targetKeyCol, rowKeys, node)
-		rows, err := f.db.Query(ctx, sql, args...)
+		ranked, err := f.buildPerParentLimited(ctx, rel, targetKeyCol, rowKeys, node)
 		if err != nil {
 			return none, nil, err
 		}
-		if err := scanAll(rows, childSlice.Addr().Interface()); err != nil {
+		if err := ranked.All(ctx, childSlice.Addr().Interface()); err != nil {
 			return none, nil, err
 		}
 	} else {
-		childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
+		childQuery := f.childSelect(rel.To, node).Where(In(targetKeyCol, rowKeys...))
 		if rel.Kind == MorphManyKind {
 			childQuery.Where(Eq(rel.MorphTypeCol, rel.MorphType))
 		}
@@ -633,8 +654,7 @@ func (f *FindBuilder) loadManyToMany(
 
 	// Step 1: junction query. Defer Close so every exit path frees the
 	// cursor, including panics and the targetKeyField lookup below.
-	junctionRows, err := f.db.Select(rel.ThroughFK1, rel.ThroughFK2).
-		From(rel.Through).
+	junctionRows, err := f.childSelect(rel.Through, node, rel.ThroughFK1, rel.ThroughFK2).
 		Where(In(rel.ThroughFK1, rowKeys...)).
 		Rows(ctx)
 	if err != nil {
@@ -683,7 +703,7 @@ func (f *FindBuilder) loadManyToMany(
 	}
 
 	// Step 2: target query, narrowed/sorted by the node's constraints.
-	targetQuery := f.db.Select().From(rel.To).Where(In(rel.ChildKey, remoteKeys...))
+	targetQuery := f.childSelect(rel.To, node).Where(In(rel.ChildKey, remoteKeys...))
 	if len(node.wheres) > 0 {
 		targetQuery.Where(node.wheres...)
 	}
@@ -853,44 +873,62 @@ func coerceSlice(src reflect.Value, dstType reflect.Type) reflect.Value {
 	return out
 }
 
-// buildPerParentLimitedSQL renders the window-function rewrite used
-// when a relation has node.limit > 0. The query has shape:
+// childSelect begins the query for one relation edge against table,
+// honouring the edge's own Unscoped.
+//
+// Every relation loader goes through it for the same reason the
+// executors resolve context filters at all: a child query built by hand
+// is a child query that silently misses whatever scoping the target
+// table declares, and the only way to keep that from happening again as
+// loaders are added is to leave one place where a child query is built.
+func (f *FindBuilder) childSelect(table *Table, node *relNode, cols ...drops.Expression) *SelectBuilder {
+	q := f.db.Select(cols...).From(table)
+	if node.unscoped {
+		q.Unscoped()
+	}
+	return q
+}
+
+// buildPerParentLimited composes the window-function rewrite used when
+// a relation has node.limit > 0:
 //
 //	SELECT * FROM (
 //	  SELECT <cols>, ROW_NUMBER() OVER (
 //	    PARTITION BY <fk> ORDER BY <orderBy or fallback>
 //	  ) AS _rn
 //	  FROM <child>
-//	  WHERE <fk> IN (...) [AND <wheres>] [AND morph guard]
+//	  WHERE <scopes> AND <fk> IN (...) [AND morph guard] [AND <wheres>]
 //	) AS _ranked
 //	WHERE _rn > <offset> AND _rn <= <offset + limit>
 //
-// Each parent's slice gets at most limit children, skipping the
-// first offset. Mirrors drizzle's "with: { posts: { limit } }"
-// semantics. The extra _rn column is discarded by scanAll since
-// no struct field matches the name.
-func (f *FindBuilder) buildPerParentLimitedSQL(
-	rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
-) (sql string, args []any) {
-	b := drops.NewBuilder()
-	b.WriteString("SELECT * FROM (SELECT ")
+// Each parent's slice gets at most limit children, skipping the first
+// offset. Mirrors drizzle's "with: { posts: { limit } }" semantics. The
+// extra _rn column is discarded by scanAll since no struct field
+// matches the name.
+//
+// The inner query is a SelectBuilder over the child table rather than a
+// hand-written string, and that is the whole fix for the bug this
+// replaced: the string spelled out its own WHERE clause, so the target
+// table's DefaultFilters never reached it and adding .Limit(5) to a
+// soft-deleted relation resurrected the deleted rows. bun does not have
+// this class of bug because its relation queries are ordinary query
+// builders; expressing the rewrite as one buys the same immunity for
+// every scope drops has now and every one it adds later.
+//
+// The inner builder is resolved against ctx explicitly before being
+// embedded, because it is reached as a subquery expression and a
+// subquery is rendered by WriteSQL with no ctx to hand.
+func (f *FindBuilder) buildPerParentLimited(
+	ctx context.Context, rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
+) (*SelectBuilder, error) {
 	cols := rel.To.Columns()
-	for i, c := range cols {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		c.WriteSQL(b)
+	projection := make([]drops.Expression, 0, len(cols)+1)
+	for _, c := range cols {
+		projection = append(projection, c)
 	}
-	b.WriteString(", ROW_NUMBER() OVER (PARTITION BY ")
-	targetKeyCol.WriteSQL(b)
-	b.WriteString(" ORDER BY ")
+	win := WindowSpec().PartitionBy(targetKeyCol)
 	if len(node.orderBys) > 0 {
-		for i, e := range node.orderBys {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			e.WriteSQL(b)
-		}
+		win.OrderBy(node.orderBys...)
 	} else {
 		// Default: order by PK so partitioning is stable.
 		var pk *Column
@@ -901,28 +939,41 @@ func (f *FindBuilder) buildPerParentLimitedSQL(
 			}
 		}
 		if pk != nil {
-			pk.WriteSQL(b)
+			win.OrderBy(pk)
 		} else {
-			targetKeyCol.WriteSQL(b)
+			win.OrderBy(targetKeyCol)
 		}
 	}
-	b.WriteString(") AS _rn FROM ")
-	rel.To.writeFrom(b)
-	b.WriteString(" WHERE ")
-	In(targetKeyCol, rowKeys...).WriteSQL(b)
+	ranked := Over(drops.Raw("ROW_NUMBER()"), win)
+	projection = append(projection, drops.ExprFunc(func(b *drops.Builder) {
+		b.Append(ranked)
+		b.WriteString(" AS _rn")
+	}))
+
+	inner := f.childSelect(rel.To, node, projection...).Where(In(targetKeyCol, rowKeys...))
 	if rel.Kind == MorphManyKind {
-		b.WriteString(" AND ")
-		Eq(rel.MorphTypeCol, rel.MorphType).WriteSQL(b)
+		inner.Where(Eq(rel.MorphTypeCol, rel.MorphType))
 	}
-	for _, w := range node.wheres {
-		b.WriteString(" AND ")
-		w.WriteSQL(b)
+	if len(node.wheres) > 0 {
+		inner.Where(node.wheres...)
 	}
-	b.WriteString(") AS _ranked WHERE _rn > ")
-	b.AddArg(node.offset)
-	b.WriteString(" AND _rn <= ")
-	b.AddArg(node.offset + node.limit)
-	return b.SQL()
+	resolved, err := inner.resolveCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return f.db.Select().
+		FromExpr(resolved.AsSubquery("_ranked")).
+		Where(rnBound("_rn > ", node.offset), rnBound("_rn <= ", node.offset+node.limit)), nil
+}
+
+// rnBound renders one side of the row-number window, e.g. "_rn > $3".
+// The bound is bound as an argument rather than formatted into the text
+// so the two integers travel the same path as every other value.
+func rnBound(op string, n int) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteString(op)
+		b.AddArg(n)
+	})
 }
 
 // relationKeyField returns the index path of the struct field that maps
@@ -1053,7 +1104,7 @@ func (f *FindBuilder) loadMorphTo(
 			return none, nil, fmt.Errorf("drops/pg: relation %q: morph target table %q has no PRIMARY KEY",
 				rel.Name, b.entry.table.Name())
 		}
-		q := f.db.Select().From(b.entry.table).Where(In(targetPK, ids...))
+		q := f.childSelect(b.entry.table, node).Where(In(targetPK, ids...))
 		if len(node.wheres) > 0 {
 			q.Where(node.wheres...)
 		}

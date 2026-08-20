@@ -98,7 +98,32 @@ type Entity[T any] struct {
 	// Delete. The subject lives on ctx (WithSubject); missing
 	// subject errors out.
 	guard Guard
+
+	// rowType is T with pointers stripped. It names the entity in
+	// the keys under which the tenant axis and the guard register
+	// their context filters on the table.
+	rowType reflect.Type
 }
+
+// rowScopeKey names the context filter this entity registers on its
+// table for kind ("tenant" or "guard").
+//
+// The row type is in the key so that two entities sharing one table
+// each keep their own filter — the conservative outcome, since both
+// predicates then apply — while the same entity declared twice, or
+// rebuilt inside a request handler, replaces its own rather than
+// stacking a copy per call.
+func (e *Entity[T]) rowScopeKey(kind string) string {
+	return kind + ":" + e.rowType.String()
+}
+
+// hasRowScope reports whether the entity restricts which rows an
+// operation may touch — a tenant axis, an authorisation guard, or
+// both. Callers use it to stay off the paths that would answer from a
+// key alone: the PK cache is keyed by primary key and nothing else, so
+// serving a scoped Get from it would hand one tenant a row it is not
+// allowed to see, without a statement ever being sent.
+func (e *Entity[T]) hasRowScope() bool { return e.tenantCol != nil || e.guard != nil }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
 // need: one Scan call per row. Generated code is written against
@@ -200,6 +225,7 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 
 	return &Entity[T]{
 		table:        t,
+		rowType:      rt,
 		pk:           pk,
 		pkField:      pkField,
 		pks:          pks,
@@ -434,7 +460,10 @@ var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock vers
 //
 // When a cache is attached via WithCache, Get serves hits from the
 // cache and dedupes concurrent cache misses via single-flight so a
-// thundering herd resolves to one DB query.
+// thundering herd resolves to one DB query. A tenant-scoped or guarded
+// entity skips that path entirely: the cache is keyed by primary key
+// alone, so answering from it would hand one caller a row another
+// caller cached, without a statement ever being sent.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	pred, err := e.pkPredicate(key)
 	if err != nil {
@@ -442,37 +471,15 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	}
 	ctx, cancel := e.budgetCtx(ctx)
 	defer cancel()
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return *new(T), err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return *new(T), err
-	}
-	if e.cache != nil && tenantPred == nil && guardPred == nil {
+	if e.cache != nil && !e.hasRowScope() {
 		return e.getCached(db, ctx, key, pred)
 	}
 	var out T
 	if e.fastScan != nil {
-		sel := db.Select().From(e.table).Where(pred)
-		if tenantPred != nil {
-			sel.Where(tenantPred)
-		}
-		if guardPred != nil {
-			sel.Where(guardPred)
-		}
-		err := e.scanOneFast(ctx, sel, &out)
+		err := e.scanOneFast(ctx, db.Select().From(e.table).Where(pred), &out)
 		return out, err
 	}
-	fb := db.Find(e.table).Where(pred)
-	if tenantPred != nil {
-		fb.Where(tenantPred)
-	}
-	if guardPred != nil {
-		fb.Where(guardPred)
-	}
-	err = fb.One(ctx, &out)
+	err = db.Find(e.table).Where(pred).One(ctx, &out)
 	return out, err
 }
 
@@ -720,14 +727,6 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if err != nil {
 		return err
 	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return err
-	}
 	doUpdate := func(tx *DB) error {
 		upd := tx.Update(e.table)
 		wroteSet := false
@@ -762,12 +761,6 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 			return errors.New("drops/pg: Update has no fields to set")
 		}
 		upd.Where(pred)
-		if tenantPred != nil {
-			upd.Where(tenantPred)
-		}
-		if guardPred != nil {
-			upd.Where(guardPred)
-		}
 		if e.versionCol != nil {
 			curVer := v.FieldByIndex(e.versionField).Interface()
 			upd.Where(Eq(e.versionCol, curVer))
@@ -816,24 +809,9 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var res drops.Result
 	doDelete := func(tx *DB) error {
-		del := tx.Delete(e.table).Where(pred)
-		if tenantPred != nil {
-			del.Where(tenantPred)
-		}
-		if guardPred != nil {
-			del.Where(guardPred)
-		}
-		r, derr := del.Exec(ctx)
+		r, derr := tx.Delete(e.table).Where(pred).Exec(ctx)
 		if derr != nil {
 			return derr
 		}
@@ -916,32 +894,6 @@ func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 	return &EntityQuery[T]{e: e, fb: db.Find(e.table)}
 }
 
-// applyTenantOnFB injects the tenant predicate on q.fb when the
-// entity is scoped. Helper used by All / One / Stream / Page.
-func (q *EntityQuery[T]) applyTenantOnFB(ctx context.Context) error {
-	tenantPred, err := q.e.tenantPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	if tenantPred != nil {
-		q.fb.Where(tenantPred)
-	}
-	return nil
-}
-
-// applyGuardOnFB injects the authorisation predicate on q.fb
-// when the entity is guarded.
-func (q *EntityQuery[T]) applyGuardOnFB(ctx context.Context) error {
-	guardPred, err := q.e.guardPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	if guardPred != nil {
-		q.fb.Where(guardPred)
-	}
-	return nil
-}
-
 // Where appends predicates joined by AND.
 func (q *EntityQuery[T]) Where(preds ...drops.Expression) *EntityQuery[T] {
 	q.fb.Where(preds...)
@@ -1000,19 +952,19 @@ func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
-	if err := q.applyTenantOnFB(ctx); err != nil {
-		return nil, err
-	}
-	if err := q.applyGuardOnFB(ctx); err != nil {
-		return nil, err
-	}
 	if q.e.budget.MaxRows > 0 {
 		// Apply the row-cap LIMIT before rendering. Honour the
 		// user's tighter Limit by leaving it alone.
 		applyBudgetLimit(q.fb.Select(), q.e.budget.MaxRows)
 	}
 	if q.e.budget.MaxArgs > 0 {
-		_, args := q.fb.Select().ToSQL()
+		// Rendered with the ctx: the tenant axis and the guard bind
+		// arguments too, and a budget that counted only the ones the
+		// caller wrote would pass a statement the server rejects.
+		_, args, err := q.fb.Select().ToSQLCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
 		if err := q.e.checkArgs(args); err != nil {
 			return nil, err
 		}
@@ -1036,12 +988,6 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
-	if err := q.applyTenantOnFB(ctx); err != nil {
-		return *new(T), err
-	}
-	if err := q.applyGuardOnFB(ctx); err != nil {
-		return *new(T), err
-	}
 	if q.cacheable() {
 		return q.oneCached(ctx)
 	}
@@ -1059,12 +1005,19 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // the entity must have a cache, and the query must not pull in
 // eager-loaded relations (those need the reflection-populated slice
 // for stitching).
+//
+// A scoped entity stays cacheable, unlike Get: the key is built from
+// the statement the ctx resolves to, so the tenant and the subject are
+// part of it and two tenants asking the same question get two entries.
 func (q *EntityQuery[T]) cacheable() bool {
 	return q.e.cache != nil && !q.fb.HasEagerLoads()
 }
 
 func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
-	sql, args := q.fb.Select().ToSQL()
+	sql, args, err := q.fb.Select().ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	key := queryKey(q.e.table.Name(), sql, args)
 	var out []T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
@@ -1095,9 +1048,12 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 }
 
 func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
-	sql, args := q.fb.Select().ToSQL()
-	key := queryKey(q.e.table.Name(), sql, args) + ":one"
 	var out T
+	sql, args, err := q.fb.Select().ToSQLCtx(ctx)
+	if err != nil {
+		return out, err
+	}
+	key := queryKey(q.e.table.Name(), sql, args) + ":one"
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
 		return out, nil
 	}

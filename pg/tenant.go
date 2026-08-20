@@ -11,10 +11,25 @@ import (
 // Multi-tenant SaaS without explicit data isolation is a leak waiting
 // to happen — one forgotten WHERE tenantId = $1 and rows cross
 // customers. ScopeByTenant + WithTenant make the isolation a property
-// of the entity rather than the call site: every Get / Query /
-// Update / Delete on the entity reads the tenant from ctx and
-// auto-injects the predicate. Forgetting to set the ctx errors out
-// — bad code path fails closed, not open.
+// of the table rather than the call site: every statement that reads or
+// writes it takes the tenant from ctx and carries the predicate.
+// Forgetting to set the ctx errors out — bad code path fails closed,
+// not open.
+//
+// "Of the table" is load-bearing and was learned the hard way. While
+// the predicate was injected by the Entity methods it reached the
+// queries those methods built and nothing else, so an eager-loaded
+// relation — whose child query is built by the relation loader, with no
+// Entity anywhere in the call — came back holding every tenant's rows.
+// Declared on the table, the axis is applied by whatever executor runs
+// the statement, which is the same list for a root query and for a
+// relation edge.
+//
+// The axis is per table, because the predicate names a column: an
+// entity on `users` cannot say what a row of `posts` belongs to. A
+// schema is scoped when each tenant-owning table declares its own axis
+// — through its entity, or directly with
+// Posts.ContextFilter(pg.TenantFilter(PostTenantID)).
 //
 //	var Projects = pg.NewAutoEntity[Project]("projects").
 //	    ScopeByTenant(ProjectsCols.TenantID)
@@ -54,10 +69,50 @@ var ErrTenantMissing = errors.New("drops/pg: entity is tenant-scoped but ctx has
 // "background job stamped the wrong tenant" class of bug.
 var ErrTenantMismatch = errors.New("drops/pg: row tenant disagrees with ctx tenant")
 
+// TenantFilter is the canonical [ContextFilterFunc]: it reads the
+// tenant off ctx and renders "<col> = $tenant".
+//
+//	Posts.ContextFilter(pg.TenantFilter(PostTenantID))
+//
+// It fails closed. A ctx with no tenant produces [ErrTenantMissing] and
+// no statement at all, rather than a query that quietly spans every
+// customer — which is the only defensible default for a filter whose
+// absence is invisible in the result set. A background job that legally
+// has no tenant says so with Unscoped() at the query, where a reviewer
+// can see it.
+//
+// col is rendered as given, so pass the handle belonging to the table
+// the filter is registered on: an alias handle would qualify with an
+// alias the query has no FROM entry for.
+func TenantFilter(col ColRef) ContextFilterFunc {
+	c := col.col()
+	return func(ctx context.Context) (drops.Expression, error) {
+		t, ok := TenantFrom(ctx)
+		if !ok {
+			return nil, ErrTenantMissing
+		}
+		return Eq(c, t), nil
+	}
+}
+
 // ScopeByTenant marks col as the entity's tenant axis. Every
 // subsequent Get / Query / Update / Delete reads the tenant from
 // ctx (via WithTenant) and AND-s "<col> = $tenant" into the
 // predicate. Create stamps the tenant onto r automatically.
+//
+// The axis is installed as a [Table.ContextFilter] rather than injected
+// by each Entity method, and that is what makes it a defence rather
+// than a habit. An eager-loaded relation has no Entity to ask: its
+// child query is built as db.Select().From(rel.To), so a predicate that
+// only the entity methods knew about filtered the parents and loaded
+// every tenant's children. Registered on the table, the axis is applied
+// by whichever executor runs the statement — including the relation
+// loaders, the per-parent-limit rewrite, Page and Stream.
+//
+// The consequence worth stating plainly: from here on *every* query
+// against this table needs a tenant on its ctx, including one built
+// straight from db.Select(). Queries that legitimately span tenants say
+// so with Unscoped().
 //
 // Panics if col has no matching struct field — fail loudly at
 // startup rather than at the first query.
@@ -73,6 +128,10 @@ func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 		if cf.col.key() == c.key() {
 			e.tenantCol = cf.col
 			e.tenantField = cf.field
+			// The filter closes over the entity, not over the column,
+			// so there is one source of truth: whatever tenantPredicate
+			// answers is what the statement carries.
+			e.table.setContextFilter(e.rowScopeKey("tenant"), e.tenantPredicate)
 			return e
 		}
 	}
@@ -82,6 +141,12 @@ func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 // tenantPredicate returns "tenantCol = $ctx-tenant" when the
 // entity is scoped, or nil when it isn't. Returns ErrTenantMissing
 // when scoped but no tenant is on ctx.
+//
+// It is registered on the table as a context filter by ScopeByTenant
+// and called by the executors; nothing injects it directly any more.
+// Two places that build the same predicate would eventually disagree —
+// and the way they disagree is that one of them stops being applied to
+// a path somebody added later.
 func (e *Entity[T]) tenantPredicate(ctx context.Context) (drops.Expression, error) {
 	if e.tenantCol == nil {
 		return nil, nil

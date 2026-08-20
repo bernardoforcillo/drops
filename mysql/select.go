@@ -22,6 +22,14 @@ type SelectBuilder struct {
 	forShare bool
 	forUpd   string
 	unscoped bool
+
+	// fromExprs are arbitrary FROM sources — a CTE reference, a
+	// derived table, a JSON_TABLE call — comma-joined after the
+	// declared table. ctes / recursiveCTE carry the WITH prefix; see
+	// cte.go.
+	fromExprs    []drops.Expression
+	ctes         []*CTE
+	recursiveCTE bool
 }
 
 type joinKind string
@@ -40,6 +48,19 @@ type joinClause struct {
 
 // From sets the FROM table. Required before execution.
 func (s *SelectBuilder) From(t *Table) *SelectBuilder { s.from = t; return s }
+
+// FromExpr appends an arbitrary FROM source — a [CTE] reference, a
+// derived table from (*SelectBuilder).AsSubquery, a [JSONTable] call.
+// Multiple sources are comma-joined, which is to say cross-joined.
+//
+// MySQL requires every derived table to carry an alias, so pass one
+// through whichever helper produced the expression; the server answers
+// error 1248, "Every derived table must have its own alias", if you do
+// not.
+func (s *SelectBuilder) FromExpr(e drops.Expression) *SelectBuilder {
+	s.fromExprs = append(s.fromExprs, e)
+	return s
+}
 
 // Distinct toggles SELECT DISTINCT.
 func (s *SelectBuilder) Distinct() *SelectBuilder { s.distinct = true; return s }
@@ -118,6 +139,7 @@ func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s 
 
 // WriteSQL renders the SELECT.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
+	writeCTEs(b, s.ctes, s.recursiveCTE)
 	b.WriteString("SELECT ")
 	if s.distinct {
 		b.WriteString("DISTINCT ")
@@ -127,9 +149,20 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 	} else {
 		b.AppendList(", ", s.columns)
 	}
-	if s.from != nil {
+	if s.from != nil || len(s.fromExprs) > 0 {
 		b.WriteString(" FROM ")
-		s.from.writeFrom(b)
+		first := true
+		if s.from != nil {
+			s.from.writeFrom(b)
+			first = false
+		}
+		for _, e := range s.fromExprs {
+			if !first {
+				b.WriteString(", ")
+			}
+			b.Append(e)
+			first = false
+		}
 	}
 	for _, j := range s.joins {
 		b.WriteByte(' ')

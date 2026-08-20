@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/bernardoforcillo/drops"
 )
 
 // ErrInvalidIdentifier is returned when a table or column name fails
@@ -40,4 +42,17 @@ func mustIdent(kind, name string) {
 	if err := validateIdent(kind, name); err != nil {
 		panic(err)
 	}
+}
+
+// quoteIdent wraps a name in backticks for the raw SQL the migration
+// layer assembles as strings rather than through a drops.Builder.
+func quoteIdent(name string) string { return drops.BacktickQuoteIdent(name) }
+
+// quoteIdents backtick-quotes each name in a list.
+func quoteIdents(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = quoteIdent(n)
+	}
+	return out
 }

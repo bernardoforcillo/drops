@@ -19,8 +19,9 @@ import (
 // Safe for concurrent use if the underlying Driver is; builders are
 // not — create one per query.
 type DB struct {
-	drv  drops.Driver
-	hook drops.Hook
+	drv   drops.Driver
+	hook  drops.Hook
+	retry *RetryPolicy
 }
 
 // New wraps a drops.Driver as a MySQL DB.
@@ -70,9 +71,44 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 
 // InTx runs fn in a transaction, committing on nil and rolling back
 // otherwise — including on panic, which is re-raised after the
-// rollback. Rollback uses a detached context with a short timeout so a
-// cancelled caller cannot leave the transaction open.
-func (db *DB) InTx(ctx context.Context, fn func(*DB) error) (err error) {
+// rollback.
+//
+// With a [RetryPolicy] installed by [DB.WithRetry], a failure the
+// policy calls transient — a deadlock, a lock wait timeout — rolls the
+// transaction back and re-runs fn in a fresh one. See RetryPolicy for
+// what that demands of fn.
+func (db *DB) InTx(ctx context.Context, fn func(*DB) error) error {
+	if db.retry == nil {
+		return db.inTxOnce(ctx, fn)
+	}
+	policy := *db.retry
+	var lastErr error
+	for attempt := 1; attempt <= policy.attempts(); attempt++ {
+		if attempt > 1 && policy.Backoff != nil {
+			if cerr := retrySleep(ctx, policy.Backoff(attempt-1)); cerr != nil {
+				return cerr
+			}
+		}
+		err := db.inTxOnce(ctx, fn)
+		if err == nil {
+			return nil
+		}
+		if !policy.shouldRetry(err) {
+			return err
+		}
+		lastErr = err
+		// Bail out early if the context expired between attempts.
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+	}
+	return lastErr
+}
+
+// inTxOnce runs fn inside a single transaction, without any retry.
+// Rollback uses a detached context with a short timeout so a cancelled
+// caller cannot leave the transaction open.
+func (db *DB) inTxOnce(ctx context.Context, fn func(*DB) error) (err error) {
 	txDB, tx, err := db.Begin(ctx)
 	if err != nil {
 		return err
@@ -122,6 +158,9 @@ func (db *DB) Delete(t *Table) *DeleteBuilder { return &DeleteBuilder{db: db, ta
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
 	start := time.Now()
 	res, err := db.drv.Exec(ctx, sql, args...)
+	// Classify before the hook sees it, so a log line and a caller's
+	// errors.Is agree about what happened — see [ServerError].
+	err = classifyError(err)
 	db.emit(ctx, drops.QueryEvent{Kind: "exec", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return res, err
 }
@@ -130,6 +169,7 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
 	start := time.Now()
 	rows, err := db.drv.Query(ctx, sql, args...)
+	err = classifyError(err)
 	db.emit(ctx, drops.QueryEvent{Kind: "query", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return rows, err
 }

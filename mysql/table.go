@@ -25,6 +25,13 @@ type Table struct {
 	// defaultFilters are AND-ed onto every SELECT from this table
 	// unless the builder opts out with Unscoped.
 	defaultFilters []drops.Expression
+
+	// indexes and checks are what the migration layer needs and the
+	// query layer never looks at: the secondary indexes and CHECK
+	// constraints declared against this table. Registered through
+	// AddIndex / AddCheck, read by BuildSnapshot.
+	indexes []*Index
+	checks  map[string]string
 }
 
 // NewTable creates a table in the connection's default database.

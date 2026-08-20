@@ -50,6 +50,10 @@ type Table struct {
 	// SECURITY. Policies are only enforced when this is true.
 	rlsEnabled bool
 
+	// rlsForced mirrors PG's ALTER TABLE ... FORCE ROW LEVEL
+	// SECURITY: policies apply to the table's owner too.
+	rlsForced bool
+
 	// insertHooks / updateHooks / deleteHooks are the optional
 	// lifecycle hooks registered on this table. They are invoked by
 	// the corresponding builders during WriteSQL. Empty by default —
@@ -515,6 +519,18 @@ func (t *Table) EnableRLS() *Table { t.rlsEnabled = true; return t }
 
 // RLSEnabled reports whether the table has RLS enabled.
 func (t *Table) RLSEnabled() bool { return t.rlsEnabled }
+
+// ForceRLS marks the table as having Row-Level Security forced —
+// ALTER TABLE ... FORCE ROW LEVEL SECURITY, which subjects the
+// table's owner to its own policies instead of exempting them.
+//
+// Like AddPolicy it is inert until EnableRLS is also called: PostgreSQL
+// keeps the two flags apart, and forcing a table nothing filters
+// filters nothing.
+func (t *Table) ForceRLS() *Table { t.rlsForced = true; return t }
+
+// RLSForced reports whether the table has RLS forced.
+func (t *Table) RLSForced() bool { return t.rlsForced }
 
 // AddPolicy attaches a row-level security policy to the table.
 // Policies are inert until EnableRLS is also called.

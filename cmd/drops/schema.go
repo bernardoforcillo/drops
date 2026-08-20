@@ -1,0 +1,357 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/bernardoforcillo/drops/pg"
+)
+
+// The convention.
+//
+// A CLI cannot read a Go variable. The schema drops migrates lives in
+// Go — pg.NewTable, pg.Add, pg.References — and evaluating it means
+// running it, so `drops` writes a small program that imports the
+// schema package, calls into it, and prints the answer as JSON on
+// stdout. `go run` compiles that program with the real compiler
+// against the real package, which is the only way the answer is the
+// same one the application gets.
+//
+// The one thing the generated program has to know is where to call:
+//
+//	// db/schema/schema.go
+//	func Schema() *pg.Schema {
+//	    return pg.NewSchema(Users, Posts)
+//	}
+//
+// That is the whole contract. Anything the function returns is what
+// gets diffed, pushed and generated from, so a table the schema
+// package declares but does not register is deliberately invisible —
+// which is how a table that another tool owns stays out of drops's way.
+const schemaFuncHint = `add a Schema function to the package:
+
+    func Schema() *pg.Schema {
+        return pg.NewSchema(Users, Posts)  // every table drops should manage
+    }`
+
+// bridge is a generated program compiled against the user's schema
+// package. It has exactly three jobs, one per subcommand that needs a
+// Go schema rather than a database.
+type bridgeMode string
+
+const (
+	// bridgeSnapshot prints pg.BuildSnapshot(Schema()) as JSON.
+	bridgeSnapshot bridgeMode = "snapshot"
+	// bridgeGenerate runs pg.GenerateMigration and prints the result.
+	bridgeGenerate bridgeMode = "generate"
+	// bridgePush runs pg.Push against a live database.
+	bridgePush bridgeMode = "push"
+)
+
+// bridgeRequest is the JSON the CLI hands the generated program on
+// stdin. One struct for all three modes; a mode reads the fields it
+// needs.
+type bridgeRequest struct {
+	Mode                 bridgeMode `json:"mode"`
+	DSN                  string     `json:"dsn,omitempty"`
+	Dir                  string     `json:"dir,omitempty"`
+	Name                 string     `json:"name,omitempty"`
+	SchemaName           string     `json:"schemaName,omitempty"`
+	Safe                 bool       `json:"safe,omitempty"`
+	WithDown             bool       `json:"withDown,omitempty"`
+	DryRun               bool       `json:"dryRun,omitempty"`
+	DropUnmanagedIndexes bool       `json:"dropUnmanagedIndexes,omitempty"`
+}
+
+// bridgeReply is the JSON the generated program prints. Only the
+// fields belonging to the request's mode are populated.
+type bridgeReply struct {
+	Snapshot json.RawMessage   `json:"snapshot,omitempty"`
+	Generate *bridgeGenerated  `json:"generate,omitempty"`
+	Push     *bridgePushResult `json:"push,omitempty"`
+}
+
+type bridgeGenerated struct {
+	Tag     string `json:"tag"`
+	Idx     int    `json:"idx"`
+	SQL     string `json:"sql"`
+	DownSQL string `json:"downSql"`
+	NoOp    bool   `json:"noOp"`
+}
+
+type bridgePushResult struct {
+	Statements []string       `json:"statements"`
+	Applied    bool           `json:"applied"`
+	Notices    []bridgeNotice `json:"notices"`
+}
+
+type bridgeNotice struct {
+	Rule    string `json:"rule"`
+	Table   string `json:"table"`
+	Object  string `json:"object"`
+	Message string `json:"message"`
+	SQL     string `json:"sql"`
+}
+
+// schemaPackage is a located Go package that declares a schema.
+type schemaPackage struct {
+	ImportPath string
+	Dir        string
+	ModuleDir  string
+}
+
+// locateSchema resolves a package pattern (./db/schema, or an import
+// path) to the package on disk and checks the convention before
+// anything is compiled, so the common mistake is reported as itself
+// rather than as a compiler error inside a generated file.
+func locateSchema(ctx context.Context, pattern string) (*schemaPackage, error) {
+	if pattern == "" {
+		// Not having been told which package to read is the command
+		// line being wrong, the same as not having been told which
+		// database to touch.
+		return nil, usagef("--schema is required: point it at the Go package that declares your tables, e.g. --schema ./db/schema")
+	}
+	var out, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "go", "list", "-json", pattern)
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("go list %s: %v\n%s\nrun drops from inside the Go module that declares the schema, and pass --schema as a package pattern such as ./db/schema", pattern, err, strings.TrimSpace(stderr.String()))
+	}
+	var listed struct {
+		ImportPath string
+		Dir        string
+		Name       string
+		Module     struct{ Dir string }
+	}
+	if err := json.Unmarshal(out.Bytes(), &listed); err != nil {
+		return nil, fmt.Errorf("parse go list output for %s: %w", pattern, err)
+	}
+	if listed.Module.Dir == "" {
+		return nil, fmt.Errorf("package %s is not inside a Go module; drops needs one so it can compile a program that imports your schema", pattern)
+	}
+	if err := checkSchemaFunc(listed.Dir, listed.ImportPath); err != nil {
+		return nil, err
+	}
+	return &schemaPackage{ImportPath: listed.ImportPath, Dir: listed.Dir, ModuleDir: listed.Module.Dir}, nil
+}
+
+// checkSchemaFunc looks for the convention in the package's source. It
+// reads names, not types — the compiler stays the authority on whether
+// the function returns what it should — but it turns the usual mistake
+// into a sentence that says what to write.
+func checkSchemaFunc(dir, importPath string) error {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", dir, err)
+	}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Recv != nil || fn.Name.Name != "Schema" {
+					continue
+				}
+				if fn.Type.Params.NumFields() != 0 {
+					return fmt.Errorf("%s.Schema takes arguments; drops calls it with none — %s", importPath, schemaFuncHint)
+				}
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("package %s declares no Schema function, so drops has nothing to read — %s", importPath, schemaFuncHint)
+}
+
+// runBridge writes the generated program, runs it with `go run`, and
+// decodes its reply.
+//
+// The program is written inside the schema package's module because
+// that is the only place an import of the schema package resolves, and
+// `go run` is invoked from the working directory the user started in
+// so a relative --dir means what it says on the command line.
+func runBridge(ctx context.Context, pkg *schemaPackage, req bridgeRequest) (*bridgeReply, error) {
+	dir, err := os.MkdirTemp(pkg.ModuleDir, ".drops-bridge-")
+	if err != nil {
+		return nil, fmt.Errorf("create the directory for the generated program: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	src := renderBridge(pkg.ImportPath)
+	main := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(main, []byte(src), 0o644); err != nil {
+		return nil, fmt.Errorf("write the generated program: %w", err)
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "go", "run", main)
+	cmd.Stdin = bytes.NewReader(body)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	runErr := cmd.Run()
+	// The generated program prints its progress on stderr; showing it
+	// is how a push that takes a minute looks like one.
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+	if runErr != nil {
+		return nil, fmt.Errorf("evaluating the schema in %s failed: %w", pkg.ImportPath, runErr)
+	}
+	var reply bridgeReply
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		return nil, fmt.Errorf("the generated program printed something that is not a drops reply: %w\n%s", err, excerpt(stdout.String()))
+	}
+	return &reply, nil
+}
+
+// loadSnapshot returns the snapshot of the Go schema in pkg.
+func loadSnapshot(ctx context.Context, pkg *schemaPackage) (*pg.Snapshot, error) {
+	reply, err := runBridge(ctx, pkg, bridgeRequest{Mode: bridgeSnapshot})
+	if err != nil {
+		return nil, err
+	}
+	if len(reply.Snapshot) == 0 {
+		return nil, fmt.Errorf("the generated program returned no snapshot")
+	}
+	return pg.UnmarshalSnapshot(reply.Snapshot)
+}
+
+func excerpt(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 400 {
+		return s[:400] + "..."
+	}
+	return s
+}
+
+// renderBridge produces the program's source. It is deliberately
+// dull: every decision it could make is one the CLI has already made,
+// and code that only exists inside a temporary directory is code no
+// test can reach.
+func renderBridge(importPath string) string {
+	return strings.ReplaceAll(bridgeTemplate, "$IMPORT$", importPath)
+}
+
+const bridgeTemplate = `// Code generated by drops. DO NOT EDIT.
+//
+// This program exists for one process lifetime. It imports the
+// schema package, calls the drops/pg function the CLI asked for, and
+// prints the answer as JSON.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+
+	userschema "$IMPORT$"
+	"github.com/bernardoforcillo/drops/cmd/drops/pgwire"
+	"github.com/bernardoforcillo/drops/pg"
+)
+
+type request struct {
+	Mode                 string ` + "`json:\"mode\"`" + `
+	DSN                  string ` + "`json:\"dsn\"`" + `
+	Dir                  string ` + "`json:\"dir\"`" + `
+	Name                 string ` + "`json:\"name\"`" + `
+	SchemaName           string ` + "`json:\"schemaName\"`" + `
+	Safe                 bool   ` + "`json:\"safe\"`" + `
+	WithDown             bool   ` + "`json:\"withDown\"`" + `
+	DryRun               bool   ` + "`json:\"dryRun\"`" + `
+	DropUnmanagedIndexes bool   ` + "`json:\"dropUnmanagedIndexes\"`" + `
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "drops:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	var req request
+	if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil {
+		return fmt.Errorf("read request: %w", err)
+	}
+	schema := userschema.Schema()
+	if schema == nil {
+		return fmt.Errorf("$IMPORT$.Schema() returned nil")
+	}
+	reply := map[string]any{}
+	ctx := context.Background()
+
+	switch req.Mode {
+	case "snapshot":
+		body, err := pg.BuildSnapshot(schema).Marshal()
+		if err != nil {
+			return err
+		}
+		reply["snapshot"] = json.RawMessage(body)
+
+	case "generate":
+		res, err := pg.GenerateMigration(pg.GenerateOptions{
+			Schema:   schema,
+			Dir:      req.Dir,
+			Name:     req.Name,
+			Safe:     req.Safe,
+			WithDown: req.WithDown,
+		})
+		if err != nil {
+			return err
+		}
+		reply["generate"] = map[string]any{
+			"tag": res.Tag, "idx": res.Idx, "sql": res.SQL,
+			"downSql": res.DownSQL, "noOp": res.NoOp,
+		}
+
+	case "push":
+		conn, err := pgwire.Connect(ctx, req.DSN)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		conn.Notice = func(e *pgwire.Error) {
+			if !pgwire.Boilerplate(e) {
+				fmt.Fprintln(os.Stderr, "drops: server notice:", e.Message)
+			}
+		}
+		res, err := pg.Push(ctx, pg.New(conn), schema, pg.PushOptions{
+			Schema:               req.SchemaName,
+			Safe:                 req.Safe,
+			DryRun:               req.DryRun,
+			DropUnmanagedIndexes: req.DropUnmanagedIndexes,
+		})
+		if err != nil {
+			return err
+		}
+		notices := make([]map[string]any, 0, len(res.Notices))
+		for _, n := range res.Notices {
+			notices = append(notices, map[string]any{
+				"rule": n.Rule, "table": n.Table, "object": n.Object,
+				"message": n.Message, "sql": n.SQL,
+			})
+		}
+		reply["push"] = map[string]any{
+			"statements": res.Statements, "applied": res.Applied, "notices": notices,
+		}
+
+	default:
+		return fmt.Errorf("unknown mode %q", req.Mode)
+	}
+	return json.NewEncoder(os.Stdout).Encode(reply)
+}
+`

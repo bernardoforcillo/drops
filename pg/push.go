@@ -33,6 +33,15 @@ type PushOptions struct {
 	// database but appears in no table of the Go schema. It is off by
 	// default; see Push's doc comment for why.
 	DropUnmanagedIndexes bool
+
+	// DropUnmanagedObjects lets Push drop an enum, sequence, view or
+	// policy that exists in the database and appears nowhere in the Go
+	// schema, and lets it switch off a row-level security the schema
+	// does not declare. It is off by default for the same reason
+	// DropUnmanagedIndexes is, with a sharper edge: turning RLS off is
+	// not a slow rebuild, it is every row of the table becoming
+	// visible to everyone the moment the push commits.
+	DropUnmanagedObjects bool
 }
 
 // PushResult is the outcome of a Push call.
@@ -57,8 +66,11 @@ type PushResult struct {
 // here rather than being dropped on the floor.
 type SchemaNotice struct {
 	// Rule is a stable identifier for the kind of notice —
-	// "unmanaged-index", "unrepresentable-index",
-	// "check-not-normalised", "index-predicate-not-normalised".
+	// "unmanaged-index", "unmanaged-enum", "unmanaged-sequence",
+	// "unmanaged-view", "unmanaged-policy", "unmanaged-rls",
+	// "unrepresentable-index", "enum-labels-reordered",
+	// "check-not-normalised", "index-predicate-not-normalised",
+	// "policy-expression-not-normalised", "view-not-normalised".
 	Rule string
 	// Table is the table the notice concerns, unqualified.
 	Table string
@@ -89,10 +101,11 @@ func (n SchemaNotice) String() string {
 // Behaviour:
 //   - Reads the current state of the configured schema via Introspect.
 //   - Builds a target snapshot from `schema`.
-//   - Asks the server to respell the declared CHECK expressions and
-//     partial-index predicates, so the two sides of the diff are
-//     written in the same dialect of PostgreSQL's own deparser.
-//     See "What the probe costs" below: this happens on a DryRun too.
+//   - Asks the server to respell the declared CHECK expressions,
+//     partial-index predicates, policy expressions and view bodies, so
+//     the two sides of the diff are written in the same dialect of
+//     PostgreSQL's own deparser. See "What the probe costs" below:
+//     this happens on a DryRun too.
 //   - Diffs the two using DiffOptions{Safe: opts.Safe}.
 //   - If DryRun, returns the statements unexecuted.
 //   - Otherwise applies them inside a single transaction; any failure
@@ -103,17 +116,25 @@ func (n SchemaNotice) String() string {
 //
 // # What the probe costs
 //
-// Respelling a declared expression means handing it to the server as a
-// CHECK constraint added NOT VALID and reading back what the deparser
-// makes of it. NOT VALID skips the table scan, and the whole thing is
-// rolled back, but ALTER TABLE ADD CONSTRAINT still takes an ACCESS
-// EXCLUSIVE lock on the table, and PostgreSQL holds a lock until the
-// transaction ends — not until the savepoint rolls back. So a push
-// against a schema with CHECK constraints or partial indexes briefly
-// locks every table carrying one, all at once, and blocks readers of
-// those tables for the length of the probe. It happens on a DryRun as
-// well, because there is no way to preview a change to an expression
-// without first learning how the server spells it.
+// Respelling a declared expression means handing it to the server
+// under a throwaway name and reading back what the deparser makes of
+// it. Each kind of expression is handed over as the kind of object it
+// is: a CHECK body and an index predicate as a CHECK constraint added
+// NOT VALID, a policy's USING and WITH CHECK as a policy, a view body
+// as a view — the last two because a policy may hold a subquery and a
+// view is one, and a CHECK constraint may not. Reusing one probe for
+// all of them would have reported every such policy as unparseable.
+//
+// NOT VALID skips the table scan, a materialised view is probed WITH
+// NO DATA, and the whole thing is rolled back, but ALTER TABLE ADD
+// CONSTRAINT and CREATE POLICY still take an ACCESS EXCLUSIVE lock on
+// the table, and PostgreSQL holds a lock until the transaction ends —
+// not until the savepoint rolls back. So a push against a schema with
+// CHECK constraints, partial indexes or policies briefly locks every
+// table carrying one, all at once, and blocks readers of those tables
+// for the length of the probe. It happens on a DryRun as well, because
+// there is no way to preview a change to an expression without first
+// learning how the server spells it.
 //
 // Set lock_timeout on the connection if a push must never wait behind
 // a long reader. A probe that fails for an operational reason — a lock
@@ -121,7 +142,7 @@ func (n SchemaNotice) String() string {
 // rather than being reported as an unparseable expression, so a
 // change is never quietly left unapplied.
 //
-// # An index the schema never declared
+// # An object the schema never declared
 //
 // Push does not drop one. Diff does, and is right to: it compares two
 // declarations, so an index missing from the newer one was removed.
@@ -133,6 +154,20 @@ func (n SchemaNotice) String() string {
 // Set DropUnmanagedIndexes to take the other side of that trade; the
 // withheld statements are reported as notices either way, ready to run
 // by hand.
+//
+// The same reasoning covers the objects Introspect learned to read
+// after indexes did — an enum, a sequence, a view, a policy, and a
+// row-level security somebody switched on by hand — under
+// DropUnmanagedObjects. The RLS case is the one worth reading twice: a
+// table with RLS enabled in the database and no EnableRLS in the Go
+// schema is one ALTER TABLE away from serving every row to every
+// caller, and a migration tool that performs that silently is worse
+// than one that will not perform it at all. Push withholds it and
+// reports an "unmanaged-rls" notice.
+//
+// What an extension owns is not withheld, it is never seen: Introspect
+// leaves those out of the snapshot entirely, so no drop is proposed for
+// PostGIS's views or for the sequence behind a serial column.
 //
 // # What Push cannot see
 //
@@ -149,11 +184,19 @@ func (n SchemaNotice) String() string {
 //     it against one the database already has. It is reported as an
 //     "unrepresentable-index" notice; emit pg.CreateIndex for it;
 //   - a multi-column FOREIGN KEY, which Introspect skips;
-//   - enums, sequences, views, RLS and policies, which Introspect does
-//     not read at all — Diff sees them as new on every push;
-//   - a CHECK expression or index predicate the server refused to
-//     respell, reported as a "not-normalised" notice and left alone
-//     rather than churned;
+//   - a change to a sequence's attributes: Introspect reads them and
+//     Diff compares sequences by name only, so a START WITH or an
+//     INCREMENT BY that moved is neither applied nor reported;
+//   - an enum label that was removed or reordered. PostgreSQL cannot
+//     drop a label at all, and can only reorder one by rewriting every
+//     column of the type, so Diff appends new labels and leaves the
+//     rest alone. A reorder is at least reported, as an
+//     "enum-labels-reordered" notice: the order is part of the type,
+//     so leaving it unmentioned would be claiming the database matches
+//     the schema when it does not;
+//   - a CHECK expression, index predicate, policy clause or view body
+//     the server refused to respell, reported as a "not-normalised"
+//     notice and left alone rather than churned;
 //   - a partial index whose predicate binds a value with no literal
 //     spelling, which the snapshot records as no predicate at all —
 //     the same declaration pg.CreateIndex cannot render either.
@@ -185,11 +228,17 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		return nil, fmt.Errorf("drops/pg: normalise declared expressions: %w", err)
 	}
 	notices = append(notices, unrepresentableIndexNotices(desired)...)
+	notices = append(notices, enumOrderNotices(current, desired)...)
 
 	stmts := Diff(current, desired, DiffOptions{Safe: opt.Safe})
 	if !opt.DropUnmanagedIndexes {
 		var withheld []SchemaNotice
-		stmts, withheld = withholdUnmanagedIndexDrops(stmts, current, desired, opt.Safe)
+		stmts, withheld = withhold(stmts, unmanagedIndexDrops(current, desired, opt.Safe))
+		notices = append(notices, withheld...)
+	}
+	if !opt.DropUnmanagedObjects {
+		var withheld []SchemaNotice
+		stmts, withheld = withhold(stmts, unmanagedObjectDrops(current, desired, opt.Safe))
 		notices = append(notices, withheld...)
 	}
 	sortNotices(notices)
@@ -244,33 +293,44 @@ var errProbeDone = errors.New("drops/pg: probe complete")
 
 // exprProbe is one expression to be respelled by the server.
 type exprProbe struct {
-	table    string // qualified, as written into the ALTER TABLE
-	name     string // table name for the notice
-	object   string // index or constraint name
+	name     string // table name for the notice, empty for a schema-level object
+	object   string
 	rule     string
 	expr     string  // the declared expression, as the Go schema wrote it
 	target   *string // where the server's spelling is written back
 	fallback *string // what to use instead when the probe fails
+	// respell creates the throwaway object named probe, reads the
+	// deparsed form back out of the catalogue, and leaves the caller
+	// to roll the savepoint back.
+	respell func(ctx context.Context, tx *DB, probe string) (string, error)
 }
 
 // renormaliseExpressions rewrites the expression-valued fields of the
 // desired snapshot into the spelling PostgreSQL itself would report,
 // so Diff can compare them as text.
 //
-// This is the one thing only a server can do. pg_get_expr and
-// pg_get_constraintdef do not echo an expression back, they print a
-// parse tree: `"age" >= 0` comes back `(age >= 0)`, `status = 'x'`
-// comes back `(status = 'x'::text)`, and `IN (...)` comes back
-// `= ANY (ARRAY[...])`. No amount of string tidying in Go reproduces
-// that, and guessing produces a diff that either churns forever or
-// misses a real change. So the declared expression is handed to the
-// server as a CHECK constraint that is added NOT VALID — which skips
-// the table scan — read back through the same deparser Introspect
-// reads, and rolled back.
+// This is the one thing only a server can do. pg_get_expr,
+// pg_get_constraintdef and pg_get_viewdef do not echo an expression
+// back, they print a parse tree: `"age" >= 0` comes back `(age >= 0)`,
+// `status = 'x'` comes back `(status = 'x'::text)`, `IN (...)` comes
+// back `= ANY (ARRAY[...])`, and a view's SELECT comes back with its
+// columns expanded and its table aliases rewritten. No amount of
+// string tidying in Go reproduces that, and guessing produces a diff
+// that either churns forever or misses a real change. So the declared
+// expression is handed to the server, read back through the same
+// deparser Introspect reads, and rolled back.
+//
+// Each kind goes over as the kind of object it is — a CHECK body and
+// an index predicate as a NOT VALID CHECK constraint, a policy's
+// clauses as a policy, a view's body as a view. A policy may hold a
+// subquery and a view is one; a CHECK constraint may not hold either,
+// so probing everything as a CHECK would have reported the whole class
+// as unparseable and silently frozen it at whatever the database held.
 //
 // Only expressions already present on both sides are probed: a
-// constraint or index the database does not have yet is created from
-// the declared spelling, and the server stores its own on the way in.
+// constraint, index, policy or view the database does not have yet is
+// created from the declared spelling, and the server stores its own on
+// the way in.
 //
 // A probe that fails leaves the desired side carrying the database's
 // value, so the push does not churn, and returns a notice saying the
@@ -291,13 +351,13 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 			}
 			dc := dt.CheckConstraints[name]
 			probes = append(probes, &exprProbe{
-				table:    qualified,
 				name:     dt.Name,
 				object:   name,
 				rule:     "check-not-normalised",
 				expr:     dc.Value,
 				target:   &dc.Value,
 				fallback: &cc.Value,
+				respell:  checkProbe(qualified, dc.Value),
 			})
 		}
 		for _, name := range sortedKeys(dt.Indexes) {
@@ -307,15 +367,60 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 				continue
 			}
 			probes = append(probes, &exprProbe{
-				table:    qualified,
 				name:     dt.Name,
 				object:   name,
 				rule:     "index-predicate-not-normalised",
 				expr:     di.Where,
 				target:   &di.Where,
 				fallback: &ci.Where,
+				respell:  checkProbe(qualified, di.Where),
 			})
 		}
+		for _, name := range sortedKeys(dt.Policies) {
+			cp, ok := ct.Policies[name]
+			if !ok {
+				continue
+			}
+			dp := dt.Policies[name]
+			for _, clause := range []struct {
+				withCheck        bool
+				declared, actual *string
+			}{
+				{false, &dp.Using, &cp.Using},
+				{true, &dp.WithCheck, &cp.WithCheck},
+			} {
+				if *clause.declared == "" {
+					continue
+				}
+				probes = append(probes, &exprProbe{
+					name:     dt.Name,
+					object:   name,
+					rule:     "policy-expression-not-normalised",
+					expr:     *clause.declared,
+					target:   clause.declared,
+					fallback: clause.actual,
+					respell:  policyProbe(qualified, *clause.declared, clause.withCheck),
+				})
+			}
+		}
+	}
+	for _, key := range sortedKeys(desired.Views) {
+		dv := desired.Views[key]
+		cv, ok := current.Views[key]
+		if !ok || dv.Definition == "" {
+			continue
+		}
+		probes = append(probes, &exprProbe{
+			object:   dv.Name,
+			rule:     "view-not-normalised",
+			expr:     dv.Definition,
+			target:   &dv.Definition,
+			fallback: &cv.Definition,
+			// The probe goes into the namespace the view was read
+			// from, so the catalogue lookup that follows cannot land
+			// on a same-named view in another schema of the path.
+			respell: viewProbe(cv.Schema, dv.Definition, dv.Materialized),
+		})
 	}
 	if len(probes) == 0 {
 		return nil, nil
@@ -331,7 +436,7 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 			if _, err := tx.Exec(ctx, "SAVEPOINT "+savepoint); err != nil {
 				return err
 			}
-			def, perr := probeConstraintDef(ctx, tx, p, savepoint)
+			def, perr := p.respell(ctx, tx, savepoint)
 			if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); err != nil {
 				return err
 			}
@@ -358,21 +463,85 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 	return notices, nil
 }
 
-// probeConstraintDef adds the declared expression as a NOT VALID CHECK
-// constraint, reads the spelling the server gives it back, and leaves
-// the caller to roll the savepoint back.
-func probeConstraintDef(ctx context.Context, tx *DB, p *exprProbe, name string) (string, error) {
-	stmt := fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID`,
-		p.table, quoteIdent(name), p.expr)
-	if _, err := tx.Exec(ctx, stmt); err != nil {
-		return "", err
+// checkProbe adds the declared expression as a NOT VALID CHECK
+// constraint and reads the spelling the server gives it back.
+func checkProbe(table, expr string) func(context.Context, *DB, string) (string, error) {
+	return func(ctx context.Context, tx *DB, name string) (string, error) {
+		stmt := fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID`,
+			table, quoteIdent(name), expr)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return "", err
+		}
+		// Scoped to the table, not just the name: a probe is
+		// short-lived but the catalogue is global, and another schema
+		// is entitled to a constraint called the same thing.
+		def, err := probeScalar(ctx, tx,
+			`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+			 WHERE conrelid = $1::regclass AND conname = $2`, table, name)
+		if err != nil {
+			return "", err
+		}
+		return checkExprOf(def), nil
 	}
-	// Scoped to the table, not just the name: a probe is short-lived
-	// but the catalogue is global, and another schema is entitled to a
-	// constraint called the same thing.
-	rows, err := tx.Query(ctx,
-		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
-		 WHERE conrelid = $1::regclass AND conname = $2`, p.table, name)
+}
+
+// policyProbe adds the declared expression as a policy on the table and
+// reads back pg_get_expr's spelling of it — the same column and the
+// same function readIntrospectPolicies reads.
+//
+// The probe policy is created without a FOR clause whatever command the
+// real one names: PostgreSQL rejects USING on a FOR INSERT policy and
+// WITH CHECK on a FOR SELECT one, and the deparsing does not depend on
+// which command the expression was attached to.
+func policyProbe(table, expr string, withCheck bool) func(context.Context, *DB, string) (string, error) {
+	clause, column := "USING", "polqual"
+	if withCheck {
+		clause, column = "WITH CHECK", "polwithcheck"
+	}
+	return func(ctx context.Context, tx *DB, name string) (string, error) {
+		stmt := fmt.Sprintf(`CREATE POLICY %s ON %s %s (%s)`,
+			quoteIdent(name), table, clause, expr)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return "", err
+		}
+		return probeScalar(ctx, tx, fmt.Sprintf(
+			`SELECT coalesce(pg_get_expr(%s, polrelid), '') FROM pg_policy
+			 WHERE polrelid = $1::regclass AND polname = $2`, column), table, name)
+	}
+}
+
+// viewProbe creates the declared body as a view and reads back
+// pg_get_viewdef's spelling of it.
+//
+// A materialised view is probed as one, WITH NO DATA so the query is
+// planned and rewritten but never run — a matview accepts query shapes
+// a plain view does not, and the point of the probe is to find out
+// what the server makes of this query, not of one like it.
+func viewProbe(schema, def string, materialized bool) func(context.Context, *DB, string) (string, error) {
+	return func(ctx context.Context, tx *DB, name string) (string, error) {
+		qualified := quoteIdent(schema) + "." + quoteIdent(name)
+		stmt := fmt.Sprintf(`CREATE VIEW %s AS %s`, qualified, def)
+		if materialized {
+			stmt = fmt.Sprintf(`CREATE MATERIALIZED VIEW %s AS %s WITH NO DATA`, qualified, def)
+		}
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return "", err
+		}
+		body, err := probeScalar(ctx, tx,
+			`SELECT pg_get_viewdef(oid, true) FROM pg_class WHERE oid = $1::regclass`, qualified)
+		if err != nil {
+			return "", err
+		}
+		return viewBodyOf(body), nil
+	}
+}
+
+// probeScalar runs a one-row, one-column catalogue query and returns
+// the value. A missing row means the object the probe just created is
+// not where it was looked for, which is a bug in the probe rather than
+// a verdict on the expression.
+func probeScalar(ctx context.Context, tx *DB, query string, args ...any) (string, error) {
+	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return "", err
 	}
@@ -381,13 +550,13 @@ func probeConstraintDef(ctx context.Context, tx *DB, p *exprProbe, name string) 
 		if err := rows.Err(); err != nil {
 			return "", err
 		}
-		return "", errors.New("the probe constraint was not found in pg_constraint")
+		return "", errors.New("the probe object was not found in the catalogue")
 	}
-	var def string
-	if err := rows.Scan(&def); err != nil {
+	var out string
+	if err := rows.Scan(&out); err != nil {
 		return "", err
 	}
-	return checkExprOf(def), rows.Err()
+	return out, rows.Err()
 }
 
 // probeRefusedExpression reports whether err is the server refusing the
@@ -428,16 +597,16 @@ func qualifiedTableSQL(t *TableSnapshot) string {
 // Notices
 // ----------------------------------------------------------------------
 
-// withholdUnmanagedIndexDrops removes from stmts every DROP INDEX that
-// targets an index the database has and the Go schema never declared,
-// returning what is left and a notice for each one held back.
+// unmanagedIndexDrops returns, keyed by the exact statement Diff would
+// emit, a notice for every DROP INDEX that targets an index the
+// database has and the Go schema never declared.
 //
-// The statements are matched by text rather than re-derived, because
-// the text is what Diff produced from the same two snapshots a moment
-// earlier — anything that does not match is a drop Diff emitted for a
-// different reason (an index declared on both sides whose shape
-// changed) and has to go through.
-func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot, safe bool) ([]string, []SchemaNotice) {
+// The statements are matched by text rather than re-derived by the
+// caller, because the text is what Diff produced from the same two
+// snapshots a moment earlier — anything that does not match is a drop
+// Diff emitted for a different reason (an index declared on both sides
+// whose shape changed) and has to go through.
+func unmanagedIndexDrops(current, desired *Snapshot, safe bool) map[string]SchemaNotice {
 	// Index names are unique across a schema, not per table, so the
 	// question is whether the Go schema declares the name anywhere —
 	// not whether it declares it on the table the database put it on.
@@ -464,19 +633,173 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot, saf
 			}
 		}
 	}
-	if len(withheld) == 0 {
+	return withheld
+}
+
+// unmanagedObjectDrops is unmanagedIndexDrops for the rest of what
+// Introspect reads: enums, sequences, views, policies, and the two
+// row-level security flags.
+//
+// The RLS entries are the odd ones out in that they are not drops of
+// anything. They are here for the same reason: the database has a
+// protection the Go schema does not mention, and the difference between
+// "the schema removed it" and "the schema never knew about it" is not
+// one a snapshot can tell — so the statement that would remove it is
+// withheld and named rather than run.
+//
+// Only a table the Go schema declares is examined. A table absent from
+// it is being dropped whole, and Diff's DROP TABLE takes its policies
+// with it; withholding an RLS statement for a table that will not
+// exist would report a difference nobody can act on.
+func unmanagedObjectDrops(current, desired *Snapshot, safe bool) map[string]SchemaNotice {
+	withheld := map[string]SchemaNotice{}
+	add := func(sql string, n SchemaNotice) {
+		n.SQL = sql
+		withheld[sql] = n
+	}
+	for _, key := range sortedKeys(current.Enums) {
+		if _, ok := desired.Enums[key]; ok {
+			continue
+		}
+		add(dropEnumSQL(key, safe), SchemaNotice{
+			Rule:   "unmanaged-enum",
+			Object: key,
+			Message: fmt.Sprintf(
+				"enum type %q exists in the database and is declared by no Schema.AddEnum; Push left it alone", key),
+		})
+	}
+	for _, key := range sortedKeys(current.Sequences) {
+		if _, ok := desired.Sequences[key]; ok {
+			continue
+		}
+		seq := current.Sequences[key]
+		add(dropSequenceSQL(seq.Name, safe), SchemaNotice{
+			Rule:   "unmanaged-sequence",
+			Object: seq.Name,
+			Message: fmt.Sprintf(
+				"sequence %q exists in the database and is declared by no Schema.AddSequence; Push left it alone", seq.Name),
+		})
+	}
+	for _, key := range sortedKeys(current.Views) {
+		if _, ok := desired.Views[key]; ok {
+			continue
+		}
+		view := current.Views[key]
+		add(dropViewSQL(view, safe), SchemaNotice{
+			Rule:   "unmanaged-view",
+			Object: view.Name,
+			Message: fmt.Sprintf(
+				"view %q exists in the database and is declared by no Schema.AddView; Push left it alone", view.Name),
+		})
+	}
+	for _, key := range sortedKeys(current.Tables) {
+		ct := current.Tables[key]
+		dt, ok := desired.Tables[key]
+		if !ok {
+			continue
+		}
+		for _, name := range sortedKeys(ct.Policies) {
+			if _, ok := dt.Policies[name]; ok {
+				continue
+			}
+			add(dropPolicySQL(dt.Name, name, safe), SchemaNotice{
+				Rule:   "unmanaged-policy",
+				Table:  dt.Name,
+				Object: name,
+				Message: fmt.Sprintf(
+					"policy %q on %q exists in the database and is declared by no Table.AddPolicy; Push left it alone", name, dt.Name),
+			})
+		}
+		if ct.IsRLSEnabled && !dt.IsRLSEnabled {
+			add(fmt.Sprintf(`ALTER TABLE %s DISABLE ROW LEVEL SECURITY;`, quoteIdent(dt.Name)), SchemaNotice{
+				Rule:   "unmanaged-rls",
+				Table:  dt.Name,
+				Object: dt.Name,
+				Message: fmt.Sprintf(
+					"row-level security is enabled on %q in the database and no EnableRLS declares it; Push did not switch it off, which would have made every row readable by every caller", dt.Name),
+			})
+		}
+		if ct.IsRLSForced && !dt.IsRLSForced {
+			add(fmt.Sprintf(`ALTER TABLE %s NO FORCE ROW LEVEL SECURITY;`, quoteIdent(dt.Name)), SchemaNotice{
+				Rule:   "unmanaged-rls",
+				Table:  dt.Name,
+				Object: dt.Name,
+				Message: fmt.Sprintf(
+					"row-level security is forced on %q in the database and no ForceRLS declares it; Push did not lift it, which would have exempted the table's owner from its own policies", dt.Name),
+			})
+		}
+	}
+	return withheld
+}
+
+// withhold removes from stmts every statement the map has a notice
+// for, returning what is left and the notices for what was held back.
+func withhold(stmts []string, unmanaged map[string]SchemaNotice) ([]string, []SchemaNotice) {
+	if len(unmanaged) == 0 {
 		return stmts, nil
 	}
 	kept := make([]string, 0, len(stmts))
 	var notices []SchemaNotice
 	for _, s := range stmts {
-		if n, ok := withheld[s]; ok {
+		if n, ok := unmanaged[s]; ok {
 			notices = append(notices, n)
 			continue
 		}
 		kept = append(kept, s)
 	}
 	return kept, notices
+}
+
+// enumOrderNotices reports an enum whose labels the Go schema declares
+// in a different order from the one the database holds.
+//
+// Label order is part of the type — it is the ordering `<` uses and the
+// one ORDER BY follows — and PostgreSQL offers no way to change it in
+// place. Diff appends the new labels and stops there, so the reorder
+// would otherwise be a difference Push saw, could not act on, and did
+// not mention: a push that reports success against a database whose
+// enum sorts differently from the declared one.
+//
+// Only the labels both sides carry are compared. A label the schema
+// adds has not been placed yet, and one the database has and the
+// schema does not cannot be removed at all.
+func enumOrderNotices(current, desired *Snapshot) []SchemaNotice {
+	var out []SchemaNotice
+	for _, key := range sortedKeys(desired.Enums) {
+		ce, ok := current.Enums[key]
+		if !ok {
+			continue
+		}
+		de := desired.Enums[key]
+		shared := commonLabels(ce.Values, de.Values)
+		if sameStrings(shared, commonLabels(de.Values, ce.Values)) {
+			continue
+		}
+		out = append(out, SchemaNotice{
+			Rule:   "enum-labels-reordered",
+			Object: key,
+			Message: fmt.Sprintf(
+				"enum type %q holds its labels as %v and the Go schema declares them as %v; PostgreSQL cannot reorder them and Push did not try",
+				key, ce.Values, de.Values),
+		})
+	}
+	return out
+}
+
+// commonLabels returns the members of a that also appear in b, in a's
+// order.
+func commonLabels(a, b []string) []string {
+	in := make(map[string]bool, len(b))
+	for _, v := range b {
+		in[v] = true
+	}
+	out := make([]string, 0, len(a))
+	for _, v := range a {
+		if in[v] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // unrepresentableIndexNotices reports declared indexes the snapshot

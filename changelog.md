@@ -9,6 +9,34 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **The `drops` CLI** — every step of the migration loop existed as a
+  library function and had no front end, so a project that wanted
+  drizzle-kit's workflow had to write its own `main` for each of them.
+  `drops generate`, `migrate` (with `migrate down`), `push`, `drift`,
+  `pull`, `baseline` and `status` now drive `pg.GenerateMigration`,
+  `pg.DrizzleMigrator`, `pg.Push`, `pg.Introspect` and
+  `pg.DetectDrift` directly. A CLI cannot read a Go variable, so the
+  schema-aware commands generate a program that imports the schema
+  package, call `func Schema() *pg.Schema`, and run it with `go run` —
+  the real compiler evaluating the real declarations. `push`,
+  `migrate` and `migrate down` route their statements through
+  `pg.AnalyzeMigration` and refuse the destructive ones without
+  `--allow-destructive`, naming each statement they held back;
+  `drift` exits 3 so it can gate a pipeline. The gate classifies a
+  statement collapsed to one line: the safety analyser's patterns join
+  their two halves with `.*`, which does not cross a newline, so a
+  wrapped `ALTER TABLE ... DROP COLUMN` — drizzle-kit's spelling, or an
+  edited file's — would otherwise be applied unremarked. `push` and
+  `baseline` refuse a `--pg-schema` other than `public`, because
+  `pg.Diff` writes unqualified identifiers and would put the tables in
+  whatever `search_path` points at while reporting success.
+- **`cmd/drops/pgwire`** — the CLI needs a connection and drops has no
+  dependencies, so the binary speaks the PostgreSQL v3 wire protocol
+  itself: simple and extended query, trust, cleartext, MD5 and
+  SCRAM-SHA-256 authentication, TLS, transactions and savepoints, in
+  the standard library. It implements `drops.Driver`, and its errors
+  carry SQLSTATE, so `pg.ErrUniqueViolation` and friends classify
+  through it exactly as they do through pgx.
 - **Version bands in `drops/mirror`** — `Change.Version` decides which
   of two writes to a row the mirror keeps, and a `ReplacingMergeTree`
   never revisits that decision. Two incomparable spaces were in play

@@ -12,6 +12,7 @@ ClickHouse and Qdrant.
 | [Getting started](getting-started.md) | Install, connect, first query, first entity. Twenty minutes. |
 | [Declaring a schema](schema.md) | Tables, columns, types — and how to keep the schema and the struct from drifting apart. |
 | [Entities and CRUD](entities.md) | Get / Create / Update / Delete, composite keys, relations, pagination. |
+| [The `drops` CLI](cli.md) | generate, migrate, push, drift, pull, baseline, status — and how a CLI reads a Go schema. |
 
 ## By topic
 

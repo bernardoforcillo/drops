@@ -2,6 +2,7 @@ package pg
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -32,16 +33,28 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 // sorted order — so re-running against the same input produces
 // byte-identical SQL.
 //
-// Operation order:
-//  1. DROP TABLE   for tables removed entirely
-//  2. CREATE TABLE for new tables (column defs only — every
+// Operation order — each step exists where it does because the step
+// after it depends on the step before having run:
+//
+//  1. DROP VIEW / DROP MATERIALIZED VIEW for views removed entirely,
+//     ahead of the table drops that would CASCADE them away first
+//  2. CREATE TYPE, CREATE SEQUENCE for enums and sequences the schema
+//     newly declares, ahead of the CREATE TABLE naming them
+//  3. DROP TABLE   for tables removed entirely
+//  4. CREATE TABLE for new tables (column defs only — every
 //     composite key, UNIQUE, FOREIGN KEY and CHECK constraint is
 //     emitted as a separate ALTER TABLE below, never inline)
-//  3. ALTER TABLE  for column-level changes on surviving tables
+//  5. ALTER TABLE  for column-level changes on surviving tables
 //     (drop, add, type, NOT NULL, DEFAULT)
-//  4. UNIQUE       constraint adds/drops on every table
-//  5. FOREIGN KEY  adds/drops on every table — emitted after CREATE
-//     TABLEs so cross-table references resolve.
+//  6. UNIQUE       constraint adds/drops on every table
+//  7. FOREIGN KEY  adds/drops on every table — emitted after CREATE
+//     TABLEs so cross-table references resolve
+//  8. CREATE INDEX / DROP INDEX
+//  9. DROP SEQUENCE, DROP TYPE, once the last table naming them is
+//     gone
+//  10. CREATE / CREATE OR REPLACE VIEW, once the tables a view selects
+//     from are in their final shape
+//  11. ROW LEVEL SECURITY and its policies, table by table
 func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	var opt DiffOptions
 	if len(opts) > 0 {
@@ -112,13 +125,32 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 		out = append(out, diffIndexes(prevT, curT, opt.Safe)...)
 	}
 
-	// Top-level objects (enums / sequences / views) — emit
-	// drops first (so CREATE TABLE doesn't reference a stale
-	// enum), then creates after table DDL settles.
-	out = append([]string{}, prependEnumDrops(prev, cur, opt.Safe, out)...)
-	out = append(out, diffEnumsCreate(prev, cur, opt.Safe)...)
-	out = append(out, diffSequences(prev, cur, opt.Safe)...)
-	out = append(out, diffViews(prev, cur, opt.Safe)...)
+	// Top-level objects. A type or a sequence a column references has
+	// to exist before the CREATE TABLE that names it, and cannot be
+	// dropped until the last table naming it is gone — so the creates
+	// go in front of the table DDL and the drops behind it. Emitting
+	// the creates last, as this once did, meant a schema declaring a
+	// single enum column produced a migration whose CREATE TABLE
+	// named a type three statements before it existed.
+	//
+	// A view that is going away goes in front of everything: DROP
+	// TABLE is emitted CASCADE, which takes every view selecting from
+	// the table with it, and the DROP VIEW that followed then named an
+	// object PostgreSQL had already removed (SQLSTATE 42P01), stopping
+	// the migration halfway. Dropping the view first is always legal —
+	// nothing depends on a view being there — and leaves the CASCADE
+	// with nothing left to take.
+	//
+	// Views that survive are built last of all: a view selects from
+	// the tables, so it can only be built once they are in their final
+	// shape.
+	head := diffViewsDrop(prev, cur, opt.Safe)
+	head = append(head, diffEnumsCreate(prev, cur, opt.Safe)...)
+	head = append(head, diffSequencesCreate(prev, cur, opt.Safe)...)
+	out = append(head, out...)
+	out = append(out, diffSequencesDrop(prev, cur, opt.Safe)...)
+	out = append(out, diffEnumsDrop(prev, cur, opt.Safe)...)
+	out = append(out, diffViewsCreate(prev, cur, opt.Safe)...)
 
 	// RLS + policies, table-scoped.
 	for _, key := range sortedKeys(cur.Tables) {
@@ -134,20 +166,15 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	return out
 }
 
-// prependEnumDrops returns out with DROP TYPE statements inserted
-// before any CREATE TABLE that might reference the removed enum.
-// Other operations remain in their original positions.
-func prependEnumDrops(prev, cur *Snapshot, safe bool, current []string) []string {
-	var drops []string
+// diffEnumsDrop emits DROP TYPE for every enum cur no longer declares.
+func diffEnumsDrop(prev, cur *Snapshot, safe bool) []string {
+	var out []string
 	for _, key := range sortedKeys(prev.Enums) {
 		if _, ok := cur.Enums[key]; !ok {
-			drops = append(drops, dropEnumSQL(key, safe))
+			out = append(out, dropEnumSQL(key, safe))
 		}
 	}
-	if len(drops) == 0 {
-		return current
-	}
-	return append(drops, current...)
+	return out
 }
 
 func diffEnumsCreate(prev, cur *Snapshot, safe bool) []string {
@@ -173,13 +200,17 @@ func diffEnumsCreate(prev, cur *Snapshot, safe bool) []string {
 	return out
 }
 
-func diffSequences(prev, cur *Snapshot, safe bool) []string {
+// diffSequencesCreate emits CREATE SEQUENCE for every sequence cur
+// declares and prev does not.
+//
+// A sequence present on both sides is left alone whatever its
+// attributes say. Introspect reads the attributes back, but only the
+// ones the declaration named — see readIntrospectSequences — and
+// PostgreSQL's ALTER SEQUENCE ... RESTART is not a migration anybody
+// should get by accident, so a moved START WITH is neither applied nor
+// reported. Push's doc comment lists it among what Push cannot see.
+func diffSequencesCreate(prev, cur *Snapshot, safe bool) []string {
 	var out []string
-	for _, key := range sortedKeys(prev.Sequences) {
-		if _, ok := cur.Sequences[key]; !ok {
-			out = append(out, dropSequenceSQL(prev.Sequences[key].Name, safe))
-		}
-	}
 	for _, key := range sortedKeys(cur.Sequences) {
 		if _, ok := prev.Sequences[key]; ok {
 			continue
@@ -189,18 +220,50 @@ func diffSequences(prev, cur *Snapshot, safe bool) []string {
 	return out
 }
 
-func diffViews(prev, cur *Snapshot, safe bool) []string {
+// diffSequencesDrop emits DROP SEQUENCE for every sequence cur no
+// longer declares.
+func diffSequencesDrop(prev, cur *Snapshot, safe bool) []string {
+	var out []string
+	for _, key := range sortedKeys(prev.Sequences) {
+		if _, ok := cur.Sequences[key]; !ok {
+			out = append(out, dropSequenceSQL(prev.Sequences[key].Name, safe))
+		}
+	}
+	return out
+}
+
+// diffViewsDrop emits the DROP for every view cur no longer declares.
+// It is emitted ahead of the table DDL; see Diff.
+func diffViewsDrop(prev, cur *Snapshot, safe bool) []string {
 	var out []string
 	for _, key := range sortedKeys(prev.Views) {
 		if _, ok := cur.Views[key]; !ok {
 			out = append(out, dropViewSQL(prev.Views[key], safe))
 		}
 	}
+	return out
+}
+
+// diffViewsCreate builds the views cur declares and brings the ones
+// that changed into line.
+func diffViewsCreate(prev, cur *Snapshot, safe bool) []string {
+	var out []string
 	for _, key := range sortedKeys(cur.Views) {
 		curV := cur.Views[key]
 		prevV, ok := prev.Views[key]
 		switch {
 		case !ok:
+			out = append(out, createViewSQL(curV, false))
+		case prevV.Materialized != curV.Materialized:
+			// A view and a materialised view are different kinds of
+			// relation and PostgreSQL has no ALTER between them, so
+			// the old one has to go whatever its body says. Comparing
+			// only the body left a declaration that had switched from
+			// NewView to NewMaterializedView emitting nothing at all:
+			// the probe respells both sides identically, the two
+			// bodies then agree, and Push reported success against a
+			// database still holding the other kind.
+			out = append(out, dropViewSQL(prevV, safe))
 			out = append(out, createViewSQL(curV, false))
 		case prevV.Definition != curV.Definition:
 			// CREATE OR REPLACE if the shape didn't change
@@ -217,16 +280,33 @@ func diffViews(prev, cur *Snapshot, safe bool) []string {
 	return out
 }
 
-// diffRLS emits ENABLE / DISABLE ROW LEVEL SECURITY when the
-// flag flips between prev and cur.
+// diffRLS emits ENABLE / DISABLE and FORCE / NO FORCE ROW LEVEL
+// SECURITY when either flag flips between prev and cur.
+//
+// The two are independent in PostgreSQL and independent here: FORCE
+// says whether the table's owner is subject to its own policies, and
+// a table can carry it while RLS is switched off, so a diff that
+// inferred one from the other would either leave a declared FORCE
+// unapplied or emit it again on every push.
 func diffRLS(prev, cur *TableSnapshot) []string {
-	if prev.IsRLSEnabled == cur.IsRLSEnabled {
-		return nil
+	var out []string
+	if prev.IsRLSEnabled != cur.IsRLSEnabled {
+		out = append(out, fmt.Sprintf(`ALTER TABLE %s %s ROW LEVEL SECURITY;`,
+			quoteIdent(cur.Name), rlsVerb(cur.IsRLSEnabled, "ENABLE", "DISABLE")))
 	}
-	if cur.IsRLSEnabled {
-		return []string{fmt.Sprintf(`ALTER TABLE %s ENABLE ROW LEVEL SECURITY;`, quoteIdent(cur.Name))}
+	if prev.IsRLSForced != cur.IsRLSForced {
+		out = append(out, fmt.Sprintf(`ALTER TABLE %s %s ROW LEVEL SECURITY;`,
+			quoteIdent(cur.Name), rlsVerb(cur.IsRLSForced, "FORCE", "NO FORCE")))
 	}
-	return []string{fmt.Sprintf(`ALTER TABLE %s DISABLE ROW LEVEL SECURITY;`, quoteIdent(cur.Name))}
+	return out
+}
+
+// rlsVerb picks the ALTER TABLE keyword for a row-level security flag.
+func rlsVerb(on bool, yes, no string) string {
+	if on {
+		return yes
+	}
+	return no
 }
 
 func diffPolicies(prev, cur *TableSnapshot, safe bool) []string {
@@ -401,15 +481,26 @@ func policyEqual(a, b *PolicySnapshot) bool {
 	if a.As != b.As || a.For != b.For || a.Using != b.Using || a.WithCheck != b.WithCheck {
 		return false
 	}
-	if len(a.To) != len(b.To) {
+	// TO is a set, not a list. PostgreSQL 16 happens to store
+	// polroles in the order CREATE POLICY named the roles, but the
+	// column is an oid array with no ordering contract — a policy is
+	// the same policy whichever way its roles were typed, and a drop
+	// and recreate on every push would be the cost of assuming
+	// otherwise.
+	return sameStringSets(a.To, b.To)
+}
+
+// sameStringSets reports whether two identifier lists hold the same
+// names, in any order.
+func sameStringSets(a, b []string) bool {
+	if len(a) != len(b) {
 		return false
 	}
-	for i := range a.To {
-		if a.To[i] != b.To[i] {
-			return false
-		}
-	}
-	return true
+	x := append([]string(nil), a...)
+	y := append([]string(nil), b...)
+	sort.Strings(x)
+	sort.Strings(y)
+	return sameStrings(x, y)
 }
 
 func escapeLit(s string) string {
@@ -450,12 +541,54 @@ func dropTableSQL(t *TableSnapshot, safe bool) string {
 	return fmt.Sprintf(`DROP TABLE %s CASCADE;`, quoteIdent(t.Name))
 }
 
+// snapshotTypeSQL renders a snapshot's column type for DDL.
+//
+// The snapshot holds the type as the catalogue reports it in udt_name,
+// which is what the two sides of a diff are compared on. Written
+// straight into a CREATE TABLE that is right for every built-in type
+// and wrong for a user-defined one whose name carries an uppercase
+// letter: unquoted, PostgreSQL folds docKind to dockind and reports
+// the type missing (SQLSTATE 42704), so a schema declaring an enum in
+// the camelCase the rest of drops uses could not be pushed at all.
+//
+// Only a bare identifier carrying an uppercase letter is quoted. No
+// built-in type name has one, and the parametrised and multi-word
+// spellings — varchar(255), double precision, timestamp with time
+// zone — are not bare identifiers, so none of them is caught.
+func snapshotTypeSQL(t string) string {
+	if strings.ToLower(t) == t || !isBareIdent(t) {
+		return t
+	}
+	return quoteIdent(t)
+}
+
+// isBareIdent reports whether s is an unquoted SQL identifier and
+// nothing else — no parentheses, spaces or brackets.
+func isBareIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case (c >= '0' && c <= '9') || c == '$':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func columnDefSQL(c *ColumnSnapshot) string {
 	var b strings.Builder
 	b.WriteByte('"')
 	b.WriteString(c.Name)
 	b.WriteString(`" `)
-	b.WriteString(c.Type)
+	b.WriteString(snapshotTypeSQL(c.Type))
 	if c.PrimaryKey {
 		b.WriteString(" PRIMARY KEY")
 	}
@@ -498,7 +631,7 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 		curC := cur.Columns[k]
 		if prevC.Type != curC.Type {
 			out = append(out, fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s SET DATA TYPE %s;`,
-				quoteIdent(cur.Name), quoteIdent(k), curC.Type))
+				quoteIdent(cur.Name), quoteIdent(k), snapshotTypeSQL(curC.Type)))
 		}
 		if prevC.NotNull != curC.NotNull {
 			if curC.NotNull {

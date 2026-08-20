@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -21,18 +22,44 @@ type IntrospectOptions struct {
 // constraints, indexes, and single-column foreign keys with referential
 // actions.
 //
+// Alongside the tables it reads the schema-level objects: enum types
+// with their labels in catalogue order, standalone sequences, views and
+// materialised views, and per table whether row-level security is
+// enabled and forced together with the policies attached to it.
+//
+// Enums, sequences and views are keyed by bare name, the way
+// BuildSnapshot keys them and the snapshot format holds them, so
+// introspecting two schemas that each carry a type of the same name
+// reports only one of the two. Tables are keyed schema-qualified and
+// have no such limit.
+//
 // The returned snapshot is in the same format as BuildSnapshot's output
 // and can be diffed against a Go-schema snapshot via Diff. Everything
 // the schema layer can declare has to be read back here, or Diff sees
 // the difference between "absent" and "not looked at" as work to do and
-// Push stops being idempotent. Enums, sequences, views, RLS and
-// policies are the remaining gaps; Push's doc comment lists what that
-// costs.
+// Push stops being idempotent. What remains unread is listed under
+// "What Push cannot see" in Push's doc comment.
+//
+// # What belongs to somebody else
+//
+// An object created by an extension is not reported at all. PostGIS
+// installs a table, two views and a fistful of types; a serial column
+// owns a sequence and an identity column owns another. None of them
+// appear in any Go schema, so Diff — which compares two declarations
+// and takes an absence for a removal — would emit a DROP for every one
+// of them. They are recognised by their pg_depend entry: an extension
+// member (deptype 'e') or a sequence owned by a column ('a' or 'i').
+//
+// An object a person created outside the Go schema cannot be told from
+// one by any catalogue column, so it *is* reported, and Push is where
+// the drop is withheld and named — see "An object the schema never
+// declared" in Push's doc comment.
 //
 // The expressions read back here — a CHECK's body, a partial index's
-// predicate — are PostgreSQL's own spelling of them, not the one a Go
-// schema wrote. Comparing the two needs the declared side respelled by
-// the server first; see renormaliseExpressions.
+// predicate, a policy's USING clause, a view's body — are PostgreSQL's
+// own spelling of them, not the one a Go schema wrote. Comparing the
+// two needs the declared side respelled by the server first; see
+// renormaliseExpressions.
 func Introspect(ctx context.Context, db *DB, opts ...IntrospectOptions) (*Snapshot, error) {
 	var opt IntrospectOptions
 	if len(opts) > 0 {
@@ -71,7 +98,34 @@ func Introspect(ctx context.Context, db *DB, opts ...IntrospectOptions) (*Snapsh
 	if err := readIntrospectForeignKeys(ctx, db, opt.Schemas, snap.Tables); err != nil {
 		return nil, err
 	}
+	if err := readIntrospectPolicies(ctx, db, opt.Schemas, snap.Tables); err != nil {
+		return nil, err
+	}
+	if err := readIntrospectEnums(ctx, db, opt.Schemas, snap); err != nil {
+		return nil, err
+	}
+	if err := readIntrospectSequences(ctx, db, opt.Schemas, snap); err != nil {
+		return nil, err
+	}
+	if err := readIntrospectViews(ctx, db, opt.Schemas, snap); err != nil {
+		return nil, err
+	}
 	return snap, nil
+}
+
+// notExtensionOwned is the WHERE fragment that hides an object an
+// extension installed. classid names the catalogue the object lives
+// in; alias is the alias its oid is available under.
+//
+// deptype 'e' is extension membership. For a sequence, 'a' and 'i'
+// matter as well: an owned sequence — a serial column's, an identity
+// column's — is created and dropped with the column, appears in no Go
+// declaration, and cannot be dropped on its own.
+func notExtensionOwned(classid, alias string, deptypes string) string {
+	return fmt.Sprintf(
+		`NOT EXISTS (SELECT 1 FROM pg_depend d
+			WHERE d.classid = '%s'::regclass AND d.objid = %s.oid
+				AND d.deptype IN (%s))`, classid, alias, deptypes)
 }
 
 func introspectTableKey(schema, name string) string {
@@ -81,14 +135,25 @@ func introspectTableKey(schema, name string) string {
 	return schema + "." + name
 }
 
-// readIntrospectTables lists all base tables in the requested schemas.
+// readIntrospectTables lists all base tables in the requested schemas,
+// with their row-level security flags.
+//
+// The source is pg_class rather than information_schema.tables: the
+// two agree on which relations are base tables ('r' ordinary and 'p'
+// partitioned), but relrowsecurity and relforcerowsecurity have no
+// information_schema counterpart, and neither does the extension
+// membership that hides PostGIS's spatial_ref_sys from a Diff that
+// would otherwise DROP TABLE it.
 func readIntrospectTables(ctx context.Context, db *DB, schemas []string) ([]*TableSnapshot, error) {
 	rows, err := db.Query(ctx, fmt.Sprintf(`
-		SELECT table_schema, table_name
-		FROM information_schema.tables
-		WHERE table_type = 'BASE TABLE' AND table_schema IN (%s)
-		ORDER BY table_schema, table_name`,
-		placeholderList(len(schemas))), anySlice(schemas)...)
+		SELECT n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('r', 'p') AND n.nspname IN (%s)
+			AND %s
+		ORDER BY n.nspname, c.relname`,
+		placeholderList(len(schemas)),
+		notExtensionOwned("pg_class", "c", "'e'")), anySlice(schemas)...)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +162,8 @@ func readIntrospectTables(ctx context.Context, db *DB, schemas []string) ([]*Tab
 	var out []*TableSnapshot
 	for rows.Next() {
 		var schema, name string
-		if err := rows.Scan(&schema, &name); err != nil {
+		var rls, forced bool
+		if err := rows.Scan(&schema, &name, &rls, &forced); err != nil {
 			return nil, err
 		}
 		storedSchema := schema
@@ -114,7 +180,8 @@ func readIntrospectTables(ctx context.Context, db *DB, schemas []string) ([]*Tab
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
 			Policies:             map[string]*PolicySnapshot{},
 			CheckConstraints:     map[string]*CheckSnapshot{},
-			IsRLSEnabled:         false,
+			IsRLSEnabled:         rls,
+			IsRLSForced:          forced,
 		})
 	}
 	return out, rows.Err()
@@ -607,6 +674,243 @@ func readIntrospectForeignKeys(ctx context.Context, db *DB, schemas []string, ta
 		}
 	}
 	return nil
+}
+
+// readIntrospectPolicies pulls the row-level security policies
+// attached to each table.
+//
+// The USING and WITH CHECK expressions come back through pg_get_expr,
+// which prints a parse tree rather than echoing what CREATE POLICY was
+// given — the same gap CHECK constraints have, closed the same way by
+// Push. The parenthesised form pg_get_expr returns is kept verbatim,
+// because that is also what checkExprOf leaves behind when the probe
+// respells the declared side.
+//
+// polroles holds oid 0 for PUBLIC, which CREATE POLICY spells by
+// omitting the TO clause entirely; it is dropped here so a policy the
+// Go schema declared without roles compares equal to the one the
+// server holds.
+func readIntrospectPolicies(ctx context.Context, db *DB, schemas []string, tables map[string]*TableSnapshot) error {
+	rows, err := db.Query(ctx, fmt.Sprintf(`
+		SELECT n.nspname, c.relname, pol.polname, pol.polcmd, pol.polpermissive,
+			array_to_string(ARRAY(
+				SELECT pg_get_userbyid(r) FROM unnest(pol.polroles) AS r WHERE r <> 0
+			), ','),
+			coalesce(pg_get_expr(pol.polqual, pol.polrelid), ''),
+			coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), '')
+		FROM pg_policy pol
+		JOIN pg_class c ON c.oid = pol.polrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname IN (%s)
+		ORDER BY n.nspname, c.relname, pol.polname`,
+		placeholderList(len(schemas))), anySlice(schemas)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, table, name, cmd, roles, using, withCheck string
+		var permissive bool
+		if err := rows.Scan(&schema, &table, &name, &cmd, &permissive, &roles, &using, &withCheck); err != nil {
+			return err
+		}
+		ts, ok := tables[introspectTableKey(schema, table)]
+		if !ok {
+			continue
+		}
+		as := "RESTRICTIVE"
+		if permissive {
+			as = "PERMISSIVE"
+		}
+		var to []string
+		if roles != "" {
+			to = strings.Split(roles, ",")
+		}
+		ts.Policies[name] = &PolicySnapshot{
+			Name:      name,
+			As:        as,
+			For:       policyCommandOf(cmd),
+			To:        to,
+			Using:     using,
+			WithCheck: withCheck,
+		}
+	}
+	return rows.Err()
+}
+
+// policyCommandOf expands pg_policy.polcmd to the keyword CREATE
+// POLICY's FOR clause uses, which is what the schema layer declares.
+func policyCommandOf(cmd string) string {
+	switch cmd {
+	case "r":
+		return "SELECT"
+	case "a":
+		return "INSERT"
+	case "w":
+		return "UPDATE"
+	case "d":
+		return "DELETE"
+	}
+	return "ALL"
+}
+
+// readIntrospectEnums pulls the enum types declared in the requested
+// schemas.
+//
+// Labels are ordered by enumsortorder, not by oid: ALTER TYPE ... ADD
+// VALUE BEFORE inserts a label whose oid is the highest of the set and
+// whose position is not, and the position is the part that is the
+// type. Two enums with the same labels in a different order are
+// different types, and PostgreSQL cannot turn one into the other, so
+// the order has to survive the read for Push to be able to say so.
+func readIntrospectEnums(ctx context.Context, db *DB, schemas []string, snap *Snapshot) error {
+	rows, err := db.Query(ctx, fmt.Sprintf(`
+		SELECT n.nspname, t.typname, e.enumlabel
+		FROM pg_type t
+		JOIN pg_namespace n ON n.oid = t.typnamespace
+		JOIN pg_enum e ON e.enumtypid = t.oid
+		WHERE t.typtype = 'e' AND n.nspname IN (%s)
+			AND %s
+		ORDER BY n.nspname, t.typname, e.enumsortorder`,
+		placeholderList(len(schemas)),
+		notExtensionOwned("pg_type", "t", "'e'")), anySlice(schemas)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, name, label string
+		if err := rows.Scan(&schema, &name, &label); err != nil {
+			return err
+		}
+		e := snap.Enums[name]
+		if e == nil {
+			e = &EnumSnapshot{Name: name, Schema: schema}
+			snap.Enums[name] = e
+		}
+		e.Values = append(e.Values, label)
+	}
+	return rows.Err()
+}
+
+// readIntrospectSequences pulls the standalone sequences.
+//
+// An attribute the declaration left to PostgreSQL is read back unset
+// rather than as the value PostgreSQL chose. NewSequence("orderSeq")
+// names none of them, so recording the START WITH 1, MINVALUE 1 and
+// MAXVALUE 9223372036854775807 the server picked would leave the two
+// sides unequal for every sequence anybody ever declared plainly.
+func readIntrospectSequences(ctx context.Context, db *DB, schemas []string, snap *Snapshot) error {
+	rows, err := db.Query(ctx, fmt.Sprintf(`
+		SELECT n.nspname, c.relname,
+			s.seqstart, s.seqincrement, s.seqmin, s.seqmax, s.seqcache, s.seqcycle
+		FROM pg_sequence s
+		JOIN pg_class c ON c.oid = s.seqrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname IN (%s)
+			AND %s
+		ORDER BY n.nspname, c.relname`,
+		placeholderList(len(schemas)),
+		notExtensionOwned("pg_class", "c", "'e', 'a', 'i'")), anySlice(schemas)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, name string
+		var start, increment, minValue, maxValue, cache int64
+		var cycle bool
+		if err := rows.Scan(&schema, &name, &start, &increment, &minValue, &maxValue, &cache, &cycle); err != nil {
+			return err
+		}
+		ss := &SequenceSnapshot{Name: name, Schema: schema, Cycle: cycle}
+		d := sequenceDefaults(increment)
+		ss.Increment = nonDefaultInt64(increment, d.increment)
+		ss.Start = nonDefaultInt64(start, d.start)
+		ss.MinValue = nonDefaultInt64(minValue, d.minValue)
+		ss.MaxValue = nonDefaultInt64(maxValue, d.maxValue)
+		ss.Cache = nonDefaultInt64(cache, d.cache)
+		snap.Sequences[name] = ss
+	}
+	return rows.Err()
+}
+
+// seqDefaults are the values CREATE SEQUENCE picks for the attributes
+// a statement does not name.
+type seqDefaults struct {
+	start, increment, minValue, maxValue, cache int64
+}
+
+// sequenceDefaults returns the defaults for a sequence with the given
+// increment, which is what decides the direction: a descending
+// sequence starts at -1 and runs to the bottom of the range, an
+// ascending one starts at 1 and runs to the top.
+//
+// The bounds are bigint's. A sequence declared over a narrower type
+// has narrower ones and reads back with them spelled out, which is the
+// truth about it — SequenceOptions cannot name a type, so nothing
+// declared through drops lands there.
+func sequenceDefaults(increment int64) seqDefaults {
+	if increment < 0 {
+		return seqDefaults{start: -1, increment: 1, minValue: math.MinInt64, maxValue: -1, cache: 1}
+	}
+	return seqDefaults{start: 1, increment: 1, minValue: 1, maxValue: math.MaxInt64, cache: 1}
+}
+
+// nonDefaultInt64 returns a pointer to v, or nil when v is what the
+// server would have chosen anyway.
+func nonDefaultInt64(v, def int64) *int64 {
+	if v == def {
+		return nil
+	}
+	out := v
+	return &out
+}
+
+// readIntrospectViews pulls views and materialised views.
+//
+// pg_get_viewdef returns the rewritten query, indented and terminated
+// with a semicolon; the semicolon is stripped because the snapshot
+// holds the body a CREATE VIEW ... AS would be given, and createViewSQL
+// appends its own. The body is PostgreSQL's spelling of the query, not
+// the Go schema's — see renormaliseExpressions for how the declared
+// side is brought into the same one.
+func readIntrospectViews(ctx context.Context, db *DB, schemas []string, snap *Snapshot) error {
+	rows, err := db.Query(ctx, fmt.Sprintf(`
+		SELECT n.nspname, c.relname, c.relkind, pg_get_viewdef(c.oid, true)
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relkind IN ('v', 'm') AND n.nspname IN (%s)
+			AND %s
+		ORDER BY n.nspname, c.relname`,
+		placeholderList(len(schemas)),
+		notExtensionOwned("pg_class", "c", "'e'")), anySlice(schemas)...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, name, kind, def string
+		if err := rows.Scan(&schema, &name, &kind, &def); err != nil {
+			return err
+		}
+		snap.Views[name] = &ViewSnapshot{
+			Name:         name,
+			Schema:       schema,
+			Definition:   viewBodyOf(def),
+			Materialized: kind == "m",
+		}
+	}
+	return rows.Err()
+}
+
+// viewBodyOf trims pg_get_viewdef's output down to the query itself.
+func viewBodyOf(def string) string {
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(def), ";"))
 }
 
 // placeholderList returns "$1, $2, ..., $count".

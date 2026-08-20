@@ -83,6 +83,12 @@ type TableSnapshot struct {
 	Policies             map[string]*PolicySnapshot      `json:"policies"`
 	CheckConstraints     map[string]*CheckSnapshot       `json:"checkConstraints"`
 	IsRLSEnabled         bool                            `json:"isRLSEnabled"`
+	// IsRLSForced mirrors ALTER TABLE ... FORCE ROW LEVEL SECURITY,
+	// which subjects the table's owner to its policies. drizzle-kit's
+	// v7 format has no counterpart; without it Introspect could not
+	// tell a forced table from an unforced one and Push would leave a
+	// declared FORCE unapplied for ever.
+	IsRLSForced bool `json:"isRLSForced"`
 }
 
 // IndexSnapshot is one entry in TableSnapshot.Indexes. JSON keys
@@ -183,6 +189,7 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			Policies:             map[string]*PolicySnapshot{},
 			CheckConstraints:     map[string]*CheckSnapshot{},
 			IsRLSEnabled:         t.RLSEnabled(),
+			IsRLSForced:          t.RLSForced(),
 		}
 		// Policies attached to the table.
 		for _, p := range t.Policies() {

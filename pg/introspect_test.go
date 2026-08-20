@@ -148,12 +148,12 @@ func TestTableExistsDefaultsToPublic(t *testing.T) {
 func introspectFake() *fakeDriver {
 	return &fakeDriver{handler: func(q string, _ []any) (drops.Rows, error) {
 		switch {
-		case strings.Contains(q, "information_schema.tables"):
+		case strings.Contains(q, "c.relrowsecurity"):
 			return &fakeRows{
-				cols: []string{"table_schema", "table_name"},
+				cols: []string{"nspname", "relname", "relrowsecurity", "relforcerowsecurity"},
 				data: [][]any{
-					{"public", "users"},
-					{"public", "posts"},
+					{"public", "users", false, false},
+					{"public", "posts", false, false},
 				},
 			}, nil
 		case strings.Contains(q, "information_schema.columns"):

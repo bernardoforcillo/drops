@@ -669,6 +669,13 @@ relations already cap at one.
 
 ### Migrations
 
+The whole loop has a front end — `drops generate`, `drops migrate`,
+`drops push`, `drops drift`, `drops pull`, `drops baseline`,
+`drops status` — described under [The `drops` CLI](#the-drops-cli).
+Everything it does, it does by calling the four library pieces below,
+so a project that would rather drive them from its own `main` loses
+nothing.
+
 Four pieces ship in the box:
 
 1. `pg.GenerateMigration` — produces drizzle-kit-format migrations from a Go schema (diff against the previous snapshot).
@@ -711,9 +718,9 @@ Typical workflow: stash this in a `cmd/migrate/main.go` (or similar) and run `go
 
 A runnable in-memory walkthrough is in [examples/generate/main.go](examples/generate/main.go).
 
-What `GenerateMigration` covers (today): CREATE TABLE, DROP TABLE, ADD/DROP COLUMN, ALTER COLUMN type/NOT NULL/DEFAULT, ADD/DROP single-column UNIQUE, ADD/DROP single-column FOREIGN KEY (with ON DELETE/ON UPDATE).
+What `GenerateMigration` covers (today): CREATE TABLE, DROP TABLE, ADD/DROP COLUMN, ALTER COLUMN type/NOT NULL/DEFAULT, UNIQUE and FOREIGN KEY (single- and multi-column, with ON DELETE/ON UPDATE), composite primary keys, CHECK constraints, indexes, enums, sequences, views and materialised views, row-level security (enabled and forced) and policies. `BuildSnapshot` fills all of those, and `Diff` renders DDL for them.
 
-What it does not cover yet: indexes, composite primary keys, composite uniques/FKs, check constraints, enums, sequences, views, RLS policies. The generated snapshot leaves those collections empty, which matches drizzle-kit's "no such constructs declared" state — but if you mix drops's generator with hand-edited or drizzle-kit-authored snapshots that use these features, drops won't be aware of them.
+What it does not cover: renames, which a structural diff cannot tell from a drop plus an add; an index's operator class, storage parameters, column ordering or `NULLS NOT DISTINCT`, none of which reach the snapshot; an index over an expression rather than a column, which the snapshot cannot describe at all; a change to a sequence's attributes, since sequences are compared by name; and removing or reordering an enum's labels, which PostgreSQL cannot do in place. `pg.Push`'s doc comment lists the same limits from the live-database side, along with the notices Push raises for the ones it can see but not act on.
 
 #### Pushing directly (`pg.Push`)
 
@@ -728,9 +735,13 @@ if err != nil {
 log.Printf("applied %d statements", len(res.Statements))
 ```
 
-`Push` introspects the live database via `information_schema`, builds a snapshot from your Go schema, diffs the two, and applies the SQL inside a single transaction. A `DryRun: true` option returns the statements without executing — useful for previewing in CI.
+`Push` introspects the live database — `information_schema` for the columns and constraints, `pg_catalog` for what it has no view of: enums, sequences, views, policies and the row-level security flags — builds a snapshot from your Go schema, diffs the two, and applies the SQL inside a single transaction. A `DryRun: true` option returns the statements without executing — useful for previewing in CI.
 
 There is no migration history written: `Push` is convenient for prototyping and tests, not for production where you want reviewable, reproducible migrations. For those, use `GenerateMigration` + `DrizzleMigrator`.
+
+`Push` does not remove something the Go schema never declared. `Diff` compares two declarations, so an object missing from the newer one was removed; `Push`'s "previous" side is a database, where an index, an enum, a sequence, a view or a policy missing from the Go schema was very likely never declared there at all. Those drops are held back and returned as `res.Notices`, each carrying the exact statement so you can run it by hand — set `DropUnmanagedIndexes` or `DropUnmanagedObjects` to let them through instead. Row-level security is held back the same way and for a sharper reason: a table with RLS enabled in the database and no `EnableRLS` in Go is one `ALTER TABLE` away from serving every row to every caller, so `Push` reports an `unmanaged-rls` notice rather than performing it.
+
+Notices also cover what `Push` can see but cannot act on — an enum whose labels were reordered, an index it cannot represent, an expression the server would not parse. A push that returns no statements and no notices is a database that matches the schema.
 
 Underneath, `Push` is just three reusable pieces you can also call separately:
 
@@ -740,6 +751,8 @@ desired := pg.BuildSnapshot(pg.NewSchema(Users, Posts)) // *Snapshot from the Go
 stmts := pg.Diff(current, desired, pg.DiffOptions{Safe: true})
 // stmts is the SQL diff — execute, review, or pipe wherever
 ```
+
+One thing `Push` does that this three-line version does not: it asks the server to respell the declared CHECK bodies, index predicates, policy clauses and view definitions before diffing them. `Introspect` reads those back in PostgreSQL's own spelling — `age >= 0` comes back `(age >= 0)` — so a bare `Diff` of the two reports a difference in every one of them and keeps reporting it. Use `Push` (with `DryRun: true` to preview) for anything holding an expression.
 
 #### Idempotent DDL
 
@@ -878,6 +891,95 @@ m.AfterEach(func(ctx context.Context, tx *pg.DB, e pg.DrizzleEntry) error {
 
 A hook that returns an error aborts that migration; the whole transaction
 rolls back.
+
+## The `drops` CLI
+
+```
+go install github.com/bernardoforcillo/drops/cmd/drops@latest
+```
+
+```
+drops generate --schema ./db/schema --name add_articles   # write a migration
+drops migrate                                             # apply the pending ones
+drops migrate down --allow-destructive                    # roll the last one back
+drops push --schema ./db/schema --dry-run                 # diff against the live DB
+drops drift --schema ./db/schema                          # exit 3 if they disagree
+drops pull --out ./db/schema/schema.go                    # introspect a database into Go
+drops baseline                                            # adopt a database that already exists
+drops status                                              # applied, pending, unaccounted for
+```
+
+Connection: `--dsn`, else `$DROPS_PG_DSN`, else `$DATABASE_URL`. The
+binary carries its own PostgreSQL client (`cmd/drops/pgwire`, v3 wire
+protocol, standard library only), so it links no driver and needs no
+configuration beyond the connection string.
+
+### How the CLI reads a Go schema
+
+It runs it. A schema built out of `pg.NewTable` and `pg.Add` is a Go
+value, and no amount of parsing recovers a value — resolving it means
+resolving the whole language. So `drops` writes a small program into
+your module that imports your schema package, calls into it, and
+prints the answer as JSON; `go run` compiles that against your real
+package with the real compiler. The program is deleted afterwards.
+
+The one thing it has to know is where to call, which is the whole
+convention:
+
+```go
+// db/schema/schema.go
+package schema
+
+import "github.com/bernardoforcillo/drops/pg"
+
+var (
+	Users     = pg.NewTable("users")
+	UserID    = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
+	UserEmail = pg.Add(Users, pg.Text("email").NotNull().Unique())
+)
+
+// Schema is what drops manages. A table you declare and do not
+// register here is invisible to it — which is how a table another
+// tool owns stays out of drops's way.
+func Schema() *pg.Schema {
+	return pg.NewSchema(Users)
+}
+```
+
+`examples/cli` is that package, in full, with a foreign key, a check
+constraint and an index.
+
+### Destructive changes
+
+`push`, `migrate` and `migrate down` run every statement they are
+about to apply through `pg.AnalyzeMigration` first. A statement that
+destroys data or an object — `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`,
+`DROP TYPE`, `ALTER TYPE ... DROP VALUE` — stops the command, which
+prints each statement it is holding back and exits 3. `--allow-destructive`
+runs them. Statements that are merely expensive — a rewrite, a
+non-concurrent index build, a `SET NOT NULL` — are printed as warnings
+and applied.
+
+### Exit codes
+
+| code | meaning |
+| ---- | ------- |
+| 0 | success |
+| 1 | failure — unreachable database, bad SQL, a file that would not parse |
+| 2 | the command line was wrong |
+| 3 | the command ran and the answer was no: drift found, or changes refused |
+
+`drops drift` returning 3 is what makes it a CI gate.
+
+### drizzle-kit interoperability
+
+`drops migrate` applies a migration set drizzle-kit generated, and
+drizzle-orm applies one `drops generate` wrote: the directory layout,
+the journal, the SHA-256 of each file and the
+`drizzle.__drizzle_migrations` history table are the same on both
+sides. The one addition is the rollback direction — `drops generate`
+writes a `<tag>.down.sql` beside each migration, which drizzle-kit has
+no concept of, and `drops migrate down` uses it.
 
 ## PostgreSQL feature surface
 
@@ -1166,6 +1268,9 @@ drops/cache/memcached/       Memcached cache backend (own ASCII client)
 drops/cache/tiered/          two-level L1+L2 read-through cache
 drops/otel/                  OpenTelemetry spans + metrics from Hook
 drops/stdlib/                database/sql adapter
+drops/cmd/drops/             the CLI: generate, migrate, push, drift, pull, baseline, status
+drops/cmd/drops/pgwire/      the CLI's PostgreSQL client — v3 wire protocol, standard library only
+drops/examples/cli/          a schema package shaped the way the CLI expects
 drops/examples/sqlgen/       no-deps SQL-generation demo (pg)
 drops/examples/generate/     drizzle-kit-style migration generation demo
 drops/_examples/postgres/    full DB demo via pgx (excluded from build)
@@ -1178,14 +1283,34 @@ list, and each line says what it costs you.
 
 **In the migration loop**
 
-- Postgres introspection does not read back enums, sequences, views,
-  RLS or policies. `pg/diff.go` can *write* all of them, so a schema
-  declaring one enum makes `Push` re-emit its `CREATE TYPE` for ever
-  and `DetectDrift` permanently noisy. `pg/introspect.go`'s doc
-  comment states the rule this breaks.
-- The CLI is `diagram` and `version`. Every step of the migration loop
-  — generate, push, migrate, drift, pull — exists as a library
-  function and has no operator-facing front end.
+- Postgres introspection reads enums (labels in order), sequences,
+  views, materialised views, RLS (enabled and forced) and policies, so
+  `Push` reaches a steady state for a schema declaring them. Two gaps
+  remain inside those objects: a sequence whose attributes moved is
+  neither applied nor reported — `Diff` compares sequences by name —
+  and an enum whose labels were reordered or removed is reported as a
+  notice and left alone, because PostgreSQL cannot do either in place.
+  `pg/push.go`'s "What Push cannot see" lists the rest.
+- `DetectDrift` does not reach that steady state, and neither does
+  `drops drift`. Both are pure snapshot arithmetic with no server to
+  ask, so every expression — a CHECK body, a partial index's
+  predicate, a policy's USING clause, a view's definition — is
+  compared as the text each side happens to spell it in, and the
+  database always answers in PostgreSQL's own. A schema carrying any
+  of them reports drift on every run against a database that matches
+  it exactly. `pg.Push` with `DryRun: true` has a connection and
+  respells the declared side first; it is the accurate preview until
+  drift detection grows the same step.
+- The CLI evaluates your schema by generating a program that imports
+  it and running it with `go run`, so it needs a Go toolchain on the
+  machine and it needs to be run from inside your module. A prebuilt
+  binary on a deploy host can `migrate`, `status`, `baseline` and
+  `pull` — those read the database and the migration directory — but
+  not `generate`, `push` or `drift`, which have to read your Go.
+- `pg.Diff` renders every statement unqualified, so a table declared
+  with `pg.NewSchemaTable("reporting", ...)` is created wherever the
+  connection's `search_path` points. Declare non-public tables with
+  their schema in the name, or push them with a `search_path` set.
 - No rename detection. A structural diff cannot tell `RENAME COLUMN`
   from a drop plus an add, so drops generates the destructive pair.
   `pg.AnalyzeMigration` flags it, which is a backstop, not a fix.

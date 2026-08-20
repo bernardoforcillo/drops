@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -2043,4 +2045,641 @@ type pgPatchCollated struct {
 	ID    int64  `drop:"id"`
 	Plain string `drop:"plain"`
 	CI    string `drop:"ci"`
+}
+
+// ----------------------------------------------------------------------
+// Schema-level objects: enums, sequences, views, RLS and policies
+// ----------------------------------------------------------------------
+
+// int64p is a pointer to a sequence attribute, which SequenceOptions
+// takes by pointer so "unset" is distinguishable from zero.
+func int64p(v int64) *int64 { return &v }
+
+// objectSchemaPG declares one table carrying every schema-level object
+// drops can express, in the scratch schema the test pushes into.
+func objectSchemaPG(schemaName string) *pg.Schema {
+	status := pg.NewEnum("doc_status", "draft", "review", "published")
+	// A camelCase type name has to survive quoting on the way into the
+	// column definition: unquoted, PostgreSQL folds it and reports the
+	// type missing.
+	kind := pg.NewEnum("docKind", "note", "memo")
+
+	docs := pg.NewSchemaTable(schemaName, "docs")
+	pg.Add(docs, pg.BigSerial("id").PrimaryKey())
+	pg.Add(docs, pg.BigInt("tenantId").NotNull())
+	pg.Add(docs, pg.Text("owner").NotNull())
+	pg.Add(docs, status.Col("status").NotNull())
+	pg.Add(docs, kind.Col("kind").NotNull())
+	docs.EnableRLS().ForceRLS()
+	docs.AddPolicy(pg.NewPolicy("docsTenant").
+		Using(`"tenantId" = current_setting('app.tenant')::bigint`).
+		WithCheck(`"tenantId" = current_setting('app.tenant')::bigint`))
+	docs.AddPolicy(pg.NewPolicy("docsOwnerReads").
+		Restrictive().For("SELECT").To("drops").
+		Using(`"owner" = current_user`))
+
+	return pg.NewSchema(docs).
+		AddEnum(status).
+		AddEnum(kind).
+		AddSequence(pg.NewSequence("docOrder", pg.SequenceOptions{
+			Start: int64p(10), Increment: int64p(5),
+		})).
+		AddSequence(pg.NewSequence("docPlain")).
+		AddView(pg.NewView("activeDocs",
+			`SELECT "id", "owner" FROM "docs" WHERE "status" = 'published'`)).
+		AddView(pg.NewMaterializedView("docOwners",
+			`SELECT "owner", count(*) AS n FROM "docs" GROUP BY "owner"`))
+}
+
+// Push has to be re-runnable for a schema that declares more than
+// tables. Every one of these objects used to be created on every push:
+// Introspect read none of them, so Diff saw each one as new work for
+// ever, and a schema with a single enum could never reach a steady
+// state.
+func TestPGPushIsIdempotentWithSchemaObjects(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+	sch := objectSchemaPG(schemaName)
+	opts := pg.PushOptions{Schema: schemaName}
+
+	first, err := pg.Push(ctx, db, sch, opts)
+	if err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	if !first.Applied {
+		t.Fatal("the first push applied nothing")
+	}
+
+	second, err := pg.Push(ctx, db, sch, opts)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if len(second.Statements) != 0 {
+		t.Errorf("the second push is not a no-op:\n%s", strings.Join(second.Statements, "\n"))
+	}
+	for _, n := range second.Notices {
+		t.Errorf("the second push reported a difference it would not act on: %s", n)
+	}
+}
+
+// The bar is not the rendered SQL, it is what the server holds: create
+// each object from the Go declaration, read it back, and check the two
+// describe the same thing.
+func TestPGIntrospectReadsBackTheDeclaredObjects(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+	sch := objectSchemaPG(schemaName)
+
+	if _, err := pg.Push(ctx, db, sch, pg.PushOptions{Schema: schemaName}); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	live, err := pg.Introspect(ctx, db, pg.IntrospectOptions{Schemas: []string{schemaName}})
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	declared := pg.BuildSnapshot(sch)
+
+	// Enums, sequences: the whole entry has to match, Schema aside.
+	// NewEnum and NewSequence take no schema, so BuildSnapshot writes
+	// the default while Introspect writes the namespace it read; Diff
+	// keys both by name and never looks at the field.
+	for name, want := range declared.Enums {
+		got := live.Enums[name]
+		if got == nil {
+			t.Errorf("enum %q was not read back", name)
+			continue
+		}
+		got.Schema = want.Schema
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("enum %q: read back %+v, declared %+v", name, got, want)
+		}
+	}
+	for name, want := range declared.Sequences {
+		got := live.Sequences[name]
+		if got == nil {
+			t.Errorf("sequence %q was not read back", name)
+			continue
+		}
+		got.Schema = want.Schema
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("sequence %q: read back %+v, declared %+v", name, got, want)
+		}
+	}
+	// A view's body and a policy's expressions come back in
+	// PostgreSQL's spelling, not the Go schema's — Push respells the
+	// declared side before comparing them and TestPGPushIsIdempotent-
+	// WithSchemaObjects is what proves that lines up. Everything else
+	// about them has to match here.
+	for name, want := range declared.Views {
+		got := live.Views[name]
+		if got == nil {
+			t.Errorf("view %q was not read back", name)
+			continue
+		}
+		if got.Materialized != want.Materialized {
+			t.Errorf("view %q: materialized=%v, declared %v", name, got.Materialized, want.Materialized)
+		}
+		if got.Definition == "" {
+			t.Errorf("view %q was read back with an empty body", name)
+		}
+	}
+	docs := live.Tables[schemaName+".docs"]
+	if docs == nil {
+		t.Fatalf("table docs was not read back; got %v", sortedTableKeysPG(live))
+	}
+	if !docs.IsRLSEnabled || !docs.IsRLSForced {
+		t.Errorf("row-level security read back as enabled=%v forced=%v, want both true",
+			docs.IsRLSEnabled, docs.IsRLSForced)
+	}
+	wantDocs := declared.Tables[schemaName+".docs"]
+	for name, want := range wantDocs.Policies {
+		got := docs.Policies[name]
+		if got == nil {
+			t.Errorf("policy %q was not read back", name)
+			continue
+		}
+		if got.As != want.As || got.For != want.For {
+			t.Errorf("policy %q: as=%q for=%q, declared as=%q for=%q", name, got.As, got.For, want.As, want.For)
+		}
+		if !reflect.DeepEqual(got.To, want.To) && !(len(got.To) == 0 && len(want.To) == 0) {
+			t.Errorf("policy %q: roles %v, declared %v", name, got.To, want.To)
+		}
+		if got.Using == "" {
+			t.Errorf("policy %q was read back with no USING expression", name)
+		}
+	}
+	if wc := docs.Policies["docsOwnerReads"]; wc != nil && wc.WithCheck != "" {
+		t.Errorf("a policy declared without WITH CHECK read back with one: %q", wc.WithCheck)
+	}
+}
+
+// sortedTableKeysPG names the tables a snapshot holds, for a failure
+// message that says what was found instead.
+func sortedTableKeysPG(snap *pg.Snapshot) []string {
+	out := make([]string, 0, len(snap.Tables))
+	for k := range snap.Tables {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// An enum, a sequence, a view, a policy and a row-level security
+// somebody switched on by hand are all things Diff reads as removals
+// the moment Introspect can see them. Push withholds each drop and
+// names it. The RLS case is the one that matters most: a silent
+// DISABLE ROW LEVEL SECURITY hands every row to every caller.
+func TestPGPushLeavesUndeclaredObjectsAlone(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	docs := pg.NewSchemaTable(schemaName, "docs")
+	pg.Add(docs, pg.BigSerial("id").PrimaryKey())
+	pg.Add(docs, pg.Text("owner").NotNull())
+	sch := pg.NewSchema(docs)
+	opts := pg.PushOptions{Schema: schemaName}
+
+	if _, err := pg.Push(ctx, db, sch, opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	// Somebody else's objects arrive: another tool's enum, a sequence
+	// a job counter uses, a DBA's view, and row-level security with a
+	// policy behind it. None of them are in any Go file.
+	for _, s := range []string{
+		`CREATE TYPE "otherStatus" AS ENUM ('a', 'b')`,
+		`CREATE SEQUENCE "otherCounter"`,
+		`CREATE VIEW "otherDocs" AS SELECT "id" FROM "docs"`,
+		`ALTER TABLE "docs" ENABLE ROW LEVEL SECURITY`,
+		`ALTER TABLE "docs" FORCE ROW LEVEL SECURITY`,
+		`CREATE POLICY "otherOwner" ON "docs" USING ("owner" = current_user)`,
+	} {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	second, err := pg.Push(ctx, db, sch, opts)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	for _, s := range second.Statements {
+		t.Errorf("Push acted on an object it does not manage: %s", s)
+	}
+	for _, want := range []struct{ rule, object string }{
+		{"unmanaged-enum", "otherStatus"},
+		{"unmanaged-sequence", "otherCounter"},
+		{"unmanaged-view", "otherDocs"},
+		{"unmanaged-policy", "otherOwner"},
+		{"unmanaged-rls", "docs"},
+	} {
+		n := noticeFor(second.Notices, want.rule)
+		if n.Object != want.object {
+			t.Errorf("no %s notice for %q; notices were %v", want.rule, want.object, second.Notices)
+			continue
+		}
+		if n.SQL == "" {
+			t.Errorf("the %s notice carries no statement to run by hand: %+v", want.rule, n)
+		}
+	}
+	// Both halves of the RLS state are reported, not just the first.
+	var rls int
+	for _, n := range second.Notices {
+		if n.Rule == "unmanaged-rls" {
+			rls++
+		}
+	}
+	if rls != 2 {
+		t.Errorf("got %d unmanaged-rls notices, want one for ENABLE and one for FORCE", rls)
+	}
+	if !rlsEnabledPG(t, db, schemaName, "docs") {
+		t.Fatal("Push switched row-level security off")
+	}
+
+	// Opting in performs every one of them.
+	optIn := opts
+	optIn.DropUnmanagedObjects = true
+	third, err := pg.Push(ctx, db, sch, optIn)
+	if err != nil {
+		t.Fatalf("opt-in push: %v", err)
+	}
+	if !third.Applied {
+		t.Fatalf("DropUnmanagedObjects applied nothing: %v", third.Statements)
+	}
+	if rlsEnabledPG(t, db, schemaName, "docs") {
+		t.Error("DropUnmanagedObjects left row-level security on")
+	}
+	after, err := pg.Introspect(ctx, db, pg.IntrospectOptions{Schemas: []string{schemaName}})
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	if len(after.Enums) != 0 || len(after.Sequences) != 0 || len(after.Views) != 0 {
+		t.Errorf("DropUnmanagedObjects left objects behind: enums=%v sequences=%v views=%v",
+			after.Enums, after.Sequences, after.Views)
+	}
+}
+
+// rlsEnabledPG reports pg_class.relrowsecurity for one table, read
+// straight from the catalogue rather than through Introspect — the
+// thing under test cannot also be the witness.
+func rlsEnabledPG(t *testing.T, db *pg.DB, schema, table string) bool {
+	t.Helper()
+	rows, err := db.Query(context.Background(), `
+		SELECT c.relrowsecurity FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, schema, table)
+	if err != nil {
+		t.Fatalf("read relrowsecurity: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("table %q is not in %q", table, schema)
+	}
+	var on bool
+	if err := rows.Scan(&on); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	return on
+}
+
+// What an extension installed is not drops's to drop. PostGIS puts a
+// table and two views in public and a serial column owns a sequence;
+// all of them would otherwise be reported as objects the Go schema no
+// longer declares, and Diff emits a DROP for each of those.
+func TestPGIntrospectSkipsWhatAnExtensionOwns(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+
+	if !extensionInstalledPG(t, db, "postgis") {
+		t.Skip("postgis is not installed in this database")
+	}
+	snap, err := pg.Introspect(ctx, db)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	if _, ok := snap.Tables["public.spatial_ref_sys"]; ok {
+		t.Error("PostGIS's spatial_ref_sys is in the snapshot; a push would DROP TABLE it")
+	}
+	for _, name := range []string{"geometry_columns", "geography_columns"} {
+		if _, ok := snap.Views[name]; ok {
+			t.Errorf("PostGIS's %q view is in the snapshot; a push would DROP VIEW it", name)
+		}
+	}
+
+	// A serial column's sequence is owned by the column: it is in no
+	// Go declaration and cannot be dropped on its own anyway.
+	tbl := pg.NewTable(integration.UniqueName(t, "owned"))
+	dropPG(t, db, tbl)
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	execPG(t, db, pg.CreateTable(tbl))
+
+	snap, err = pg.Introspect(ctx, db)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	for name := range snap.Sequences {
+		if strings.HasPrefix(name, tbl.Name()) {
+			t.Errorf("the sequence %q behind a serial column is in the snapshot", name)
+		}
+	}
+}
+
+// extensionInstalledPG reports whether an extension is present.
+func extensionInstalledPG(t *testing.T, db *pg.DB, name string) bool {
+	t.Helper()
+	rows, err := db.Query(context.Background(),
+		`SELECT 1 FROM pg_extension WHERE extname = $1`, name)
+	if err != nil {
+		t.Fatalf("read pg_extension: %v", err)
+	}
+	defer rows.Close()
+	return rows.Next()
+}
+
+// Label order is part of an enum type: it is the order `<` and ORDER BY
+// follow, and PostgreSQL cannot change it in place. Push cannot act on
+// a reorder, so it has to say so — a push that reported success here
+// would be claiming a database sorts the way the Go schema says when it
+// does not.
+func TestPGPushReportsAnEnumReorder(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	build := func(labels ...string) *pg.Schema {
+		docs := pg.NewSchemaTable(schemaName, "docs")
+		pg.Add(docs, pg.BigSerial("id").PrimaryKey())
+		return pg.NewSchema(docs).AddEnum(pg.NewEnum("doc_status", labels...))
+	}
+	opts := pg.PushOptions{Schema: schemaName}
+
+	if _, err := pg.Push(ctx, db, build("draft", "published"), opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	// Appending is something PostgreSQL can do, so it is done and not
+	// merely reported.
+	third, err := pg.Push(ctx, db, build("draft", "published", "archived"), opts)
+	if err != nil {
+		t.Fatalf("append push: %v", err)
+	}
+	if len(third.Statements) == 0 {
+		t.Error("a new enum label produced no statement")
+	}
+	if n := noticeFor(third.Notices, "enum-labels-reordered"); n.Rule != "" {
+		t.Errorf("appending a label was reported as a reorder: %s", n)
+	}
+
+	// Reordering is not.
+	fourth, err := pg.Push(ctx, db, build("published", "draft", "archived"), opts)
+	if err != nil {
+		t.Fatalf("reorder push: %v", err)
+	}
+	if len(fourth.Statements) != 0 {
+		t.Errorf("Push tried to reorder an enum: %v", fourth.Statements)
+	}
+	n := noticeFor(fourth.Notices, "enum-labels-reordered")
+	if n.Object != "doc_status" {
+		t.Fatalf("no enum-labels-reordered notice; got %v", fourth.Notices)
+	}
+	if !strings.Contains(n.Message, "draft") {
+		t.Errorf("the notice does not say what the two orders are: %q", n.Message)
+	}
+}
+
+// A view is dropped by the CASCADE that drops the table under it, so a
+// DROP VIEW emitted afterwards is a statement PostgreSQL refuses
+// (SQLSTATE 42P01) and a migration that stops halfway. The whole point
+// of reading views back is that Push and GenerateMigration can now
+// reach this, so the drop has to come first.
+func TestPGDiffDropsAViewBeforeTheTableUnderIt(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	docs := pg.NewSchemaTable(schemaName, "docs")
+	pg.Add(docs, pg.BigSerial("id").PrimaryKey())
+	sch := pg.NewSchema(docs).
+		AddView(pg.NewView("activeDocs", `SELECT "id" FROM "docs"`)).
+		AddView(pg.NewMaterializedView("docCount", `SELECT count(*) AS n FROM "docs"`))
+
+	for _, s := range pg.Diff(pg.EmptySnapshot(), pg.BuildSnapshot(sch)) {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Fatalf("building the fixture with %q: %v", s, err)
+		}
+	}
+	live, err := pg.Introspect(ctx, db, pg.IntrospectOptions{Schemas: []string{schemaName}})
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	// Withdrawing the table and both views at once is what a migration
+	// generated from an emptied schema holds.
+	for _, s := range pg.Diff(live, pg.EmptySnapshot()) {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Errorf("the diff shipped a statement the server refused: %q: %v", s, err)
+		}
+	}
+}
+
+// A view that became materialised is a different kind of object, and
+// PostgreSQL has no ALTER that converts one into the other. Comparing
+// only the body meant Push reported success against a database still
+// holding a plain view — and once the body is respelled by the probe
+// the two bodies agree, so nothing at all was emitted.
+func TestPGDiffTurnsAViewIntoAMaterialisedOne(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	for _, s := range []string{
+		`CREATE TABLE "docs" ("id" bigserial PRIMARY KEY NOT NULL)`,
+		`CREATE VIEW "summary" AS SELECT "id" FROM "docs"`,
+	} {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+	live, err := pg.Introspect(ctx, db, pg.IntrospectOptions{Schemas: []string{schemaName}})
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	// Declared with the server's own spelling of the body, which is
+	// what renormaliseExpressions leaves behind on a real push: the
+	// kind is then the only difference left.
+	body := live.Views["summary"].Definition
+	docs := pg.NewSchemaTable(schemaName, "docs")
+	pg.Add(docs, pg.BigSerial("id").PrimaryKey())
+	sch := pg.NewSchema(docs).AddView(pg.NewMaterializedView("summary", body))
+
+	stmts := pg.Diff(live, pg.BuildSnapshot(sch))
+	if len(stmts) == 0 {
+		t.Fatal("turning a view into a materialised view produced no statement")
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Fatalf("applying %q: %v", s, err)
+		}
+	}
+	if kind := relkindPG(t, db, schemaName, "summary"); kind != "m" {
+		t.Errorf("relkind is %q after the push, want \"m\" — the database still holds a plain view", kind)
+	}
+
+	// And back again, so the comparison is not one-directional.
+	live, err = pg.Introspect(ctx, db, pg.IntrospectOptions{Schemas: []string{schemaName}})
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	plainDocs := pg.NewSchemaTable(schemaName, "docs")
+	pg.Add(plainDocs, pg.BigSerial("id").PrimaryKey())
+	back := pg.NewSchema(plainDocs).AddView(pg.NewView("summary", live.Views["summary"].Definition))
+	stmts = pg.Diff(live, pg.BuildSnapshot(back))
+	if len(stmts) == 0 {
+		t.Fatal("turning a materialised view back into a plain one produced no statement")
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Fatalf("applying %q: %v", s, err)
+		}
+	}
+	if kind := relkindPG(t, db, schemaName, "summary"); kind != "v" {
+		t.Errorf("relkind is %q, want \"v\"", kind)
+	}
+}
+
+// relkindPG reads pg_class.relkind for one relation, straight from the
+// catalogue rather than through Introspect.
+func relkindPG(t *testing.T, db *pg.DB, schema, name string) string {
+	t.Helper()
+	rows, err := db.Query(context.Background(), `
+		SELECT c.relkind::text FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, schema, name)
+	if err != nil {
+		t.Fatalf("read relkind: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("relation %q is not in %q", name, schema)
+	}
+	var kind string
+	if err := rows.Scan(&kind); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	return kind
+}
+
+// Label order is read from enumsortorder, not from oid. ALTER TYPE ...
+// ADD VALUE BEFORE gives the new label the highest oid in the set and
+// a position that is not last, so the two orders disagree — and the
+// position is the part that is the type. Reading oid order back would
+// have Push report a reorder against a database that matches the Go
+// schema exactly.
+func TestPGIntrospectReadsEnumLabelsInSortOrder(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	for _, s := range []string{
+		`CREATE TYPE "docStatus" AS ENUM ('draft', 'published')`,
+		`ALTER TYPE "docStatus" ADD VALUE 'review' BEFORE 'published'`,
+	} {
+		if _, err := db.Exec(ctx, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	live, err := pg.Introspect(ctx, db, pg.IntrospectOptions{Schemas: []string{schemaName}})
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	got := live.Enums["docStatus"]
+	if got == nil {
+		t.Fatal("the enum was not read back")
+	}
+	want := []string{"draft", "review", "published"}
+	if !reflect.DeepEqual(got.Values, want) {
+		t.Errorf("labels read back as %v, want %v — that is oid order, not the type's order", got.Values, want)
+	}
+
+	// And a Go schema declaring them in that order has nothing to do
+	// and nothing to say about it.
+	sch := pg.NewSchema().AddEnum(pg.NewEnum("docStatus", want...))
+	res, err := pg.Push(ctx, db, sch, pg.PushOptions{Schema: schemaName})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if len(res.Statements) != 0 {
+		t.Errorf("push wanted to change a matching enum: %v", res.Statements)
+	}
+	for _, n := range res.Notices {
+		t.Errorf("push reported a difference against a matching enum: %s", n)
+	}
+}
+
+// A policy's expression is handed to the server as a policy, not as a
+// CHECK constraint. A CHECK may not hold a subquery (SQLSTATE 0A000)
+// and a policy very often does, so probing one as the other reports
+// the whole class as unparseable: the comparison silently falls back
+// to whatever the database holds, and a changed policy stops shipping.
+func TestPGPushNormalisesAPolicyHoldingASubquery(t *testing.T) {
+	db, schemaName := pushScratchPG(t)
+	ctx := context.Background()
+
+	build := func(role string) *pg.Schema {
+		tenants := pg.NewSchemaTable(schemaName, "tenants")
+		pg.Add(tenants, pg.BigInt("id").PrimaryKey())
+		pg.Add(tenants, pg.Text("owner").NotNull())
+
+		docs := pg.NewSchemaTable(schemaName, "docs")
+		pg.Add(docs, pg.BigSerial("id").PrimaryKey())
+		pg.Add(docs, pg.BigInt("tenantId").NotNull())
+		docs.EnableRLS()
+		docs.AddPolicy(pg.NewPolicy("docsVisible").Using(
+			`"tenantId" IN (SELECT "id" FROM "tenants" WHERE "owner" = ` + role + `)`))
+		return pg.NewSchema(tenants, docs)
+	}
+	opts := pg.PushOptions{Schema: schemaName}
+
+	if _, err := pg.Push(ctx, db, build("current_user"), opts); err != nil {
+		t.Fatalf("first push: %v", err)
+	}
+	second, err := pg.Push(ctx, db, build("current_user"), opts)
+	if err != nil {
+		t.Fatalf("second push: %v", err)
+	}
+	if len(second.Statements) != 0 {
+		t.Errorf("the second push is not a no-op:\n%s", strings.Join(second.Statements, "\n"))
+	}
+	for _, n := range second.Notices {
+		t.Errorf("the policy expression went unchecked: %s", n)
+	}
+
+	// The point of respelling it is that a real change still ships.
+	third, err := pg.Push(ctx, db, build("session_user"), opts)
+	if err != nil {
+		t.Fatalf("third push: %v", err)
+	}
+	if len(third.Statements) == 0 {
+		t.Fatal("a changed policy expression produced no statement")
+	}
+	if using := policyUsingPG(t, db, schemaName, "docs", "docsVisible"); !strings.Contains(using, "SESSION_USER") {
+		t.Errorf("the database still holds %q; the change did not ship", using)
+	}
+}
+
+// policyUsingPG reads a policy's USING expression from the catalogue.
+func policyUsingPG(t *testing.T, db *pg.DB, schema, table, policy string) string {
+	t.Helper()
+	rows, err := db.Query(context.Background(), `
+		SELECT coalesce(pg_get_expr(pol.polqual, pol.polrelid), '')
+		FROM pg_policy pol
+		JOIN pg_class c ON c.oid = pol.polrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2 AND pol.polname = $3`, schema, table, policy)
+	if err != nil {
+		t.Fatalf("read polqual: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("policy %q on %q is not in the catalogue", policy, table)
+	}
+	var out string
+	if err := rows.Scan(&out); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	return out
 }

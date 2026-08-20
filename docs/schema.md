@@ -157,6 +157,7 @@ db.ExecExpr(ctx, pg.DropTableIfExists(Users))
 ```
 
 For anything beyond a fresh create, use the migration tooling —
-`pg.Diff` against a snapshot, or the drizzle-kit interop. That is a
-separate topic; see the package docs for `pg/migrate.go` and
-`pg/diff.go`.
+`pg.Diff` against a snapshot, or the drizzle-kit interop. The `drops`
+binary drives all of it from the command line: see
+[The `drops` CLI](cli.md), and the package docs for `pg/migrate.go`
+and `pg/diff.go` for the library underneath.

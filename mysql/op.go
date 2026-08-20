@@ -45,12 +45,49 @@ func Lte(left, right any) drops.Expression { return binOp(left, "<=", right) }
 // the operator. Force one way or the other with an explicit COLLATE.
 func Like(left, pattern any) drops.Expression { return binOp(left, "LIKE", pattern) }
 
-// And / Or combine predicates. And with no arguments renders TRUE, Or
-// renders FALSE — the identity of each.
+// And / Or combine predicates, ignoring the nil ones. With no
+// arguments — or with nothing but nils — And renders TRUE and Or
+// renders FALSE, the identity of each.
 func And(preds ...drops.Expression) drops.Expression { return joinPreds(" AND ", "TRUE", preds) }
 func Or(preds ...drops.Expression) drops.Expression  { return joinPreds(" OR ", "FALSE", preds) }
 
+// dropNilPreds removes the nil entries. A nil predicate is how a
+// conditional filter says "no restriction" — the shape every caller
+// reaches for once a search box can be empty — so it has to mean
+// nothing at all rather than a nil dereference or a dangling AND. The
+// slice is only copied when there is something to drop, so the usual
+// case allocates nothing.
+func dropNilPreds(preds []drops.Expression) []drops.Expression {
+	nils := 0
+	for _, p := range preds {
+		if p == nil {
+			nils++
+		}
+	}
+	if nils == 0 {
+		return preds
+	}
+	kept := make([]drops.Expression, 0, len(preds)-nils)
+	for _, p := range preds {
+		if p != nil {
+			kept = append(kept, p)
+		}
+	}
+	return kept
+}
+
+// orTrue substitutes the empty conjunction for a nil predicate, for
+// the places the grammar requires one — a join's ON, where omitting
+// the expression is not an option the way omitting a WHERE is.
+func orTrue(p drops.Expression) drops.Expression {
+	if p == nil {
+		return And()
+	}
+	return p
+}
+
 func joinPreds(sep, empty string, preds []drops.Expression) drops.Expression {
+	preds = dropNilPreds(preds)
 	return drops.ExprFunc(func(b *drops.Builder) {
 		if len(preds) == 0 {
 			b.WriteString(empty)
@@ -71,8 +108,10 @@ func joinPreds(sep, empty string, preds []drops.Expression) drops.Expression {
 	})
 }
 
-// Not negates a predicate.
+// Not negates a predicate. A nil predicate is the empty conjunction,
+// so Not(nil) renders "(NOT TRUE)".
 func Not(p drops.Expression) drops.Expression {
+	p = orTrue(p)
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("(NOT ")
 		p.WriteSQL(b)

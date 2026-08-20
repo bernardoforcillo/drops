@@ -42,8 +42,22 @@ import (
 var (
 	buildOnce sync.Once
 	builtCLI  string
+	buildDir  string
 	buildErr  error
 )
+
+// TestMain exists to take the CLI's build directory away again. It is
+// eighteen megabytes of linked binary per run of this suite, and
+// os.MkdirTemp does not clean up after itself — a few weeks of CI on
+// one machine filled a disk that way, which fails every test here for
+// a reason none of them mention.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if buildDir != "" {
+		os.RemoveAll(buildDir)
+	}
+	os.Exit(code)
+}
 
 // cliBinary builds cmd/drops once per test run and returns its path.
 func cliBinary(t *testing.T) string {
@@ -54,6 +68,7 @@ func cliBinary(t *testing.T) string {
 			buildErr = err
 			return
 		}
+		buildDir = dir
 		builtCLI = filepath.Join(dir, "drops")
 		// cmd/drops is a module of its own — the root ./... does not
 		// reach it, and it has to be built from inside its own
@@ -110,30 +125,62 @@ func newBareProject(t *testing.T, dsn string) *project {
 func makeProject(t *testing.T, dsn string, withDriver bool) *project {
 	t.Helper()
 	dir := t.TempDir()
-	driver := ""
-	if withDriver {
-		driver = "\nrequire github.com/jackc/pgx/v5 v5.10.0\n"
-	}
-	writeFile(t, filepath.Join(dir, "go.mod"), fmt.Sprintf(`module dropscli.test
+	if !withDriver {
+		writeFile(t, filepath.Join(dir, "go.mod"), fmt.Sprintf(`module dropscli.test
 
 go 1.25.0
 
 require github.com/bernardoforcillo/drops v0.0.0
-%s
+
 replace github.com/bernardoforcillo/drops => %s
-`, driver, repoRoot(t)))
-	// The generated program is built in readonly mode like any other,
-	// so pgx has to be verifiable without a network. cmd/drops has the
-	// same dependency graph this module does — drops plus pgx — so its
-	// go.sum is the one that resolves to the same versions.
-	if withDriver {
-		sum, err := os.ReadFile(filepath.Join(repoRoot(t), "cmd", "drops", "go.sum"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		writeFile(t, filepath.Join(dir, "go.sum"), string(sum))
+`, repoRoot(t)))
+		return &project{dir: dir, dsn: dsn, t: t}
 	}
+	// The generated program is built in readonly mode like any other,
+	// so pgx has to be verifiable without a network, and the go.sum
+	// that verifies it is the CLI's. A go.sum only covers the versions
+	// its own module selects, though, and the CLI's graph is wider than
+	// a bare drops+pgx one — the linter brings golang.org/x/tools in,
+	// which raises golang.org/x/sync above what pgx alone asks for. So
+	// this module borrows the CLI's requirements as well as its sums:
+	// the two resolve to the same versions because they are the same
+	// graph under a different name.
+	mod, err := os.ReadFile(filepath.Join(repoRoot(t), "cmd", "drops", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "go.mod"), rehomeModule(t, string(mod), repoRoot(t)))
+	sum, err := os.ReadFile(filepath.Join(repoRoot(t), "cmd", "drops", "go.sum"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "go.sum"), string(sum))
 	return &project{dir: dir, dsn: dsn, t: t}
+}
+
+// rehomeModule renames the CLI's module to the throwaway one and points
+// its relative replace at the checkout, leaving every requirement
+// alone. Only those two lines change: anything else would let the two
+// module graphs drift apart again, which is the whole reason the go.sum
+// is shared.
+func rehomeModule(t *testing.T, mod, root string) string {
+	t.Helper()
+	lines := strings.Split(mod, "\n")
+	renamed, rehomed := false, false
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "module "):
+			lines[i] = "module dropscli.test"
+			renamed = true
+		case strings.HasPrefix(line, "replace github.com/bernardoforcillo/drops =>"):
+			lines[i] = "replace github.com/bernardoforcillo/drops => " + root
+			rehomed = true
+		}
+	}
+	if !renamed || !rehomed {
+		t.Fatalf("cmd/drops/go.mod no longer has the module and replace lines this rewrite expects:\n%s", mod)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // schema writes the schema package, replacing whatever was there.

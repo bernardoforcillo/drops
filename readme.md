@@ -542,10 +542,90 @@ db := pg.New(stdlib.New(sqlDB)).WithHook(
 db = db.WithHook(drops.ChainHooks(metricsHook, loggerHook))
 ```
 
-Each event is a `drops.QueryEvent{Kind, SQL, Args, Duration, Err}`.
-`LoggerHook` is one convenience built on top — write your own for OTel,
-Prometheus, Datadog, etc. in a few lines. `db.Ping(ctx)` issues
-`SELECT 1` and is the natural shape for a Kubernetes readiness probe.
+Each event is a `drops.QueryEvent{Kind, SQL, Args, Duration,
+WaitDuration, WaitKnown, Err}`. `LoggerHook` is one convenience built
+on top — write your own for OTel, Prometheus, Datadog, etc. in a few
+lines. `db.Ping(ctx)` issues `SELECT 1` and is the natural shape for a
+Kubernetes readiness probe.
+
+#### Queue time is not query time
+
+`Duration` is two measurements added together: the wait for a
+connection from the pool, and the time the database took. They have
+opposite remedies — the first says add connections or shed
+concurrency, the second says fix the query or the index — so reporting
+only their sum leaves neither actionable.
+
+drops cannot time the acquisition itself; `drops.Driver` is three
+methods and the pool lives behind them. A pool that can check out a
+single connection can implement `pg.ConnAcquirer`, and
+`pg.QueueTimed` then measures the checkout and nothing else:
+
+```go
+db := pg.New(pg.QueueTimed(myPool)).WithHook(hook)
+
+// in the hook:
+if e.WaitKnown {
+    queueTime.Observe(e.WaitDuration.Seconds())
+}
+if serverTime, ok := e.QueryDuration(); ok {
+    dbTime.Observe(serverTime.Seconds())
+}
+```
+
+A driver that measures the wait internally can report it directly with
+`drops.ReportConnWait`. A driver that reports nothing leaves
+`WaitKnown` false and the split simply absent — a queue-time gauge
+reading zero because nobody was counting is worse than no gauge at
+all, so `drops/otel` records `db.client.connection.wait_time` and
+`db.client.operation.query_time` only for events that carry a real
+measurement.
+
+### Replicas and the post-write window
+
+`pg.NewReplicated(primary, replicas...)` is a `drops.Driver` that sends
+writes to the primary and fans reads out over the replicas. The hard
+part is not the fan-out, it is the moment right after a write, when the
+replica a read would land on may not have replayed it yet.
+
+```go
+repl := pg.NewReplicated(primary, r1, r2).
+    WithLSNTracking(50 * time.Millisecond). // route by replay position
+    WithWriteDelay(1 * time.Second)         // ...but not for a second after a write
+db := pg.New(repl)
+
+ctx = pg.WithReadYourWrites(ctx, 2*time.Second)
+```
+
+- **`WithReadYourWrites(ctx, d)`** is the window: a write on this
+  context arms it, and reads stay off the replicas while it is open.
+  `d=0` clears it.
+- **`WithLSNTracking(ttl)`** spends less of the primary's capacity on
+  it: the write's WAL position is captured and a read may go to any
+  replica that has replayed past it.
+- **`WithWriteDelay(d)`** is the floor under that. A caught-up replay
+  position proves the row just written is there and says nothing about
+  what the write set in motion — a trigger, a view refresh, a row in
+  another table. For `d` after a write, reads go to the primary
+  whatever the replicas report. It widens a caller's shorter window and
+  leaves one explicitly cleared with `d=0` cleared.
+
+A commit is a write: a transaction that wrote arms the window when it
+commits, and a rolled-back one arms nothing. So is a statement with a
+`RETURNING` clause, even though it is issued through `Query` — that is
+how `InsertBuilder.Scan` gets a generated key back — so `Query` routes
+by what the statement does, not by the method it arrived on.
+
+Routing decides where a statement goes; it does not decide what a
+statement does. `db.InReadTx(ctx, fn)` makes "this only reads" a rule
+the server keeps, running `fn` inside a read-only transaction that
+PostgreSQL refuses writes in with SQLSTATE 25006, and routing it the
+way a read is routed. `drops.Driver.Begin` takes a context and nothing
+else, so drops issues `SET TRANSACTION READ ONLY` as the transaction's
+first statement; a driver that implements the one-method
+`pg.ReadOnlyBeginner` extension saves that round trip. If neither path
+works the call returns `pg.ErrNotReadOnly` rather than a transaction
+that can write.
 
 ### Query tagging
 
@@ -744,6 +824,117 @@ db.Find(Users).
 
 It applies to `HasMany`, `MorphMany` and `ManyToMany`; the single-row
 relations already cap at one.
+
+#### Filtering the parent by its relation
+
+`With` and `Load` answer "these authors, and their books". `WhereHas`
+answers the other question — "the authors who *have* a published book" —
+where the relation is evidence about the parent rather than something to
+load. It is Eloquent's `whereHas`, and it compiles to an `EXISTS` over
+the relation's own join condition:
+
+```go
+var authors []Author
+db.Find(Authors).
+    WhereHas("books", func(q *pg.RelQuery) {
+        q.Where(BookPublished.Eq(true))
+    }).
+    All(ctx, &authors)
+
+// SELECT * FROM authors WHERE EXISTS (
+//   SELECT 1 FROM books
+//   WHERE books.author_id = authors.id
+//     AND books.deleted_at IS NULL   -- the books table's own filters
+//     AND books.published = $1
+// )
+```
+
+The related table's global filters are **inside** the subquery, so a
+soft-deleted book does not make its author match. Step around one by
+name with `q.IgnoreFilters(pg.FilterSoftDelete)`, or all of them with
+`q.Unscoped()`.
+
+That means the filters the *table* registers. The tenant axis is not
+one of them — `Entity.ScopeByTenant` builds it per query from the ctx
+tenant, which a `*Table` cannot see — so it narrows the outer `SELECT`
+and not the subquery: an author of yours whose only book belongs to
+another tenant still matches, and `q.IgnoreFilters(pg.FilterTenant)`
+has nothing to bypass. The eager loaders reach exactly as far. Where it
+matters, exclude the other tenant in the callback:
+`q.Where(BookOrg.Eq(org))`.
+
+`WhereDoesntHave` is the same subquery under `NOT EXISTS` — "every order
+with no shipment". `WhereHasRel` / `WhereDoesntHaveRel` take a relation
+handle instead of a name, the way `LoadRel` does. Both are available on
+the typed `Entity.Query` too, and both nest: `q.WhereHas(...)` inside the
+callback puts an `EXISTS` inside the `EXISTS`.
+
+Every kind but `MorphTo` works — a `ManyToMany` joins its junction to its
+target inside the subquery, and both tables' filters apply.
+
+A count bound replaces the `EXISTS` with a correlated `count(…)`
+comparison, because there is nothing to short-circuit once a threshold is
+involved:
+
+```go
+db.Find(Authors).WhereHas("books", func(q *pg.RelQuery) {
+    q.Where(BookPublished.Eq(true)).CountGte(3)
+})
+```
+
+`CountEq`, `CountGt`, `CountGte`, `CountLt`, `CountLte`. The number goes
+in the method name so a mis-typed comparison is a compile error. For a
+many-to-many it counts distinct targets, not junction rows.
+
+### Seeding generated data
+
+`pg.SeedAdd` takes rows you wrote out, which is right for a fixture with
+three named users in it and wrong for a table that needs to look
+populated. `pg.SeedMany` takes a count and a template instead, and
+`pg.SeedRelated` fans out along a relation you already declared:
+
+```go
+seeder := pg.NewSeeder(db).WithSeed(42)
+
+authors := pg.SeedMany(seeder, AuthorEntity, 10, func(g *pg.Gen, a *Author) {
+    a.Name  = g.FullName()
+    a.Email = g.Email()            // distinct within a run, so UNIQUE holds
+    a.Bio   = pg.Maybe(g, 0.5, g.Sentence()) // sometimes NULL
+})
+pg.SeedRelated(authors, "books", BookEntity, 2, 5, func(g *pg.Gen, b *Book, a *Author) {
+    b.Title     = g.Sentence()
+    b.Published = pg.Weighted(g,
+        pg.Choice[bool]{Value: true, Weight: 7},
+        pg.Choice[bool]{Value: false, Weight: 3})
+    b.WrittenAt = g.TimeBetween(start, end)
+})
+
+if err := seeder.Apply(ctx); err != nil { ... }
+// authors.Rows() and the books handle report what was created, keys included.
+```
+
+Nothing in the second call restates how a book points at an author: the
+relation was declared once with `NewRelations`, and that declaration is
+what `SeedRelated` reads to write the foreign key. Plans nest to any
+depth, and the per-parent count is drawn per parent — ten authors get ten
+different numbers between two and five, not one number ten times.
+
+Every value comes from the seeder's `pg.Gen`, a PRNG built from one
+integer (`math/rand/v2`, no dependency). `Apply` rewinds it first, so the
+same seed against a clean database produces the same rows — which is what
+makes a test that fails on generated data re-runnable. Two rules keep
+that true and are worth knowing: nothing in `pg.Gen` reads the clock
+(timestamps come from a range you supply), and a `Gen` is not safe for
+concurrent use.
+
+The generators are `FullName`, `FirstName`, `LastName`, `Email`, `Word`,
+`Words`, `Sentence`, `Paragraph`, `TimeBetween`, `IntN`, `IntRange`,
+`Float64Range`, `Bool`, `Chance`, plus the free functions `Pick`,
+`Weighted`, `Maybe` and `Shuffle`. That is the whole list on purpose:
+this is not a faker library, and the name and word lists are short,
+fixed and English rather than pretending to be localised data. Domain
+values — statuses, currencies, SKUs — come from `Pick` and `Weighted`,
+where the caller supplies them.
 
 ### Migrations
 
@@ -985,6 +1176,7 @@ drops drift --schema ./db/schema                          # exit 3 if they disag
 drops pull --out ./db/schema/schema.go                    # introspect a database into Go
 drops baseline                                            # adopt a database that already exists
 drops status                                              # applied, pending, unaccounted for
+drops lint ./...                                          # exit 3 on a query mistake
 ```
 
 Connection: `--dsn`, else `$DROPS_PG_DSN`, else `$DATABASE_URL`. The
@@ -1057,6 +1249,30 @@ and applied.
 | 3 | the command ran and the answer was no: drift found, or changes refused |
 
 `drops drift` returning 3 is what makes it a CI gate.
+
+### `drops lint`
+
+The one subcommand that reads Go source rather than a schema or a
+database. Three `go/analysis` rules: a DELETE or UPDATE executed with
+nothing to bound it, a read of every row of a table, a relation
+eager-loaded once per iteration of a loop — the N+1
+`pg.WithN1Detector` reports at run time, reported before it runs.
+
+The equivalent ESLint plugin has to guess from a method name. A
+`go/analysis` pass is handed the type checker's answers, so it knows
+the value is a `*pg.DeleteBuilder`, knows which package-level
+`pg.Table` the statement targets, and can carry a fact about that
+table — "this one is small" — into every package that imports the
+schema. `//drops:lint lookup` on the declaration is how a table says
+so; `//drops:lint ignore <rule> — reason` is how a deliberate offender
+does.
+
+A linter is judged on false positives, so each rule documents where it
+stops: within one function body, flow-insensitively, at the point a
+statement executes rather than where `ToSQL` renders it. Run over
+drops itself — `pg`, `sqlite`, `mysql`, `clickhouse`, the examples,
+the CLI and the integration suite — it is quiet, and getting it there
+corrected two rules. [docs/lint.md](docs/lint.md) has the details.
 
 ### drizzle-kit interoperability
 

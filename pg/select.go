@@ -120,9 +120,11 @@ func (s *SelectBuilder) FullJoin(t *Table, on drops.Expression) *SelectBuilder {
 	return s
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a caller can pass one that is only sometimes present without
+// first collecting the non-nil ones into a slice.
 func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
-	s.wheres = append(s.wheres, preds...)
+	s.wheres = append(s.wheres, dropNilPreds(preds)...)
 	return s
 }
 
@@ -133,8 +135,9 @@ func (s *SelectBuilder) GroupBy(exprs ...drops.Expression) *SelectBuilder {
 }
 
 // Having appends predicates to the HAVING clause (joined by AND).
+// Nil predicates are ignored, as in Where.
 func (s *SelectBuilder) Having(preds ...drops.Expression) *SelectBuilder {
-	s.havings = append(s.havings, preds...)
+	s.havings = append(s.havings, dropNilPreds(preds)...)
 	return s
 }
 
@@ -248,7 +251,10 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		b.WriteByte(' ')
 		j.table.writeFrom(b)
 		b.WriteString(" ON ")
-		b.Append(j.on)
+		// A nil condition is the empty conjunction, rendered where
+		// the grammar insists on a predicate. Writing nothing here
+		// produced SQL no server would parse.
+		b.Append(orTrue(j.on))
 	}
 	wheres := s.scope.apply(s.from, s.wheres)
 	if len(wheres) > 0 {

@@ -20,6 +20,13 @@
 // dialect's SELECT builder already has, so a join or an aggregate
 // scans into a type named at the call site.
 //
+// [Multi] is a transaction written down as a value: an ordered list of
+// named steps run inside one transaction. When a step fails, the
+// [MultiError] says which one, why, and what had already succeeded —
+// the three things a bare closure passed to [InTx] cannot tell you.
+// Being a value, it can also be enumerated before it runs, which is
+// something a test can assert about a transaction script.
+//
 // Observability is provided by [Hook], [ChainHooks], and [CallHook] — a
 // single contract shared by every dialect. A ready-made structured hook
 // is available via [LoggerHook].

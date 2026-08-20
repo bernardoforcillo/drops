@@ -728,6 +728,14 @@ func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 	if q.fb.HasEagerLoads() {
 		return errors.New("drops/pg: Stream is incompatible with eager-loaded relations; use Query.All instead")
 	}
+	// A relation name nothing answered to, from a WhereHas. Stream
+	// renders the SelectBuilder itself and never reaches
+	// FindBuilder.All, where this is otherwise surfaced — and the query
+	// it would fall back to is the whole table, with the predicate the
+	// caller asked for simply absent.
+	if q.fb.relErr != nil {
+		return q.fb.relErr
+	}
 	// Stream is a read like any other, so it owes the same scoping.
 	// Reaching straight for the SelectBuilder used to skip both, which
 	// made a batch job or an export the one way to read every tenant's
@@ -1105,7 +1113,15 @@ func (q *EntityQuery[T]) Without(names ...string) *EntityQuery[T] {
 // checkStrict runs the strict-loading check against T. The fast-scan
 // and cache paths never reach FindBuilder.All, so the check has to be
 // stated here too or it would apply to some queries and not others.
+//
+// The deferred relation-path error is surfaced here for the same
+// reason: a name no relation on the table answers to — in a With, or in
+// a WhereHas, where dropping the predicate would silently widen the
+// result — must not be swallowed by whichever path happens to run.
 func (q *EntityQuery[T]) checkStrict() error {
+	if q.fb.relErr != nil {
+		return q.fb.relErr
+	}
 	return q.fb.checkStrictLoading(reflect.TypeOf((*T)(nil)).Elem())
 }
 

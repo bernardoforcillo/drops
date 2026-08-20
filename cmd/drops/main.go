@@ -76,6 +76,8 @@ func run() error {
 		return runStatus(ctx, args)
 	case "diagram":
 		return runDiagram(args)
+	case "lint":
+		return runLint(ctx, args)
 	case "version", "--version", "-v":
 		fmt.Println("drops", version)
 	case "help", "-h", "--help":
@@ -107,6 +109,7 @@ Database commands (need --dsn, or DROPS_PG_DSN / DATABASE_URL):
   pull       Introspect a live database into a Go schema file
 
 Offline:
+  lint       Report query mistakes the type checker can see: "drops lint ./..."
   diagram    Emit a Mermaid ER diagram from a snapshot JSON
   version    Print the toolkit version
 

@@ -28,9 +28,12 @@ func (u *UpdateBuilder) SetExpr(col *Column, expr drops.Expression) *UpdateBuild
 	return u
 }
 
-// Where AND-s the given predicates onto the statement.
+// Where AND-s the given predicates onto the statement. Nil predicates
+// are ignored, so a filter that is only sometimes present can be passed
+// straight in — but an UPDATE all of whose predicates were nil is an
+// UPDATE with no WHERE, and rewrites every row.
 func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
-	u.wheres = append(u.wheres, preds...)
+	u.wheres = append(u.wheres, dropNilPreds(preds)...)
 	return u
 }
 

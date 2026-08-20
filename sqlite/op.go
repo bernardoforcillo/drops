@@ -111,8 +111,45 @@ func Regexp(left, pattern any) drops.Expression { return binOp(left, "REGEXP", p
 //
 // And / Or live in column.go. Not is defined here for parity with pg.
 
-// Not negates a predicate.
+// dropNilPreds removes the nil entries. A nil predicate is how a
+// conditional filter says "no restriction" — the shape every caller
+// reaches for once a search box can be empty — so it has to mean
+// nothing at all rather than a dangling AND. The slice is only copied
+// when there is something to drop, so the usual case allocates
+// nothing.
+func dropNilPreds(preds []drops.Expression) []drops.Expression {
+	nils := 0
+	for _, p := range preds {
+		if p == nil {
+			nils++
+		}
+	}
+	if nils == 0 {
+		return preds
+	}
+	kept := make([]drops.Expression, 0, len(preds)-nils)
+	for _, p := range preds {
+		if p != nil {
+			kept = append(kept, p)
+		}
+	}
+	return kept
+}
+
+// orTrue substitutes the empty conjunction for a nil predicate, for
+// the places the grammar requires one — a join's ON, where omitting
+// the expression is not an option the way omitting a WHERE is.
+func orTrue(p drops.Expression) drops.Expression {
+	if p == nil {
+		return And()
+	}
+	return p
+}
+
+// Not negates a predicate. A nil predicate is the empty conjunction,
+// so Not(nil) renders "(NOT TRUE)".
 func Not(p drops.Expression) drops.Expression {
+	p = orTrue(p)
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("(NOT ")
 		p.WriteSQL(b)

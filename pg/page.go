@@ -79,10 +79,11 @@ func (p *PageBuilder[T]) OrderBy(cols ...OrderingColumn) *PageBuilder[T] {
 	return p
 }
 
-// Where appends predicates joined by AND. Composes with the cursor
-// guard so additional filters narrow the page set.
+// Where appends predicates joined by AND, ignoring the nil ones.
+// Composes with the cursor guard so additional filters narrow the page
+// set.
 func (p *PageBuilder[T]) Where(preds ...drops.Expression) *PageBuilder[T] {
-	p.wheres = append(p.wheres, preds...)
+	p.wheres = append(p.wheres, dropNilPreds(preds)...)
 	return p
 }
 

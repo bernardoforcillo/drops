@@ -17,9 +17,12 @@ type DeleteBuilder struct {
 	scope    filterScope
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a filter that is only sometimes present can be passed straight in
+// — but a DELETE all of whose predicates were nil is a DELETE with no
+// WHERE, and removes every row the table's filters still admit.
 func (d *DeleteBuilder) Where(preds ...drops.Expression) *DeleteBuilder {
-	d.wheres = append(d.wheres, preds...)
+	d.wheres = append(d.wheres, dropNilPreds(preds)...)
 	return d
 }
 

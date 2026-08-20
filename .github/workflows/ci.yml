@@ -91,6 +91,16 @@ jobs:
         run: go test ./... -count=1
         working-directory: cmd/drops
 
+      # The linter's own corpus proves it reports what it should. This
+      # step proves the other half: that it stays quiet over a codebase
+      # that is supposed to be clean.
+      - name: lint the tree with drops lint
+        run: |
+          go build -C cmd/drops -o "$PWD/bin/drops" .
+          ./bin/drops lint ./...
+          (cd cmd/drops && "$PWD/../../bin/drops" lint ./...)
+          (cd integration && "$PWD/../bin/drops" lint ./...)
+
   # ── integration ──────────────────────────────────────────────────────
   # Everything above tests the SQL drops *generates*, by comparing it to
   # what a test author expected. Three invalid-SQL bugs have shipped

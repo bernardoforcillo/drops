@@ -12,6 +12,7 @@ drops generate --schema ./db/schema --name add_articles
 drops migrate
 drops push --schema ./db/schema --dry-run
 drops drift --schema ./db/schema
+drops lint ./...
 ```
 
 Every command takes `-h`. Connection strings come from `--dsn`, else
@@ -152,6 +153,21 @@ pending — plus any migration hash in the database that no file in the
 directory accounts for, which means a file was edited after it was
 applied or came from another branch. Pass `--schema` and it reports
 drift as well.
+
+### `drops lint`
+
+Reads the source rather than the database: a DELETE or UPDATE executed
+with nothing to bound it, a read of every row of a table, a relation
+eager-loaded once per iteration of a loop. Exits 3 on a finding.
+
+```
+drops lint ./...
+```
+
+The rules are `go/analysis` analyzers, so they also run under
+golangci-lint or `go vet -vettool`. What each one will and will not
+say — the false-positive story matters more than the true-positive one
+— is in [lint.md](lint.md).
 
 ## Destructive changes
 

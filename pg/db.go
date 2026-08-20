@@ -86,9 +86,12 @@ func (db *DB) Ping(ctx context.Context) error {
 // Tx handle. Most callers should prefer InTx for automatic commit/
 // rollback and full hook coverage.
 func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
+	drvCtx, waited := db.armConnWait(ctx)
 	start := time.Now()
-	tx, err := db.drv.Begin(ctx)
-	db.emit(ctx, drops.QueryEvent{Kind: "begin", Duration: time.Since(start), Err: err})
+	tx, err := db.drv.Begin(drvCtx)
+	bev := drops.QueryEvent{Kind: "begin", Duration: time.Since(start), Err: err}
+	bev.WaitDuration, bev.WaitKnown = waited()
+	db.emit(ctx, bev)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -136,9 +139,12 @@ func (db *DB) InTx(ctx context.Context, fn func(*DB) error) error {
 // inTxOnce runs fn inside a single transaction without any retry
 // logic. Used by InTx — extracted so the retry loop stays readable.
 func (db *DB) inTxOnce(ctx context.Context, fn func(*DB) error) (err error) {
+	drvCtx, waited := db.armConnWait(ctx)
 	bstart := time.Now()
-	tx, berr := db.drv.Begin(ctx)
-	db.emit(ctx, drops.QueryEvent{Kind: "begin", Duration: time.Since(bstart), Err: berr})
+	tx, berr := db.drv.Begin(drvCtx)
+	bev := drops.QueryEvent{Kind: "begin", Duration: time.Since(bstart), Err: berr}
+	bev.WaitDuration, bev.WaitKnown = waited()
+	db.emit(ctx, bev)
 	if berr != nil {
 		return berr
 	}
@@ -209,6 +215,7 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 	span.SetAttribute(AttrOperation, "exec")
 	span.SetAttribute(AttrStatement, sql)
 	span.SetAttribute(AttrArgsCount, len(args))
+	spanCtx, waited := db.armConnWait(spanCtx)
 	start := time.Now()
 	// Unwrap PII markers before reaching the driver — they're a
 	// pure observability concept and must not affect the wire form.
@@ -222,10 +229,12 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 		span.RecordError(err)
 	}
 	span.End()
-	db.emit(ctx, drops.QueryEvent{
+	ev := drops.QueryEvent{
 		Kind: "exec", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,
-	})
+	}
+	ev.WaitDuration, ev.WaitKnown = waited()
+	db.emit(ctx, ev)
 	return res, err
 }
 
@@ -238,6 +247,7 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 	span.SetAttribute(AttrOperation, "query")
 	span.SetAttribute(AttrStatement, sql)
 	span.SetAttribute(AttrArgsCount, len(args))
+	spanCtx, waited := db.armConnWait(spanCtx)
 	start := time.Now()
 	driverArgs := args
 	if containsPII(args) {
@@ -249,10 +259,12 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 		span.RecordError(err)
 	}
 	span.End()
-	db.emit(ctx, drops.QueryEvent{
+	ev := drops.QueryEvent{
 		Kind: "query", SQL: sql, Args: args,
 		Duration: time.Since(start), Err: err,
-	})
+	}
+	ev.WaitDuration, ev.WaitKnown = waited()
+	db.emit(ctx, ev)
 	return rows, err
 }
 

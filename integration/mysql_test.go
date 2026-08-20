@@ -5192,6 +5192,9 @@ func TestMySQLSetIfChangedReachesANullColumn(t *testing.T) {
 	if _, err := db.Insert(tbl).Row(label.Val("")).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// Every row, on purpose: the table holds one and the point is to
+	// put a NULL under SetIfChanged before it runs.
+	//drops:lint ignore unfilteredwrite
 	if _, err := db.Update(tbl).Set(mysql.Bind(label, nil)).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}

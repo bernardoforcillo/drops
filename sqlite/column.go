@@ -286,12 +286,24 @@ func nullCheck(c *Column, isNull bool) drops.Expression {
 	})
 }
 
-// And / Or combine predicates.
-func And(preds ...drops.Expression) drops.Expression { return boolChain(" AND ", preds) }
-func Or(preds ...drops.Expression) drops.Expression  { return boolChain(" OR ", preds) }
+// And / Or combine predicates, ignoring the nil ones. With no
+// arguments — or with nothing but nils — And renders TRUE and Or
+// renders FALSE, the identity of each. (SQLite has understood the two
+// keywords since 3.23.)
+func And(preds ...drops.Expression) drops.Expression { return boolChain(" AND ", "TRUE", preds) }
+func Or(preds ...drops.Expression) drops.Expression  { return boolChain(" OR ", "FALSE", preds) }
 
-func boolChain(sep string, preds []drops.Expression) drops.Expression {
+func boolChain(sep, empty string, preds []drops.Expression) drops.Expression {
+	preds = dropNilPreds(preds)
 	return drops.ExprFunc(func(b *drops.Builder) {
+		if len(preds) == 0 {
+			b.WriteString(empty)
+			return
+		}
+		if len(preds) == 1 {
+			b.Append(preds[0])
+			return
+		}
 		b.WriteByte('(')
 		for i, p := range preds {
 			if i > 0 {

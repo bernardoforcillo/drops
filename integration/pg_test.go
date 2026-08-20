@@ -1311,6 +1311,7 @@ func TestPGAliasedBindingDoesNotDuplicateAHookColumn(t *testing.T) {
 	if _, err := db.Insert(tbl).Row(name.Val("a")).Exec(ctx); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	//drops:lint ignore unfilteredwrite — one seeded row, deliberately
 	if _, err := db.Update(tbl).
 		Set(name.Val("b")).
 		Set(aliasCol[time.Time](u.Col("updatedAt")).Val(fixed)).

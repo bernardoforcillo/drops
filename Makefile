@@ -106,8 +106,14 @@ govulncheck: ## Check for known vulnerabilities (install: go install golang.org/
 golangci-lint: ## Run golangci-lint (install: brew install golangci-lint)
 	golangci-lint run
 
+.PHONY: query-lint
+query-lint: cli ## Run "drops lint" over every module (the tree should be clean)
+	./cmd/drops/drops lint ./...
+	cd cmd/drops && ./drops lint ./...
+	cd integration && ../cmd/drops/drops lint ./...
+
 .PHONY: lint
-lint: vet staticcheck golangci-lint ## Run all linters (vet + staticcheck + golangci-lint)
+lint: vet staticcheck golangci-lint query-lint ## Run all linters (vet + staticcheck + golangci-lint + drops lint)
 
 # ── module hygiene ────────────────────────────────────────────────────
 .PHONY: tidy

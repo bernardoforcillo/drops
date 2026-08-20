@@ -103,13 +103,15 @@ func (s *SelectBuilder) AsofJoin(t *Table, on drops.Expression) *SelectBuilder {
 // WHERE, with the right primary-key columns it can dramatically cut
 // scanned data on MergeTree tables.
 func (s *SelectBuilder) Prewhere(preds ...drops.Expression) *SelectBuilder {
-	s.prewheres = append(s.prewheres, preds...)
+	s.prewheres = append(s.prewheres, dropNilPreds(preds)...)
 	return s
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a caller can pass one that is only sometimes present without
+// first collecting the non-nil ones into a slice.
 func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
-	s.wheres = append(s.wheres, preds...)
+	s.wheres = append(s.wheres, dropNilPreds(preds)...)
 	return s
 }
 
@@ -123,7 +125,7 @@ func (s *SelectBuilder) GroupBy(exprs ...drops.Expression) *SelectBuilder {
 	return s
 }
 func (s *SelectBuilder) Having(preds ...drops.Expression) *SelectBuilder {
-	s.havings = append(s.havings, preds...)
+	s.havings = append(s.havings, dropNilPreds(preds)...)
 	return s
 }
 func (s *SelectBuilder) OrderBy(exprs ...drops.Expression) *SelectBuilder {
@@ -168,7 +170,9 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteByte(' ')
 		j.table.writeFrom(b)
 		b.WriteString(" ON ")
-		b.Append(j.on)
+		// A nil condition is the empty conjunction, rendered where
+		// the grammar insists on a predicate.
+		b.Append(orTrue(j.on))
 	}
 	if len(s.prewheres) > 0 {
 		b.WriteString(" PREWHERE ")

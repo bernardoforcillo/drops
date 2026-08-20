@@ -43,9 +43,11 @@ func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
 }
 
 // Where AND-s the given predicates onto the statement. A DELETE with no
-// WHERE removes every row — that is intentional but rarely desired.
+// WHERE removes every row — that is intentional but rarely desired, and
+// a Where whose predicates were all nil is one of them: nil means "no
+// restriction", so nothing is left to restrict.
 func (d *DeleteBuilder) Where(preds ...drops.Expression) *DeleteBuilder {
-	d.wheres = append(d.wheres, preds...)
+	d.wheres = append(d.wheres, dropNilPreds(preds)...)
 	return d
 }
 

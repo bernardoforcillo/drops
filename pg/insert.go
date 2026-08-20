@@ -149,9 +149,10 @@ func (cu *ConflictUpdate) Set(values ...ColumnValue) *ConflictUpdate {
 	return cu
 }
 
-// Where adds predicates that gate the conflict update.
+// Where adds predicates that gate the conflict update, ignoring the nil
+// ones. Gated by nothing but nils, the conflict update is ungated.
 func (cu *ConflictUpdate) Where(preds ...drops.Expression) *ConflictUpdate {
-	cu.c.where = append(cu.c.where, preds...)
+	cu.c.where = append(cu.c.where, dropNilPreds(preds)...)
 	return cu
 }
 

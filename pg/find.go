@@ -86,9 +86,11 @@ type RelConfig struct {
 }
 
 // Where AND-s predicates into this relation's batched query, filtering
-// the related rows (e.g. only published posts).
+// the related rows (e.g. only published posts). Nil predicates are
+// ignored, as in [SelectBuilder.Where]; the related table's own global
+// filters apply either way.
 func (c *RelConfig) Where(preds ...drops.Expression) *RelConfig {
-	c.node.wheres = append(c.node.wheres, preds...)
+	c.node.wheres = append(c.node.wheres, dropNilPreds(preds)...)
 	return c
 }
 

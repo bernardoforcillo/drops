@@ -43,9 +43,12 @@ func (u *UpdateBuilder) SetExpr(col ColRef, e drops.Expression) *UpdateBuilder {
 	return u.Set(exprValue{col: col.col(), expr: e})
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a filter that is only sometimes present can be passed straight in
+// — but an UPDATE all of whose predicates were nil is an UPDATE with no
+// WHERE, and rewrites every row the table's filters still admit.
 func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
-	u.wheres = append(u.wheres, preds...)
+	u.wheres = append(u.wheres, dropNilPreds(preds)...)
 	return u
 }
 

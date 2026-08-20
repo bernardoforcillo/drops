@@ -9,6 +9,123 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **`drops lint`: three query mistakes, caught before the query
+  runs.** Drizzle ships an ESLint plugin whose flagship rule is
+  "delete without a where clause", and it is the single most-cited
+  reason people install it. ESLint has to guess from a method name.
+  `go/analysis` is handed the type checker's answers whether it asks
+  or not, so a rule knows the value is a `*pg.DeleteBuilder` and knows
+  which package-level `*pg.Table` the statement targets.
+
+  `drops lint ./...` runs three analyzers, exported from
+  `cmd/drops/dropslint` so they also work under golangci-lint or
+  `go vet -vettool`. `unfilteredwrite` reports a DELETE or UPDATE
+  executed with nothing to bound it — MySQL's `LIMIT` on a write
+  counts as a bound; `Unscoped()` pointedly does not, since it removes
+  predicates rather than adding one. `unboundedread` reports an `All`
+  that reads every row: no `Where`, no `Limit`, and no
+  `Budget.MaxRows`, whose vocabulary it borrows deliberately — the two
+  are the build-time and run-time answers to one question, and
+  `MaxRows` is enforced by injecting a LIMIT on exactly the call the
+  rule watches. `loopload` reports a query that eager-loads a relation
+  and executes inside a loop: the N+1 `pg.WithN1Detector` reports at
+  run time, reported at build time instead.
+
+  A linter is judged on its false positives, so each rule says where
+  it stops. All three follow a builder within one function body and no
+  further, flow-insensitively — a `Where` anywhere on the value
+  counts, which misses the bug hidden under an `if` and never
+  mis-reads the careful spelling. A builder that is returned, passed
+  to a call, or aliased goes unreported. A statement is reported where
+  it *executes*, never where `ToSQL` renders it. `unboundedread` asks
+  the most before speaking: whole-row reads only, `All` only, and only
+  when it can name the table — a table built inside a function is one
+  whose size the analyzer cannot know and to which nobody can attach a
+  budget, so a finding there would be a finding with no fix.
+
+  A deliberate offender says so: `//drops:lint ignore <rule> — reason`
+  on the line, the line above, or the enclosing function's doc
+  comment. A table that really is small says so once on its
+  declaration, `//drops:lint lookup`, which travels as an analysis
+  fact to every package that imports the schema.
+
+  Running it over drops itself moved the rules twice. A MySQL batched
+  `UPDATE … LIMIT 2` was reported and should not have been; `Limit`
+  now bounds a write. Seventy-odd unit tests reading three-row fixture
+  tables built inside the test function were reported and should not
+  have been — the rule was answering a question about table size for
+  tables whose size it had no way to know, which is the requirement
+  that a target be nameable. The tree is clean now but for two
+  directives in the integration suite, where a test deliberately
+  rewrites a one-row table. `docs/lint.md` has the whole story.
+- **`drops.Multi`: a transaction as an inspectable value.** A
+  multi-step transaction has been an opaque closure passed to
+  `InTx`, and when step four fails at three in the morning the
+  closure returns one error and nothing else — not which step, not
+  what had already run. `drops.NewMulti().Run("team", …).Run("audit",
+  …)` describes the same transaction as an ordered list of named
+  steps; `Exec` runs them in one transaction, and a failure comes back
+  as a `*MultiError` carrying the step's name, its position, its
+  cause, and the `Results` of every step that had already succeeded.
+  Results are keyed by step name and read out typed via
+  `drops.StepResult[T]`; declaring a step with `drops.Step[T]` instead
+  of `Run` makes the writer's and the reader's types the same thing to
+  the compiler, so the run-time check cannot fail.
+
+  The sharper argument for it is `pg.RetryPolicy`, which re-runs an
+  arbitrary callback on a serialization failure. That is safe only by
+  convention — nothing stops a closure from having sent an email on
+  the attempt that got rolled back. A Multi is a list of steps that
+  can be enumerated with `Names()` before it ever runs, so "this
+  script touches these four things, in this order" becomes a fact CI
+  can assert rather than a comment. It does not make a step body pure;
+  it puts the shape of the transaction where a reviewer and a test can
+  see it.
+
+  `Multi` is not a second saga, and the doc says where the line is. A
+  Multi is *one* transaction: all steps or none, no compensations
+  because a failure leaves no trace, bounded to work short enough to
+  hold a transaction open. A saga is one transaction per step, durable
+  as it goes, and in exchange every step needs a compensating action
+  and those compensations are best-effort. A saga can leave the world
+  half-undone; a Multi cannot. It lives in the root package and takes
+  a `drops.Driver`, so it works for every dialect through the one
+  interface.
+
+- **`And` and `Or` drop nil predicates, in every dialect.** Building a
+  filter that depends on a request parameter meant accumulating into a
+  `[]drops.Expression` and appending under an `if`, because passing a
+  nil predicate was a nil-pointer dereference (pg, mysql, clickhouse)
+  or a dangling `( AND x AND )` that no server would parse (sqlite).
+  Nil now means what the caller meant by it — no restriction — so
+  `pg.And(nil, x, nil)` is `x`, and the `if` and the slice go away.
+  With nothing left to join, `And()` renders the identity `TRUE` and
+  `Or()` renders `FALSE`; SQLite's `And()` used to render `()`, which
+  was a syntax error.
+
+  The same rule is applied one layer up, where the nil actually
+  arrives: `Where`, `Having` and ClickHouse's `Prewhere` ignore nil
+  predicates, and a clause that is left with nothing is omitted rather
+  than emitted empty. A join's `ON` cannot be omitted — the grammar
+  demands a predicate — so a nil condition there renders the same
+  identity, `ON TRUE`, instead of the `ON` followed by nothing it
+  produced before. That the three live engines accept `TRUE`, `FALSE`
+  and `ON TRUE`, and agree on what they mean, is asserted against
+  PostgreSQL, MariaDB and SQLite in the integration suite; SQLite only
+  learned the two keywords in 3.23. `vector.And` / `vector.Or` already
+  dropped the zero `Filter`, which is the value-typed version of the
+  same idea — with one deliberate difference documented there: an empty
+  `vector.Or()` is *no constraint*, not `FALSE`, because that API
+  declines to express an unsatisfiable predicate at all.
+
+  The rule cuts the other way on a write, and the doc comments now say
+  so: `Delete(t).Where(nil)` used to be a nil dereference and is now a
+  DELETE with no `WHERE`. What still bounds it is the table's global
+  filters, which are merged in at render time and are unaffected by
+  what the caller passed — asserted against a live PostgreSQL with a
+  second tenant's row and a soft-deleted row in the table, since a
+  lost guard shows up as a row and not as a string difference.
+
 - **Query tagging from context (SQLCommenter).** A slow statement in
   `pg_stat_statements` or a MySQL slow log says what ran and says
   nothing about which line of application code ran it; the usual
@@ -403,6 +520,68 @@ once a 1.0 is cut.
   in general and certain to fail for a mirror, because
   `ClickHouseSink` writes NULL into every non-key column of every
   tombstone.
+- **Queue time is reported separately from query time.** A statement's
+  `Duration` has always been two measurements added together — the
+  wait for a connection from the pool and the time the database took —
+  and they have opposite remedies, so their sum tells an operator
+  which question to ask only by accident. `drops.QueryEvent` now
+  carries `WaitDuration` and `WaitKnown`, and `QueryDuration()`
+  returns the difference.
+
+  drops cannot take that measurement on its own: `drops.Driver` is
+  three methods and acquisition happens inside whatever the caller
+  plugged in. So the split arrives through an optional interface a
+  pool may implement — `pg.ConnAcquirer`, one method that checks out a
+  single connection — with `pg.QueueTimed` putting a clock around the
+  checkout and nothing else, holding the connection until `Rows.Close`
+  or `Commit`, and reporting through `drops.ReportConnWait`. A driver
+  that measures the wait internally can report it directly.
+
+  A driver that reports nothing leaves `WaitKnown` false, and every
+  consumer treats that as unknown rather than zero: `drops/otel`
+  records the new `db.client.connection.wait_time` and
+  `db.client.operation.query_time` histograms only for events that
+  carry a real measurement, because a queue-time gauge reading zero
+  because nobody was counting looks exactly like a pool under no
+  pressure. `db.client.operation.duration` still means the total.
+- **`pg.Replicated` gained a post-write delay, and read routing gained
+  teeth.** Rails' `DatabaseSelector` has two things drops did not.
+  Half of the first turned out to exist under another name —
+  `pg.WithReadYourWrites` is the window, armed by a write and checked
+  by every read on the same context — but it was armed only by
+  `Replicated.Exec`, so a write committed through `InTx`, which is how
+  most writes worth reading back are made, left it unarmed and the
+  next read went to a possibly-lagging replica. It now arms at commit,
+  for transactions that actually wrote.
+
+  The same blind spot ran deeper: a write carrying a `RETURNING` clause
+  is issued through `Query`, not `Exec` — `InsertBuilder.Scan`,
+  `UpdateBuilder.Scan` and `DeleteBuilder.Scan` all do it, and it is
+  how a generated key comes back — and `Query` is the method that
+  routes to a replica. `INSERT ... RETURNING id` was therefore sent to
+  a replica and left the window unarmed. `Replicated.Query` now routes
+  by what the statement does rather than by the method it arrived on:
+  a statement whose leading keyword writes (or a `WITH` / `EXPLAIN`
+  containing one) goes to the primary and arms the window exactly as
+  `Exec` does.
+
+  `Replicated.WithWriteDelay` is the other half: for the given
+  duration after a write, that session's reads go to the primary
+  regardless of replication position. It is the floor `WithLSNTracking`
+  lacked — a caught-up replay position proves the row just written is
+  there and says nothing about what else the write set in motion — and
+  it widens a caller's window when it is longer, while leaving a
+  window explicitly cleared with `d=0` cleared.
+
+  `DB.InReadTx` makes "this only reads" enforced rather than assumed,
+  by the one party that can enforce it: PostgreSQL refuses writes
+  inside a read-only transaction with SQLSTATE 25006. `drops.Driver`
+  cannot ask for one — `Begin` takes a context and nothing else — so
+  drops issues `SET TRANSACTION READ ONLY` as the transaction's first
+  statement, and `pg.ReadOnlyBeginner` is the one-method extension a
+  driver can implement to save the round trip. When neither works the
+  call fails with `pg.ErrNotReadOnly` rather than handing back a
+  transaction that can write.
 - Smaller additions: `pg.SmallSerial`, `sqlite.Column.Asc/Desc/As`,
   `clickhouse.Bind`, `clickhouse.Table.OrderByColumns`,
   `(*Col[T]).Managed` on pg/sqlite/clickhouse.

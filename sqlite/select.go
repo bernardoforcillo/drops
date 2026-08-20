@@ -67,9 +67,11 @@ func (s *SelectBuilder) LeftJoin(t *Table, on drops.Expression) *SelectBuilder {
 	return s
 }
 
-// Where AND-s the given predicates onto the statement.
+// Where AND-s the given predicates onto the statement. Nil predicates
+// are ignored, so a caller can pass one that is only sometimes present
+// without first collecting the non-nil ones into a slice.
 func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
-	s.wheres = append(s.wheres, preds...)
+	s.wheres = append(s.wheres, dropNilPreds(preds)...)
 	return s
 }
 
@@ -108,7 +110,9 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteByte(' ')
 		j.table.writeFrom(b)
 		b.WriteString(" ON ")
-		b.Append(j.on)
+		// A nil condition is the empty conjunction, rendered where
+		// the grammar insists on a predicate.
+		b.Append(orTrue(j.on))
 	}
 	wheres := s.scope.apply(s.table, s.wheres)
 	if len(wheres) > 0 {

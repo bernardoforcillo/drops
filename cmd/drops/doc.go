@@ -9,6 +9,7 @@
 //	drops pull       Introspect a live database into a Go schema file
 //	drops baseline   Adopt an existing database: snapshot it, mark the history applied
 //	drops status     Show what is applied, what is pending and what is unaccounted for
+//	drops lint       Report query mistakes the type checker can see
 //	drops diagram    Emit a Mermaid ER diagram from a snapshot JSON
 //	drops version    Print the toolkit version
 //
@@ -57,6 +58,14 @@
 // Every command that applies anything routes its statements through
 // pg.AnalyzeMigration first and refuses the destructive ones unless
 // --allow-destructive is passed, printing what it refused.
+//
+// # Linting
+//
+// lint is the odd one out: it reads Go source rather than a schema or
+// a database. Its rules are go/analysis analyzers in the dropslint
+// package next door, so they run under golangci-lint or
+// `go vet -vettool` too; the subcommand exists because most people
+// want them without wiring a driver up. See docs/lint.md.
 //
 // Codegen helpers (bind/scan, struct introspection) live in the
 // sibling `dropsgen` binary.

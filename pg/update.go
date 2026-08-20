@@ -25,6 +25,21 @@ func (u *UpdateBuilder) Set(values ...ColumnValue) *UpdateBuilder {
 }
 
 // From adds tables to a PostgreSQL UPDATE ... FROM clause for joins.
+//
+// Each table is joined as a scoped table, not as a bare relation name:
+// its DefaultFilters and its ContextFilters are carried by the
+// statement like the target table's own. There is no ON clause to
+// choose between here — UPDATE ... FROM states its join condition in
+// the WHERE clause — so they go into the WHERE clause with everything
+// else, and none of the placement reasoning a SELECT's outer joins
+// need applies.
+//
+// Carrying them is what stops the join from deciding the write. While
+// the FROM tables went in unfiltered, "UPDATE accounts SET ... FROM
+// posts WHERE accounts.id = posts.accountId" matched against every
+// tenant's posts and every soft-deleted one, so whose rows got written
+// depended on another tenant's data. Say Unscoped() to opt the whole
+// statement out.
 func (u *UpdateBuilder) From(tables ...*Table) *UpdateBuilder {
 	u.from = append(u.from, tables...)
 	return u
@@ -42,10 +57,17 @@ func (u *UpdateBuilder) Returning(cols ...drops.Expression) *UpdateBuilder {
 	return u
 }
 
-// Unscoped opts out of the table's automatic predicates for this
-// UPDATE — both its DefaultFilter list and its ContextFilter list. Use
-// when an administrative job must bypass a soft-delete guard, or write
-// across every tenant.
+// Unscoped opts out of the automatic predicates for this UPDATE — both
+// the DefaultFilter list and the ContextFilter list, of the target
+// table and of every table named in From alike. Use when an
+// administrative job must bypass a soft-delete guard, or write across
+// every tenant.
+//
+// It is statement-wide rather than per table for the reason
+// [SelectBuilder.Unscoped] is: a flag that unscoped the target while a
+// FROM table kept its tenant axis would answer the administrative
+// UPDATE by writing a silently narrowed set of rows — neither the
+// caller's intent nor the safe refusal, and invisible in the row count.
 //
 // On an UPDATE the widening is the dangerous direction: an unscoped
 // statement does not read another tenant's rows, it writes them. Prefer
@@ -63,8 +85,10 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		sets = u.applyUpdateHooks()
 	}
 	wheres := u.wheres
-	if !u.unscoped && len(u.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), wheres...)
+	if !u.unscoped {
+		if auto := u.autoWheres(); len(auto) > 0 {
+			wheres = append(auto, wheres...)
+		}
 	}
 	b.WriteString("UPDATE ")
 	u.table.writeFrom(b)
@@ -94,6 +118,42 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" RETURNING ")
 		b.AppendList(", ", u.returning)
 	}
+}
+
+// autoWheres gathers the render-time predicates the statement carries
+// on its own account — the DefaultFilters of the target table and of
+// every table named in the FROM clause — in the order they are written,
+// ahead of the caller's own. So a statement reads scoping first, intent
+// second, and a query log shows at a glance whether a write was scoped
+// at all.
+//
+// Two things about it are load-bearing.
+//
+// The filters are taken through Table.resolveDefaultFilters rather than
+// read off Table.defaultFilters, which is what restates them against
+// the instance of the table the statement actually names. A filter is
+// an opaque tree of closures over the declared column handles, so
+// against UPDATE "notes" AS "n" a raw read renders "notes"."deletedAt"
+// — a relation the statement has no FROM entry for, and PostgreSQL
+// answers 42P01. That is not a widened write, it is a statement that
+// cannot run, which made the tables that most need their scoping the
+// ones that could not be written under an alias at all.
+//
+// The FROM tables are included because UPDATE ... FROM puts its join
+// condition in the WHERE clause: there is no ON clause here and so
+// none of the placement reasoning joinKind.filterPlacement has to do
+// for SELECT. An unfiltered FROM table therefore does not merely widen
+// a result — it lets another tenant's rows, or rows a soft delete
+// retired, decide which of this tenant's rows get written. Scoping the
+// target table alone answered that with a statement that looked
+// scoped.
+func (u *UpdateBuilder) autoWheres() []drops.Expression {
+	var out []drops.Expression
+	out = append(out, u.table.resolveDefaultFilters()...)
+	for _, t := range u.from {
+		out = append(out, t.resolveDefaultFilters()...)
+	}
+	return out
 }
 
 // applyUpdateHooks runs every UpdateHook registered on the table and
@@ -137,17 +197,39 @@ func (u *UpdateBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 }
 
 // resolveCtx returns the builder to render for one execution — this one
-// when the table has no context filters, otherwise a shallow copy whose
-// WHERE list carries the resolved predicates. The copy is what keeps
-// the same builder executable twice without accumulating a predicate
-// per run; see [SelectBuilder.resolveCtx].
+// when no table the statement names has a context filter, otherwise a
+// shallow copy whose WHERE list carries the resolved predicates. The
+// copy is what keeps the same builder executable twice without
+// accumulating a predicate per run; see [SelectBuilder.resolveCtx].
+//
+// Every table the statement names is resolved, the FROM tables
+// included, because a context filter is a property of the table and the
+// promise in tenant.go is about statements rather than about clauses.
+// The FROM table of an UPDATE ... FROM is joined through the WHERE
+// clause, so leaving its tenant axis off does not narrow a result set —
+// it lets another tenant's rows select which of this tenant's rows are
+// written, which is the read defect one grade worse.
+//
+// A filter that refuses — [TenantFilter] with no tenant on ctx — aborts
+// the whole resolution, for the FROM tables exactly as for the target.
+// A write that cannot say which tenant's rows it is joining must not be
+// sent unfiltered.
 func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) {
-	if u.unscoped || !u.table.hasContextFilters() {
+	if u.unscoped {
 		return u, nil
 	}
-	preds, err := u.table.resolveContextFilters(ctx)
+	var preds []drops.Expression
+	tp, err := u.table.resolveContextFilters(ctx)
 	if err != nil {
 		return nil, err
+	}
+	preds = append(preds, tp...)
+	for _, t := range u.from {
+		fp, err := t.resolveContextFilters(ctx)
+		if err != nil {
+			return nil, err
+		}
+		preds = append(preds, fp...)
 	}
 	if len(preds) == 0 {
 		return u, nil

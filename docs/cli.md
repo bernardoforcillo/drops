@@ -15,9 +15,14 @@ drops drift --schema ./db/schema
 ```
 
 Every command takes `-h`. Connection strings come from `--dsn`, else
-`$DROPS_PG_DSN`, else `$DATABASE_URL`; the binary carries its own
-PostgreSQL client, so there is no driver to choose and nothing to
-configure.
+`$DROPS_PG_DSN`, else `$DATABASE_URL`; the binary carries pgx, so
+there is no driver to choose and nothing to configure.
+
+`cmd/drops` is a Go module of its own, which is how it can carry a
+driver at all: drops the library has no dependencies and CI asserts
+it, so the binary that needs one lives outside that promise. See
+[the module, and what it costs](#the-module-and-what-it-costs) — one
+command, `push`, needs a driver in *your* module too.
 
 ## The convention
 
@@ -62,6 +67,11 @@ Two consequences worth knowing before you script this:
   migration directory, not your source.
 - The program is written into a temporary directory inside your module
   and removed afterwards.
+- `push` is the one mode where that program opens a database
+  connection, so it is the one command that needs
+  `github.com/jackc/pgx/v5` in your `go.mod`. It says so if it is
+  missing. `generate`, `drift` and `status --schema` compile the same
+  program without the connection and need nothing but drops.
 
 `examples/cli` in this repository is a schema package in full, with a
 foreign key, a check constraint and an index.
@@ -212,6 +222,64 @@ That is checked against a live server: the tables land in `reporting`.
 | 1 | failure — unreachable database, bad SQL, a file that would not parse |
 | 2 | the command line was wrong |
 | 3 | the command ran and the answer was no: drift found, or changes refused |
+
+## The module, and what it costs
+
+`cmd/drops` has its own `go.mod`. The library it front-ends has no
+dependencies — that is drops's stated differentiator, and the CI
+`tidy` job proves it by diffing the tree after `go mod tidy`. A binary
+that migrates a database has to open a connection, though, and for a
+year this one did it by speaking the PostgreSQL v3 wire protocol by
+hand, SCRAM-SHA-256 included, because it could not link pgx from
+inside the root module. Splitting the module deleted ~1,500 lines of
+hand-written, security-critical network code and replaced them with
+`pgx` behind `drops/stdlib`, the adapter drops already ships.
+
+Three things follow, and all three are the bill:
+
+- **`push` needs pgx in your module.** Evaluating a Go schema means
+  running Go inside *your* module, and `go run` resolves that
+  program's imports there rather than in the binary's own module. The
+  binary's pgx is not in scope for it. `drops push` therefore checks
+  first and tells you to `go get github.com/jackc/pgx/v5`; nothing
+  else the CLI does is affected.
+- **The CLI needs a newer toolchain than the library.** drops itself
+  still builds on Go 1.22. `cmd/drops` follows pgx, which requires
+  1.25.
+- **Releasing it takes an extra step.** See below.
+
+### Cutting a release
+
+A nested module carries the directory in its tag. The version of
+`github.com/bernardoforcillo/drops/cmd/drops` that corresponds to
+`v0.7.0` of the library is tagged
+
+```
+cmd/drops/v0.7.0
+```
+
+and *not* `v0.7.0` — that tag names the root module, whose contents no
+longer include the CLI. `go install …/cmd/drops@latest` finds the
+nested module's own tags and nothing else.
+
+Two things have to be true before that tag is pushed:
+
+1. **`cmd/drops/go.mod` must not contain a `replace`.** In the
+   checkout it replaces `github.com/bernardoforcillo/drops` with
+   `../../`, so the binary under test is built against the library in
+   the tree. `go install pkg@version` refuses a module whose `go.mod`
+   replaces anything — the install would fail with *"the go.mod file
+   for the module providing named packages contains one or more
+   replace directives"*. Remove the line and require the version of
+   the library you are releasing alongside it.
+2. **Tag the root module first.** The require in step 1 has to name a
+   version that exists, and `go mod tidy` has to be able to resolve it
+   to fill in `go.sum`.
+
+So: tag `v0.7.0`, swap the replace for `require
+github.com/bernardoforcillo/drops v0.7.0`, run `go mod tidy` in
+`cmd/drops`, commit, tag `cmd/drops/v0.7.0`. Then put the replace
+back for development.
 
 ## drizzle-kit interoperability
 

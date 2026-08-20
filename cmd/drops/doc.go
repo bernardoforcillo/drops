@@ -34,9 +34,17 @@
 //
 // # Connecting
 //
-// --dsn, else $DROPS_PG_DSN, else $DATABASE_URL. The binary speaks the
-// PostgreSQL v3 wire protocol itself (cmd/drops/pgwire) because drops
-// has no dependencies and so cannot link pgx.
+// --dsn, else $DROPS_PG_DSN, else $DATABASE_URL. The binary connects
+// with pgx, through the drops/stdlib adapter. It can, because cmd/drops
+// is a module of its own: the library keeps its promise of having no
+// dependencies while the CLI links the driver everyone else links.
+//
+// One command pays for that split. push has to evaluate the Go schema
+// and reach the server in the same process, and the program that
+// evaluates the schema is compiled inside your module — so push, alone,
+// needs github.com/jackc/pgx/v5 in your go.mod. It says so if it is
+// missing. generate, drift and status --schema compile the same
+// program without the connection and need nothing.
 //
 // # Exit codes
 //

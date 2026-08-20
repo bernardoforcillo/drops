@@ -65,7 +65,7 @@ func TestCheckSchemaFuncIgnoresTestFiles(t *testing.T) {
 // The generated program is the only part of drops a user never sees
 // and cannot debug, so it has to be valid Go before it is written.
 func TestRenderBridgeIsValidGo(t *testing.T) {
-	src := renderBridge("example.com/db/schema")
+	src := renderBridge("example.com/db/schema", false)
 	if strings.Contains(src, "$IMPORT$") {
 		t.Fatal("the import path placeholder survived rendering")
 	}
@@ -94,4 +94,54 @@ func parseGo(path string) error {
 	fset := token.NewFileSet()
 	_, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
 	return err
+}
+
+// push is the only mode whose generated program opens a connection,
+// and the half that does is the only part of drops that costs the
+// user's module a dependency. Leaving it out of the other modes is
+// what keeps generate working in a module that requires nothing but
+// drops.
+func TestRenderBridgeCarriesTheDriverOnlyForPush(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name    string
+		withDB  bool
+		wants   []string
+		unwants []string
+	}{
+		{
+			name:    "push",
+			withDB:  true,
+			wants:   []string{`"github.com/jackc/pgx/v5"`, `"github.com/bernardoforcillo/drops/stdlib"`, "stdlib.New(sqlDB)"},
+			unwants: nil,
+		},
+		{
+			name:    "generate",
+			withDB:  false,
+			wants:   nil,
+			unwants: []string{"pgx", "stdlib"},
+		},
+	} {
+		src := renderBridge("example.com/db/schema", tc.withDB)
+		for _, placeholder := range []string{"$IMPORT$", "$DBIMPORTS$", "$CONNECT$"} {
+			if strings.Contains(src, placeholder) {
+				t.Errorf("%s: the %s placeholder survived rendering", tc.name, placeholder)
+			}
+		}
+		for _, want := range tc.wants {
+			if !strings.Contains(src, want) {
+				t.Errorf("%s: the generated program does not contain %q:\n%s", tc.name, want, src)
+			}
+		}
+		for _, unwant := range tc.unwants {
+			if strings.Contains(src, unwant) {
+				t.Errorf("%s: the generated program mentions %q, which its module need not have:\n%s", tc.name, unwant, src)
+			}
+		}
+		path := filepath.Join(dir, tc.name+".go")
+		write(t, path, src)
+		if err := parseGo(path); err != nil {
+			t.Fatalf("%s: the generated program does not parse: %v\n%s", tc.name, err, src)
+		}
+	}
 }

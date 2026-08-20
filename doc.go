@@ -5,6 +5,16 @@
 // pgx, or your own pool) plus the building blocks for composing SQL:
 // [Expression] and [Builder].
 //
+// [SQL] is the escape hatch for the operator the DSL does not model:
+// it mixes literal SQL text with column references and with values that
+// [Arg] binds as parameters, so leaving the builder no longer means
+// leaving parameterisation with it.
+//
+// [FieldError] is the shape a constraint violation takes once a dialect
+// has translated it back into the struct field the database refused —
+// the answer to "the email is taken" that cannot be established in
+// application code without a race.
+//
 // [All] and [One] give an ad-hoc query the typing an entity query gets
 // for free: they are generic over [RowSource], the Rows method every
 // dialect's SELECT builder already has, so a join or an aggregate

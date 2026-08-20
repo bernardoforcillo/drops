@@ -12,12 +12,19 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Composite keys | ✅ | ✅ | ✅ | n/a | n/a |
 | Relations, eager loading | ✅ | partial | declaration only | — | — |
 | Keyset pagination | ✅ | ✅ | ✅ | ✅ (via mirror) | ✅ (via vector) |
-| Migrations, diff, snapshot | ✅ | ✅ | ✅ | — | — |
-| Introspection reads back | most¹ | ✅ | ✅ | — | — |
+| Migrations, diff, snapshot | ✅ | ✅ | ✅ | diff + push² | — |
+| Introspection reads back | most¹ | ✅ | ✅ | most² | — |
 | Outbox, saga, event store | ✅ | ✅ | outbox, event store | event store | — |
 | Typed driver errors, retry | ✅ | sentinels only | ✅ | — | — |
 | Audit, tenancy, authz, cache | ✅ | ✅ | — | — | — |
 | Vector search | ✅ pgvector | — | — | ✅ built-in | ✅ native |
+
+² ClickHouse has `Introspect`, `BuildSnapshot`, `Diff` and `Push` but
+no migration generator, and its `Diff` returns a plan rather than a
+list of statements — a great deal of what a ClickHouse schema change
+would mean has no `ALTER` behind it and comes back as a refusal. Column
+TTLs are the one declared thing `system.columns` cannot report, so they
+are left out of the comparison and reported as a notice.
 
 ¹ PostgreSQL introspection does not yet read back enums, sequences,
 views, RLS or policies, though the diff generator can write all of
@@ -152,6 +159,26 @@ INSERT, materialised views, and the analytics aggregates.
 There is no `UPDATE`/`DELETE` in the usual sense — mutations rewrite
 whole parts asynchronously — so the shape of a ClickHouse workload is
 append, and collapse on merge. [mirror.md](mirror.md) is built on that.
+
+`Introspect` reads a table back out of `system.tables` and
+`system.columns`, `BuildSnapshot` derives the same shape from the Go
+declaration, `Diff` puts them side by side and `Push` applies the
+result. What makes this dialect different is what `Diff` cannot emit:
+ClickHouse has no `ALTER` for a table's engine, its partitioning, its
+primary key or — beyond appending columns the same statement adds — its
+sorting key, and none for a column that takes part in any of them.
+Those come back as refusals naming the remedy, which is always a new
+table and a copy.
+
+On a `ReplacingMergeTree` the sorting key deserves the emphasis it
+gets: the engine collapses rows that share it, so the key is the
+definition of "the same row" rather than a layout choice, and changing
+it changes how many rows the table holds.
+
+`clickhouse.Analyze` grades what a plan does carry — metadata, a
+background rewrite, or a deletion with no way back. A ClickHouse
+`ALTER` returns before its work is done (`mutations_sync` defaults to
+0), so `system.mutations` is where a migration actually finishes.
 
 ## Qdrant
 

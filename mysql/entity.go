@@ -25,6 +25,12 @@ type Entity[T any] struct {
 	pks       []*Column
 	pkFields  [][]int
 	colFields []entityColField
+
+	// constraintFields maps an index or constraint name to the
+	// struct field a violation of it is reported against. Filled by
+	// MapConstraint; the names drops and MySQL generate are derived
+	// rather than stored — see (*Entity[T]).FieldError.
+	constraintFields map[string]string
 }
 
 type entityColField struct {
@@ -291,7 +297,7 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	ins.Row(e.bindings(v, false)...)
 	res, err := ins.Exec(ctx)
 	if err != nil {
-		return err
+		return e.FieldError(err)
 	}
 	e.applyGeneratedKey(v, res)
 	return nil
@@ -309,7 +315,8 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	for i := range rows {
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
-	return ins.Exec(ctx)
+	res, err := ins.Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // UpsertMany inserts rows, updating the non-key columns of any that
@@ -328,7 +335,8 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	for i := range rows {
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
-	return ins.OnDuplicateKeyUpdateAll().Exec(ctx)
+	res, err := ins.OnDuplicateKeyUpdateAll().Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // Update writes every non-key column of r to the row its key
@@ -347,7 +355,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		return ErrNoAssignments
 	}
 	_, err = db.Update(e.table).Set(sets...).Where(pred).Exec(ctx)
-	return err
+	return e.FieldError(err)
 }
 
 // Save inserts r when every key field is zero, and updates it
@@ -365,7 +373,8 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
-	return db.Delete(e.table).Where(pred).Exec(ctx)
+	res, err := db.Delete(e.table).Where(pred).Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // bindings extracts column values from a row. skipKey omits the

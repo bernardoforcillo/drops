@@ -30,13 +30,25 @@ once a 1.0 is cut.
   `baseline` refuse a `--pg-schema` other than `public`, because
   `pg.Diff` writes unqualified identifiers and would put the tables in
   whatever `search_path` points at while reporting success.
-- **`cmd/drops/pgwire`** — the CLI needs a connection and drops has no
-  dependencies, so the binary speaks the PostgreSQL v3 wire protocol
-  itself: simple and extended query, trust, cleartext, MD5 and
-  SCRAM-SHA-256 authentication, TLS, transactions and savepoints, in
-  the standard library. It implements `drops.Driver`, and its errors
-  carry SQLSTATE, so `pg.ErrUniqueViolation` and friends classify
-  through it exactly as they do through pgx.
+- **`cmd/drops` is a module of its own** — the CLI needs a connection
+  and drops has no dependencies, so the binary began by speaking the
+  PostgreSQL v3 wire protocol itself, SCRAM-SHA-256 included: ~1,500
+  lines of hand-written, security-critical network code that one
+  author wrote and nobody audited. The constraint had a better answer.
+  `cmd/drops` now has its own `go.mod`, exactly as `integration/`
+  does, and links `github.com/jackc/pgx/v5` behind `drops/stdlib` like
+  any other program; the library's promise is untouched and CI still
+  proves it. Two things follow. `go install
+  github.com/bernardoforcillo/drops/cmd/drops@latest` is unchanged,
+  but a release of the CLI is tagged `cmd/drops/vX.Y.Z` — a nested
+  module carries its directory in the tag — and the `replace` that
+  builds it against the checkout has to come out first. And `drops
+  push`, alone among the commands, needs pgx in *your* `go.mod`: it is
+  the one whose generated program opens the connection, and `go run`
+  resolves that program's imports in your module rather than in the
+  binary's. It checks, and names the `go get`. `generate`, `drift` and
+  `status --schema` compile the same program without the connection
+  and need nothing but drops.
 - **Version bands in `drops/mirror`** — `Change.Version` decides which
   of two writes to a row the mirror keeps, and a `ReplacingMergeTree`
   never revisits that decision. Two incomparable spaces were in play
@@ -129,6 +141,56 @@ once a 1.0 is cut.
 - **Bare-identifier mode on `drops.Builder`** — `BareIdents` /
   `SetBareIdents`, so DDL that defines a table can render unqualified
   column references even when they are nested inside an expression.
+- **ClickHouse introspection, snapshots, `Diff` and `Push`** —
+  `clickhouse.Introspect` reads a table's real shape out of
+  `system.tables` and `system.columns` (columns and types, the engine
+  and its parameters, the sorting, primary, partition and sampling
+  keys, the table TTL, the SETTINGS, and which columns take part in
+  which key), `BuildSnapshot` derives the same shape from a
+  `clickhouse.Schema`, `Diff` produces the statements between the two
+  and `Push` applies them. The package doc said all four were planned;
+  `drops/mirror` had meanwhile grown its own `InspectMirror` over
+  `system.columns` because the dialect offered nothing, which put the
+  hole in the load-bearing part of the library.
+
+  `Diff` returns a `Plan` rather than the `[]string` the other
+  dialects return, because ClickHouse is the dialect where a schema
+  difference does not always have a statement behind it: there is no
+  `ALTER` for a table's engine, its partitioning, its primary key or —
+  beyond appending columns the same statement adds — its sorting key,
+  and none for a column taking part in any of them. Those come back as
+  `Refusal` values naming the remedy. On a `ReplacingMergeTree` the
+  sorting key is worth the emphasis: the engine collapses rows that
+  share it, so changing it is not a schema tweak but a change to what
+  "the same row" means.
+
+  A second category is reported rather than emitted. Where
+  introspection cannot read back what a declaration says — a column
+  TTL, which `system.columns` does not report — or where the server
+  re-renders an expression in its own spelling (`ts + INTERVAL 30 DAY`
+  reads back as `ts + toIntervalDay(30)`), drops withholds the
+  statement as a `Notice` carrying the SQL rather than re-emitting it
+  on every push for ever. Settings are compared only where the
+  declaration names them, since ClickHouse materialises an engine's
+  defaults into the metadata and a live `index_granularity` nobody
+  declared is not evidence that anyone removed it.
+
+  `clickhouse.Analyze` grades the statements a plan does carry —
+  metadata, a background rewrite of every part, or a deletion with no
+  way back — and it matters more here than in the other dialects
+  because a ClickHouse `ALTER` returns before its work is done:
+  `mutations_sync` defaults to 0, so a statement the server accepted
+  may have hours of rewriting still ahead of it in `system.mutations`.
+- **`clickhouse.ClassifyTypeChange`** — whether a column's type change
+  widens, is unprovable, or is refused outright, together with the
+  type a `MODIFY COLUMN` should actually set once a live
+  `LowCardinality` wrapper is carried onto it. `drops/mirror`'s
+  `Evolver` had this analysis to itself; it now calls the dialect for
+  it and keeps only the judgements that are about mirroring — chiefly
+  that a column losing its `Nullable` is merely unprovable for a table
+  in general and certain to fail for a mirror, because
+  `ClickHouseSink` writes NULL into every non-key column of every
+  tombstone.
 - Smaller additions: `pg.SmallSerial`, `sqlite.Column.Asc/Desc/As`,
   `clickhouse.Bind`, `clickhouse.Table.OrderByColumns`,
   `(*Col[T]).Managed` on pg/sqlite/clickhouse.
@@ -143,6 +205,25 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **`clickhouse.Analyze` graded a statement by the text of its column
+  comment.** Every keyword the rules match is also an ordinary English
+  word, and the matcher read the whole statement including its
+  literals. A `MODIFY COLUMN` carrying `COMMENT 'we remove this in Q3'`
+  matched the `REMOVE` rule and came back as a metadata change that
+  "touches no data", which is the opposite of what a type change does
+  and is said reassuringly; an `ADD COLUMN` whose comment mentioned a
+  drop table raised a destructive finding and cried wolf. Literals are
+  emptied out before the rules run now.
+- **A ClickHouse column comment could escape its own string literal.**
+  `drops/clickhouse` quoted literals the way `drops/pg` does, by
+  doubling the single quote, and ClickHouse's lexer is not PostgreSQL's:
+  it reads C-style escapes inside a literal. A comment ending in a
+  backslash therefore escaped its own closing quote and ran on into the
+  rest of the statement, and a comment of `\' OR 1=1 --` left the
+  literal altogether — through `CreateTable`, through `Diff`'s
+  `COMMENT COLUMN`, and through the `MODIFY COLUMN` restatement that
+  carries a comment. A comment is the one string in a schema statement
+  that drops did not write itself. The backslash is escaped first now.
 - **`Dec` added a negated delta, so an unsigned counter climbed.** In
   all three dialects. The constraint behind `Inc`/`Dec` admits the
   unsigned types, and negating an unsigned value wraps, so

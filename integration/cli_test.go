@@ -17,9 +17,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bernardoforcillo/drops/cmd/drops/pgwire"
+	_ "github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/bernardoforcillo/drops/integration"
 	"github.com/bernardoforcillo/drops/pg"
+	"github.com/bernardoforcillo/drops/stdlib"
 )
 
 // The `drops` binary, end to end.
@@ -53,8 +55,11 @@ func cliBinary(t *testing.T) string {
 			return
 		}
 		builtCLI = filepath.Join(dir, "drops")
-		cmd := osexec.Command("go", "build", "-o", builtCLI, "./cmd/drops")
-		cmd.Dir = repoRoot(t)
+		// cmd/drops is a module of its own — the root ./... does not
+		// reach it, and it has to be built from inside its own
+		// directory or its go.mod (and its pgx) are not in scope.
+		cmd := osexec.Command("go", "build", "-o", builtCLI, ".")
+		cmd.Dir = filepath.Join(repoRoot(t), "cmd", "drops")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("go build ./cmd/drops: %v\n%s", err, out)
 		}
@@ -86,17 +91,48 @@ type project struct {
 
 // newProject creates the module, replacing drops with this checkout so
 // the generated program compiles against the code under test.
+//
+// It requires pgx as well, because `drops push` compiles a program
+// *inside this module* and that program opens the connection: the CLI
+// carries its own driver, but `go run` resolves the generated
+// program's imports here. newBareProject is the same module without
+// it, which is what most people's modules look like.
 func newProject(t *testing.T, dsn string) *project {
 	t.Helper()
+	return makeProject(t, dsn, true)
+}
+
+func newBareProject(t *testing.T, dsn string) *project {
+	t.Helper()
+	return makeProject(t, dsn, false)
+}
+
+func makeProject(t *testing.T, dsn string, withDriver bool) *project {
+	t.Helper()
 	dir := t.TempDir()
+	driver := ""
+	if withDriver {
+		driver = "\nrequire github.com/jackc/pgx/v5 v5.10.0\n"
+	}
 	writeFile(t, filepath.Join(dir, "go.mod"), fmt.Sprintf(`module dropscli.test
 
-go 1.22
+go 1.25.0
 
 require github.com/bernardoforcillo/drops v0.0.0
-
+%s
 replace github.com/bernardoforcillo/drops => %s
-`, repoRoot(t)))
+`, driver, repoRoot(t)))
+	// The generated program is built in readonly mode like any other,
+	// so pgx has to be verifiable without a network. cmd/drops has the
+	// same dependency graph this module does — drops plus pgx — so its
+	// go.sum is the one that resolves to the same versions.
+	if withDriver {
+		sum, err := os.ReadFile(filepath.Join(repoRoot(t), "cmd", "drops", "go.sum"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(dir, "go.sum"), string(sum))
+	}
 	return &project{dir: dir, dsn: dsn, t: t}
 }
 
@@ -166,11 +202,11 @@ func freshDatabase(t *testing.T) string {
 		name = name[len(name)-40:]
 	}
 	name = fmt.Sprintf("%s_%x", name, suffix)
-	admin := openWire(t, base)
+	admin := openDB(t, base)
 	ctx := context.Background()
 	// CREATE DATABASE cannot run inside a transaction block, which is
-	// also a check that the client sends a bare statement rather than
-	// wrapping it.
+	// also a check that nothing in this stack quietly wraps a
+	// statement in one.
 	if _, err := admin.Exec(ctx, `CREATE DATABASE `+quote(name)); err != nil {
 		t.Fatalf("create database: %v", err)
 	}
@@ -200,17 +236,21 @@ func quote(ident string) string {
 	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
 }
 
-// openWire connects with the CLI's own client — the same one the
-// binary under test uses, which is the point: if it cannot read the
-// database back, the test that asserts on the database says so.
-func openWire(t *testing.T, dsn string) *pg.DB {
+// openDB connects the way the binary does: pgx behind drops/stdlib.
+// Every assertion in this file is read back through it, so a pairing
+// that cannot read the database says so here rather than in one
+// confusing test.
+func openDB(t *testing.T, dsn string) *pg.DB {
 	t.Helper()
-	conn, err := pgwire.Connect(context.Background(), dsn)
+	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
-		t.Fatalf("pgwire.Connect: %v", err)
+		t.Fatalf("open %s: %v", dsn, err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
-	return pg.New(conn)
+	if err := sqlDB.PingContext(context.Background()); err != nil {
+		t.Fatalf("connect to %s: %v", dsn, err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	return pg.New(stdlib.New(sqlDB))
 }
 
 // columnsOf reads a table's columns straight from the catalogue.
@@ -260,121 +300,176 @@ func scalar(t *testing.T, db *pg.DB, query string, args ...any) string {
 }
 
 // ----------------------------------------------------------------------
-// The wire client
+// The connection the binary opens
 // ----------------------------------------------------------------------
 
-func TestWireClientRoundTrips(t *testing.T) {
-	db := openWire(t, integration.DSN(t, integration.EnvPostgres))
-	ctx := context.Background()
-	if err := db.Ping(ctx); err != nil {
-		t.Fatalf("ping: %v", err)
-	}
-	rows, err := db.Query(ctx,
-		`SELECT $1::text, $2::bigint, $3::bool, null::text, $4::timestamptz`,
-		"hello", int64(42), true, "2026-08-20 07:25:46+00")
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		t.Fatal("no row")
-	}
-	var (
-		text  string
-		n     int64
-		flag  bool
-		null  sql.NullString
-		stamp sql.NullString
-	)
-	if err := rows.Scan(&text, &n, &flag, &null, &stamp); err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	if text != "hello" || n != 42 || !flag || null.Valid || !stamp.Valid {
-		t.Fatalf("row = %q %d %v %+v %+v", text, n, flag, null, stamp)
-	}
-}
-
-// A failed statement must leave the connection usable: the migrator
-// runs several statements per connection and the next one has to be
-// able to speak.
-func TestWireClientRecoversFromAnError(t *testing.T) {
-	db := openWire(t, integration.DSN(t, integration.EnvPostgres))
-	ctx := context.Background()
-	_, err := db.Exec(ctx, `SELECT * FROM a_table_that_is_not_there`)
-	if err == nil {
-		t.Fatal("selecting from a missing table succeeded")
-	}
-	// drops classifies by SQLSTATE, which only works if the driver
-	// exposes one.
-	if !errorIs(err, pg.ErrUndefinedTable) {
-		t.Errorf("error did not carry SQLSTATE 42P01: %v", err)
-	}
-	if got := scalar(t, db, `SELECT 'still here'::text`); got != "still here" {
-		t.Fatalf("the connection was unusable after an error: %q", got)
-	}
-}
-
-// Which constraint fired is the part of a violation an application
-// acts on — one table has several uniques, and "duplicate key" alone
-// does not say which field to complain about. pg reads it through an
-// errors.As for ConstraintName, so the driver has to carry it.
-func TestWireClientCarriesTheConstraintName(t *testing.T) {
-	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
-	ctx := context.Background()
-	if _, err := db.Exec(ctx, `CREATE TABLE people (
-		email text NOT NULL CONSTRAINT people_email_uq UNIQUE,
-		handle text NOT NULL CONSTRAINT people_handle_uq UNIQUE)`); err != nil {
+// writeMigrationSet writes a one-entry drizzle journal and its SQL,
+// which is all `drops migrate` reads.
+func writeMigrationSet(t *testing.T, p *project, tag, body string) {
+	t.Helper()
+	dir := filepath.Join(p.dir, "drizzle")
+	if err := os.MkdirAll(filepath.Join(dir, "meta"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO people VALUES ('a@b', 'one')`); err != nil {
+	writeFile(t, filepath.Join(dir, tag+".sql"), body)
+	writeFile(t, filepath.Join(dir, "meta", "_journal.json"), fmt.Sprintf(`{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {"idx": 0, "version": "7", "when": 1700000000000, "tag": %q, "breakpoints": true}
+  ]
+}`, tag))
+}
+
+// Which constraint fired is the part of a violation an operator acts
+// on: a table has several uniques, and "duplicate key" alone does not
+// say which one to go and look at.
+//
+// The wire client this replaced carried the name through a
+// ConstraintName method. pgx carries it as a struct field instead, and
+// drops/pg reads that by reflection — so the port needs no adapter
+// between the two, and this is the test that says so rather than
+// assuming it. It asserts on the classified form,
+// "SQLSTATE 23505 (people_email_uq)", because the server's own message
+// carries the name as well: an assertion that only looked for the name
+// would pass with the classification gone entirely.
+func TestCLIFailedMigrationNamesTheConstraint(t *testing.T) {
+	dsn := freshDatabase(t)
+	db := openDB(t, dsn)
+	ctx := context.Background()
+	if _, err := db.Exec(ctx, `CREATE TABLE people (email text NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	_, err := db.Exec(ctx, `INSERT INTO people VALUES ('c@d', 'one')`)
-	if !errorIs(err, pg.ErrUniqueViolation) {
-		t.Fatalf("a duplicate handle did not classify as a unique violation: %v", err)
+	if _, err := db.Exec(ctx, `INSERT INTO people VALUES ('a@b'), ('a@b')`); err != nil {
+		t.Fatal(err)
 	}
-	var pgErr *pg.PgError
-	if !errors.As(err, &pgErr) {
-		t.Fatalf("the error is not a *pg.PgError: %v", err)
+
+	p := newBareProject(t, dsn)
+	writeMigrationSet(t, p, "0000_unique_email",
+		`ALTER TABLE "people" ADD CONSTRAINT "people_email_uq" UNIQUE ("email");`)
+
+	stdout, stderr, code := p.run("migrate")
+	if code != 1 {
+		t.Fatalf("migrate exited %d, want 1\n%s%s", code, stdout, stderr)
 	}
-	if pgErr.Constraint != "people_handle_uq" {
-		t.Errorf("constraint = %q, want people_handle_uq — the violation does not say which unique it was", pgErr.Constraint)
+	out := stdout + stderr
+	for _, want := range []string{"23505", "(people_email_uq)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the failure does not report %s — the constraint name did not survive the driver:\n%s", want, out)
+		}
 	}
 }
 
-// A rolled-back transaction has to leave nothing behind, which is what
-// makes a failed push safe.
-func TestWireClientTransactionsRollBack(t *testing.T) {
+// A migration is one transaction. If its second statement is rejected
+// the first must not survive, or a failed migrate leaves a database no
+// re-run can fix.
+func TestCLIFailedMigrationRollsBack(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
-	ctx := context.Background()
-	err := db.InTx(ctx, func(tx *pg.DB) error {
-		if _, err := tx.Exec(ctx, `CREATE TABLE rolled_back (id int)`); err != nil {
-			return err
-		}
-		return fmt.Errorf("changed my mind")
-	})
-	if err == nil {
-		t.Fatal("InTx returned nil for a function that failed")
+	db := openDB(t, dsn)
+	p := newBareProject(t, dsn)
+	writeMigrationSet(t, p, "0000_half_applied", `CREATE TABLE "half_applied" ("id" bigint);
+--> statement-breakpoint
+CREATE TABLE "half_applied" ("id" bigint);
+`)
+	stdout, stderr, code := p.run("migrate")
+	if code != 1 {
+		t.Fatalf("migrate exited %d, want 1\n%s%s", code, stdout, stderr)
 	}
-	if tableExists(t, db, "rolled_back") {
-		t.Fatal("the table created in a rolled-back transaction is still there")
+	if tableExists(t, db, "half_applied") {
+		t.Fatal("the table created before the failing statement is still there: the migration did not roll back")
 	}
 }
 
-func errorIs(err error, target error) bool {
-	for e := err; e != nil; {
-		if is, ok := e.(interface{ Is(error) bool }); ok && is.Is(target) {
-			return true
-		}
-		u, ok := e.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		e = u.Unwrap()
+// Ctrl-C has to reach the server. The CLI cancels its context, which
+// cancels the statement and rolls back the transaction around it — an
+// operator who interrupts a migration and is left with half of it
+// applied has been failed twice.
+func TestCLIInterruptRollsBackTheMigrationInFlight(t *testing.T) {
+	dsn := freshDatabase(t)
+	db := openDB(t, dsn)
+	p := newBareProject(t, dsn)
+	writeMigrationSet(t, p, "0000_slow", `CREATE TABLE "interrupted" ("id" bigint);
+--> statement-breakpoint
+SELECT pg_sleep(60);
+`)
+	cmd := osexec.Command(cliBinary(t), "migrate")
+	cmd.Dir = p.dir
+	cmd.Env = append(os.Environ(), "DROPS_PG_DSN="+p.dsn)
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting the CLI: %v", err)
 	}
-	return false
+	// Long enough for the process to have reached pg_sleep, short
+	// enough that the test is not the slow part of the suite.
+	time.Sleep(3 * time.Second)
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("interrupting the CLI: %v", err)
+	}
+	start := time.Now()
+	err := cmd.Wait()
+	if err == nil {
+		t.Fatalf("the interrupted migration reported success:\n%s", out.String())
+	}
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Fatalf("the CLI took %s to give up after Ctrl-C:\n%s", elapsed, out.String())
+	}
+	// The rollback on its own proves nothing about this binary. A
+	// process that takes the default disposition for SIGINT dies
+	// where it stands, its socket closes, and the server rolls the
+	// open transaction back without being asked — so the table is
+	// gone either way. What says the signal was *handled* is that the
+	// process chose its own exit: code 1, the documented failure
+	// code, and a line saying why.
+	exit, ok := err.(*osexec.ExitError)
+	if !ok || !exit.Exited() {
+		t.Fatalf("the CLI was killed by the signal instead of handling it (%v): Ctrl-C never reached the migration\n%s", err, out.String())
+	}
+	if exit.ExitCode() != 1 {
+		t.Fatalf("the interrupted migration exited %d, want 1\n%s", exit.ExitCode(), out.String())
+	}
+	if !strings.Contains(out.String(), "drops: interrupted") {
+		t.Errorf("the CLI gave no sign it had been interrupted:\n%s", out.String())
+	}
+	if tableExists(t, db, "interrupted") {
+		t.Fatal("the interrupted migration left its first statement applied")
+	}
+}
+
+// push is the one command whose work happens inside the user's module,
+// so it is the one command that needs a driver there. A module without
+// one has to be told which, and how — the alternative is a compiler
+// error inside a file the user never wrote.
+func TestCLIPushWithoutADriverSaysWhatToInstall(t *testing.T) {
+	dsn := freshDatabase(t)
+	p := newBareProject(t, dsn)
+	p.schema(schemaV1)
+
+	stdout, stderr, code := p.run("push", "--schema", "./schema")
+	if code != 1 {
+		t.Fatalf("push exited %d, want 1\n%s%s", code, stdout, stderr)
+	}
+	// The remedy alone is not enough to assert on: when the preflight
+	// is gone the compiler names the same `go get` from inside the
+	// generated file, so a test looking only for that passes while
+	// the user reads a build error about a path in a temporary
+	// directory they have never seen. The preflight's own sentence,
+	// and the absence of that directory, are what separate the two.
+	out := stdout + stderr
+	for _, want := range []string{
+		"push needs a PostgreSQL driver in the module that declares the schema",
+		"go get github.com/jackc/pgx/v5",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the failure does not mention %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, ".drops-bridge-") {
+		t.Errorf("the failure is a compiler error inside the generated program, not the preflight:\n%s", out)
+	}
+	// generate, which compiles the same program without the
+	// connection, still works in that module.
+	p.mustRun("generate", "--schema", "./schema", "--name", "init")
 }
 
 // ----------------------------------------------------------------------
@@ -410,7 +505,7 @@ func Schema() *pg.Schema { return pg.NewSchema(Users) }
 
 func TestCLIGenerateThenMigrate(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	p := newProject(t, dsn)
 	p.schema(schemaV1)
 
@@ -453,7 +548,7 @@ func TestCLIGenerateThenMigrate(t *testing.T) {
 
 func TestCLIMigrateDownNeedsPermissionAndThenWorks(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	p := newProject(t, dsn)
 	p.schema(schemaV1)
 	p.mustRun("generate", "--schema", "./schema", "--name", "init")
@@ -492,7 +587,7 @@ func TestCLIMigrateDownNeedsPermissionAndThenWorks(t *testing.T) {
 
 func TestCLIPushAppliesAndRefusesDestruction(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	p := newProject(t, dsn)
 	p.schema(`package schema
 
@@ -571,7 +666,7 @@ func Schema() *pg.Schema { return pg.NewSchema(Users) }
 
 func TestCLIDriftSeesAManualChange(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	p := newProject(t, dsn)
 	p.schema(schemaV1)
 	p.mustRun("push", "--schema", "./schema")
@@ -615,7 +710,7 @@ INSERT INTO legacy_authors (email) VALUES ('someone@example.com');
 
 func TestCLIBaselineAdoptsALiveDatabase(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	if _, err := db.Exec(context.Background(), legacyDDL); err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +742,7 @@ func TestCLIBaselineAdoptsALiveDatabase(t *testing.T) {
 // proves the file compiles.
 func TestCLIPullRoundTrips(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	if _, err := db.Exec(context.Background(), legacyDDL); err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +796,7 @@ func TestCLIPullRoundTrips(t *testing.T) {
 // the combination it cannot honour rather than misplacing the tables.
 func TestCLIRefusesToPushIntoANonPublicSchema(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	p := newProject(t, dsn)
 	p.schema(schemaV1)
 
@@ -728,7 +823,7 @@ func TestCLIRefusesToPushIntoANonPublicSchema(t *testing.T) {
 // file per entry with statement breakpoints, and no down direction.
 func TestCLIAppliesADrizzleKitMigrationSet(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	p := newProject(t, dsn)
 
 	const first = `CREATE TABLE "kit_users" (
@@ -792,7 +887,7 @@ CREATE UNIQUE INDEX "kit_users_email_idx" ON "kit_users" ("email");
 // drizzle-kit's sets.
 func TestCLIRefusesAWrappedDropColumn(t *testing.T) {
 	dsn := freshDatabase(t)
-	db := openWire(t, dsn)
+	db := openDB(t, dsn)
 	p := newProject(t, dsn)
 
 	dir := filepath.Join(p.dir, "drizzle")
@@ -958,11 +1053,17 @@ func TestCLIFailureModes(t *testing.T) {
 	}
 }
 
-// A cancelled context has to reach a blocking read, or Ctrl-C during a
-// long migration would leave the operator watching a process that has
+// A cancelled context has to reach the server, or Ctrl-C during a long
+// migration would leave the operator watching a process that has
 // stopped listening.
-func TestWireClientHonoursContextCancellation(t *testing.T) {
-	db := openWire(t, integration.DSN(t, integration.EnvPostgres))
+//
+// The lever is drops/stdlib handing the context to database/sql's
+// ExecContext, which pgx turns into a cancellation request on the
+// connection. An adapter that dropped the context would still return
+// eventually — after pg_sleep finished — which is what this test's
+// deadline is for.
+func TestCancellationReachesTheServer(t *testing.T) {
+	db := openDB(t, integration.DSN(t, integration.EnvPostgres))
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(200 * time.Millisecond)
@@ -976,10 +1077,9 @@ func TestWireClientHonoursContextCancellation(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("the cancelled query took %s to give up", elapsed)
 	}
-	// The lever is a socket deadline, so the read fails with an i/o
-	// timeout. Reporting that verbatim tells an operator who pressed
-	// Ctrl-C to go and look at their network; the error has to say
-	// what actually happened.
+	// The error has to say what actually happened. An operator who
+	// pressed Ctrl-C and is handed a network error goes and looks at
+	// the network.
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("a cancelled query reported %v, which is not a cancellation", err)
 	}

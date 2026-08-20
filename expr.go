@@ -193,8 +193,10 @@ func StringWithDialect(d Dialect, e Expression) (sql string, args []any) {
 }
 
 // Raw is an Expression containing pre-formed SQL text. Use sparingly —
-// values inside Raw are not parameter-checked; for parameterised
-// fragments, compose Param or ExprFunc instead.
+// nothing inside Raw is parameter-checked, so a value formatted into it
+// is an injection. A fragment that carries values belongs in [SQL],
+// which binds them; Param and ExprFunc remain the lower-level pieces
+// Raw was previously composed with.
 type Raw string
 
 // WriteSQL implements Expression by writing the raw SQL verbatim.

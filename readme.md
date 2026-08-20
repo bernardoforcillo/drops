@@ -251,6 +251,33 @@ differences are intentional: ClickHouse-flavoured SQL (PREWHERE,
 FINAL, SAMPLE, SETTINGS, ASOF JOIN), engine-bound tables, no
 RETURNING / ON CONFLICT / foreign keys.
 
+`clickhouse.Introspect` reads a table's real shape back out of
+`system.tables` and `system.columns` — columns and types, the engine
+and its parameters, the sorting, primary and partition keys, the TTL,
+the settings — `BuildSnapshot` derives the same from the Go
+declaration, and `Diff` puts the two side by side. `Push` applies the
+result.
+
+`Diff` returns a `Plan` where the other dialects return `[]string`,
+because ClickHouse is the dialect where a schema difference does not
+always have a statement behind it. There is no `ALTER` for a table's
+engine, its partitioning, its primary key, or — beyond appending
+columns the same statement adds — its sorting key, and none for a
+column that takes part in any of those. Those come back as `Refusal`
+values naming the remedy, which is always a new table and a copy.
+
+The sorting key is the one worth pausing on. A `ReplacingMergeTree`
+collapses rows that share it, so it is not a layout choice that
+happens to affect performance — it is the definition of "the same
+row". Changing it changes which rows are one row.
+
+`clickhouse.Analyze` grades the statements a plan does carry: metadata,
+a background rewrite of every part, or a deletion with no way back. It
+earns its place here more than elsewhere, because a ClickHouse `ALTER`
+returns before its work is done — `mutations_sync` defaults to 0 — so a
+statement the server accepted may have hours of rewriting still ahead
+of it in `system.mutations`.
+
 ### Vectors: pgvector
 
 The `pg` package speaks pgvector once the extension is installed.
@@ -910,9 +937,18 @@ drops status                                              # applied, pending, un
 ```
 
 Connection: `--dsn`, else `$DROPS_PG_DSN`, else `$DATABASE_URL`. The
-binary carries its own PostgreSQL client (`cmd/drops/pgwire`, v3 wire
-protocol, standard library only), so it links no driver and needs no
-configuration beyond the connection string.
+binary carries pgx behind `drops/stdlib`, so it needs no configuration
+beyond the connection string.
+
+It can carry a driver because `cmd/drops` is a Go module of its own,
+outside the no-dependencies promise the library keeps — `go install`
+resolves a nested module by tags that carry the directory, so a
+release is tagged `cmd/drops/v0.7.0`, not `v0.7.0`. One command,
+`push`, needs `github.com/jackc/pgx/v5` in *your* module as well: it
+is the one whose generated program opens the connection, and `go run`
+resolves that program's imports in your module rather than in the
+binary's. It says so if it is missing. See
+[docs/cli.md](docs/cli.md#the-module-and-what-it-costs).
 
 ### How the CLI reads a Go schema
 
@@ -1255,7 +1291,7 @@ drops/pg/                    Postgres schema, query builders, relations,
 drops/sqlite/                SQLite schema, query builders, entities,
                              relations, migrations, pagination, soft delete
 drops/clickhouse/            ClickHouse schema, engines, query builder,
-                             analytical aggregates
+                             analytical aggregates, introspection + push
 drops/mysql/                 MySQL / MariaDB schema, query builders, entities
 drops/qdrant/                Qdrant vector-database HTTP client
 drops/vector/                portable vector search shared by pg/CH/Qdrant
@@ -1268,8 +1304,7 @@ drops/cache/memcached/       Memcached cache backend (own ASCII client)
 drops/cache/tiered/          two-level L1+L2 read-through cache
 drops/otel/                  OpenTelemetry spans + metrics from Hook
 drops/stdlib/                database/sql adapter
-drops/cmd/drops/             the CLI: generate, migrate, push, drift, pull, baseline, status
-drops/cmd/drops/pgwire/      the CLI's PostgreSQL client — v3 wire protocol, standard library only
+drops/cmd/drops/             the CLI: generate, migrate, push, drift, pull, baseline, status (own module — links pgx)
 drops/examples/cli/          a schema package shaped the way the CLI expects
 drops/examples/sqlgen/       no-deps SQL-generation demo (pg)
 drops/examples/generate/     drizzle-kit-style migration generation demo
@@ -1314,9 +1349,23 @@ list, and each line says what it costs you.
 - No rename detection. A structural diff cannot tell `RENAME COLUMN`
   from a drop plus an add, so drops generates the destructive pair.
   `pg.AnalyzeMigration` flags it, which is a backstop, not a fix.
-- ClickHouse has no `Introspect`, `Snapshot`, `Diff` or `Push`. The
-  mirror's `Evolver` reads the live ClickHouse side for its own
-  purposes; the dialect itself cannot.
+- `clickhouse.Introspect` cannot read a column's TTL — `system.columns`
+  does not report one — so `clickhouse.Diff` leaves column TTLs out of
+  the comparison and reports a declared one as a notice rather than
+  re-emitting the same statement on every push. A table TTL the server
+  has re-spelled from its own parse tree (`ts + INTERVAL 30 DAY` reads
+  back as `ts + toIntervalDay(30)`) is withheld the same way. Neither
+  is a difference drops can settle without parsing SQL.
+- `clickhouse.Push` acts on one database per call, and the schema has
+  to agree on which: mixing `clickhouse.NewTable` with
+  `clickhouse.NewDatabaseTable` in one `Schema` is `ErrMixedDatabases`,
+  because an unqualified statement lands wherever the connection points
+  and there is no single database to read back.
+- ClickHouse settings are compared only where the declaration names
+  them. The server materialises an engine's defaults into the table's
+  metadata — every MergeTree reports `index_granularity` whether or not
+  anyone asked for it — so a live setting with no declared counterpart
+  is not evidence that it was removed, and drops never resets one.
 
 **In the type system**
 

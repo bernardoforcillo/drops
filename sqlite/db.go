@@ -168,6 +168,7 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 		drvArgs = unwrapPII(args)
 	}
 	res, err := db.drv.Exec(ctx, sql, drvArgs...)
+	err = classifyError(err)
 	if err != nil {
 		span.RecordError(err)
 	}
@@ -186,6 +187,7 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 		drvArgs = unwrapPII(args)
 	}
 	rows, err := db.drv.Query(ctx, sql, drvArgs...)
+	err = classifyError(err)
 	if err != nil {
 		span.RecordError(err)
 	}

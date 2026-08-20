@@ -46,6 +46,11 @@ import (
 // SoftDelete, …) registered on the table fire normally because every
 // operation routes through the underlying Insert / Update / Delete
 // builders.
+//
+// The write paths return a constraint violation as a
+// [drops.FieldError] naming the struct field the database refused —
+// see [Entity.FieldError] for the mapping and [Entity.MapConstraint]
+// for the constraints whose names do not follow from the table.
 type Entity[T any] struct {
 	table *Table
 
@@ -58,8 +63,15 @@ type Entity[T any] struct {
 	pks      []*Column
 	pkFields [][]int
 
-	colFields    []entityColField // columns that map to a struct field
-	validators   []Validator[T]
+	colFields  []entityColField // columns that map to a struct field
+	validators []Validator[T]
+
+	// constraintFields maps a database constraint name to the
+	// struct field a violation of it is reported against. Filled by
+	// MapConstraint; the conventional names PostgreSQL generates
+	// are derived rather than stored — see (*Entity[T]).FieldError.
+	constraintFields map[string]string
+
 	versionCol   *Column // optimistic-locking version column, nil if none
 	versionField []int   // field path on T for the version value
 
@@ -568,7 +580,8 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		v := reflect.ValueOf(&rs[i]).Elem()
 		ins.Row(e.collectInsertBindings(v)...)
 	}
-	return ins.Exec(ctx)
+	res, err := ins.Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // UpsertMany INSERTs rs and, on PK conflict, updates every non-PK
@@ -603,7 +616,8 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		}
 		cu = cu.Set(&exprBinding{col: cf.col, expr: Excluded(cf.col)})
 	}
-	return cu.Done().Exec(ctx)
+	res, err := cu.Done().Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // EntityQuery is the typed counterpart of FindBuilder — same shape,
@@ -690,7 +704,7 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 		err = doCreate(db)
 	}
 	if err != nil {
-		return err
+		return e.FieldError(err)
 	}
 	if e.cache != nil {
 		// Populate the PK cache with the freshly-inserted row so the
@@ -792,7 +806,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if err == nil && e.cache != nil {
 		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
-	return err
+	return e.FieldError(err)
 }
 
 // Save inserts r if its primary-key field is the zero value, or
@@ -848,7 +862,7 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err == nil {
 		e.invalidatePK(ctx, key)
 	}
-	return res, err
+	return res, e.FieldError(err)
 }
 
 // auditKey renders a key for the audit trail's single rowID column.

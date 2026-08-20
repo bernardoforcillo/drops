@@ -1,200 +1,40 @@
 package clickhouse
 
 import (
-	"fmt"
+	"errors"
 	"reflect"
-	"strings"
-	"sync"
 
 	"github.com/bernardoforcillo/drops"
 )
 
-// scanAll consumes rows into dest (pointer to slice of struct or
-// *struct). Mapping rules identical to drops/pg:
+// scanAll consumes rows into dest (a pointer to a slice of struct,
+// *struct or scalar), and scanOne the first row into a pointer to a
+// struct or scalar. Both are [drops.ScanAll] and [drops.ScanOne]: this
+// package used to carry a copy of the reflection walk, and a copy of a
+// mapping rule is a rule that drifts. It had — like the pg copy it was
+// derived from — stopped walking anonymous fields of unexported struct
+// types, so a row type embedding an unexported struct lost every
+// promoted field with no error to show for it, and it resolved a name
+// claimed by two fields by whichever the walk reached last, making the
+// destination's declaration order part of the query's meaning.
 //
-//  1. `drop:"name"` tag if present; "-" to skip
-//  2. exact field-name match
-//  3. snake_case of the field name
-//
-// Unmatched columns scan into a discard sink.
-func scanAll(rows drops.Rows, dest any) error {
-	defer rows.Close()
-	rv := reflect.ValueOf(dest)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return fmt.Errorf("drops/clickhouse: All requires a non-nil pointer to slice, got %T", dest)
-	}
-	slice := rv.Elem()
-	if slice.Kind() != reflect.Slice {
-		return fmt.Errorf("drops/clickhouse: All requires a pointer to slice, got *%s", slice.Kind())
-	}
-	elemType := slice.Type().Elem()
-	isPtr := elemType.Kind() == reflect.Ptr
-	structType := elemType
-	if isPtr {
-		structType = elemType.Elem()
-	}
-	if structType.Kind() != reflect.Struct {
-		return fmt.Errorf("drops/clickhouse: slice element must be struct or *struct, got %s", structType.Kind())
-	}
-	cols, err := rows.Columns()
-	if err != nil {
-		return err
-	}
-	fields := fieldMap(structType)
-	for rows.Next() {
-		ptr := reflect.New(structType)
-		if err := scanRowInto(rows, ptr.Elem(), cols, fields); err != nil {
-			return err
-		}
-		if isPtr {
-			slice.Set(reflect.Append(slice, ptr))
-		} else {
-			slice.Set(reflect.Append(slice, ptr.Elem()))
-		}
-	}
-	return rows.Err()
-}
+// Unmatched columns still scan into a discard sink; the root scanner is
+// no stricter about the width of a result set than this one was.
+func scanAll(rows drops.Rows, dest any) error { return drops.ScanAll(rows, dest) }
 
-// scanOne consumes the first row into dest (pointer to struct).
+// scanOne returns ErrNoRows — the clickhouse spelling — where the root
+// scanner returns [drops.ErrNoRows], so callers that test the package
+// sentinel keep working.
 func scanOne(rows drops.Rows, dest any) error {
-	defer rows.Close()
-	rv := reflect.ValueOf(dest)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return fmt.Errorf("drops/clickhouse: One requires a non-nil pointer to struct, got %T", dest)
-	}
-	elem := rv.Elem()
-	scalar := drops.IsScalarDest(elem.Type())
-	if !scalar && elem.Kind() != reflect.Struct {
-		return fmt.Errorf("drops/clickhouse: One requires a pointer to struct or to a scalar, got *%s", elem.Kind())
-	}
-	cols, err := rows.Columns()
-	if err != nil {
-		return err
-	}
-	if scalar && len(cols) > 1 {
-		return fmt.Errorf("drops/clickhouse: One into *%s needs a single-column result, got %d columns %v",
-			elem.Type(), len(cols), cols)
-	}
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return err
-		}
+	err := drops.ScanOne(rows, dest)
+	if errors.Is(err, drops.ErrNoRows) {
 		return ErrNoRows
 	}
-	if scalar {
-		if err := rows.Scan(dest); err != nil {
-			return err
-		}
-		return rows.Err()
-	}
-	if err := scanRowInto(rows, elem, cols, fieldMap(elem.Type())); err != nil {
-		return err
-	}
-	return rows.Err()
+	return err
 }
 
-func scanRowInto(rows drops.Rows, structVal reflect.Value, cols []string, fields map[string][]int) error {
-	targets := make([]any, len(cols))
-	var discard any
-	for i, c := range cols {
-		idx, ok := fields[c]
-		if !ok {
-			targets[i] = &discard
-			continue
-		}
-		targets[i] = structVal.FieldByIndex(idx).Addr().Interface()
-	}
-	return rows.Scan(targets...)
-}
-
-var fieldMapCache sync.Map // map[reflect.Type]map[string][]int
-
-func fieldMap(t reflect.Type) map[string][]int {
-	if v, ok := fieldMapCache.Load(t); ok {
-		return v.(map[string][]int)
-	}
-	m := map[string][]int{}
-	var walk func(reflect.Type, []int)
-	walk = func(t reflect.Type, prefix []int) {
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if !f.IsExported() {
-				continue
-			}
-			idx := append(append([]int(nil), prefix...), i)
-			tag := f.Tag.Get("drop")
-			if tag == "-" {
-				continue
-			}
-			if tag != "" {
-				name := tag
-				if j := strings.IndexByte(tag, ','); j >= 0 {
-					name = tag[:j]
-				}
-				m[name] = idx
-				continue
-			}
-			if f.Anonymous && f.Type.Kind() == reflect.Struct {
-				walk(f.Type, idx)
-				continue
-			}
-			m[f.Name] = idx
-			m[camelCase(f.Name)] = idx
-		}
-	}
-	walk(t, nil)
-	fieldMapCache.Store(t, m)
-	return m
-}
-
-// camelCase converts PascalCase to camelCase. Used as the fallback
-// column-name match for untagged struct fields:
-//
-//	"UserID"     → "userId"
-//	"HTTPStatus" → "httpStatus"
-func camelCase(s string) string {
-	if s == "" {
-		return ""
-	}
-	type word struct{ start, end int }
-	var words []word
-	startW := 0
-	for i := 1; i < len(s); i++ {
-		c := s[i]
-		isUpper := c >= 'A' && c <= 'Z'
-		if isUpper {
-			prev := s[i-1]
-			prevLower := prev >= 'a' && prev <= 'z'
-			nextLower := i+1 < len(s) && s[i+1] >= 'a' && s[i+1] <= 'z'
-			if prevLower || nextLower {
-				words = append(words, word{startW, i})
-				startW = i
-			}
-		}
-	}
-	words = append(words, word{startW, len(s)})
-
-	var b strings.Builder
-	b.Grow(len(s))
-	for wi, w := range words {
-		if wi == 0 {
-			for i := w.start; i < w.end; i++ {
-				c := s[i]
-				if c >= 'A' && c <= 'Z' {
-					c += 'a' - 'A'
-				}
-				b.WriteByte(c)
-			}
-			continue
-		}
-		b.WriteByte(s[w.start]) // already uppercase
-		for i := w.start + 1; i < w.end; i++ {
-			c := s[i]
-			if c >= 'A' && c <= 'Z' {
-				c += 'a' - 'A'
-			}
-			b.WriteByte(c)
-		}
-	}
-	return b.String()
-}
+// fieldMap is the column→field index map, shared with the scanner so
+// that the entity layer binds its keys to the same field a SELECT would
+// scan into. Divergence here is invisible to any test that writes and
+// reads through the same struct.
+func fieldMap(t reflect.Type) map[string][]int { return drops.StructFields(t) }

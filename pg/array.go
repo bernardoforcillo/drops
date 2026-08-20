@@ -17,61 +17,59 @@ func ArrayOverlaps(a, b any) drops.Expression { return binOp(a, "&&", b) }
 func ArrayConcat(a, b any) drops.Expression { return binOp(a, "||", b) }
 
 // Any renders <value> = ANY(<array>).
+//
+// The array operand is held rather than closed over, so it may be a
+// statement — Any(col, Subquery(sel)) — and is scoped as one. That is
+// the same treatment AnySub gives its subquery, and the reason the two
+// spellings no longer disagree about the tenant axis. See opExpr.
 func Any(value, array any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, value)
-		b.WriteString(" = ANY(")
-		writeOperand(b, array)
-		b.WriteString("))")
-	})
+	return &opExpr{
+		parts:    []string{"(", " = ANY(", "))"},
+		operands: []drops.Expression{operandExpr(value), operandExpr(array)},
+	}
 }
 
-// All renders <value> = ALL(<array>).
+// All renders <value> = ALL(<array>). Its operands are held and scoped
+// exactly as [Any]'s are.
 func All(value, array any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, value)
-		b.WriteString(" = ALL(")
-		writeOperand(b, array)
-		b.WriteString("))")
-	})
+	return &opExpr{
+		parts:    []string{"(", " = ALL(", "))"},
+		operands: []drops.Expression{operandExpr(value), operandExpr(array)},
+	}
 }
 
 // Aggregate / constructor / inspection functions ----------------------
+//
+// These render through funcExpr rather than funcCall: identical text,
+// but the arguments are held in a node the resolver walk can reach, so
+// array_agg((SELECT ...)) over a scoped table carries that table's
+// context filters. funcCall — pg/strings.go — still closes over its
+// arguments and every helper built on it has the leak opExpr describes.
 
-func ArrayAgg(e any) drops.Expression           { return funcCall("array_agg", []any{e}) }
-func ArrayLength(arr, dim any) drops.Expression { return funcCall("array_length", []any{arr, dim}) }
-func ArrayUpper(arr, dim any) drops.Expression  { return funcCall("array_upper", []any{arr, dim}) }
-func ArrayLower(arr, dim any) drops.Expression  { return funcCall("array_lower", []any{arr, dim}) }
-func ArrayAppend(arr, v any) drops.Expression   { return funcCall("array_append", []any{arr, v}) }
-func ArrayPrepend(v, arr any) drops.Expression  { return funcCall("array_prepend", []any{v, arr}) }
-func ArrayRemove(arr, v any) drops.Expression   { return funcCall("array_remove", []any{arr, v}) }
+func ArrayAgg(e any) drops.Expression           { return funcExpr("array_agg", []any{e}) }
+func ArrayLength(arr, dim any) drops.Expression { return funcExpr("array_length", []any{arr, dim}) }
+func ArrayUpper(arr, dim any) drops.Expression  { return funcExpr("array_upper", []any{arr, dim}) }
+func ArrayLower(arr, dim any) drops.Expression  { return funcExpr("array_lower", []any{arr, dim}) }
+func ArrayAppend(arr, v any) drops.Expression   { return funcExpr("array_append", []any{arr, v}) }
+func ArrayPrepend(v, arr any) drops.Expression  { return funcExpr("array_prepend", []any{v, arr}) }
+func ArrayRemove(arr, v any) drops.Expression   { return funcExpr("array_remove", []any{arr, v}) }
 func ArrayReplace(arr, oldV, newV any) drops.Expression {
-	return funcCall("array_replace", []any{arr, oldV, newV})
+	return funcExpr("array_replace", []any{arr, oldV, newV})
 }
-func ArrayPosition(arr, v any) drops.Expression  { return funcCall("array_position", []any{arr, v}) }
-func ArrayPositions(arr, v any) drops.Expression { return funcCall("array_positions", []any{arr, v}) }
+func ArrayPosition(arr, v any) drops.Expression  { return funcExpr("array_position", []any{arr, v}) }
+func ArrayPositions(arr, v any) drops.Expression { return funcExpr("array_positions", []any{arr, v}) }
 func ArrayToString(arr, sep any) drops.Expression {
-	return funcCall("array_to_string", []any{arr, sep})
+	return funcExpr("array_to_string", []any{arr, sep})
 }
 func StringToArray(str, sep any) drops.Expression {
-	return funcCall("string_to_array", []any{str, sep})
+	return funcExpr("string_to_array", []any{str, sep})
 }
-func Cardinality(arr any) drops.Expression { return funcCall("cardinality", []any{arr}) }
-func Unnest(arr any) drops.Expression      { return funcCall("unnest", []any{arr}) }
+func Cardinality(arr any) drops.Expression { return funcExpr("cardinality", []any{arr}) }
+func Unnest(arr any) drops.Expression      { return funcExpr("unnest", []any{arr}) }
 
 // ArrayLit renders an ARRAY[...] literal. Values may be expressions or
-// Go values (bound as params).
+// Go values (bound as params), and each is held rather than closed
+// over, so a statement among them is scoped as one.
 func ArrayLit(values ...any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("ARRAY[")
-		for i, v := range values {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			writeOperand(b, v)
-		}
-		b.WriteByte(']')
-	})
+	return listOp("ARRAY[", ", ", "]", operandExprs(values))
 }

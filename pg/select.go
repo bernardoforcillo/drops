@@ -400,8 +400,24 @@ func (s *SelectBuilder) ExceptAll(other *SelectBuilder) *SelectBuilder {
 	return s
 }
 
-// WriteSQL renders the SELECT into a Builder. Wrapped in parentheses so
-// the same builder can be embedded as a subquery.
+// WriteSQL renders the SELECT into a Builder bare — no parentheses of
+// its own — and with no ctx to resolve against, so the FROM table's
+// DefaultFilters are written and its ContextFilters are not.
+//
+// This sentence used to claim the opposite, that the statement was
+// wrapped so the builder could be embedded as a subquery. It never
+// was, and it is the sentence a reader consults when deciding whether
+// to wrap: Eq(col, sel) rendered "= SELECT ..." and FromExpr(sel)
+// rendered "FROM SELECT ...", both of which PostgreSQL rejects with
+// 42601. Wrapping here instead would have parenthesised every
+// statement this package renders, top-level ones included, so the
+// wrappers stay explicit: [Subquery] for a scalar operand,
+// [SelectBuilder.AsSubquery] for an aliased FROM source, [Exists] and
+// [In] for the shapes that bring their own parentheses.
+//
+// Rendering is not how a statement gets its context filters — see
+// [SelectBuilder.ToSQLCtx] and resolveCtx, which resolve them against
+// a ctx and hand this method an already-scoped builder.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 	ctes, recursive := s.hoistCTEs()
 	writeCTEs(b, ctes, recursive)
@@ -1003,14 +1019,65 @@ func writeAnd(b *drops.Builder, preds []drops.Expression) {
 		if i > 0 {
 			b.WriteString(" AND ")
 		}
-		if bracket && escapesConjunct(p) {
-			b.WriteByte('(')
-			b.Append(p)
-			b.WriteByte(')')
+		if bracket {
+			writeConjunct(b, p)
 			continue
 		}
 		b.Append(p)
 	}
+}
+
+// writeConjunct writes p bracketed when leaving it bare would let it
+// reach past its own position, and as the caller wrote it otherwise.
+func writeConjunct(b *drops.Builder, p drops.Expression) {
+	if escapesConjunct(p) {
+		b.WriteByte('(')
+		b.Append(p)
+		b.WriteByte(')')
+		return
+	}
+	b.Append(p)
+}
+
+// bracketConjunct returns p parenthesised when leaving it bare in a
+// conjunction would let it reach past its own position, and p itself
+// otherwise. It is writeConjunct's decision, taken once when the
+// expression is built rather than each time it is rendered.
+//
+// And, Or and Not take it, because a connective is a clause in
+// miniature and used to join its operands with a bare separator:
+// And(drops.Raw("a OR b"), guard) reassociated to "a OR (b AND guard)"
+// precisely as the WHERE clause did before writeAnd bracketed anything,
+// which left the tenant guard in the statement binding nothing. Not was
+// worse — NOT binds tighter than every connective a caller can put
+// inside it, so Not(drops.Raw("a OR b")) rendered "(NOT a OR b)", which
+// negates half of what the caller wrote.
+//
+// Deciding at construction rather than at render is what keeps a
+// predicate tree affordable. The check reads the operand's rendered
+// text, so a nested tree checked at render time would render each
+// subtree once per level, per render, and a predicate built from user
+// input a dozen combinators deep would cost more to bracket than to
+// execute. The answer cannot change afterwards: it depends on the
+// operand's shape, and the only thing resolution substitutes is a
+// scoped copy of a statement — which adds bracketed conjuncts inside a
+// SELECT and so can neither introduce a top-level OR nor unbalance a
+// parenthesis.
+func bracketConjunct(p drops.Expression) drops.Expression {
+	if escapesConjunct(p) {
+		return parens(p)
+	}
+	return p
+}
+
+// bracketConjuncts applies bracketConjunct to a whole list, into a new
+// slice so the caller's variadic backing array is not written through.
+func bracketConjuncts(preds []drops.Expression) []drops.Expression {
+	out := make([]drops.Expression, len(preds))
+	for i, p := range preds {
+		out[i] = bracketConjunct(p)
+	}
+	return out
 }
 
 // escapesConjunct reports whether p, written bare between two " AND "s,
@@ -1133,10 +1200,10 @@ func identByte(sql string, i int) bool {
 //
 // The result keeps this builder rather than closing over it, so a
 // statement that embeds it resolves it against the executing ctx like
-// any other subquery — see subExpr. Rendered through [SelectBuilder.ToSQL],
+// any other subquery — see opExpr. Rendered through [SelectBuilder.ToSQL],
 // where there is no ctx to resolve against, it still carries the FROM
 // table's DefaultFilters and none of its context filters; that is what
 // ToSQL means and why ToSQLCtx is the call to assert on.
 func (s *SelectBuilder) AsSubquery(alias string) drops.Expression {
-	return &subExpr{open: "(", inner: s, close: ")", alias: alias}
+	return &opExpr{parts: []string{"(", ")"}, operands: []drops.Expression{s}, alias: alias}
 }

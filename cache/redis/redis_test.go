@@ -29,6 +29,7 @@ type fakeRedis struct {
 	authPass string
 	conns    []net.Conn // tracked so tests can force-close from the server side
 	cmds     []string   // every command name seen, lowercase
+	bogus    int        // replies to mangle, decremented per use
 }
 
 type fakeEntry struct {
@@ -38,7 +39,7 @@ type fakeEntry struct {
 
 func newFakeRedis(t *testing.T) *fakeRedis {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -111,6 +112,33 @@ func (fr *fakeRedis) cmdCount(name string) int {
 	return n
 }
 
+// mangleNext makes the next n GET / MGET replies malformed so tests can
+// drive the client's protocol-error handling.
+func (fr *fakeRedis) mangleNext(n int) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	fr.bogus = n
+}
+
+// takeBogus reports whether this reply should be mangled, consuming one
+// of the budget set by mangleNext.
+func (fr *fakeRedis) takeBogus() bool {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if fr.bogus == 0 {
+		return false
+	}
+	fr.bogus--
+	return true
+}
+
+// connCount reports how many connections the server has accepted.
+func (fr *fakeRedis) connCount() int {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	return len(fr.conns)
+}
+
 // cmdLog returns the full ordered list of dispatched commands. Useful
 // for assertion error messages.
 func (fr *fakeRedis) cmdLog() []string {
@@ -146,6 +174,12 @@ func (fr *fakeRedis) dispatch(w *bufio.Writer, args [][]byte) {
 	case "SELECT":
 		writeSimple(w, "OK")
 	case "GET":
+		if fr.takeBogus() {
+			// A reply the client's parser cannot make sense of, of the
+			// kind a RESP3 push or a half-written buffer produces.
+			_, _ = w.WriteString("?bogus\r\n")
+			return
+		}
 		fr.mu.Lock()
 		e, ok := fr.data[string(args[1])]
 		expired := ok && !e.expiresAt.IsZero() && time.Now().After(e.expiresAt)
@@ -167,6 +201,10 @@ func (fr *fakeRedis) dispatch(w *bufio.Writer, args [][]byte) {
 			switch strings.ToUpper(string(args[i])) {
 			case "PX":
 				n, _ := strconv.Atoi(string(args[i+1]))
+				if n <= 0 {
+					writeError(w, "ERR invalid expire time in 'set' command")
+					return
+				}
 				ttl = time.Duration(n) * time.Millisecond
 			case "EX":
 				n, _ := strconv.Atoi(string(args[i+1]))
@@ -218,6 +256,15 @@ func (fr *fakeRedis) dispatch(w *bufio.Writer, args [][]byte) {
 			writeInt(w, ms)
 		}
 	case "MGET":
+		if fr.takeBogus() {
+			// One element more than the client asked for — what a
+			// desynchronised stream hands back.
+			fmt.Fprintf(w, "*%d\r\n", len(args))
+			for i := 0; i < len(args); i++ {
+				writeBulk(w, []byte("x"))
+			}
+			return
+		}
 		fmt.Fprintf(w, "*%d\r\n", len(args)-1)
 		fr.mu.Lock()
 		for _, k := range args[1:] {
@@ -490,5 +537,63 @@ func TestRedisEmptyKeyRejected(t *testing.T) {
 	c := newRedis(t, redis.Options{})
 	if err := c.Set(context.Background(), "", []byte("v"), 0); !errors.Is(err, cache.ErrInvalidKey) {
 		t.Errorf("empty Set: %v", err)
+	}
+}
+
+func TestRedisProtocolErrorRetriesOnAFreshConnection(t *testing.T) {
+	fr := newFakeRedis(t)
+	// One slot, so the malformed reply arrives on the pooled connection
+	// and any second connection can only be a fresh dial.
+	c := redis.New(redis.Options{Addr: fr.addr(), MaxConns: 1})
+	defer c.Close()
+	ctx := context.Background()
+
+	if err := c.Set(ctx, "k", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	before := fr.connCount()
+	fr.mangleNext(1)
+
+	// Options.MaxRetries documents a protocol error as retryable, and a
+	// connection whose reply stream the client could not parse must not
+	// go back into the pool: the leftover bytes become the next
+	// command's reply, serving one key's value under another key.
+	v, err := c.Get(ctx, "k")
+	if err != nil || string(v) != "v" {
+		t.Fatalf("Get after a malformed reply: %q %v", v, err)
+	}
+	if got := c.Stats().Retries; got != 1 {
+		t.Errorf("Retries = %d, want 1", got)
+	}
+	if got := fr.connCount(); got != before+1 {
+		t.Errorf("accepted %d connections, want %d: the desynchronised one was reused", got, before+1)
+	}
+}
+
+func TestRedisGetMultiRejectsMismatchedReply(t *testing.T) {
+	fr := newFakeRedis(t)
+	c := redis.New(redis.Options{Addr: fr.addr(), MaxRetries: -1})
+	defer c.Close()
+	ctx := context.Background()
+
+	// An array longer than the key list indexes past the end of it.
+	fr.mangleNext(1)
+	if _, err := c.GetMulti(ctx, "a", "b"); !errors.Is(err, redis.ErrProtocol) {
+		t.Errorf("GetMulti with an over-long reply: %v, want ErrProtocol", err)
+	}
+}
+
+func TestRedisSubMillisecondTTLDoesNotBecomeZero(t *testing.T) {
+	c := newRedis(t, redis.Options{})
+	ctx := context.Background()
+
+	// PX truncates to whole milliseconds, so anything under 1ms rounds
+	// to 0 — which Redis rejects outright. Round up instead, as the
+	// memcached backend does for sub-second TTLs.
+	if err := c.Set(ctx, "k", []byte("v"), 500*time.Microsecond); err != nil {
+		t.Errorf("Set with a sub-millisecond TTL: %v", err)
+	}
+	if err := c.SetMulti(ctx, map[string][]byte{"m": []byte("v")}, 500*time.Microsecond); err != nil {
+		t.Errorf("SetMulti with a sub-millisecond TTL: %v", err)
 	}
 }

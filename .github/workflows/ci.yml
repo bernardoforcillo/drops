@@ -20,9 +20,17 @@ jobs:
           go-version: '1.24'
           check-latest: true
       - run: go mod tidy
-      # Whole-tree diff: this module has no external deps, so go.sum does
-      # not exist — naming it explicitly errored with "no such path". A
-      # bare diff still catches any go.mod (or future go.sum) drift.
+      # The integration suite is a second module on purpose — its
+      # drivers must never reach a user's build. Tidying it here is what
+      # keeps that true: a dependency that creeps into the root module
+      # shows up as a diff, and a driver added to integration/ without
+      # its go.sum entry fails the same way.
+      - run: go mod tidy
+        working-directory: integration
+      # Whole-tree diff: the root module has no external deps, so its
+      # go.sum does not exist — naming it explicitly errored with "no
+      # such path". A bare diff still catches any go.mod (or go.sum)
+      # drift in either module.
       - run: git diff --exit-code
 
   # ── test matrix ──────────────────────────────────────────────────────
@@ -48,6 +56,71 @@ jobs:
         run: go test ./... -count=1
       - name: race
         run: go test ./... -race -count=1
+      # The integration module is not reachable from the root ./... , so
+      # without this it compiles for the first time in the integration
+      # job — after the servers have been paid for and started.
+      - name: vet integration
+        run: go vet ./...
+        working-directory: integration
+
+  # ── integration ──────────────────────────────────────────────────────
+  # Everything above tests the SQL drops *generates*, by comparing it to
+  # what a test author expected. Three invalid-SQL bugs have shipped
+  # past exactly that check. This job is the one where a server parses
+  # the statement.
+  integration:
+    name: integration (real servers)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: drops
+          POSTGRES_PASSWORD: drops
+          POSTGRES_DB: drops
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U drops -d drops"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_USER: drops
+          MYSQL_PASSWORD: drops
+          MYSQL_DATABASE: drops
+        ports: ['3307:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -udrops -pdrops"
+          --health-interval 2s --health-timeout 3s --health-retries 40
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        ports: ['8124:8123', '9001:9000']
+        options: >-
+          --health-cmd "wget --spider -q http://127.0.0.1:8123/ping"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+      qdrant:
+        image: qdrant/qdrant:v1.12.1
+        ports: ['6334:6333']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+          cache: true
+      - name: test
+        working-directory: integration
+        env:
+          DROPS_PG_DSN: postgres://drops:drops@localhost:5433/drops?sslmode=disable
+          DROPS_MYSQL_DSN: drops:drops@tcp(localhost:3307)/drops?parseTime=true&multiStatements=true
+          DROPS_CLICKHOUSE_DSN: clickhouse://localhost:9001/default
+          DROPS_QDRANT_URL: http://localhost:6334
+          # A DSN present but a server unreachable must fail rather than
+          # skip: a silently skipped integration job is worse than none,
+          # because it reports green.
+          DROPS_REQUIRE_ALL: '1'
+        run: go test ./... -count=1 -v
 
   # ── linters ───────────────────────────────────────────────────────────
   staticcheck:
@@ -62,6 +135,8 @@ jobs:
           cache: true
       - run: go install honnef.co/go/tools/cmd/staticcheck@latest
       - run: staticcheck ./...
+      - run: staticcheck ./...
+        working-directory: integration
 
   golangci-lint:
     name: golangci-lint
@@ -94,3 +169,8 @@ jobs:
           cache: true
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
+      # The root module has no dependencies to be vulnerable; the
+      # integration module has four drivers, which is where an advisory
+      # would actually land.
+      - run: govulncheck ./...
+        working-directory: integration

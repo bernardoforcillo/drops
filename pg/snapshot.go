@@ -86,10 +86,14 @@ type TableSnapshot struct {
 }
 
 // IndexSnapshot is one entry in TableSnapshot.Indexes. JSON keys
-// follow drizzle-kit's v7 PostgreSQL schema.
+// follow drizzle-kit's v7 PostgreSQL schema, with one addition:
+// "include" has no counterpart there, and a covering index whose
+// INCLUDE columns went unrecorded was indistinguishable from a plain
+// one — so Push created it plain and never noticed.
 type IndexSnapshot struct {
 	Name             string         `json:"name"`
 	Columns          []string       `json:"columns"`
+	Include          []string       `json:"include,omitempty"`
 	IsUnique         bool           `json:"isUnique"`
 	Where            string         `json:"where"`
 	With             map[string]any `json:"with"`
@@ -191,10 +195,29 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 				WithCheck: p.WithCheckExpr(),
 			}
 		}
-		// Composite primary key.
-		if pk := t.CompositePrimaryKey(); len(pk) > 0 {
-			cols := make([]string, len(pk))
-			for i, c := range pk {
+		// The PRIMARY KEY, however the schema spelled it.
+		//
+		// A key spanning one column rides on the column definition;
+		// a key spanning two cannot, because PostgreSQL rejects a
+		// second inline PRIMARY KEY, so it is recorded table-level.
+		// That is the same rule writeTableBody applies to the CREATE
+		// TABLE, and the two have to agree: a key the snapshot puts
+		// in both places is emitted twice, and one it puts in
+		// neither never reaches Diff at all.
+		keys := t.primaryKeyColumns()
+		// Keyed by Column.key: primaryKeyColumns can answer from
+		// compositePK while the column loop below walks Columns(), and
+		// on an aliased table those are two handles on one column. A
+		// snapshot that missed the overlap would record the key column
+		// as an ordinary nullable one and feed that to Diff and Push.
+		inKey := make(map[*Column]bool, len(keys))
+		for _, c := range keys {
+			inKey[c.key()] = true
+		}
+		compositeKey := len(keys) > 1
+		if compositeKey {
+			cols := make([]string, len(keys))
+			for i, c := range keys {
 				cols[i] = c.Name()
 			}
 			name := compositePKName(t.Name(), cols)
@@ -249,8 +272,13 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			cs := &ColumnSnapshot{
 				Name:       c.Name(),
 				Type:       c.Type().TypeSQL(),
-				PrimaryKey: c.IsPrimaryKey(),
-				NotNull:    c.IsNotNull(),
+				PrimaryKey: inKey[c.key()] && !compositeKey,
+				// A key column is NOT NULL whether or not the schema
+				// said so — PostgreSQL sets attnotnull when the key is
+				// created and Introspect reads it back that way, so a
+				// snapshot that recorded it nullable would have every
+				// push emit a DROP NOT NULL the next push undoes.
+				NotNull: c.IsNotNull() || inKey[c.key()],
 			}
 			if c.HasDefault() {
 				d := c.DefaultSQL()
@@ -258,7 +286,7 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			}
 			ts.Columns[c.Name()] = cs
 
-			if c.IsUnique() && !c.IsPrimaryKey() {
+			if c.IsUnique() && !inKey[c.key()] {
 				name := uniqueName(t.Name(), []string{c.Name()})
 				ts.UniqueConstraints[name] = &UniqueSnapshot{
 					Name:             name,
@@ -415,11 +443,26 @@ func compositePKName(table string, cols []string) string {
 	return out
 }
 
-// indexSnapshotOf extracts the snapshot form of an *Index. Only
-// the well-known shape (simple column refs, btree default) is
-// captured cleanly; functional or expression indexes pass through
-// as empty Columns and the original DDL is recoverable from the
-// schema-level renderer rather than the snapshot.
+// indexSnapshotOf extracts the snapshot form of an *Index.
+//
+// Only the well-known shape is captured: simple column refs, the
+// INCLUDE list, the partial predicate and the access method. An
+// operator class and a WITH storage parameter are not representable
+// here, and neither is a functional or expression element.
+//
+// One unrepresentable element makes the whole index unrepresentable,
+// so Columns is left empty rather than one entry shorter. Keeping the
+// columns it could read looked harmless and was not: an index on
+// (name, lower(email)) was recorded as an index on (name), created as
+// an index on (name), and read back from the catalogue as an index on
+// (name) — a different index under the declared name, agreeing with
+// itself for ever after and reported by nothing. Empty is the shape
+// diffIndexes skips and unrepresentableIndexNotices reports.
+//
+// The predicate is recorded in the spelling a CREATE INDEX would
+// carry, which is the Go program's, not PostgreSQL's. Push
+// renormalises it against the server before diffing; see
+// renormaliseExpressions.
 func indexSnapshotOf(idx *Index) *IndexSnapshot {
 	is := &IndexSnapshot{
 		Name:         idx.Name(),
@@ -431,6 +474,12 @@ func indexSnapshotOf(idx *Index) *IndexSnapshot {
 	if is.Method == "" {
 		is.Method = "btree"
 	}
+	if pred, ok := indexPredicateSQL(idx.where); ok {
+		is.Where = pred
+	}
+	for _, c := range idx.include {
+		is.Include = append(is.Include, c.Name())
+	}
 	for _, expr := range idx.columns {
 		if c, ok := expr.(*Column); ok {
 			is.Columns = append(is.Columns, c.Name())
@@ -441,6 +490,8 @@ func indexSnapshotOf(idx *Index) *IndexSnapshot {
 			is.Columns = append(is.Columns, cr.col().Name())
 			continue
 		}
+		is.Columns = nil
+		break
 	}
 	return is
 }

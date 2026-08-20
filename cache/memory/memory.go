@@ -154,6 +154,12 @@ func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Dura
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Close nils the map under the same lock, so the guard above is not
+	// enough: a Close that lands between it and here would turn this
+	// into a write to a nil map and take the process down.
+	if c.closed {
+		return cache.ErrClosed
+	}
 	_, existed := c.entries[key]
 	c.entries[key] = e
 	if !existed {
@@ -272,6 +278,9 @@ func (c *Cache) SetMulti(ctx context.Context, items map[string][]byte, ttl time.
 	now := c.opts.Clock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return cache.ErrClosed
+	}
 	for k, v := range items {
 		stored := make([]byte, len(v))
 		copy(stored, v)
@@ -354,7 +363,7 @@ func (c *Cache) evictIfNeeded() {
 	}
 }
 
-func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) { //nolint:gocritic // errp is read at defer time to observe the final error value
+func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) {
 	drops.CallHook(c.opts.Hook, ctx, drops.QueryEvent{
 		Kind:     kind,
 		Duration: c.opts.Clock().Sub(start),

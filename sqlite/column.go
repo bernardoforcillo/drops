@@ -24,6 +24,7 @@ type Column struct {
 	hasDefault bool
 	ref        *FK
 	pii        bool
+	managed    bool // drops writes this column, not the application
 }
 
 // FK describes a single-column foreign-key reference.
@@ -61,6 +62,12 @@ type ColRef interface {
 // WriteSQL writes a table-qualified column reference. The dialect on
 // the Builder controls the quote character.
 func (c *Column) WriteSQL(b *drops.Builder) {
+	if b.BareIdents() {
+		// DDL that defines this very table cannot qualify the
+		// reference — see (*drops.Builder).BareIdents.
+		b.WriteIdent(c.name)
+		return
+	}
 	if c.table != nil {
 		c.table.writeRef(b)
 		b.WriteByte('.')
@@ -95,6 +102,15 @@ func (c *Col[T]) AutoIncrement() *Col[T] {
 
 // Unique marks the column UNIQUE.
 func (c *Col[T]) Unique() *Col[T] { c.Column.unique = true; return c }
+
+// Managed marks the column as written by drops rather than by the
+// application — the soft-delete marker, the timestamps a template
+// keeps current. NewEntity's drift check skips managed columns.
+func (c *Col[T]) Managed() *Col[T] { c.Column.managed = true; return c }
+
+// IsManaged reports whether drops writes this column rather than the
+// application.
+func (c *Column) IsManaged() bool { return c.managed }
 
 // Default sets a raw SQL default expression (e.g. "0", "CURRENT_TIMESTAMP").
 func (c *Col[T]) Default(sqlExpr string) *Col[T] {
@@ -154,6 +170,30 @@ func (c *Col[T]) In(values ...T) drops.Expression {
 			b.AddArg(v)
 		}
 		b.WriteString("))")
+	})
+}
+
+// Asc / Desc produce ORDER BY terms.
+//
+// These exist on the untyped Column so any handle can order a query,
+// and are distinct from the package-level Asc / Desc, which build the
+// OrderingColumn that keyset pagination needs.
+func (c *Column) Asc() drops.Expression  { return orderTerm(c, " ASC") }
+func (c *Column) Desc() drops.Expression { return orderTerm(c, " DESC") }
+
+func orderTerm(c *Column, dir string) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(dir)
+	})
+}
+
+// As aliases a column in a SELECT projection.
+func (c *Column) As(alias string) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(" AS ")
+		b.WriteIdent(alias)
 	})
 }
 

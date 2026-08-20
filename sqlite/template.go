@@ -25,8 +25,8 @@ type TimestampsCols struct {
 // defaulting to CURRENT_TIMESTAMP to t.
 func Timestamps(t *Table) TimestampsCols {
 	return TimestampsCols{
-		CreatedAt: Add(t, Timestamp("createdAt", false).NotNull().Default("CURRENT_TIMESTAMP")),
-		UpdatedAt: Add(t, Timestamp("updatedAt", false).NotNull().Default("CURRENT_TIMESTAMP")),
+		CreatedAt: Add(t, Timestamp("createdAt", false).NotNull().Default("CURRENT_TIMESTAMP").Managed()),
+		UpdatedAt: Add(t, Timestamp("updatedAt", false).NotNull().Default("CURRENT_TIMESTAMP").Managed()),
 	}
 }
 

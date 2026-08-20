@@ -3,6 +3,7 @@ package sqlite
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -39,6 +40,22 @@ func DiffDown(prev, cur *Snapshot) []string {
 //  1. DROP TABLE   for tables removed entirely
 //  2. CREATE TABLE for new tables (all constraints inline)
 //  3. per surviving table: ADD COLUMN statements, or a rebuild sequence
+//
+// Indexes and triggers are preserved, never diffed. Diff emits no
+// CREATE INDEX, no DROP INDEX and no CREATE TRIGGER of its own: the Go
+// schema DSL has no way to declare either, so every index in a database
+// is by definition one drops was not told about, and treating those as
+// drift would drop the index the application's hot query depends on.
+// They appear in the output only where a rebuild has just destroyed
+// them, put back as they were — see replayObjectsSQL.
+//
+// That replay reaches only as far as prev does. Diff does not read the
+// database; it replays what prev recorded, and only Introspect records
+// an index or a trigger — BuildSnapshot cannot, having nothing to build
+// them from. So Push and DetectDrift, which diff against a live
+// introspection, come through a rebuild with their indexes, and
+// GenerateMigration, which diffs two snapshot files, does not. It says
+// so in the migration it writes; see noteBlindRebuilds.
 func Diff(prev, cur *Snapshot) []string {
 	if prev == nil {
 		prev = EmptySnapshot()
@@ -106,10 +123,10 @@ func diffTable(prev, cur *TableSnapshot) []string {
 		}
 	}
 
-	constraintsDiffer := !reflect.DeepEqual(prev.CompositePrimaryKeys, cur.CompositePrimaryKeys) ||
-		!reflect.DeepEqual(prev.UniqueConstraints, cur.UniqueConstraints) ||
-		!reflect.DeepEqual(prev.CheckConstraints, cur.CheckConstraints) ||
-		!reflect.DeepEqual(prev.ForeignKeys, cur.ForeignKeys)
+	constraintsDiffer := !sameConstraintMap(prev.CompositePrimaryKeys, cur.CompositePrimaryKeys) ||
+		!sameUniqueKeys(prev, cur) ||
+		!sameConstraintMap(prev.CheckConstraints, cur.CheckConstraints) ||
+		!sameConstraintMap(prev.ForeignKeys, cur.ForeignKeys)
 
 	needsRebuild := len(dropped) > 0 || len(changed) > 0 ||
 		len(addedNotAddable) > 0 || constraintsDiffer
@@ -149,9 +166,12 @@ func rebuildReason(prev, cur *TableSnapshot, dropped, changed, addedNotAddable [
 	return strings.Join(parts, "; ")
 }
 
-// rebuildTable emits the four-step SQLite table rebuild preceded by a
-// comment. The new table is built with cur's full shape; the shared
-// columns (present in both prev and cur, sorted) are copied across.
+// rebuildTable emits the SQLite table rebuild preceded by a comment:
+// create "t_new" with cur's shape, copy the shared columns (present in
+// both prev and cur, sorted) across, DROP the old table, RENAME the new
+// one into place — and then put back the indexes and triggers the DROP
+// destroyed. See replayObjectsSQL for what survives that and what does
+// not.
 func rebuildTable(prev, cur *TableSnapshot, reason string) []string {
 	newName := cur.Name + "_new"
 	var shared []string
@@ -163,19 +183,142 @@ func rebuildTable(prev, cur *TableSnapshot, reason string) []string {
 	cols := strings.Join(quoteIdentList(shared), ", ")
 	insert := fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s;",
 		quoteIdent(newName), cols, cols, quoteIdent(cur.Name))
-	return []string{
+	out := []string{
 		fmt.Sprintf("-- rebuild %s: %s", quoteIdent(cur.Name), reason),
 		createTableSQL(cur, newName),
 		insert,
 		fmt.Sprintf("DROP TABLE %s;", quoteIdent(cur.Name)),
 		fmt.Sprintf("ALTER TABLE %s RENAME TO %s;", quoteIdent(newName), quoteIdent(cur.Name)),
 	}
+	return append(out, replayObjectsSQL(prev, cur)...)
+}
+
+// replayObjectsSQL re-creates the indexes and triggers that the
+// rebuild's DROP TABLE destroys, from the DDL SQLite stored for them.
+// Everything it emits runs after the RENAME, when the names are free
+// again.
+//
+// A rebuild that only widens a table gets all of them back untouched.
+// A rebuild that removes a column cannot, and the three ways that goes
+// are deliberately different:
+//
+//   - An index that keys a removed column is NOT re-created, and a
+//     comment in its place records that. Replaying it would abort the
+//     migration on "no such column", which would make dropping a column
+//     impossible while any index mentions it; PostgreSQL drops the
+//     dependent index along with the column, and so does this.
+//
+//   - An index that reaches the removed column some other way — a
+//     partial index's WHERE, an expression key — is replayed as stored,
+//     because PRAGMA index_info does not report what those name and
+//     drops has no way to know. SQLite resolves the names when the
+//     CREATE INDEX runs and rejects it, so the migration fails loudly
+//     and rolls back. That is the intended outcome: drops will not
+//     silently discard an index it cannot reason about.
+//
+//   - A trigger is always replayed as stored. Its body is arbitrary SQL
+//     and SQLite does not resolve the names in it at CREATE TRIGGER
+//     time, so a trigger naming a removed column is accepted here and
+//     fails the first time it fires. drops cannot prevent that without
+//     parsing SQL, so it warns instead: a trigger whose text mentions a
+//     removed column gets a comment above it.
+func replayObjectsSQL(prev, cur *TableSnapshot) []string {
+	var dropped []string
+	for _, k := range sortedMapKeys(prev.Columns) {
+		if _, ok := cur.Columns[k]; !ok {
+			dropped = append(dropped, k)
+		}
+	}
+	goneCol := map[string]bool{}
+	for _, k := range dropped {
+		goneCol[k] = true
+	}
+
+	var out []string
+	for _, name := range sortedMapKeys(prev.Indexes) {
+		idx := prev.Indexes[name]
+		if idx.SQL == "" {
+			continue
+		}
+		var lost []string
+		for _, c := range idx.Columns {
+			if goneCol[c] {
+				lost = append(lost, quoteIdent(c))
+			}
+		}
+		if len(lost) > 0 {
+			out = append(out, fmt.Sprintf("-- index %s dropped with column %s",
+				quoteIdent(name), strings.Join(lost, ", ")))
+			continue
+		}
+		out = append(out, idx.SQL+";")
+	}
+	for _, name := range sortedMapKeys(prev.Triggers) {
+		trg := prev.Triggers[name]
+		if trg.SQL == "" {
+			continue
+		}
+		if named := identsMentioned(trg.SQL, dropped); len(named) > 0 {
+			out = append(out, fmt.Sprintf("-- trigger %s names dropped column %s; it will fail when it fires",
+				quoteIdent(name), strings.Join(quoteIdentList(named), ", ")))
+		}
+		out = append(out, trg.SQL+";")
+	}
+	return out
+}
+
+// identsMentioned returns the entries of names that appear in sql as
+// whole identifiers.
+//
+// This is a text scan, not a parse: it sees a column name inside a
+// string literal or a comment, and it cannot tell one table's "id" from
+// another's. That is acceptable because the only thing it drives is the
+// wording of a warning comment — a false positive costs a line of
+// noise, where missing a real one costs a trigger that fails at 3am.
+func identsMentioned(sql string, names []string) []string {
+	lower := strings.ToLower(sql)
+	var out []string
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		target := strings.ToLower(n)
+		for i := 0; ; {
+			j := strings.Index(lower[i:], target)
+			if j < 0 {
+				break
+			}
+			at := i + j
+			end := at + len(target)
+			if !isIdentByte(byteAt(lower, at-1)) && !isIdentByte(byteAt(lower, end)) {
+				out = append(out, n)
+				break
+			}
+			i = at + 1
+		}
+	}
+	return out
+}
+
+func byteAt(s string, i int) byte {
+	if i < 0 || i >= len(s) {
+		return ' '
+	}
+	return s[i]
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || b == '$' ||
+		(b >= '0' && b <= '9') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z')
 }
 
 // columnAddable reports whether an added column can be introduced with
 // ALTER TABLE ADD COLUMN. SQLite forbids adding a PRIMARY KEY or UNIQUE
-// column, a NOT NULL column without a default, or (here, conservatively)
-// a column that is the source of a foreign key.
+// column, a NOT NULL column without a default, a column whose default is
+// not a constant, or (here, conservatively) a column that is the source
+// of a foreign key.
 func columnAddable(c *ColumnSnapshot, hasFK bool) bool {
 	if c.PrimaryKey || c.Unique || hasFK {
 		return false
@@ -183,14 +326,41 @@ func columnAddable(c *ColumnSnapshot, hasFK bool) bool {
 	if c.NotNull && c.Default == nil {
 		return false
 	}
+	if c.Default != nil && !constantDefault(*c.Default) {
+		return false
+	}
+	return true
+}
+
+// constantDefault reports whether d is a default SQLite will accept on
+// ALTER TABLE ADD COLUMN.
+//
+// The value has to be a constant there: CURRENT_TIME, CURRENT_DATE,
+// CURRENT_TIMESTAMP and any parenthesised expression are rejected with
+// "Cannot add a column with non-constant default". A CREATE TABLE takes
+// all of them, so a column carrying one reaches the table through a
+// rebuild instead. This is the same shape AnalyzeMigration's
+// add-column-dynamic-default rule warns about after the fact.
+func constantDefault(d string) bool {
+	t := strings.TrimSpace(d)
+	if strings.HasPrefix(t, "(") {
+		return false
+	}
+	switch strings.ToUpper(t) {
+	case "CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP":
+		return false
+	}
 	return true
 }
 
 // columnEqual reports whether two column snapshots describe the same
 // column shape (any difference forces a table rebuild).
+//
+// Unique is not compared here — sameUniqueKeys compares it at the table
+// level, for the reason spelled out there.
 func columnEqual(a, b *ColumnSnapshot) bool {
 	if a.Type != b.Type || a.PrimaryKey != b.PrimaryKey || a.NotNull != b.NotNull ||
-		a.Unique != b.Unique || a.AutoIncrement != b.AutoIncrement {
+		a.AutoIncrement != b.AutoIncrement {
 		return false
 	}
 	switch {
@@ -294,7 +464,13 @@ func writeColumnDefSQL(b *strings.Builder, c *ColumnSnapshot, allowInlinePK bool
 		if c.AutoIncrement {
 			b.WriteString(" AUTOINCREMENT")
 		}
-	} else if c.NotNull {
+	}
+	// A key column keeps its NOT NULL here for the same reason
+	// CreateTable emits one: SQLite does not imply it, and a rebuild
+	// that dropped it would both weaken the constraint and leave the
+	// table diffing against its declaration on the next run — so the
+	// migration would never converge.
+	if c.NotNull {
 		b.WriteString(" NOT NULL")
 	}
 	if c.Unique && !c.PrimaryKey {
@@ -351,4 +527,72 @@ func quoteIdentList(names []string) []string {
 		out[i] = quoteIdent(n)
 	}
 	return out
+}
+
+// sameUniqueKeys compares two tables' UNIQUE constraints as a set of
+// column tuples, ignoring both the constraint names and which syntax
+// declared them.
+//
+// SQLite stores neither. `email TEXT UNIQUE`, `UNIQUE (email)` and
+// `CONSTRAINT c UNIQUE (email)` all leave exactly one anonymous unique
+// index behind, which PRAGMA index_list reports under a generated name
+// like "sqlite_autoindex_users_1" — so an introspected snapshot can
+// never carry the declared name, and comparing names made every table
+// with a UNIQUE constraint report a constraint change against its own
+// declaration. On SQLite that means a full table rebuild, so such a
+// table copied itself, and lost every index and trigger on it, on every
+// single push. The column tuple is the only part of a UNIQUE constraint
+// the engine actually remembers, so it is the only part worth comparing.
+func sameUniqueKeys(a, b *TableSnapshot) bool {
+	ak, bk := uniqueKeyTuples(a), uniqueKeyTuples(b)
+	if len(ak) != len(bk) {
+		return false
+	}
+	for i := range ak {
+		if ak[i] != bk[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// uniqueKeyTuples returns the table's unique column tuples in a
+// canonical sorted form, drawn from both the inline column flag and the
+// table-level constraints.
+func uniqueKeyTuples(t *TableSnapshot) []string {
+	var out []string
+	for _, n := range sortedMapKeys(t.Columns) {
+		if c := t.Columns[n]; c.Unique && !c.PrimaryKey {
+			out = append(out, c.Name)
+		}
+	}
+	for _, n := range sortedMapKeys(t.UniqueConstraints) {
+		out = append(out, strings.Join(t.UniqueConstraints[n].Columns, "\x00"))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sameConstraintMap compares two constraint sets, treating a nil map
+// and an empty one as the same thing.
+//
+// reflect.DeepEqual does not: it reports a nil map and an empty map as
+// different. Snapshots reach this function from two producers that
+// disagree — BuildSnapshot initialises every map, Introspect leaves
+// one nil when the table has no such constraint — so comparing them
+// directly reported a constraint change for every table with no CHECK
+// constraints. On SQLite a constraint change means a full table
+// rebuild, so a schema that already matched its declaration would copy
+// itself on every deploy.
+func sameConstraintMap[V any](a, b map[string]V) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || !reflect.DeepEqual(av, bv) {
+			return false
+		}
+	}
+	return true
 }

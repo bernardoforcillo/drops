@@ -145,6 +145,7 @@ var safetyRules = []func(stmt string) (SafetyWarning, bool){
 	ruleAlterColumnType,
 	ruleAlterColumnSetNotNull,
 	ruleCreateIndexNotConcurrent,
+	ruleDropIndex,
 	ruleDropTable,
 	ruleDropColumn,
 	ruleAlterTypeDropValue,
@@ -166,6 +167,7 @@ var (
 	reAlterColSetNN  = regexp.MustCompile(`(?i)\bALTER\s+TABLE\b.*\bALTER\s+COLUMN\b.*\bSET\s+NOT\s+NULL\b`)
 	reCreateIndex    = regexp.MustCompile(`(?i)\bCREATE\s+(UNIQUE\s+)?INDEX\b`)
 	reConcurrently   = regexp.MustCompile(`(?i)\bCONCURRENTLY\b`)
+	reDropIndex      = regexp.MustCompile(`(?i)\bDROP\s+INDEX\b`)
 	reDropTable      = regexp.MustCompile(`(?i)\bDROP\s+TABLE\b`)
 	reDropColumn     = regexp.MustCompile(`(?i)\bALTER\s+TABLE\b.*\bDROP\s+COLUMN\b`)
 	reAlterTypeDrop  = regexp.MustCompile(`(?i)\bALTER\s+TYPE\b.*\bDROP\s+VALUE\b`)
@@ -258,6 +260,28 @@ func ruleCreateIndexNotConcurrent(stmt string) (SafetyWarning, bool) {
 		Statement:  stmt,
 		Message:    "CREATE INDEX without CONCURRENTLY blocks writes against the table while the index builds.",
 		Suggestion: "Append CONCURRENTLY (note: cannot run inside a transaction; emit the index DDL as a standalone migration).",
+	}, true
+}
+
+// ruleDropIndex flags DROP INDEX.
+//
+// It is here because Push can emit one for an index nobody declared —
+// a DBA's, an extension's, another migration tool's. The statement
+// itself is metadata-only and instant, so the severity is not about
+// the drop; it is about the rebuild that follows once someone notices
+// the plan that regressed, on a table large enough to have wanted the
+// index in the first place. CONCURRENTLY is not an escape either: it
+// only avoids the lock, not the loss.
+func ruleDropIndex(stmt string) (SafetyWarning, bool) {
+	if !reDropIndex.MatchString(stmt) {
+		return SafetyWarning{}, false
+	}
+	return SafetyWarning{
+		Severity:   SeverityWarn,
+		Rule:       "drop-index",
+		Statement:  stmt,
+		Message:    "DROP INDEX is not reversible in any useful sense: rebuilding it means a full index build on a table that was big enough to need it.",
+		Suggestion: "Confirm the index is unused (pg_stat_user_indexes.idx_scan) before dropping it, and keep the CREATE INDEX CONCURRENTLY that recreates it to hand.",
 	}, true
 }
 

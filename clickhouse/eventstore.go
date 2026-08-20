@@ -35,8 +35,8 @@ import (
 //	)
 //	if errors.Is(err, clickhouse.ErrConcurrencyConflict) { ... }
 //
-//	// Replay
-//	events, _ := store.Load(ctx, "match", "abc-123", 0)
+//	// Replay. -1, not 0: versions start at 0 and Load is exclusive.
+//	events, _ := store.Load(ctx, "match", "abc-123", -1)
 //	state := MatchState{}
 //	for _, ev := range events {
 //	    state.Apply(ev)
@@ -178,8 +178,8 @@ func (s *EventStore) Append(ctx context.Context, aggregateType, aggregateID stri
 		rows[i] = "(?, ?, ?, ?, ?, ?)"
 		args = append(args, aggregateType, aggregateID, version, ev.Type, string(payload), headers)
 	}
-	sql := fmt.Sprintf(`INSERT INTO "%s" ("aggregateType", "aggregateID", "version", "eventType", "payload", "headers") VALUES %s`,
-		s.table, strings.Join(rows, ", "))
+	sql := fmt.Sprintf(`INSERT INTO %s ("aggregateType", "aggregateID", "version", "eventType", "payload", "headers") VALUES %s`,
+		quoteIdent(s.table), strings.Join(rows, ", "))
 	_, err = s.db.Exec(ctx, sql, args...)
 	return err
 }
@@ -202,15 +202,22 @@ func encodeEventPayload(payload any) (json.RawMessage, error) {
 }
 
 // Load returns events for an aggregate in version order, starting
-// after fromVersion. Pass 0 to read from the beginning.
+// strictly after fromVersion — pass the version of the last event you
+// have already applied and Load resumes from the next one.
+//
+// Pass -1, not 0, to read a stream from the beginning. Versions start
+// at 0, so 0 is the first event's own version and asking for events
+// after it skips it. -1 is the same sentinel LatestVersion answers
+// with for an empty stream, which makes "load everything, then append
+// at LatestVersion" one consistent convention.
 func (s *EventStore) Load(ctx context.Context, aggregateType, aggregateID string, fromVersion int64) ([]Event, error) {
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
-		FROM "%s"
+		FROM %s
 		WHERE "aggregateType" = ?
 		  AND "aggregateID" = ?
 		  AND "version" > ?
-		ORDER BY "version"`, s.table)
+		ORDER BY "version"`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID, fromVersion)
 	if err != nil {
 		return nil, err
@@ -232,10 +239,10 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 	from := time.Unix(0, fromOffset).UTC()
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
-		FROM "%s"
+		FROM %s
 		WHERE "createdAt" > ?
 		ORDER BY "createdAt"
-		LIMIT ?`, s.table)
+		LIMIT ?`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, from, int64(limit))
 	if err != nil {
 		return nil, err
@@ -247,8 +254,27 @@ func (s *EventStore) Stream(ctx context.Context, fromOffset int64, limit int) ([
 // LatestVersion returns the highest version recorded for the stream,
 // or -1 when the stream is empty. Use this before Append to compute
 // the expectedVersion for a fresh write.
+//
+// The aggregate is maxOrNull, not max, and the reason is a ClickHouse
+// departure from the SQL standard. An aggregate over an empty set
+// answers with the return type's default, not NULL: the documented
+// example is SELECT SUM(-1), MAX(0) FROM system.one WHERE 0, which
+// returns 0 and 0. NULL is what the non-default setting
+// aggregate_functions_null_for_empty = 1 buys, and it buys it by
+// rewriting every aggregate to its -OrNull form. So coalesce(max(v),
+// -1) reports 0 for a stream nobody has written, Append's
+// expectedVersion of -1 reads as a conflict, and the store can never
+// lay down its first event.
+//
+// Naming the -OrNull form outright asks for that behaviour directly
+// rather than depending on a server setting nobody here controls,
+// which is the whole point: the setting is what a session or a
+// profile can turn on, the function name is not.
+// TestCHEventStoreFreshStreamStartsAtMinusOne in the integration
+// suite asserts the premise and the consequence separately against a
+// real server.
 func (s *EventStore) LatestVersion(ctx context.Context, aggregateType, aggregateID string) (int64, error) {
-	sql := fmt.Sprintf(`SELECT coalesce(max("version"), -1) FROM "%s" WHERE "aggregateType" = ? AND "aggregateID" = ?`, s.table)
+	sql := fmt.Sprintf(`SELECT coalesce(maxOrNull("version"), -1) FROM %s WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(s.table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
 	if err != nil {
 		return -1, err
@@ -337,7 +363,7 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 	if state == nil {
 		state = json.RawMessage("null")
 	}
-	sql := fmt.Sprintf(`INSERT INTO "%s" ("aggregateType", "aggregateID", "version", "state", "createdAt") VALUES (?, ?, ?, ?, now64(9))`, table)
+	sql := fmt.Sprintf(`INSERT INTO %s ("aggregateType", "aggregateID", "version", "state", "createdAt") VALUES (?, ?, ?, ?, now64(9))`, quoteIdent(table))
 	_, err := s.db.Exec(ctx, sql, snap.AggregateType, snap.AggregateID, snap.Version, string(state))
 	return err
 }
@@ -345,12 +371,14 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 // LoadSnapshot fetches the latest snapshot for an aggregate. The query
 // uses FINAL so it reflects the deduplicated (latest-version) row even
 // before CH background merges have run. Returns ok=false when no
-// snapshot exists — fall back to replaying from version 0.
+// snapshot exists — replay the whole stream instead, which is Load
+// with fromVersion -1. With a snapshot the resume point is
+// snap.Version, since Load is exclusive on it.
 func (s *EventStore) LoadSnapshot(ctx context.Context, table, aggregateType, aggregateID string) (AggregateSnapshot, bool, error) {
 	sql := fmt.Sprintf(`
 		SELECT "aggregateType", "aggregateID", "version", "state", "createdAt"
-		FROM "%s" FINAL
-		WHERE "aggregateType" = ? AND "aggregateID" = ?`, table)
+		FROM %s FINAL
+		WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)
 	if err != nil {
 		return AggregateSnapshot{}, false, err

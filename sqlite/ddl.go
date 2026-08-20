@@ -34,17 +34,34 @@ func createTable(t *Table, ifNotExists bool) drops.Expression {
 			}
 			first = false
 		}
-		// Column definitions.
-		singlePK := len(t.compositePK) == 0
+		// A composite key can arrive two ways: declared on the table
+		// with PrimaryKey(cols...), or by marking more than one column
+		// .PrimaryKey(). Both have to reach the table-level clause,
+		// because an inline PRIMARY KEY on each column renders two of
+		// them and SQLite rejects the statement with "table has more
+		// than one primary key".
+		keyCols := t.compositePK
+		if len(keyCols) == 0 {
+			var marked []*Column
+			for _, c := range t.columns {
+				if c.primary {
+					marked = append(marked, c)
+				}
+			}
+			if len(marked) > 1 {
+				keyCols = marked
+			}
+		}
+		singlePK := len(keyCols) == 0
+
 		for _, c := range t.columns {
 			sep()
 			writeColumnDef(b, c, singlePK)
 		}
-		// Composite PRIMARY KEY.
-		if len(t.compositePK) > 0 {
+		if len(keyCols) > 0 {
 			sep()
 			b.WriteString("PRIMARY KEY (")
-			writeColList(b, t.compositePK)
+			writeColList(b, keyCols)
 			b.WriteByte(')')
 		}
 		// Named composite UNIQUE constraints (sorted for determinism).
@@ -95,7 +112,16 @@ func writeColumnDef(b *drops.Builder, c *Column, allowInlinePK bool) {
 		if c.autoInc {
 			b.WriteString(" AUTOINCREMENT")
 		}
-	} else if c.notNull {
+	}
+	// NOT NULL is emitted for a key column too, not skipped as
+	// redundant. SQLite does not imply it: a TEXT PRIMARY KEY declared
+	// without NOT NULL accepts a NULL key, so a column drops reports as
+	// NOT NULL would silently hold one. It also keeps introspection
+	// agreeing with the declaration — pragma table_info reports
+	// notnull=0 for a key declared without it, which made a freshly
+	// created schema diff against itself and emit a table rebuild on
+	// every deploy.
+	if c.notNull {
 		b.WriteString(" NOT NULL")
 	}
 	if c.unique && !c.primary {

@@ -29,26 +29,27 @@ type InsertHookCtx struct {
 	addExprs []drops.Expression
 }
 
-// Has reports whether col is already bound on the INSERT.
-func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[col] }
+// Has reports whether col is already bound on the INSERT. An alias
+// copy of a column counts as the column itself.
+func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[col.key()] }
 
 // SetExpr binds expr to col across every row, unless col is already
 // bound — typical for DB-evaluated defaults such as drops.Raw("now()").
 func (c *InsertHookCtx) SetExpr(col *Column, expr drops.Expression) {
-	if c.bound[col] {
+	if c.bound[col.key()] {
 		return
 	}
-	c.bound[col] = true
+	c.bound[col.key()] = true
 	c.addCols = append(c.addCols, col)
 	c.addExprs = append(c.addExprs, expr)
 }
 
 // Set binds a typed ColumnValue (e.g. the result of (*Col[T]).Val(v)).
 func (c *InsertHookCtx) Set(v ColumnValue) {
-	if c.bound[v.column()] {
+	if c.bound[v.column().key()] {
 		return
 	}
-	c.bound[v.column()] = true
+	c.bound[v.column().key()] = true
 	c.addCols = append(c.addCols, v.column())
 	c.addExprs = append(c.addExprs, bindingExpr(v))
 }

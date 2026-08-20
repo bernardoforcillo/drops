@@ -27,3 +27,15 @@ type exprBinding struct {
 
 func (e *exprBinding) column() *Column             { return e.col }
 func (e *exprBinding) writeValue(b *drops.Builder) { e.expr.WriteSQL(b) }
+
+// Bind pairs a column with an untyped value.
+//
+// It is the type-erased counterpart of (*Col[T]).Val, for callers
+// that hold a *Column and a value whose Go type is only known at
+// runtime — a generic row copier, a CDC consumer, anything driving
+// an INSERT from a map. Prefer Val wherever the type is known: it is
+// what makes a mistyped binding a compile error rather than a driver
+// error.
+func Bind(col ColRef, v any) ColumnValue {
+	return &valueBinding[any]{col: col.col(), val: v}
+}

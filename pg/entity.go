@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/internal/drift"
 )
 
 // Entity binds a Go struct T to a Table and precomputes the metadata
@@ -45,9 +47,17 @@ import (
 // operation routes through the underlying Insert / Update / Delete
 // builders.
 type Entity[T any] struct {
-	table        *Table
-	pk           *Column
-	pkField      []int
+	table *Table
+
+	// pk / pkField describe the primary key when it is a single
+	// column and are nil for a composite one, so the paths that
+	// cannot generalise can branch on them. pks / pkFields are
+	// always populated, in the table's declaration order.
+	pk       *Column
+	pkField  []int
+	pks      []*Column
+	pkFields [][]int
+
 	colFields    []entityColField // columns that map to a struct field
 	validators   []Validator[T]
 	versionCol   *Column // optimistic-locking version column, nil if none
@@ -118,7 +128,12 @@ type entityColField struct {
 // Field matching rules mirror the row scanner: `drop:"colname"` tag
 // wins; otherwise the field name and its snake_case form are tried.
 // Fields tagged `drop:"-"` are skipped.
-func NewEntity[T any](t *Table) *Entity[T] {
+func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
+	var cfg entityConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	var zero T
 	rt := reflect.TypeOf(zero)
 	for rt.Kind() == reflect.Ptr {
@@ -129,22 +144,26 @@ func NewEntity[T any](t *Table) *Entity[T] {
 	}
 	fields := fieldMap(rt)
 
-	var pk *Column
-	for _, c := range t.Columns() {
-		if c.IsPrimaryKey() {
-			if pk != nil {
-				panic(fmt.Sprintf("drops/pg: NewEntity[%s]: table %q has more than one PRIMARY KEY column; composite keys are not supported by Entity", rt.Name(), t.Name()))
-			}
-			pk = c
-		}
-	}
-	if pk == nil {
+	pks := t.primaryKeyColumns()
+	if len(pks) == 0 {
 		panic(fmt.Sprintf("drops/pg: NewEntity[%s]: table %q has no PRIMARY KEY column; CRUD shortcuts require one", rt.Name(), t.Name()))
 	}
-
-	pkField, ok := lookupField(fields, pk.Name())
-	if !ok {
-		panic(fmt.Sprintf("drops/pg: NewEntity[%s]: no struct field bound to PK column %q on table %q", rt.Name(), pk.Name(), t.Name()))
+	pkFields := make([][]int, len(pks))
+	for i, c := range pks {
+		idx, ok := lookupField(fields, c.Name())
+		if !ok {
+			panic(fmt.Sprintf("drops/pg: NewEntity[%s]: no struct field bound to PK column %q on table %q", rt.Name(), c.Name(), t.Name()))
+		}
+		pkFields[i] = idx
+	}
+	// pk / pkField stay set only for a single-column key, so the
+	// paths that genuinely cannot generalise — an ON CONFLICT target,
+	// the cache's per-row key — can branch on them rather than
+	// pretending a composite key is one value.
+	var pk *Column
+	var pkField []int
+	if len(pks) == 1 {
+		pk, pkField = pks[0], pkFields[0]
 	}
 
 	colFields := make([]entityColField, 0, len(t.Columns()))
@@ -175,14 +194,84 @@ func NewEntity[T any](t *Table) *Entity[T] {
 		}
 	}
 
+	if err := checkDrift(rt, t, colFields, cfg); err != nil {
+		panic(err.Error())
+	}
+
 	return &Entity[T]{
 		table:        t,
 		pk:           pk,
 		pkField:      pkField,
+		pks:          pks,
+		pkFields:     pkFields,
 		colFields:    colFields,
 		versionCol:   versionCol,
 		versionField: versionField,
 	}
+}
+
+// EntityOption configures [NewEntity].
+type EntityOption func(*entityConfig)
+
+type entityConfig struct {
+	allowUnmapped map[string]bool
+	allowAny      bool
+}
+
+// AllowUnmappedColumns exempts the named columns from the check that
+// every column has a struct field.
+//
+// Use it for columns the database owns and the application never
+// writes — a trigger-maintained tsvector, a generated column, a
+// counter another service updates. Naming them is the point: an
+// exemption you have to type is one you have thought about, unlike
+// the silent skip this replaces.
+func AllowUnmappedColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowUnmapped == nil {
+			c.allowUnmapped = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowUnmapped[n] = true
+		}
+	}
+}
+
+// AllowAnyUnmappedColumn disables the check entirely. It exists for
+// migrating an existing codebase that has too many gaps to name at
+// once; prefer [AllowUnmappedColumns], which keeps the check working
+// for the columns you have not exempted.
+func AllowAnyUnmappedColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAny = true }
+}
+
+// checkDrift reports columns that no struct field is bound to.
+//
+// Such a column is dropped from every INSERT and UPDATE the entity
+// builds, so a renamed field or a mistyped `drop:` tag stops
+// persisting it while everything else keeps working. This panics
+// rather than returning an error, matching how NewEntity already
+// treats a missing primary key: schemas are declared in package init
+// blocks, and startup is where bad configuration should surface.
+func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAny {
+		return nil
+	}
+	mapped := make(map[string]bool, len(colFields))
+	bound := make(map[string]bool, len(colFields))
+	for _, cf := range colFields {
+		mapped[cf.col.Name()] = true
+		bound[drift.FieldKey(cf.field)] = true
+	}
+	var missing []string
+	for _, c := range t.Columns() {
+		if mapped[c.Name()] || c.IsManaged() || cfg.allowUnmapped[c.Name()] {
+			continue
+		}
+		missing = append(missing, c.Name())
+	}
+	return drift.Report("drops/pg", rt.Name(), t.Name(), missing,
+		drift.SpareFields(rt, bound), "pg.AllowUnmappedColumns")
 }
 
 // Validate registers a validator that runs before Create / Update /
@@ -237,6 +326,87 @@ func (e *Entity[T]) Table() *Table { return e.table }
 // PK returns the entity's primary-key column.
 func (e *Entity[T]) PK() *Column { return e.pk }
 
+// PKs returns the primary-key columns in declaration order. For a
+// single-column key it holds the one column [Entity.PK] returns; for
+// a composite key PK is nil and this is the whole story.
+func (e *Entity[T]) PKs() []*Column {
+	out := make([]*Column, len(e.pks))
+	copy(out, e.pks)
+	return out
+}
+
+// ErrKeyArity is returned when a key is given the wrong number of
+// values for the entity's primary key.
+var ErrKeyArity = errors.New("drops/pg: wrong number of primary-key values")
+
+// pkPredicate builds the WHERE clause addressing one row by key.
+//
+// The values are positional and must match [Entity.PKs] in order,
+// which is the table's declaration order. Getting the count wrong is
+// an error rather than a silent partial match: a composite key
+// addressed by one of its two columns would happily update every row
+// sharing that column.
+func (e *Entity[T]) pkPredicate(key []any) (drops.Expression, error) {
+	if len(key) != len(e.pks) {
+		return nil, fmt.Errorf("%w: table %q has %d key column(s) (%s), got %d value(s)",
+			ErrKeyArity, e.table.Name(), len(e.pks), strings.Join(colNames(e.pks), ", "), len(key))
+	}
+	if len(key) == 1 {
+		return Eq(e.pks[0], key[0]), nil
+	}
+	preds := make([]drops.Expression, len(key))
+	for i, c := range e.pks {
+		preds[i] = Eq(c, key[i])
+	}
+	return And(preds...), nil
+}
+
+// pkValuesOf reads the key out of a row, in [Entity.PKs] order.
+func (e *Entity[T]) pkValuesOf(r *T) []any {
+	v := reflect.ValueOf(r).Elem()
+	out := make([]any, len(e.pkFields))
+	for i, idx := range e.pkFields {
+		out[i] = v.FieldByIndex(idx).Interface()
+	}
+	return out
+}
+
+// pkIsZero reports whether every key field is the zero value — the
+// test Save uses to decide between insert and update.
+func (e *Entity[T]) pkIsZero(r *T) bool {
+	v := reflect.ValueOf(r).Elem()
+	for _, idx := range e.pkFields {
+		if !v.FieldByIndex(idx).IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// isKeyColumn reports whether c is part of the primary key.
+//
+// Compared by Column.key, not by handle: the entity's pks can come
+// from Table.PrimaryKey(cols...) while colFields come from Columns(),
+// and on an aliased table those are two handles on one column. Missing
+// the overlap puts the key columns into the SET list of every UPDATE
+// and stops Create from letting the database fill a defaulted key.
+func (e *Entity[T]) isKeyColumn(c *Column) bool {
+	for _, k := range e.pks {
+		if k.key() == c.key() {
+			return true
+		}
+	}
+	return false
+}
+
+func colNames(cols []*Column) []string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		out[i] = c.Name()
+	}
+	return out
+}
+
 // ----------------------------------------------------------------------
 // CRUD operations
 // ----------------------------------------------------------------------
@@ -251,13 +421,25 @@ var ErrPKNotSet = errors.New("drops/pg: primary key field is the zero value")
 // version, or the row was deleted between read and write.
 var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock version mismatch")
 
-// Get fetches the row whose primary key equals id. Returns ErrNoRows
-// if no row matches.
+// Get fetches the row addressed by key. Returns ErrNoRows if no row
+// matches, and [ErrKeyArity] if the number of values does not match
+// the table's primary key.
+//
+// key is variadic to carry a composite primary key, whose values are
+// positional and follow [Entity.PKs] — the table's declaration order.
+// A single-column key reads exactly as it always did:
+//
+//	u, err := UserEntity.Get(db, ctx, 42)
+//	m, err := MembershipEntity.Get(db, ctx, orgID, userID)
 //
 // When a cache is attached via WithCache, Get serves hits from the
 // cache and dedupes concurrent cache misses via single-flight so a
 // thundering herd resolves to one DB query.
-func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
+func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
+	pred, err := e.pkPredicate(key)
+	if err != nil {
+		return *new(T), err
+	}
 	ctx, cancel := e.budgetCtx(ctx)
 	defer cancel()
 	tenantPred, err := e.tenantPredicate(ctx)
@@ -269,11 +451,11 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 		return *new(T), err
 	}
 	if e.cache != nil && tenantPred == nil && guardPred == nil {
-		return e.getCached(db, ctx, id)
+		return e.getCached(db, ctx, key, pred)
 	}
 	var out T
 	if e.fastScan != nil {
-		sel := db.Select().From(e.table).Where(Eq(e.pk, id))
+		sel := db.Select().From(e.table).Where(pred)
 		if tenantPred != nil {
 			sel.Where(tenantPred)
 		}
@@ -283,7 +465,7 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 		err := e.scanOneFast(ctx, sel, &out)
 		return out, err
 	}
-	fb := db.Find(e.table).Where(Eq(e.pk, id))
+	fb := db.Find(e.table).Where(pred)
 	if tenantPred != nil {
 		fb.Where(tenantPred)
 	}
@@ -295,9 +477,9 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, id any) (T, error) {
 }
 
 // getCached is the cache-aware implementation of Get.
-func (e *Entity[T]) getCached(db *DB, ctx context.Context, id any) (T, error) {
+func (e *Entity[T]) getCached(db *DB, ctx context.Context, pkValues []any, pred drops.Expression) (T, error) {
 	var out T
-	key := e.pkKey(id)
+	key := e.pkKey(pkValues)
 
 	// 1. Cache lookup.
 	if hit, err := e.cache.readPK(ctx, key, &out); err == nil && hit {
@@ -313,9 +495,9 @@ func (e *Entity[T]) getCached(db *DB, ctx context.Context, id any) (T, error) {
 		}
 		var err error
 		if e.fastScan != nil {
-			err = e.scanOneFast(ctx, db.Select().From(e.table).Where(Eq(e.pk, id)), &t)
+			err = e.scanOneFast(ctx, db.Select().From(e.table).Where(pred), &t)
 		} else {
-			err = db.Find(e.table).Where(Eq(e.pk, id)).One(ctx, &t)
+			err = db.Find(e.table).Where(pred).One(ctx, &t)
 		}
 		if err != nil {
 			return t, err
@@ -410,9 +592,13 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		v := reflect.ValueOf(&rs[i]).Elem()
 		ins.Row(e.collectInsertBindings(v)...)
 	}
-	cu := ins.OnConflictUpdate(e.pk)
+	keyCols := make([]ColRef, len(e.pks))
+	for i, c := range e.pks {
+		keyCols[i] = c
+	}
+	cu := ins.OnConflictUpdate(keyCols...)
 	for _, cf := range e.colFields {
-		if cf.col == e.pk {
+		if e.isKeyColumn(cf.col) {
 			continue
 		}
 		cu = cu.Set(&exprBinding{col: cf.col, expr: Excluded(cf.col)})
@@ -509,8 +695,7 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if e.cache != nil {
 		// Populate the PK cache with the freshly-inserted row so the
 		// next Get hits immediately.
-		pkv := reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
-		_ = e.cache.writeKey(ctx, e.pkKey(pkv), *r)
+		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
 	return nil
 }
@@ -528,9 +713,12 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		return err
 	}
 	v := reflect.ValueOf(r).Elem()
-	pkv := v.FieldByIndex(e.pkField)
-	if pkv.IsZero() {
+	if e.pkIsZero(r) {
 		return ErrPKNotSet
+	}
+	pred, err := e.pkPredicate(e.pkValuesOf(r))
+	if err != nil {
+		return err
 	}
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
@@ -544,10 +732,10 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		upd := tx.Update(e.table)
 		wroteSet := false
 		for _, cf := range e.colFields {
-			if cf.col == e.pk {
+			if e.isKeyColumn(cf.col) {
 				continue
 			}
-			if cf.col == e.versionCol {
+			if e.versionCol != nil && cf.col.key() == e.versionCol.key() {
 				continue
 			}
 			val := v.FieldByIndex(cf.field).Interface()
@@ -573,7 +761,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		if !wroteSet && !e.table.hasUpdateHooks() {
 			return errors.New("drops/pg: Update has no fields to set")
 		}
-		upd.Where(Eq(e.pk, pkv.Interface()))
+		upd.Where(pred)
 		if tenantPred != nil {
 			upd.Where(tenantPred)
 		}
@@ -602,8 +790,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		err = doUpdate(db)
 	}
 	if err == nil && e.cache != nil {
-		pk := reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
-		_ = e.cache.writeKey(ctx, e.pkKey(pk), *r)
+		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
 	return err
 }
@@ -615,8 +802,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 // race-window between the read and the write matters.
 func (e *Entity[T]) Save(db *DB, ctx context.Context, r *T) error {
 	// Validators run inside Create/Update, no double-call needed here.
-	v := reflect.ValueOf(r).Elem()
-	if v.FieldByIndex(e.pkField).IsZero() {
+	if e.pkIsZero(r) {
 		return e.Create(db, ctx, r)
 	}
 	return e.Update(db, ctx, r)
@@ -625,7 +811,11 @@ func (e *Entity[T]) Save(db *DB, ctx context.Context, r *T) error {
 // Delete removes the row whose primary key equals id. The table's
 // DeleteHooks (e.g. SoftDelete) fire normally — so on a soft-deleted
 // table this rewrites to UPDATE deletedAt = now() instead.
-func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, error) {
+func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Result, error) {
+	pred, err := e.pkPredicate(key)
+	if err != nil {
+		return nil, err
+	}
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
 		return nil, err
@@ -636,7 +826,7 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, e
 	}
 	var res drops.Result
 	doDelete := func(tx *DB) error {
-		del := tx.Delete(e.table).Where(Eq(e.pk, id))
+		del := tx.Delete(e.table).Where(pred)
 		if tenantPred != nil {
 			del.Where(tenantPred)
 		}
@@ -648,7 +838,7 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, e
 			return derr
 		}
 		res = r
-		return e.recordAudit(tx, ctx, "delete", nil, id)
+		return e.recordAudit(tx, ctx, "delete", nil, auditKey(key))
 	}
 	if e.audit != nil {
 		err = db.InTx(ctx, doDelete)
@@ -656,9 +846,23 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, id any) (drops.Result, e
 		err = doDelete(db)
 	}
 	if err == nil {
-		e.invalidatePK(ctx, id)
+		e.invalidatePK(ctx, key)
 	}
 	return res, err
+}
+
+// auditKey renders a key for the audit trail's single rowID column.
+// A composite key is joined so the trail stays queryable by a
+// human-readable value rather than losing all but the first column.
+func auditKey(values []any) any {
+	if len(values) == 1 {
+		return values[0]
+	}
+	parts := make([]string, len(values))
+	for i, v := range values {
+		parts[i] = fmt.Sprintf("%v", v)
+	}
+	return strings.Join(parts, "|")
 }
 
 // collectInsertBindings extracts column values from r. Columns whose
@@ -670,7 +874,7 @@ func (e *Entity[T]) collectInsertBindings(v reflect.Value) []ColumnValue {
 	out := make([]ColumnValue, 0, len(e.colFields))
 	for _, cf := range e.colFields {
 		fv := v.FieldByIndex(cf.field)
-		if fv.IsZero() && (cf.col.HasDefault() || cf.col == e.pk || isImplicitDefault(cf.col)) {
+		if fv.IsZero() && (cf.col.HasDefault() || e.isKeyColumn(cf.col) || isImplicitDefault(cf.col)) {
 			continue
 		}
 		val := fv.Interface()
@@ -765,6 +969,20 @@ func (q *EntityQuery[T]) With(names ...string) *EntityQuery[T] {
 // WithRel eager-loads a relation with per-edge configuration.
 func (q *EntityQuery[T]) WithRel(name string, fn func(*RelConfig)) *EntityQuery[T] {
 	q.fb.WithRel(name, fn)
+	return q
+}
+
+// Load eager-loads relations given as handles — see [FindBuilder.Load]
+// for why both this and the string-taking With exist.
+func (q *EntityQuery[T]) Load(rels ...*Relation) *EntityQuery[T] {
+	q.fb.Load(rels...)
+	return q
+}
+
+// LoadRel eager-loads a relation by handle with per-edge
+// configuration.
+func (q *EntityQuery[T]) LoadRel(rel *Relation, fn func(*RelConfig)) *EntityQuery[T] {
+	q.fb.LoadRel(rel, fn)
 	return q
 }
 

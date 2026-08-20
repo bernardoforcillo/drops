@@ -1,8 +1,12 @@
 package qdrant
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 )
 
 // Point is a single vector + payload + ID record.
@@ -15,6 +19,53 @@ type Point struct {
 	ID      any            `json:"id"`
 	Vector  []float32      `json:"vector"`
 	Payload map[string]any `json:"payload,omitempty"`
+}
+
+// UnmarshalJSON decodes a point, keeping its ID exact.
+func (p *Point) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID      json.RawMessage `json:"id"`
+		Vector  []float32       `json:"vector"`
+		Payload map[string]any  `json:"payload"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	id, err := decodePointID(raw.ID)
+	if err != nil {
+		return err
+	}
+	p.ID, p.Vector, p.Payload = id, raw.Vector, raw.Payload
+	return nil
+}
+
+// decodePointID reads a point ID without routing it through float64.
+//
+// Qdrant IDs are unsigned 64-bit integers or UUID strings, and
+// decoding one into an `any` the ordinary way lands the integer form
+// in a float64: every ID past 2^53 comes back as a neighbouring one,
+// so a point retrieved by search can no longer be deleted or
+// re-fetched by the ID it was handed back. Small IDs survive the trip
+// numerically but arrive as float64(7) where every other drops store
+// returns an integer, which is the portability [vector.Hit.ID] exists
+// to remove.
+func decodePointID(raw json.RawMessage) (any, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+	n, err := strconv.ParseUint(string(raw), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("qdrant: point id %s is neither a u64 nor a string: %w", raw, err)
+	}
+	return n, nil
 }
 
 // WriteOptions tune the consistency of write operations. The default
@@ -30,6 +81,9 @@ type WriteOptions struct {
 // Upsert inserts or replaces a batch of points. Empty batches return
 // ErrNoPoints rather than issuing a no-op HTTP call.
 func (c *Client) Upsert(ctx context.Context, collection string, points []Point, opts ...WriteOptions) error {
+	if err := validateName("collection", collection); err != nil {
+		return err
+	}
 	if len(points) == 0 {
 		return ErrNoPoints
 	}
@@ -45,6 +99,9 @@ var ErrNoPoints = errors.New("qdrant: no points supplied")
 
 // DeleteByIDs deletes the listed points.
 func (c *Client) DeleteByIDs(ctx context.Context, collection string, ids []any, opts ...WriteOptions) error {
+	if err := validateName("collection", collection); err != nil {
+		return err
+	}
 	if len(ids) == 0 {
 		return ErrNoPoints
 	}
@@ -56,6 +113,9 @@ func (c *Client) DeleteByIDs(ctx context.Context, collection string, ids []any, 
 
 // DeleteByFilter deletes every point that matches the filter.
 func (c *Client) DeleteByFilter(ctx context.Context, collection string, f *Filter, opts ...WriteOptions) error {
+	if err := validateName("collection", collection); err != nil {
+		return err
+	}
 	if f == nil {
 		return errors.New("qdrant: DeleteByFilter requires a non-nil filter")
 	}
@@ -73,6 +133,9 @@ type RetrieveOptions struct {
 
 // Retrieve fetches the points with the given IDs.
 func (c *Client) Retrieve(ctx context.Context, collection string, ids []any, opts ...RetrieveOptions) ([]Point, error) {
+	if err := validateName("collection", collection); err != nil {
+		return nil, err
+	}
 	if len(ids) == 0 {
 		return nil, ErrNoPoints
 	}
@@ -95,6 +158,9 @@ func (c *Client) Retrieve(ctx context.Context, collection string, ids []any, opt
 // Count returns the number of points matching an optional filter.
 // Pass nil for a full count.
 func (c *Client) Count(ctx context.Context, collection string, f *Filter, exact bool) (int64, error) {
+	if err := validateName("collection", collection); err != nil {
+		return 0, err
+	}
 	body := struct {
 		Filter *Filter `json:"filter,omitempty"`
 		Exact  bool    `json:"exact"`

@@ -24,12 +24,19 @@ import (
 //	    pg.SetIfGreater(PostMaxScore, currentScore),
 //	)
 //	// UPDATE "posts" SET
-//	//   "likes"      = "likes" + 1,
-//	//   "engagement" = "engagement" + 1,
-//	//   "maxScore"   = GREATEST("maxScore", $1)
-//	// WHERE "id" = $2
+//	//   "likes"      = "posts"."likes" + $1,
+//	//   "engagement" = "posts"."engagement" + $2,
+//	//   "maxScore"   = GREATEST("posts"."maxScore", $3)
+//	// WHERE ("posts"."id" = $4)
 //	//   AND <tenant predicate>
 //	//   AND <guard predicate>
+//
+// An op names its column on the right-hand side as well as the left,
+// and qualified with the relation the handle was declared on — which
+// is not restated against the relation the UPDATE names. So an entity
+// built on an alias must be patched with the alias's own handles; the
+// package-level column names a relation the statement does not have,
+// and PostgreSQL answers 42P01.
 //
 // Patch is atomic at the row level — concurrent patches against
 // the same row serialise on row locks, no lost updates. Returns
@@ -38,8 +45,8 @@ import (
 // extra SELECT).
 
 // PatchOp describes one SET assignment in a Patch. Construct one
-// with Inc / Dec / SetVal / SetIfGreater / SetIfLess /
-// SetIfChanged.
+// with [Inc], [Dec], [Set], [SetIfGreater], [SetIfLess] or
+// [SetIfChanged]. (Not SetVal, which is the sequence function.)
 type PatchOp interface {
 	column() *Column
 	writeValue(b *drops.Builder)
@@ -54,8 +61,22 @@ type PatchOp interface {
 // Returns the result so callers can detect "no row matched"
 // without an additional SELECT.
 func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (drops.Result, error) {
+	return e.PatchKey(db, ctx, []any{id}, ops...)
+}
+
+// PatchKey is [Entity.Patch] for a composite primary key. Patch
+// cannot take a variadic key because its operations already are
+// variadic, so the multi-column form spells the key as a slice:
+//
+//	MembershipEntity.PatchKey(db, ctx, []any{orgID, userID},
+//	    pg.Inc(SeatCount, 1))
+func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...PatchOp) (drops.Result, error) {
 	if len(ops) == 0 {
 		return nil, errors.New("drops/pg: Patch requires at least one operation")
+	}
+	pred, err := e.pkPredicate(key)
+	if err != nil {
+		return nil, err
 	}
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
@@ -71,7 +92,7 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 		for _, op := range ops {
 			upd.Set(op)
 		}
-		upd.Where(Eq(e.pk, id))
+		upd.Where(pred)
 		if tenantPred != nil {
 			upd.Where(tenantPred)
 		}
@@ -83,7 +104,7 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 			return err
 		}
 		res = r
-		return e.recordAudit(tx, ctx, "patch", nil, id)
+		return e.recordAudit(tx, ctx, "patch", nil, auditKey(key))
 	}
 	if e.audit != nil {
 		err = db.InTx(ctx, doPatch)
@@ -93,7 +114,7 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 	if err == nil {
 		// Invalidate the cached entry — the patched value is
 		// computed server-side and we don't have it locally.
-		e.invalidatePK(ctx, id)
+		e.invalidatePK(ctx, key)
 	}
 	return res, err
 }
@@ -102,16 +123,34 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 // PatchOp constructors
 // ----------------------------------------------------------------------
 
-// Inc emits "col = col + delta". For unsigned counters use a
-// non-negative delta; for decrements pass a negative one or use
-// Dec.
+// Inc emits "col = col + delta".
+//
+// A NULL column is not a zero here: NULL + 1 is NULL, so an Inc
+// against a nullable counter erases it instead of starting it. Declare
+// a counter NOT NULL DEFAULT 0, which is what one wants anyway.
 func Inc[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '+'}
 }
 
-// Dec is shorthand for Inc(col, -delta).
+// Dec emits "col = col - delta". Pass the amount to subtract as a
+// positive number.
+//
+// It renders a subtraction rather than negating the delta and adding
+// it, which is the shorter spelling and is wrong for half of [number]:
+// -delta on an unsigned type wraps instead of going negative, so
+// Dec(col, uint32(5)) would bind 4294967291 and the counter would
+// climb by four billion. PostgreSQL has no unsigned column type, but
+// the type here is the Go handle's, and Custom[uint32] gives one over
+// a bigint column — so the case is reachable, and silent, because the
+// rendered statement is perfect and the server has nothing to object
+// to.
+//
+// The column being signed, a subtraction is free to take the counter
+// below zero and the server stores the negative (a Col[uint32] handle
+// then fails to scan it back). A CHECK constraint is what makes it
+// stop, raising 23514.
 func Dec[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: -delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '-'}
 }
 
 // number is the constraint for numeric counter ops.
@@ -124,12 +163,15 @@ type number interface {
 type incOp[T number] struct {
 	col   *Column
 	delta T
+	op    byte // '+' or '-'
 }
 
 func (o *incOp[T]) column() *Column { return o.col }
 func (o *incOp[T]) writeValue(b *drops.Builder) {
 	o.col.WriteSQL(b)
-	b.WriteString(" + ")
+	b.WriteByte(' ')
+	b.WriteByte(o.op)
+	b.WriteByte(' ')
 	b.AddArg(o.delta)
 }
 
@@ -151,12 +193,18 @@ func (o *setValOp[T]) writeValue(b *drops.Builder) { b.AddArg(o.val) }
 // SetIfGreater emits "col = GREATEST(col, $1)" — only raises the
 // value, never lowers it. Useful for high-watermark counters
 // (max score, last-seen timestamp).
+//
+// PostgreSQL's GREATEST ignores NULL arguments, so against a NULL
+// column this stores the new value rather than NULL. MySQL's returns
+// NULL, so a schema served by both dialects still wants the column
+// NOT NULL.
 func SetIfGreater[T any](col *Col[T], v T) PatchOp {
 	return &monotonicOp[T]{col: col.Column, val: v, fn: "GREATEST"}
 }
 
 // SetIfLess emits "col = LEAST(col, $1)" — only lowers the
-// value, never raises it. Useful for low-watermark counters.
+// value, never raises it. Useful for low-watermark counters. Same
+// NULL behaviour as [SetIfGreater].
 func SetIfLess[T any](col *Col[T], v T) PatchOp {
 	return &monotonicOp[T]{col: col.Column, val: v, fn: "LEAST"}
 }
@@ -178,10 +226,26 @@ func (o *monotonicOp[T]) writeValue(b *drops.Builder) {
 }
 
 // SetIfChanged emits "col = $1" only when $1 differs from the
-// current value — implemented as a CASE WHEN so the row is
-// touched (and triggers fire) even if no change happens.
-// Useful when the surrounding entity has hook-driven side
-// effects you don't want to elide silently.
+// current value, as a CASE over IS DISTINCT FROM. The operator is
+// null-safe: a NULL column counts as different from a non-NULL value,
+// where a plain <> would evaluate to NULL, fall to the ELSE, and
+// silently never assign.
+//
+// It does not decide whether the row is written. PostgreSQL writes a
+// new row version for every UPDATE whose WHERE matches, so the row is
+// touched and AFTER UPDATE triggers fire whether or not the CASE
+// picked the new value — a plain [Set] of the identical value does
+// exactly the same. What the CASE decides is only which value lands.
+//
+// Under a deterministic collation — the default — IS DISTINCT FROM is
+// byte-exact, so on such a column SetIfChanged stores what [Set] would
+// have stored, always. The two part company on a column declared with
+// a nondeterministic collation, where 'ada' IS DISTINCT FROM 'ADA' is
+// false and SetIfChanged declines to write a change of case or accent
+// that Set would have written. drops/mysql's version has that
+// behaviour on every text column, its <=> comparing under the column's
+// collation; here it takes an explicit nondeterministic collation to
+// reach.
 func SetIfChanged[T any](col *Col[T], v T) PatchOp {
 	return &ifChangedOp[T]{col: col.Column, val: v}
 }

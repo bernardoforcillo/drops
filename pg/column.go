@@ -28,6 +28,14 @@ type Column struct {
 	ref        *FK
 	version    bool // marked via (*Col[T]).OptimisticLock()
 	pii        bool // marked via (*Col[T]).AsPII()
+	managed    bool // drops writes this column, not the application
+
+	// origin is the column this one was copied from by (*Table).As,
+	// and nil on a column as declared. An alias copy is a second
+	// handle on one column of one table, so everything that asks
+	// which column a handle *is* has to see the two as equal — see
+	// key.
+	origin *Column
 }
 
 // FK describes a foreign-key reference.
@@ -65,6 +73,12 @@ func (c *Column) DefaultSQL() string { return c.defaultSQL }
 // ForeignKey returns the foreign-key reference, or nil if none.
 func (c *Column) ForeignKey() *FK { return c.ref }
 
+// IsManaged reports whether drops writes this column rather than the
+// application — the soft-delete marker, the timestamps a mixin keeps
+// current. Such a column legitimately has no struct field, so
+// NewEntity's drift check skips it.
+func (c *Column) IsManaged() bool { return c.managed }
+
 // IsOptimisticVersion reports whether the column is the version
 // column used for optimistic locking. Marked via
 // (*Col[T]).OptimisticLock().
@@ -73,6 +87,30 @@ func (c *Column) IsOptimisticVersion() bool { return c.version }
 // col returns c. It is the implementation of ColRef for *Column itself;
 // *Col[T] inherits the method via embedding.
 func (c *Column) col() *Column { return c }
+
+// key returns the identity a column is recognised by, collapsing every
+// alias copy onto the column it was declared as.
+//
+// Aliasing is a query-scope rename: it changes how a reference renders
+// and nothing else. So a handle taken off an alias has to answer the
+// same as the declared handle everywhere the question is "which column
+// is this" — the INSERT column list, a hook's Has, an Entity's key
+// columns, the tenant axis, a cursor's ordering column, the CREATE
+// TABLE body's key set. Comparing the two by pointer instead makes
+// them strangers, and most of the resulting failures are silent:
+// the row loses its values to the DEFAULT fill in alignRow, the
+// CREATE TABLE loses its PRIMARY KEY, a snapshot records a key column
+// as nullable.
+//
+// The identity is the declared column rather than the name because two
+// tables can both have a "name" column and they are not the same
+// column.
+func (c *Column) key() *Column {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
+}
 
 // ColRef is implemented by *Column and *Col[T]. It is the type-erased
 // column reference used by APIs that don't depend on the column's Go
@@ -84,6 +122,12 @@ type ColRef interface {
 
 // WriteSQL writes a qualified reference to the column.
 func (c *Column) WriteSQL(b *drops.Builder) {
+	if b.BareIdents() {
+		// DDL that defines this very table cannot qualify the
+		// reference — see (*drops.Builder).BareIdents.
+		b.WriteIdent(c.name)
+		return
+	}
 	if c.table != nil {
 		c.table.writeRef(b)
 		b.WriteByte('.')
@@ -164,6 +208,15 @@ func (c *Col[T]) Default(sqlExpr string) *Col[T] {
 // integer column per table.
 func (c *Col[T]) OptimisticLock() *Col[T] {
 	c.Column.version = true
+	return c
+}
+
+// Managed marks the column as written by drops rather than by the
+// application: the soft-delete marker a mixin flips, the timestamps it
+// keeps current. NewEntity's drift check skips managed columns, since
+// a struct field for them would be redundant rather than missing.
+func (c *Col[T]) Managed() *Col[T] {
+	c.Column.managed = true
 	return c
 }
 

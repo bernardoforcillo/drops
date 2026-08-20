@@ -14,8 +14,8 @@ type Index struct {
 	method       string // btree / hash / gist / gin / brin / spgist / hnsw / ivfflat
 	include      []*Column
 	where        drops.Expression
-	opClass      string // optional pgvector-style operator class (vector_cosine_ops, …)
-	with         string // raw WITH (key = value, …) clause
+	opClasses    []string // per-column operator class, positionally paired with columns
+	with         string   // raw WITH (key = value, …) clause
 }
 
 // NewIndex declares an index on t spanning cols. Cols may be column
@@ -86,9 +86,9 @@ func writeIndexCreate(b *drops.Builder, idx *Index, ifNotExists bool) {
 			b.WriteString(", ")
 		}
 		writeIndexColumn(b, c)
-		if idx.opClass != "" {
+		if j < len(idx.opClasses) && idx.opClasses[j] != "" {
 			b.WriteByte(' ')
-			b.WriteString(idx.opClass)
+			b.WriteString(idx.opClasses[j])
 		}
 	}
 	b.WriteByte(')')
@@ -109,8 +109,41 @@ func writeIndexCreate(b *drops.Builder, idx *Index, ifNotExists bool) {
 	}
 	if idx.where != nil {
 		b.WriteString(" WHERE ")
-		b.Append(idx.where)
+		if pred, ok := indexPredicateSQL(idx.where); ok {
+			b.WriteString(pred)
+		} else {
+			b.Append(idx.where)
+		}
 	}
+}
+
+// indexPredicateSQL renders a partial-index predicate as the static SQL
+// a CREATE INDEX can carry, reporting false when it cannot.
+//
+// CREATE INDEX is a utility statement, and PostgreSQL does not accept
+// parameters in one. A predicate written the ordinary way —
+// age.Gte(18) — binds its 18, so the statement arrives as
+// "WHERE (age >= $1)" and the server rejects it with SQLSTATE 42P02,
+// "there is no parameter $1". The values are known where the schema is
+// declared, not at query time, so they are folded into the text here,
+// the same choice CommentOnTable makes for its literal.
+//
+// The fold is refused, rather than guessed at, for a value with no
+// literal spelling; the caller then binds as before and the failure is
+// the server's to report.
+func indexPredicateSQL(e drops.Expression) (string, bool) {
+	if e == nil {
+		return "", false
+	}
+	sql, args := drops.StringWithDialect(Dialect, e)
+	if len(args) == 0 {
+		return sql, true
+	}
+	out, err := inlineSQLLiterals(sql, args)
+	if err != nil {
+		return "", false
+	}
+	return out, true
 }
 
 // writeIndexColumn renders one entry of a CREATE INDEX column list.

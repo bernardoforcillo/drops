@@ -158,7 +158,7 @@ func (m *MatViewManager) RefreshAll(ctx context.Context) error {
 
 // refreshOne issues SYSTEM REFRESH VIEW for v and records the success time.
 func (m *MatViewManager) refreshOne(ctx context.Context, v MatView) error {
-	sql := fmt.Sprintf(`SYSTEM REFRESH VIEW "%s"`, v.Name)
+	sql := fmt.Sprintf(`SYSTEM REFRESH VIEW %s`, quoteIdent(v.Name))
 	if _, err := m.db.Exec(ctx, sql); err != nil {
 		return err
 	}
@@ -217,10 +217,7 @@ func (m *MatViewManager) downstreamOrder(upstream string) []string {
 		}
 	}
 	visited := map[string]bool{}
-	var stack []string
-	for _, n := range dependents[upstream] {
-		stack = append(stack, n)
-	}
+	stack := append([]string(nil), dependents[upstream]...)
 	var collected []string
 	for len(stack) > 0 {
 		n := stack[len(stack)-1]

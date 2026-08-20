@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,9 +51,21 @@ func (e *Entity[T]) WithCache(c cache.Cache, ttl time.Duration) *Entity[T] {
 // HasCache reports whether a cache is wired up.
 func (e *Entity[T]) HasCache() bool { return e.cache != nil }
 
-// pkKey builds the cache key for a primary-key lookup.
-func (e *Entity[T]) pkKey(id any) string {
-	return fmt.Sprintf("drops:%s:pk:%v", e.table.Name(), id)
+// pkKey builds the cache key for a primary-key lookup. Values are
+// joined with a separator no rendered value can contain, so ("ab",
+// "c") cannot collide with ("a", "bc").
+func (e *Entity[T]) pkKey(values []any) string {
+	var sb strings.Builder
+	sb.WriteString("drops:")
+	sb.WriteString(e.table.Name())
+	sb.WriteString(":pk:")
+	for i, v := range values {
+		if i > 0 {
+			sb.WriteByte(0x1f)
+		}
+		fmt.Fprintf(&sb, "%v", v)
+	}
+	return sb.String()
 }
 
 // queryKey builds the cache key for a rendered SELECT (sql + args).
@@ -113,11 +126,11 @@ func (c *EntityCache) writeKey(ctx context.Context, key string, v any) error {
 
 // invalidatePK deletes the PK entry for id. Safe to call when no
 // cache is attached (no-op).
-func (e *Entity[T]) invalidatePK(ctx context.Context, id any) {
+func (e *Entity[T]) invalidatePK(ctx context.Context, values []any) {
 	if e.cache == nil {
 		return
 	}
-	_, _ = e.cache.backend.Delete(ctx, e.pkKey(id))
+	_, _ = e.cache.backend.Delete(ctx, e.pkKey(values))
 }
 
 // ----------------------------------------------------------------------

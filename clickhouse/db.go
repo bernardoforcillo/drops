@@ -8,9 +8,33 @@ import (
 	"github.com/bernardoforcillo/drops"
 )
 
+// chDialect implements drops.Dialect for ClickHouse.
+type chDialect struct{}
+
+func (chDialect) Name() string { return "clickhouse" }
+
+// Placeholder renders the bare positional question mark the
+// clickhouse-go database/sql driver binds against.
+func (chDialect) Placeholder(int) string { return "?" }
+
+// QuoteIdent uses standard double quotes. ClickHouse accepts
+// backticks too, but double quotes are what its own dumps emit and
+// what the rest of drops renders.
+func (chDialect) QuoteIdent(name string) string { return drops.StdQuoteIdent(name) }
+
+// SupportsReturning reports false: ClickHouse has no RETURNING, which
+// is also why [ErrReturningUnsupported] exists.
+func (chDialect) SupportsReturning() bool { return false }
+
+// Dialect is the ClickHouse dialect value. A clickhouse.DB installs it
+// on every builder; pass it to drops.WithDialect (or
+// drops.StringWithDialect) to render ClickHouse SQL from a bare
+// Builder.
+var Dialect drops.Dialect = chDialect{}
+
 // Placeholder is the placeholder strategy used by the ClickHouse
-// dialect — bare positional question marks, matching the
-// clickhouse-go database/sql driver.
+// dialect — bare positional question marks. Prefer
+// drops.WithDialect(Dialect), which sets identifier quoting as well.
 var Placeholder = drops.WithPlaceholder(func(int) string { return "?" })
 
 // Sentinel errors for assertable failure modes.

@@ -63,18 +63,29 @@ func scanOne(rows drops.Rows, dest any) error {
 		return fmt.Errorf("drops/clickhouse: One requires a non-nil pointer to struct, got %T", dest)
 	}
 	elem := rv.Elem()
-	if elem.Kind() != reflect.Struct {
-		return fmt.Errorf("drops/clickhouse: One requires a pointer to struct, got *%s", elem.Kind())
+	scalar := drops.IsScalarDest(elem.Type())
+	if !scalar && elem.Kind() != reflect.Struct {
+		return fmt.Errorf("drops/clickhouse: One requires a pointer to struct or to a scalar, got *%s", elem.Kind())
 	}
 	cols, err := rows.Columns()
 	if err != nil {
 		return err
+	}
+	if scalar && len(cols) > 1 {
+		return fmt.Errorf("drops/clickhouse: One into *%s needs a single-column result, got %d columns %v",
+			elem.Type(), len(cols), cols)
 	}
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
 			return err
 		}
 		return ErrNoRows
+	}
+	if scalar {
+		if err := rows.Scan(dest); err != nil {
+			return err
+		}
+		return rows.Err()
 	}
 	if err := scanRowInto(rows, elem, cols, fieldMap(elem.Type())); err != nil {
 		return err

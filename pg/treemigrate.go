@@ -227,7 +227,7 @@ func (m *TreeMigrator) AddFS(fsys fs.FS, dir string) error {
 
 	type fileEntry struct {
 		id, name, branch, upSQL, downSQL, description string
-		parents                                        []string
+		parents                                       []string
 	}
 	all := map[string]*fileEntry{}
 
@@ -728,7 +728,6 @@ func (m *TreeMigrator) ensureSchema(ctx context.Context) error {
 	}
 	return nil
 }
-
 
 func (m *TreeMigrator) appliedSet(ctx context.Context) (map[string]appliedEntry, error) {
 	rows, err := m.db.Query(ctx,

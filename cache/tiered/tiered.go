@@ -18,6 +18,26 @@
 // The zero value is not usable; construct with New. Both tiers must be
 // supplied. Tiered is itself a cache.Cache (and a cache.MultiCache), so
 // it nests: an L2 can itself be another tiered cache.
+//
+// # Consistency
+//
+// L1 is allowed to be stale, and that is the trade the near tier buys.
+// A read that hits L1 never consults L2, so a value some other process
+// wrote to L2 stays invisible here until the local copy expires. L1TTL
+// bounds that staleness; leaving it at 0 mirrors the L2 lifetime, which
+// for a key with no expiry means "stale until something deletes it".
+// Any deployment with more than one writer wants a small, non-zero
+// L1TTL.
+//
+// Writes reach L2 first and stop there on failure, so a half-failed Set
+// leaves both tiers on the old value rather than L1 ahead of L2.
+// Deletes also reach L2 first, then clear L1 whatever L2 said: a failed
+// L2 delete leaves the shared value in place, but never a local copy of
+// a value the caller asked to drop. A read error from L2 fails the Get;
+// a failed L1 backfill does not, since it costs only another round-trip
+// next time. Because every write path puts L1 last and returns its
+// failure rather than swallowing it, an error from Set, SetMulti or
+// GetOrLoad does not mean the value failed to reach L2.
 package tiered
 
 import (
@@ -132,12 +152,19 @@ func (c *Cache) Set(ctx context.Context, key string, value []byte, ttl time.Dura
 // Delete removes the keys from both tiers and returns the count reported
 // by L2 (the source of truth). L1 is always cleared even if L2 delete
 // fails, so a stale local copy is never left behind.
+//
+// L2 goes first deliberately. Clearing L1 first opens a window as wide as
+// the L2 round-trip in which a concurrent Get misses L1, still finds the
+// doomed value in L2, and backfills it — resurrecting it in L1 for a full
+// L1TTL (forever, when L1TTL is 0 and the L2 entry had no expiry). Once
+// L2 no longer has the value there is nothing left for a reader to
+// resurrect it from.
 func (c *Cache) Delete(ctx context.Context, keys ...string) (n int, err error) {
 	start := c.clock()
 	defer c.emit(ctx, "cache.del", start, &err)
 
-	_, l1err := c.l1.Delete(ctx, keys...)
 	n, err = c.l2.Delete(ctx, keys...)
+	_, l1err := c.l1.Delete(ctx, keys...)
 	if err == nil && l1err != nil && !errors.Is(l1err, cache.ErrNotFound) {
 		err = l1err
 	}
@@ -281,7 +308,16 @@ func (c *Cache) GetOrLoad(ctx context.Context, key string, ttl time.Duration, lo
 		}
 		return loaded, nil
 	})
-	return v, err
+	if err != nil {
+		return nil, err
+	}
+	// Every caller of a shared flight would otherwise hold the loader's
+	// one backing array, and every other read path in the package hands
+	// out a private copy. Copying for the joiners alone is not enough:
+	// the caller that ran the load returns while they are still copying,
+	// so if it mutates in place they read a half-scribbled value. Nobody
+	// gets the original.
+	return append([]byte(nil), v...), nil
 }
 
 // --- internal helpers -------------------------------------------------
@@ -366,7 +402,7 @@ func (c *Cache) setMulti(ctx context.Context, tier cache.Cache, items map[string
 	return nil
 }
 
-func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) { //nolint:gocritic // errp is read at defer time to observe the final error
+func (c *Cache) emit(ctx context.Context, kind string, start time.Time, errp *error) {
 	drops.CallHook(c.hook, ctx, drops.QueryEvent{
 		Kind:     kind,
 		Duration: c.clock().Sub(start),

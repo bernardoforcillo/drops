@@ -23,6 +23,8 @@ type fakeServer struct {
 	ln    net.Listener
 	mu    sync.Mutex
 	store map[string]fakeEntry
+	conns int           // connections accepted
+	block chan struct{} // when non-nil, handlers stall until it closes
 }
 
 type fakeEntry struct {
@@ -32,7 +34,7 @@ type fakeEntry struct {
 
 func newFakeServer(t *testing.T) *fakeServer {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,6 +45,21 @@ func newFakeServer(t *testing.T) *fakeServer {
 }
 
 func (s *fakeServer) addr() string { return s.ln.Addr().String() }
+
+// stall makes every handler wait on ch before serving, so a test can pin
+// a connection as checked out.
+func (s *fakeServer) stall(ch chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.block = ch
+}
+
+// connCount reports how many connections the server has accepted.
+func (s *fakeServer) connCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns
+}
 
 func (s *fakeServer) serve() {
 	for {
@@ -70,6 +87,13 @@ func (s *fakeServer) get(key string) ([]byte, bool) {
 
 func (s *fakeServer) handle(c net.Conn) {
 	defer c.Close()
+	s.mu.Lock()
+	s.conns++
+	block := s.block
+	s.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	r := bufio.NewReader(c)
 	for {
 		line, err := r.ReadString('\n')
@@ -90,7 +114,12 @@ func (s *fakeServer) handle(c net.Conn) {
 			body := make([]byte, n+2)
 			_, _ = io.ReadFull(r, body)
 			e := fakeEntry{val: append([]byte(nil), body[:n]...)}
-			if exptime > 0 {
+			// Memcached reads an exptime above 30 days as an absolute
+			// unix timestamp rather than a relative count of seconds.
+			switch {
+			case exptime > 60*60*24*30:
+				e.exp = time.Unix(int64(exptime), 0)
+			case exptime > 0:
 				e.exp = time.Now().Add(time.Duration(exptime) * time.Second)
 			}
 			s.mu.Lock()
@@ -287,4 +316,66 @@ func TestConcurrentPooled(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestTTLBeyondThirtyDays(t *testing.T) {
+	ctx := context.Background()
+	c := newClient(t)
+
+	// Sent as a relative count, 31 days lands past Memcached's cutoff and
+	// is read as a unix timestamp in early 1970 — the entry expires the
+	// instant it is stored, and every read is a miss.
+	if err := c.Set(ctx, "k", []byte("v"), 31*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	v, err := c.Get(ctx, "k")
+	if err != nil || string(v) != "v" {
+		t.Fatalf("Get after a 31-day Set: %q %v", v, err)
+	}
+	if err := c.SetMulti(ctx, map[string][]byte{"m": []byte("v")}, 31*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := c.Get(ctx, "m"); err != nil || string(v) != "v" {
+		t.Errorf("Get after a 31-day SetMulti: %q %v", v, err)
+	}
+}
+
+func TestMaxConnsBoundsOpenSockets(t *testing.T) {
+	s := newFakeServer(t)
+	release := make(chan struct{})
+	s.stall(release)
+	c, err := memcached.New(memcached.Options{Addr: s.addr(), MaxConns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// The first caller takes the only slot and parks inside the server.
+	stuck := make(chan struct{})
+	go func() {
+		defer close(stuck)
+		_, _ = c.Get(context.Background(), "a")
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.connCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("server never accepted the first connection")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The second must wait for that slot. Left uncapped it opens a socket
+	// of its own, and a burst of goroutines opens one each until the
+	// process runs out of file descriptors.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := c.Get(ctx, "b"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("second Get: %v, want context.DeadlineExceeded", err)
+	}
+	if got := s.connCount(); got != 1 {
+		t.Errorf("server accepted %d connections with MaxConns=1", got)
+	}
+
+	close(release)
+	<-stuck
 }

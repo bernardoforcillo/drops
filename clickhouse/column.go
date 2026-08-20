@@ -15,6 +15,13 @@ type Column struct {
 	comment  string // COMMENT '…'
 	defSQL   string // DEFAULT <expr>
 	hasDef   bool
+	managed  bool // drops writes this column, not the application
+
+	// origin is the column this one was copied from by (*Table).As,
+	// and nil on a column as declared. An alias copy is a second
+	// handle on one column of one table, so anything that identifies
+	// a column has to see the two as equal — see key.
+	origin *Column
 }
 
 // Name returns the column's unqualified identifier.
@@ -45,8 +52,33 @@ func (c *Column) TTL() string { return c.ttl }
 // Comment returns the column comment, or empty.
 func (c *Column) Comment() string { return c.comment }
 
+// Managed marks the column as written by drops rather than by the
+// application. NewEntity's drift check skips managed columns.
+func (c *Col[T]) Managed() *Col[T] { c.Column.managed = true; return c }
+
+// IsManaged reports whether drops writes this column rather than the
+// application.
+func (c *Column) IsManaged() bool { return c.managed }
+
 // col is the ColRef implementation; *Col[T] inherits via embedding.
 func (c *Column) col() *Column { return c }
+
+// key returns the identity a column is recognised by, collapsing every
+// alias copy onto the column it was declared as.
+//
+// An INSERT names the columns of exactly one table, and a caller who
+// has aliased that table for a self-join holds handles from the alias.
+// Matching those handles against the declared ones by pointer makes
+// them strangers: the row loses its values to the NULL fill in
+// alignRow, and a hook's Has answers false for a column that is
+// already bound. Both are silent. Aliasing is a query-scope rename, so
+// it must not change which column a handle means.
+func (c *Column) key() *Column {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
+}
 
 // ColRef is implemented by *Column and *Col[T]. Use it where the value
 // type doesn't matter (engine ORDER BY / PARTITION BY, index columns,
@@ -58,6 +90,12 @@ type ColRef interface {
 
 // WriteSQL writes a qualified reference to the column.
 func (c *Column) WriteSQL(b *drops.Builder) {
+	if b.BareIdents() {
+		// DDL that defines this very table cannot qualify the
+		// reference — see (*drops.Builder).BareIdents.
+		b.WriteIdent(c.name)
+		return
+	}
 	if c.table != nil {
 		c.table.writeRef(b)
 		b.WriteByte('.')
@@ -151,13 +189,19 @@ func (c *Col[T]) Lt(v T) drops.Expression  { return Lt(c.Column, v) }
 func (c *Col[T]) Lte(v T) drops.Expression { return Lte(c.Column, v) }
 
 // Column-to-column comparisons.
-
-func (c *Col[T]) EqCol(o *Col[T]) drops.Expression  { return Eq(c.Column, o.Column) }
-func (c *Col[T]) NeCol(o *Col[T]) drops.Expression  { return Ne(c.Column, o.Column) }
-func (c *Col[T]) GtCol(o *Col[T]) drops.Expression  { return Gt(c.Column, o.Column) }
-func (c *Col[T]) GteCol(o *Col[T]) drops.Expression { return Gte(c.Column, o.Column) }
-func (c *Col[T]) LtCol(o *Col[T]) drops.Expression  { return Lt(c.Column, o.Column) }
-func (c *Col[T]) LteCol(o *Col[T]) drops.Expression { return Lte(c.Column, o.Column) }
+//
+// The operand is a ColRef, not a *Col[T], because the other side of a
+// self-join is reached through (*Table).As and (*Table).Col, which
+// answer with the type-erased *Column — the two ends of the join are
+// the same column of the same table and there is no T left to agree
+// on. Matching mysql's EqCol here costs the same-T check on both
+// operands; the typed values still flow through Eq and friends.
+func (c *Col[T]) EqCol(o ColRef) drops.Expression  { return Eq(c.Column, o.col()) }
+func (c *Col[T]) NeCol(o ColRef) drops.Expression  { return Ne(c.Column, o.col()) }
+func (c *Col[T]) GtCol(o ColRef) drops.Expression  { return Gt(c.Column, o.col()) }
+func (c *Col[T]) GteCol(o ColRef) drops.Expression { return Gte(c.Column, o.col()) }
+func (c *Col[T]) LtCol(o ColRef) drops.Expression  { return Lt(c.Column, o.col()) }
+func (c *Col[T]) LteCol(o ColRef) drops.Expression { return Lte(c.Column, o.col()) }
 
 // Set / null tests.
 

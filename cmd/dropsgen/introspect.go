@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"go/format"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -35,10 +37,21 @@ func runIntrospect(snapshotPath, outDir, pkg string) error {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	written := map[string]string{}
 	for _, key := range names {
 		tbl := snap.Tables[key]
-		src := emitIntrospectFile(pkg, tbl)
+		src, err := emitIntrospectFile(pkg, tbl)
+		if err != nil {
+			return fmt.Errorf("table %s: %w", key, err)
+		}
 		file := filepath.Join(outDir, snakeForFile(tbl.Name)+"_drops.go")
+		// Two schemas may both hold a "users" table; the file name is
+		// derived from the table name alone, so the second write would
+		// silently replace the first.
+		if prev, ok := written[file]; ok {
+			return fmt.Errorf("tables %s and %s both generate %s; introspect one schema at a time", prev, key, filepath.Base(file))
+		}
+		written[file] = key
 		if err := os.WriteFile(file, src, 0o644); err != nil {
 			return err
 		}
@@ -67,7 +80,7 @@ type introspectUnique struct {
 }
 
 // emitIntrospectFile renders the Go source for a single table.
-func emitIntrospectFile(pkg string, tbl *introspectTable) []byte {
+func emitIntrospectFile(pkg string, tbl *introspectTable) ([]byte, error) {
 	structName := goIdentFor(tbl.Name)
 	cols := orderedColumns(tbl.Columns)
 	singleUniqs := singleColumnUniqueSet(tbl.UniqueConstraints)
@@ -83,8 +96,8 @@ func emitIntrospectFile(pkg string, tbl *introspectTable) []byte {
 		case "json.RawMessage":
 			needsJSON = true
 		}
-		tag := buildDropTag(c, singleUniqs[c.Name])
-		fields = append(fields, fmt.Sprintf("\t%s %s `%s`", goIdentFor(c.Name), gtype, tag))
+		tag := tagLiteral(buildDropTag(c, singleUniqs[c.Name]))
+		fields = append(fields, fmt.Sprintf("\t%s %s %s", goIdentFor(c.Name), gtype, tag))
 	}
 
 	var b strings.Builder
@@ -116,7 +129,16 @@ func emitIntrospectFile(pkg string, tbl *introspectTable) []byte {
 		b.WriteByte('\n')
 	}
 	b.WriteString("}\n")
-	return []byte(b.String())
+
+	// The sibling modes gofmt their output; this one has to as well,
+	// and not only for tidiness — a column whose name yields no legal
+	// Go identifier is otherwise written out as source nobody can
+	// build, with the generator reporting success.
+	src, err := format.Source([]byte(b.String()))
+	if err != nil {
+		return nil, fmt.Errorf("generated struct does not parse: %w", err)
+	}
+	return src, nil
 }
 
 // orderedColumns returns the columns sorted by name so output is
@@ -149,6 +171,20 @@ func singleColumnUniqueSet(uq map[string]*introspectUnique) map[string]bool {
 	return out
 }
 
+// tagLiteral renders one `drop:"..."` struct tag. The value goes
+// through strconv.Quote because a column default is arbitrary SQL: a
+// bare `default='{"a": 1}'::jsonb` looks fine in the source and still
+// compiles, but reflect.StructTag reads the tag as ending at the
+// default's first quote, so the column silently comes back with half
+// a default and a run of garbage options.
+func tagLiteral(value string) string {
+	tag := "drop:" + strconv.Quote(value)
+	if strings.Contains(tag, "`") {
+		return strconv.Quote(tag)
+	}
+	return "`" + tag + "`"
+}
+
 // buildDropTag composes the drop:"name,opt,opt=val" tag value.
 func buildDropTag(c *introspectColumn, isUnique bool) string {
 	parts := []string{c.Name}
@@ -171,7 +207,7 @@ func buildDropTag(c *introspectColumn, isUnique bool) string {
 			parts = append(parts, "default="+*c.Default)
 		}
 	}
-	return `drop:"` + strings.Join(parts, ",") + `"`
+	return strings.Join(parts, ",")
 }
 
 // sqlToGoType maps a column's SQL type to its canonical Go type.

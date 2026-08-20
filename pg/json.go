@@ -52,20 +52,20 @@ func JSONBTypeof(e any) drops.Expression      { return funcCall("jsonb_typeof", 
 // JSONBuildObject renders json_build_object(args...). Pairs are key/value:
 // JSONBuildObject("name", UserName, "age", UserAge).
 func JSONBuildObject(args ...any) drops.Expression {
-	return funcCall("json_build_object", args)
+	return variadicAnyCall("json_build_object", args)
 }
 
 // JSONBuildArray renders json_build_array(args...).
 func JSONBuildArray(args ...any) drops.Expression {
-	return funcCall("json_build_array", args)
+	return variadicAnyCall("json_build_array", args)
 }
 
 // JSONBBuildObject / JSONBBuildArray are the jsonb variants.
 func JSONBBuildObject(args ...any) drops.Expression {
-	return funcCall("jsonb_build_object", args)
+	return variadicAnyCall("jsonb_build_object", args)
 }
 func JSONBBuildArray(args ...any) drops.Expression {
-	return funcCall("jsonb_build_array", args)
+	return variadicAnyCall("jsonb_build_array", args)
 }
 
 // JSONBSet renders jsonb_set(<target>, <path>, <value>, [<createMissing>]).

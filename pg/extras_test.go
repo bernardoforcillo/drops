@@ -25,7 +25,12 @@ func TestSequenceDDL(t *testing.T) {
 		pg.CreateSequenceIfNotExists("userIdSeq", pg.SequenceOptions{Start: &start}),
 		`CREATE SEQUENCE IF NOT EXISTS "userIdSeq" START WITH 100`,
 	)
-	checkExpr(t, pg.NextVal("userIdSeq"), `nextval('userIdSeq'::regclass)`)
+	// CreateSequence quotes the name, so nextval has to quote it too:
+	// the literal is parsed as an identifier and an unquoted one is
+	// case-folded to "useridseq", which does not exist.
+	checkExpr(t, pg.NextVal("userIdSeq"), `nextval('"userIdSeq"'::regclass)`)
+	checkExpr(t, pg.CurrVal("userIdSeq"), `currval('"userIdSeq"')`)
+	checkExpr(t, pg.SetVal("userIdSeq", 42), `setval('"userIdSeq"', $1)`, 42)
 	checkExpr(t, pg.DropSequenceIfExists("userIdSeq"), `DROP SEQUENCE IF EXISTS "userIdSeq"`)
 }
 
@@ -70,14 +75,21 @@ func TestFunctionAndTriggerDDL(t *testing.T) {
 		`DROP TRIGGER IF EXISTS "usersTouch" ON "users"`)
 }
 
+// COMMENT takes a string literal, never a placeholder: PostgreSQL's
+// utility grammar has no parameter slot there, so the earlier "$1"
+// form was a syntax error the moment it reached a server.
 func TestCommentDDL(t *testing.T) {
 	gotSQL, args := drops.String(pg.CommentOnTable(users, "all known users"))
-	if gotSQL != `COMMENT ON TABLE "users" IS $1` || len(args) != 1 || args[0] != "all known users" {
+	if gotSQL != `COMMENT ON TABLE "users" IS 'all known users'` || len(args) != 0 {
 		t.Errorf("CommentOnTable: %q args=%v", gotSQL, args)
 	}
 	gotSQL, args = drops.String(pg.CommentOnColumn(userName, "display name"))
-	if gotSQL != `COMMENT ON COLUMN "users"."name" IS $1` || args[0] != "display name" {
+	if gotSQL != `COMMENT ON COLUMN "users"."name" IS 'display name'` || len(args) != 0 {
 		t.Errorf("CommentOnColumn: %q args=%v", gotSQL, args)
+	}
+	gotSQL, _ = drops.String(pg.CommentOnTable(users, "it's ours"))
+	if gotSQL != `COMMENT ON TABLE "users" IS 'it''s ours'` {
+		t.Errorf("an embedded quote must be doubled, not injected: %q", gotSQL)
 	}
 }
 
@@ -93,10 +105,16 @@ func TestCreateIndexUniqueWhereInclude(t *testing.T) {
 	// the table-qualified form ("users"."name") — PostgreSQL rejects a
 	// qualified name inside a CREATE INDEX column list (SQLSTATE 42601).
 	// The WHERE predicate, by contrast, is an ordinary expression and
-	// stays qualified.
+	// stays qualified; the server resolves it against the indexed
+	// table.
+	//
+	// The 18 is written out rather than bound. CREATE INDEX is a
+	// utility statement, and PostgreSQL accepts no parameters in one,
+	// so the "$1" this used to emit never survived contact with a
+	// server: the statement came back SQLSTATE 42P02, "there is no
+	// parameter $1", and the index was never created.
 	checkExpr(t, pg.CreateIndex(idx),
-		`CREATE UNIQUE INDEX "usersActiveEmailIdx" ON "users" USING btree ("name") INCLUDE ("id") WHERE ("users"."age" >= $1)`,
-		int32(18),
+		`CREATE UNIQUE INDEX "usersActiveEmailIdx" ON "users" USING btree ("name") INCLUDE ("id") WHERE ("users"."age" >= 18)`,
 	)
 }
 
@@ -155,8 +173,14 @@ func TestEnumDDLAndColumn(t *testing.T) {
 // --- Functions: strings / math / date / json / array -----------------
 
 func TestStringFunctions(t *testing.T) {
+	// A bound argument of a VARIADIC "any" function carries its type
+	// on the placeholder; PostgreSQL cannot infer one (SQLSTATE 42P18).
 	checkExpr(t, pg.Concat(userName, " (", userID, ")"),
-		`concat("users"."name", $1, "users"."id", $2)`, " (", ")")
+		`concat("users"."name", $1::text, "users"."id", $2::text)`, " (", ")")
+	checkExpr(t, pg.Concat(userName, 1, 2.5, true),
+		`concat("users"."name", $1::bigint, $2::double precision, $3::boolean)`, 1, 2.5, true)
+	checkExpr(t, pg.ConcatWS("-", userName, "x"),
+		`concat_ws($1::text, "users"."name", $2::text)`, "-", "x")
 	checkExpr(t, pg.ConcatOp(userName, " v2"), `("users"."name" || $1)`, " v2")
 	checkExpr(t, pg.Length(userName), `length("users"."name")`)
 	checkExpr(t, pg.Substring(userName, 1, 3), `substring("users"."name" FROM $1 FOR $2)`, 1, 3)
@@ -189,7 +213,7 @@ func TestJSONOperators(t *testing.T) {
 	checkExpr(t, pg.JSONGetText(doc, "name"), `("docs"."payload" ->> $1)`, "name")
 	checkExpr(t, pg.JSONBContains(doc, `{"k":1}`), `("docs"."payload" @> $1)`, `{"k":1}`)
 	checkExpr(t, pg.JSONBHasKey(doc, "name"), `("docs"."payload" ? $1)`, "name")
-	checkExpr(t, pg.JSONBBuildObject("k", 1), `jsonb_build_object($1, $2)`, "k", 1)
+	checkExpr(t, pg.JSONBBuildObject("k", 1), `jsonb_build_object($1::text, $2::bigint)`, "k", 1)
 	checkExpr(t, pg.JSONBSet(doc, "{path,to}", `"v"`, true),
 		`jsonb_set("docs"."payload", $1, $2, $3)`, "{path,to}", `"v"`, true)
 }

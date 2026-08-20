@@ -42,8 +42,8 @@ type TimestampsCols struct {
 // columns defaulting to now() to t.
 func Timestamps(t *Table) TimestampsCols {
 	return TimestampsCols{
-		CreatedAt: Add(t, Timestamp("createdAt", true).NotNull().Default("now()")),
-		UpdatedAt: Add(t, Timestamp("updatedAt", true).NotNull().Default("now()")),
+		CreatedAt: Add(t, Timestamp("createdAt", true).NotNull().Default("now()").Managed()),
+		UpdatedAt: Add(t, Timestamp("updatedAt", true).NotNull().Default("now()").Managed()),
 	}
 }
 
@@ -56,7 +56,7 @@ type SoftDeleteCols struct {
 // record is treated as live while deletedAt IS NULL.
 func SoftDelete(t *Table) SoftDeleteCols {
 	return SoftDeleteCols{
-		DeletedAt: Add(t, Timestamp("deletedAt", true)),
+		DeletedAt: Add(t, Timestamp("deletedAt", true).Managed()),
 	}
 }
 

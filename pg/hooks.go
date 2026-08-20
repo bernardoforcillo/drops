@@ -37,6 +37,14 @@ func (f InsertHookFunc) BeforeInsert(ctx *InsertHookCtx) { f(ctx) }
 // InsertHookCtx is the controlled handle a hook uses to inspect the
 // statement and append hook-supplied values. Hook-added expressions
 // apply uniformly to every row in the INSERT.
+//
+// bound is keyed by Column.key. A hook closes over the handle it was
+// declared with — every built-in mixin closes over the package-level
+// one — while the caller may have bound the same column through a
+// table alias. Keying by the handle would make Has answer false for a
+// column that is already in the statement, and the hook would add it a
+// second time: PostgreSQL then rejects the INSERT with 42701, and the
+// documented rule that user-supplied values win is inverted.
 type InsertHookCtx struct {
 	bound    map[*Column]bool
 	addCols  []*Column
@@ -45,15 +53,15 @@ type InsertHookCtx struct {
 
 // Has reports whether c is already bound on the INSERT — either by
 // the user or by an earlier hook.
-func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[col] }
+func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[col.key()] }
 
 // SetExpr binds expr to col across every row, unless col is already
 // bound. Use this for DB-evaluated defaults (e.g. drops.Raw("now()")).
 func (c *InsertHookCtx) SetExpr(col *Column, expr drops.Expression) {
-	if c.bound[col] {
+	if c.bound[col.key()] {
 		return
 	}
-	c.bound[col] = true
+	c.bound[col.key()] = true
 	c.addCols = append(c.addCols, col)
 	c.addExprs = append(c.addExprs, expr)
 }
@@ -61,10 +69,10 @@ func (c *InsertHookCtx) SetExpr(col *Column, expr drops.Expression) {
 // Set binds a typed ColumnValue, e.g. the result of (*Col[T]).Val(v).
 // Equivalent to SetExpr with the binding's writer.
 func (c *InsertHookCtx) Set(v ColumnValue) {
-	if c.bound[v.column()] {
+	if c.bound[v.column().key()] {
 		return
 	}
-	c.bound[v.column()] = true
+	c.bound[v.column().key()] = true
 	c.addCols = append(c.addCols, v.column())
 	c.addExprs = append(c.addExprs, bindingExpr(v))
 }
@@ -86,31 +94,35 @@ func (f UpdateHookFunc) BeforeUpdate(ctx *UpdateHookCtx) { f(ctx) }
 
 // UpdateHookCtx is the controlled handle a hook uses to add SET
 // assignments without clobbering user-supplied values.
+//
+// bound is keyed by Column.key, for the reason spelled out on
+// InsertHookCtx: the hook and the caller may hold two handles on one
+// column, and a duplicate assignment is rejected with 42601.
 type UpdateHookCtx struct {
 	bound map[*Column]bool
 	add   []ColumnValue
 }
 
 // Has reports whether col is already bound on the UPDATE.
-func (c *UpdateHookCtx) Has(col *Column) bool { return c.bound[col] }
+func (c *UpdateHookCtx) Has(col *Column) bool { return c.bound[col.key()] }
 
 // Set appends v to the UPDATE's SET list, unless its column is
 // already bound.
 func (c *UpdateHookCtx) Set(v ColumnValue) {
-	if c.bound[v.column()] {
+	if c.bound[v.column().key()] {
 		return
 	}
-	c.bound[v.column()] = true
+	c.bound[v.column().key()] = true
 	c.add = append(c.add, v)
 }
 
 // SetExpr is the raw-expression variant of Set — useful for hooks
 // that want to assign e.g. drops.Raw("now()") to a column.
 func (c *UpdateHookCtx) SetExpr(col *Column, expr drops.Expression) {
-	if c.bound[col] {
+	if c.bound[col.key()] {
 		return
 	}
-	c.bound[col] = true
+	c.bound[col.key()] = true
 	c.add = append(c.add, &exprBinding{col: col, expr: expr})
 }
 

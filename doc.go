@@ -5,6 +5,11 @@
 // pgx, or your own pool) plus the building blocks for composing SQL:
 // [Expression] and [Builder].
 //
+// [All] and [One] give an ad-hoc query the typing an entity query gets
+// for free: they are generic over [RowSource], the Rows method every
+// dialect's SELECT builder already has, so a join or an aggregate
+// scans into a type named at the call site.
+//
 // Observability is provided by [Hook], [ChainHooks], and [CallHook] — a
 // single contract shared by every dialect. A ready-made structured hook
 // is available via [LoggerHook].

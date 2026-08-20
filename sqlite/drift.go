@@ -42,6 +42,12 @@ type DriftReport struct {
 // canonical snapshot and a live introspection. Both arguments
 // must be non-nil — use EmptySnapshot when one side is genuinely
 // empty (e.g. fresh database).
+//
+// Indexes and triggers are outside what this can see, in both
+// directions: Diff never compares them, because the schema DSL cannot
+// declare one and so every index in every database would read as
+// unauthorised. An index or a trigger added to production by hand is
+// therefore not drift here — it is invisible, and it survives a push.
 func DetectDrift(repo, live *Snapshot) DriftReport {
 	if repo == nil {
 		repo = EmptySnapshot()

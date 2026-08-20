@@ -32,14 +32,25 @@ type PatchOp = ColumnValue
 
 // Patch applies ops to the row identified by id.
 func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (drops.Result, error) {
+	return e.PatchKey(db, ctx, []any{id}, ops...)
+}
+
+// PatchKey is [Entity.Patch] for a composite primary key. Patch
+// cannot take a variadic key because its operations already are, so
+// the multi-column form spells the key as a slice.
+func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...PatchOp) (drops.Result, error) {
 	if len(ops) == 0 {
 		return nil, errors.New("drops/sqlite: Patch requires at least one operation")
+	}
+	pred, err := e.pkPredicate(key)
+	if err != nil {
+		return nil, err
 	}
 	tenantPred, err := e.tenantPredicate(ctx)
 	if err != nil {
 		return nil, err
 	}
-	upd := db.Update(e.table).Set(ops...).Where(cmp(e.pk, "=", id))
+	upd := db.Update(e.table).Set(ops...).Where(pred)
 	if tenantPred != nil {
 		upd.Where(tenantPred)
 	}
@@ -55,23 +66,33 @@ type number interface {
 
 // Inc emits "col = col + delta".
 func Inc[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '+'}
 }
 
-// Dec is shorthand for Inc(col, -delta).
+// Dec emits "col = col - delta".
+//
+// It renders a subtraction rather than adding a negated delta, because
+// [number] admits the unsigned types and negating an unsigned value
+// wraps it: Dec(seats, uint32(5)) built as Inc(seats, -5) binds
+// 4294967291 and renders a perfect addition of it, so a counter at 100
+// asked to fall by five stores 4294967391. Silently — there is nothing
+// wrong with the statement.
 func Dec[T number](col *Col[T], delta T) PatchOp {
-	return &incOp[T]{col: col.Column, delta: -delta}
+	return &incOp[T]{col: col.Column, delta: delta, op: '-'}
 }
 
 type incOp[T number] struct {
 	col   *Column
 	delta T
+	op    byte // '+' or '-'
 }
 
 func (o *incOp[T]) column() *Column { return o.col }
 func (o *incOp[T]) writeValue(b *drops.Builder) {
 	o.col.WriteSQL(b)
-	b.WriteString(" + ")
+	b.WriteByte(' ')
+	b.WriteByte(o.op)
+	b.WriteByte(' ')
 	b.AddArg(o.delta)
 }
 

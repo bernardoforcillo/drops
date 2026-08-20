@@ -4,12 +4,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/bernardoforcillo/drops"
 )
 
 // simpleType is a ColumnType whose SQL form is a single literal token.
 type simpleType string
 
 func (s simpleType) TypeSQL() string { return string(s) }
+
+// enumType is the ColumnType of a column declared from a PgEnum.
+//
+// TypeSQL stays the bare name, because that is what the catalogue
+// reports in udt_name and therefore what a snapshot is compared
+// against. The DDL form has to quote it: CreateEnum quotes the name,
+// so a camelCase type referenced unquoted in a column definition is
+// case-folded and reported missing (SQLSTATE 42704).
+type enumType string
+
+func (e enumType) TypeSQL() string    { return string(e) }
+func (e enumType) ddlTypeSQL() string { return drops.StdQuoteIdent(string(e)) }
+
+// ddlTypeSQL is the form of a column type written into DDL. It differs
+// from TypeSQL only where the type name is an identifier that has to
+// carry quotes — see enumType.
+func ddlTypeSQL(t ColumnType) string {
+	if d, ok := t.(interface{ ddlTypeSQL() string }); ok {
+		return d.ddlTypeSQL()
+	}
+	return t.TypeSQL()
+}
 
 // parametrisedType is a ColumnType with a length/precision parameter.
 type parametrisedType struct {
@@ -64,9 +88,12 @@ func Char(name string, n int) *Col[string] {
 
 // Numeric columns --------------------------------------------------------
 
-func SmallInt(name string) *Col[int16]  { return newCol[int16](name, simpleType("smallint")) }
-func Integer(name string) *Col[int32]   { return newCol[int32](name, simpleType("integer")) }
-func BigInt(name string) *Col[int64]    { return newCol[int64](name, simpleType("bigint")) }
+func SmallInt(name string) *Col[int16] { return newCol[int16](name, simpleType("smallint")) }
+func Integer(name string) *Col[int32]  { return newCol[int32](name, simpleType("integer")) }
+func BigInt(name string) *Col[int64]   { return newCol[int64](name, simpleType("bigint")) }
+func SmallSerial(name string) *Col[int16] {
+	return newCol[int16](name, simpleType("smallserial"))
+}
 func Serial(name string) *Col[int32]    { return newCol[int32](name, simpleType("serial")) }
 func BigSerial(name string) *Col[int64] { return newCol[int64](name, simpleType("bigserial")) }
 

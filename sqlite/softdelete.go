@@ -30,7 +30,7 @@ type SoftDeleteCols struct {
 //	postEntity.SoftDeleteByID(db, ctx, id, sd) // hide the row
 //	postEntity.Restore(db, ctx, id, sd)        // bring it back
 func SoftDelete(t *Table) SoftDeleteCols {
-	col := Add(t, Timestamp("deletedAt", false))
+	col := Add(t, Timestamp("deletedAt", false).Managed())
 	t.DefaultFilter(col.IsNull())
 	return SoftDeleteCols{DeletedAt: col}
 }
@@ -39,9 +39,13 @@ func SoftDelete(t *Table) SoftDeleteCols {
 // soft-deleted by setting deletedAt to CURRENT_TIMESTAMP. It runs
 // Unscoped so it also works idempotently on an already-hidden row.
 func (e *Entity[T]) SoftDeleteByID(db *DB, ctx context.Context, id any, sd SoftDeleteCols) (drops.Result, error) {
+	pred, err := e.pkPredicate([]any{id})
+	if err != nil {
+		return nil, err
+	}
 	return db.Update(e.table).Unscoped().
 		SetExpr(sd.DeletedAt.Column, drops.Raw("CURRENT_TIMESTAMP")).
-		Where(cmp(e.pk, "=", id)).
+		Where(pred).
 		Exec(ctx)
 }
 
@@ -49,8 +53,12 @@ func (e *Entity[T]) SoftDeleteByID(db *DB, ctx context.Context, id any, sd SoftD
 // primary key equals id, un-hiding it. Runs Unscoped because the row is,
 // by definition, currently filtered out.
 func (e *Entity[T]) Restore(db *DB, ctx context.Context, id any, sd SoftDeleteCols) (drops.Result, error) {
+	pred, err := e.pkPredicate([]any{id})
+	if err != nil {
+		return nil, err
+	}
 	return db.Update(e.table).Unscoped().
 		SetExpr(sd.DeletedAt.Column, drops.Raw("NULL")).
-		Where(cmp(e.pk, "=", id)).
+		Where(pred).
 		Exec(ctx)
 }

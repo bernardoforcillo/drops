@@ -52,7 +52,7 @@ func TestBudgetMaxArgsErrors(t *testing.T) {
 
 	fd := &fakeDriver{}
 	db := pg.New(fd)
-	uid := entUsersTable_id(t)
+	uid := entUsersTableID(t)
 	// Build a query with > 2 args.
 	_, err := ent.Query(db).Where(uid.In(int64(1), int64(2), int64(3))).All(context.Background())
 	if err == nil {
@@ -67,9 +67,9 @@ func TestBudgetMaxArgsErrors(t *testing.T) {
 	}
 }
 
-// entUsersTable_id is a tiny helper that re-creates the schema and
+// entUsersTableID is a tiny helper that re-creates the schema and
 // returns the typed PK column for use in In() etc.
-func entUsersTable_id(t *testing.T) *pg.Col[int64] {
+func entUsersTableID(t *testing.T) *pg.Col[int64] {
 	t.Helper()
 	// Inline schema clone matching entUsersSchema's PK type.
 	tbl := pg.NewTable("users")

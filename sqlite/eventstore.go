@@ -21,6 +21,9 @@ import (
 //	})
 //	if errors.Is(err, sqlite.ErrConcurrencyConflict) { ... }
 //
+//	// Replay from the beginning. -1, not 0 — see Load.
+//	events, _ := store.Load(ctx, "match", "abc-123", -1)
+//
 // Concurrency is enforced by the UNIQUE (aggregateType, aggregateID,
 // version) constraint — a duplicate tuple surfaces as
 // ErrConcurrencyConflict instead of a raw driver error.
@@ -156,8 +159,17 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
 }
 
-// Load returns events for an aggregate in version order, starting after
-// fromVersion (pass 0 for the beginning).
+// Load returns events for an aggregate in version order, starting
+// strictly after fromVersion — hand it the version of the last event
+// you already applied and it resumes with the next one.
+//
+// Pass -1, not 0, to read a stream from the beginning: versions start
+// at 0, so 0 is the first event's own version and asking for what
+// comes after it skips it. -1 is the same "no event yet" sentinel
+// LatestVersion returns for an empty stream and Append takes as
+// expectedVersion for a fresh one, so Load(LatestVersion(...)) is
+// empty and the last Version read comes straight back in as the
+// resume cursor.
 func (s *EventStore) Load(ctx context.Context, aggregateType, aggregateID string, fromVersion int64) ([]Event, error) {
 	sql := fmt.Sprintf(`
 		SELECT "id", "aggregateType", "aggregateID", "version", "eventType", "payload", "headers", "createdAt"
@@ -284,7 +296,9 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, table string, snap Aggreg
 }
 
 // LoadSnapshot fetches the latest snapshot for an aggregate (ok=false
-// when none exists).
+// when none exists — replay the whole stream instead, which is Load
+// with fromVersion -1). With a snapshot the resume point is
+// snap.Version, since Load is exclusive on it.
 func (s *EventStore) LoadSnapshot(ctx context.Context, table, aggregateType, aggregateID string) (AggregateSnapshot, bool, error) {
 	sql := fmt.Sprintf(`SELECT "aggregateType", "aggregateID", "version", "state", "createdAt" FROM %s WHERE "aggregateType" = ? AND "aggregateID" = ?`, quoteIdent(table))
 	rows, err := s.db.Query(ctx, sql, aggregateType, aggregateID)

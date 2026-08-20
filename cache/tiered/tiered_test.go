@@ -1,6 +1,7 @@
 package tiered_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -186,4 +187,173 @@ func TestNilTierPanics(t *testing.T) {
 		}
 	}()
 	tiered.New(tiered.Options{L1: memory.New()})
+}
+
+// hookedL2 wraps a far tier so a test can run beforeDelete at the exact
+// instant the tiered cache reaches into L2.
+type hookedL2 struct {
+	cache.Cache
+	beforeDelete func()
+}
+
+func (h *hookedL2) Delete(ctx context.Context, keys ...string) (int, error) {
+	if h.beforeDelete != nil {
+		h.beforeDelete()
+	}
+	return h.Cache.Delete(ctx, keys...)
+}
+
+func TestDeleteLeavesNoStaleL1Copy(t *testing.T) {
+	ctx := context.Background()
+	l1, l2 := memory.New(), memory.New()
+	far := &hookedL2{Cache: l2}
+	c := tiered.New(tiered.Options{L1: l1, L2: far, L1TTL: time.Minute})
+
+	if err := c.Set(ctx, "k", []byte("stale"), 0); err != nil {
+		t.Fatal(err)
+	}
+	// Evict the near copy so the interleaved reader has to consult L2,
+	// which is what makes it able to resurrect the value.
+	if _, err := l1.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A reader that lands inside the invalidation: it misses L1, finds
+	// L2 still holding the pre-delete value, and backfills it.
+	far.beforeDelete = func() {
+		if v, err := c.Get(ctx, "k"); err != nil || string(v) != "stale" {
+			t.Errorf("interleaved read: %q %v", v, err)
+		}
+	}
+
+	if _, err := c.Delete(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l1.Get(ctx, "k"); !errors.Is(err, cache.ErrNotFound) {
+		t.Error("a read interleaved with Delete resurrected the value in L1")
+	}
+	if _, err := c.Get(ctx, "k"); !errors.Is(err, cache.ErrNotFound) {
+		t.Error("deleted key still readable")
+	}
+}
+
+func TestGetOrLoadSurvivesAPanickingLoad(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := newTiered(0)
+
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = c.GetOrLoad(ctx, "k", time.Minute, func(context.Context) ([]byte, error) {
+			panic("origin exploded")
+		})
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		v, err := c.GetOrLoad(ctx, "k", time.Minute, func(context.Context) ([]byte, error) {
+			return []byte("v"), nil
+		})
+		if err == nil && string(v) != "v" {
+			err = errors.New("wrong value: " + string(v))
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a panicking load wedged the key: every later caller blocks forever")
+	}
+}
+
+func TestGetOrLoadCopiesBeforeTheLoadedArrayEscapes(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := newTiered(time.Minute)
+
+	// Big enough that a caller scribbling over the array while another is
+	// copying it leaves a visible tear rather than a lucky miss.
+	const size = 1 << 20
+	joined := make(chan struct{})
+	waiterDone := make(chan struct{})
+
+	go func() {
+		v, err := c.GetOrLoad(ctx, "k", time.Minute, func(context.Context) ([]byte, error) {
+			close(joined)
+			time.Sleep(50 * time.Millisecond)
+			return bytes.Repeat([]byte{'a'}, size), nil
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		// The caller that ran the load starts using its value at once —
+		// decoding in place, appending, whatever it does with the bytes.
+		for i := 0; i < 200; i++ {
+			for j := range v {
+				v[j] = 'b'
+			}
+			select {
+			case <-waiterDone:
+				return
+			default:
+			}
+		}
+	}()
+
+	<-joined
+	v, err := c.GetOrLoad(ctx, "k", time.Minute, func(context.Context) ([]byte, error) {
+		t.Error("second caller ran its own load")
+		return nil, nil
+	})
+	close(waiterDone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i := bytes.IndexByte(v, 'b'); i >= 0 {
+		t.Errorf("value torn at byte %d: the loader's array escaped to the caller that ran it, "+
+			"which mutated it while this one was still copying", i)
+	}
+}
+
+func TestGetOrLoadGivesEachCallerItsOwnValue(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := newTiered(time.Minute)
+
+	loading := make(chan struct{})
+	release := make(chan struct{})
+	type result struct {
+		v   []byte
+		err error
+	}
+	res := make(chan result, 2)
+
+	go func() {
+		v, err := c.GetOrLoad(ctx, "k", time.Minute, func(context.Context) ([]byte, error) {
+			close(loading)
+			<-release
+			return []byte("original"), nil
+		})
+		res <- result{v, err}
+	}()
+	<-loading
+	go func() {
+		v, err := c.GetOrLoad(ctx, "k", time.Minute, func(context.Context) ([]byte, error) {
+			t.Error("second caller ran its own load")
+			return nil, nil
+		})
+		res <- result{v, err}
+	}()
+	time.Sleep(50 * time.Millisecond) // let the second caller join the flight
+	close(release)
+
+	a, b := <-res, <-res
+	if a.err != nil || b.err != nil {
+		t.Fatalf("GetOrLoad: %v / %v", a.err, b.err)
+	}
+	a.v[0] = 'X'
+	if string(b.v) != "original" {
+		t.Errorf("callers share one backing array; a mutation leaked: %q", b.v)
+	}
 }

@@ -18,11 +18,18 @@ import (
 // keys with referential actions, composite primary keys, and UNIQUE
 // constraints/indexes.
 //
+// It also records the standalone indexes and the triggers attached to
+// each table, as the DDL sqlite_master stores for them. Nothing diffs
+// against those — the Go schema DSL cannot declare either — but a table
+// rebuild needs them, because DROP TABLE takes every index and trigger
+// on the table with it. See rebuildTable.
+//
 // It mirrors pg.Introspect but reads SQLite's catalog: sqlite_master
-// for the table list and the PRAGMA table_info / foreign_key_list /
-// index_list / index_info functions for per-table detail. The
-// migration-history table (_drops_sqlite_migrations) and SQLite's
-// internal sqlite_* tables are skipped.
+// for the table list, the stored DDL, and the trigger list, and the
+// PRAGMA table_info / foreign_key_list / index_list / index_info
+// functions for per-table detail. The migration-history table
+// (_drops_sqlite_migrations) and SQLite's internal sqlite_* tables are
+// skipped.
 func Introspect(ctx context.Context, db *DB) (*Snapshot, error) {
 	snap := &Snapshot{Tables: map[string]*TableSnapshot{}}
 
@@ -38,6 +45,13 @@ func Introspect(ctx context.Context, db *DB) (*Snapshot, error) {
 			ForeignKeys:          map[string]*ForeignKeySnapshot{},
 			CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
+			// Initialised even though SQLite's catalogue is not read
+			// for CHECK constraints, so an introspected snapshot
+			// serialises the same shape a declared one does. drops/pg
+			// does the same.
+			CheckConstraints: map[string]*CheckSnapshot{},
+			Indexes:          map[string]*IndexSnapshot{},
+			Triggers:         map[string]*TriggerSnapshot{},
 		}
 		if err := introspectColumns(ctx, db, ts); err != nil {
 			return nil, err
@@ -45,7 +59,16 @@ func Introspect(ctx context.Context, db *DB) (*Snapshot, error) {
 		if err := introspectForeignKeys(ctx, db, ts); err != nil {
 			return nil, err
 		}
+		// Indexes first: introspectUniques tells a UNIQUE constraint
+		// from a standalone unique index by asking whether the index
+		// has already been claimed here.
+		if err := introspectIndexes(ctx, db, ts); err != nil {
+			return nil, err
+		}
 		if err := introspectUniques(ctx, db, ts); err != nil {
+			return nil, err
+		}
+		if err := introspectTriggers(ctx, db, ts); err != nil {
 			return nil, err
 		}
 		snap.Tables[name] = ts
@@ -109,6 +132,11 @@ func introspectColumns(ctx context.Context, db *DB, ts *TableSnapshot) error {
 	case 1:
 		if c, ok := ts.Columns[pks[0].name]; ok {
 			c.PrimaryKey = true
+			auto, err := tableIsAutoIncrement(ctx, db, ts.Name)
+			if err != nil {
+				return err
+			}
+			c.AutoIncrement = auto
 		}
 	default:
 		sort.Slice(pks, func(i, j int) bool { return pks[i].pos < pks[j].pos })
@@ -123,6 +151,33 @@ func introspectColumns(ctx context.Context, db *DB, ts *TableSnapshot) error {
 		}
 	}
 	return nil
+}
+
+// tableIsAutoIncrement reports whether the table's key was declared
+// AUTOINCREMENT.
+//
+// PRAGMA table_info does not say — AUTOINCREMENT is not a column
+// attribute SQLite tracks there, it is a rowid-allocation strategy. The
+// stored DDL is the only reliable source: sqlite_sequence would also
+// reveal it, but only once a row has been inserted, so a freshly
+// created table would read as not auto-incrementing and diff against
+// its own declaration forever.
+//
+// SQLite permits AUTOINCREMENT only on an INTEGER PRIMARY KEY, so
+// finding the keyword anywhere in the table's DDL identifies the one
+// column it can belong to.
+func tableIsAutoIncrement(ctx context.Context, db *DB, table string) (bool, error) {
+	rows, err := queryRows(ctx, db,
+		`SELECT sql FROM sqlite_master WHERE type='table' AND name=`+quoteLiteral(table))
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		if strings.Contains(strings.ToUpper(asString(r["sql"])), "AUTOINCREMENT") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // introspectForeignKeys assembles single- and multi-column foreign keys
@@ -181,9 +236,21 @@ func introspectForeignKeys(ctx context.Context, db *DB, ts *TableSnapshot) error
 	return nil
 }
 
-// introspectUniques records UNIQUE constraints/indexes from
-// PRAGMA index_list + index_info. Primary-key indexes (origin "pk") are
-// ignored — they are captured as PrimaryKey / CompositePrimaryKeys.
+// introspectUniques records the UNIQUE constraints written inside the
+// table definition, from PRAGMA index_list + index_info.
+//
+// Two kinds of index are deliberately not constraints here.
+// Primary-key indexes (origin "pk") are captured as PrimaryKey /
+// CompositePrimaryKeys. And an index that introspectIndexes already
+// claimed — one with its own CREATE INDEX statement in sqlite_master —
+// is a standalone index that happens to be unique, not a constraint on
+// the table: it lives on after a rebuild by being replayed, and calling
+// it a constraint instead would have every rebuild fold it into the new
+// CREATE TABLE, changing what the schema says.
+//
+// "Has stored DDL" is the discriminator rather than origin='c' because
+// the origin column postdates the pragma; the presence of a CREATE
+// INDEX statement means the same thing in every version.
 func introspectUniques(ctx context.Context, db *DB, ts *TableSnapshot) error {
 	idxRows, err := queryRows(ctx, db, `PRAGMA index_list(`+quoteLiteral(ts.Name)+`)`)
 	if err != nil {
@@ -200,24 +267,12 @@ func introspectUniques(ctx context.Context, db *DB, ts *TableSnapshot) error {
 		if idxName == "" {
 			continue
 		}
-		infoRows, err := queryRows(ctx, db, `PRAGMA index_info(`+quoteLiteral(idxName)+`)`)
+		if _, standalone := ts.Indexes[idxName]; standalone {
+			continue
+		}
+		names, err := indexColumnNames(ctx, db, idxName)
 		if err != nil {
 			return err
-		}
-		type colPos struct {
-			name string
-			seq  int64
-		}
-		var cols []colPos
-		for _, ir := range infoRows {
-			cols = append(cols, colPos{name: asString(ir["name"]), seq: asInt64(ir["seqno"])})
-		}
-		sort.Slice(cols, func(i, j int) bool { return cols[i].seq < cols[j].seq })
-		names := make([]string, 0, len(cols))
-		for _, c := range cols {
-			if c.name != "" {
-				names = append(names, c.name)
-			}
 		}
 		if len(names) == 0 {
 			continue
@@ -228,6 +283,97 @@ func introspectUniques(ctx context.Context, db *DB, ts *TableSnapshot) error {
 		}
 	}
 	return nil
+}
+
+// introspectIndexes records the table's standalone indexes — the ones
+// with a CREATE INDEX statement of their own in sqlite_master.
+//
+// A NULL sql column marks the anonymous index SQLite builds behind a
+// PRIMARY KEY or a UNIQUE constraint. Those come back for free when a
+// rebuild re-runs the CREATE TABLE, so they are not recorded here;
+// everything else has to be replayed by hand or it is gone.
+func introspectIndexes(ctx context.Context, db *DB, ts *TableSnapshot) error {
+	unique := map[string]bool{}
+	idxRows, err := queryRows(ctx, db, `PRAGMA index_list(`+quoteLiteral(ts.Name)+`)`)
+	if err != nil {
+		return err
+	}
+	for _, r := range idxRows {
+		unique[asString(r["name"])] = asInt64(r["unique"]) != 0
+	}
+
+	rows, err := queryRows(ctx, db,
+		`SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL AND tbl_name=`+
+			quoteLiteral(ts.Name))
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		name := asString(r["name"])
+		ddl := asString(r["sql"])
+		if name == "" || ddl == "" {
+			continue
+		}
+		cols, err := indexColumnNames(ctx, db, name)
+		if err != nil {
+			return err
+		}
+		ts.Indexes[name] = &IndexSnapshot{
+			Name:    name,
+			Table:   ts.Name,
+			Columns: cols,
+			Unique:  unique[name],
+			SQL:     ddl,
+		}
+	}
+	return nil
+}
+
+// introspectTriggers records the triggers attached to the table, as the
+// CREATE TRIGGER text sqlite_master stores.
+func introspectTriggers(ctx context.Context, db *DB, ts *TableSnapshot) error {
+	rows, err := queryRows(ctx, db,
+		`SELECT name, sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL AND tbl_name=`+
+			quoteLiteral(ts.Name))
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		name := asString(r["name"])
+		ddl := asString(r["sql"])
+		if name == "" || ddl == "" {
+			continue
+		}
+		ts.Triggers[name] = &TriggerSnapshot{Name: name, Table: ts.Name, SQL: ddl}
+	}
+	return nil
+}
+
+// indexColumnNames returns the plain column names of an index in key
+// order. A key that is an expression reports a NULL name in PRAGMA
+// index_info and is skipped, so the result can be shorter than the
+// index is wide — callers must not read it as the whole key.
+func indexColumnNames(ctx context.Context, db *DB, idxName string) ([]string, error) {
+	infoRows, err := queryRows(ctx, db, `PRAGMA index_info(`+quoteLiteral(idxName)+`)`)
+	if err != nil {
+		return nil, err
+	}
+	type colPos struct {
+		name string
+		seq  int64
+	}
+	var cols []colPos
+	for _, ir := range infoRows {
+		cols = append(cols, colPos{name: asString(ir["name"]), seq: asInt64(ir["seqno"])})
+	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].seq < cols[j].seq })
+	names := make([]string, 0, len(cols))
+	for _, c := range cols {
+		if c.name != "" {
+			names = append(names, c.name)
+		}
+	}
+	return names, nil
 }
 
 // queryRows runs sql and returns every row as a column-name→value map.

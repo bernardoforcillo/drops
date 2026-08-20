@@ -49,6 +49,10 @@ func (i *InsertBuilder) Rows(rows ...[]ColumnValue) *InsertBuilder {
 // columnsOf returns the columns referenced by values in declaration
 // order. The order matches the table's Columns() listing so SQL is
 // deterministic.
+//
+// The set is keyed by Column.key rather than by the handle, so a value
+// bound through a table alias still matches the column as the table
+// declares it.
 func columnsOf(values []ColumnValue) []*Column {
 	if len(values) == 0 {
 		return nil
@@ -56,22 +60,22 @@ func columnsOf(values []ColumnValue) []*Column {
 	tbl := values[0].column().table
 	seen := map[*Column]bool{}
 	for _, v := range values {
-		seen[v.column()] = true
+		seen[v.column().key()] = true
 	}
 	out := make([]*Column, 0, len(values))
 	if tbl != nil {
 		for _, c := range tbl.Columns() {
-			if seen[c] {
+			if seen[c.key()] {
 				out = append(out, c)
-				delete(seen, c)
+				delete(seen, c.key())
 			}
 		}
 	}
 	for _, v := range values {
 		c := v.column()
-		if seen[c] {
+		if seen[c.key()] {
 			out = append(out, c)
-			delete(seen, c)
+			delete(seen, c.key())
 		}
 	}
 	return out
@@ -79,14 +83,20 @@ func columnsOf(values []ColumnValue) []*Column {
 
 // alignRow returns a slice of expressions aligned with cols. Missing
 // columns are filled with DEFAULT.
+//
+// The index is keyed by Column.key: a row bound through an alias while
+// the column list was fixed by a row bound through the base handles
+// would otherwise match nothing and render as a row of DEFAULTs — a
+// well-formed INSERT of the wrong data, and on a nullable column a
+// silent one.
 func alignRow(cols []*Column, values []ColumnValue) []drops.Expression {
 	idx := make(map[*Column]ColumnValue, len(values))
 	for _, v := range values {
-		idx[v.column()] = v
+		idx[v.column().key()] = v
 	}
 	out := make([]drops.Expression, len(cols))
 	for j, c := range cols {
-		if v, ok := idx[c]; ok {
+		if v, ok := idx[c.key()]; ok {
 			out[j] = bindingExpr(v)
 		} else {
 			out[j] = sqlDefault{}
@@ -203,7 +213,7 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]drops.Expression) {
 	ctx := &InsertHookCtx{bound: make(map[*Column]bool, len(i.cols))}
 	for _, c := range i.cols {
-		ctx.bound[c] = true
+		ctx.bound[c.key()] = true
 	}
 	for _, h := range i.table.insertHooks {
 		h.BeforeInsert(ctx)

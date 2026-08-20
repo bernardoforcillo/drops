@@ -102,13 +102,18 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 		return nil, errors.New("drops/pg: Page requires OrderBy(...)")
 	}
 
+	orderBys, err := p.resolveOrderBys()
+	if err != nil {
+		return nil, err
+	}
+
 	sel := p.db.Select().From(p.e.table)
 	for _, w := range p.wheres {
 		sel.Where(w)
 	}
 	// Apply the cursor guard, if any.
 	if p.after != "" {
-		guard, err := cursorGuard(p.orderBys, p.after)
+		guard, err := cursorGuard(orderBys, p.after)
 		if err != nil {
 			return nil, err
 		}
@@ -116,7 +121,7 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	}
 	// Stable ordering — every OrderingColumn renders into the
 	// SELECT's ORDER BY.
-	for _, o := range p.orderBys {
+	for _, o := range orderBys {
 		sel.OrderBy(orderingExpr(o))
 	}
 	// Fetch one extra row to detect HasMore without a follow-up
@@ -142,11 +147,48 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	out := &Page[T]{Items: rows, HasMore: hasMore}
 	if hasMore && len(rows) > 0 {
 		last := rows[len(rows)-1]
-		cur, err := encodeCursor(p.e, p.orderBys, last)
+		cur, err := encodeCursor(p.e, orderBys, last)
 		if err != nil {
 			return nil, err
 		}
 		out.NextCursor = cur
+	}
+	return out, nil
+}
+
+// resolveOrderBys restates every ordering column with the handle this
+// entity's own table hands out.
+//
+// Asc and Desc are free functions, so an ordering column arrives as
+// whichever handle the caller happened to hold, and it is rendered
+// three times — into the ORDER BY, into the cursor guard's row
+// comparison, and (by name) into the error when no struct field
+// matches. A handle from another instance of the table qualifies with
+// a relation the SELECT does not name, and PostgreSQL answers 42P01:
+// an entity on an alias paged by the package-level column, or an
+// entity on the base table paged by an alias handle, both fail. The
+// column meant is the same one either way — Column.key says so — so
+// the fix is to page by the handle the entity queries, which is what
+// ScopeByTenant does with the tenant axis and for the same reason.
+//
+// Resolving here also moves the "no struct field" error ahead of the
+// query. A cursor is built from the row's field values, so an
+// ordering column with no field could never produce one; failing
+// before the round trip beats failing at the first page boundary.
+func (p *PageBuilder[T]) resolveOrderBys() ([]OrderingColumn, error) {
+	out := make([]OrderingColumn, len(p.orderBys))
+	for i, o := range p.orderBys {
+		var own *Column
+		for _, cf := range p.e.colFields {
+			if cf.col.key() == o.col.key() {
+				own = cf.col
+				break
+			}
+		}
+		if own == nil {
+			return nil, fmt.Errorf("drops/pg: Page.OrderBy column %q has no matching struct field", o.col.Name())
+		}
+		out[i] = OrderingColumn{col: own, asc: o.asc}
 	}
 	return out, nil
 }
@@ -256,7 +298,7 @@ func encodeCursor[T any](e *Entity[T], orderBys []OrderingColumn, row T) (string
 		// Find the entity field bound to o.col.
 		var idx []int
 		for _, cf := range e.colFields {
-			if cf.col == o.col {
+			if cf.col.key() == o.col.key() {
 				idx = cf.field
 				break
 			}

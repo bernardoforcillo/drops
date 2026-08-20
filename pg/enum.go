@@ -28,7 +28,7 @@ func (e *PgEnum) Values() []string { return e.values }
 // string — drizzle-orm uses the same mapping. Use Custom[Foo] if you
 // have a typed string wrapper you want preserved instead.
 func (e *PgEnum) Col(name string) *Col[string] {
-	return newCol[string](name, simpleType(e.name))
+	return newCol[string](name, enumType(e.name))
 }
 
 // CreateEnum returns a CREATE TYPE ... AS ENUM (...) statement.

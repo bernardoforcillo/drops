@@ -53,6 +53,12 @@ type Snapshot struct {
 }
 
 // TableSnapshot is one entry in Snapshot.Tables.
+//
+// Indexes and Triggers are not part of the shape Diff compares — the
+// Go schema DSL cannot declare either, so a declared snapshot never
+// carries any and comparing them would ask for every index in the
+// database to be dropped. They are here so a table rebuild can put
+// back what DROP TABLE takes away; see rebuildTable.
 type TableSnapshot struct {
 	Name                 string                          `json:"name"`
 	Columns              map[string]*ColumnSnapshot      `json:"columns"`
@@ -60,6 +66,8 @@ type TableSnapshot struct {
 	CompositePrimaryKeys map[string]*CompositePKSnapshot `json:"compositePrimaryKeys"`
 	UniqueConstraints    map[string]*UniqueSnapshot      `json:"uniqueConstraints"`
 	CheckConstraints     map[string]*CheckSnapshot       `json:"checkConstraints"`
+	Indexes              map[string]*IndexSnapshot       `json:"indexes"`
+	Triggers             map[string]*TriggerSnapshot     `json:"triggers"`
 }
 
 // ColumnSnapshot is one entry in TableSnapshot.Columns. Type is the
@@ -111,6 +119,37 @@ type CheckSnapshot struct {
 	Value string `json:"value"`
 }
 
+// IndexSnapshot is one entry in TableSnapshot.Indexes — a standalone
+// index, the kind CREATE INDEX makes, as opposed to the anonymous index
+// SQLite builds behind a UNIQUE constraint.
+//
+// SQL is the CREATE INDEX text exactly as sqlite_master stores it, and
+// it is what a rebuild replays. Re-rendering the index from Columns
+// instead would quietly discard a partial index's WHERE clause, an
+// expression index's expression, and every DESC / COLLATE in the key —
+// none of which PRAGMA index_info reports. The stored DDL has all of
+// them, so the stored DDL is the thing worth keeping.
+//
+// Columns holds the plain column names PRAGMA index_info could resolve;
+// a key that is an expression contributes nothing to it. It is used
+// only to spot an index a rebuild is about to invalidate.
+type IndexSnapshot struct {
+	Name    string   `json:"name"`
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+	Unique  bool     `json:"isUnique"`
+	SQL     string   `json:"sql"`
+}
+
+// TriggerSnapshot is one entry in TableSnapshot.Triggers. SQL is the
+// CREATE TRIGGER text as sqlite_master stores it; there is no
+// structured form to keep, because the body is arbitrary SQL.
+type TriggerSnapshot struct {
+	Name  string `json:"name"`
+	Table string `json:"table"`
+	SQL   string `json:"sql"`
+}
+
 // zeroUUID is used as PrevID for the very first snapshot.
 const zeroUUID = "00000000-0000-0000-0000-000000000000"
 
@@ -140,6 +179,10 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
 			UniqueConstraints:    map[string]*UniqueSnapshot{},
 			CheckConstraints:     map[string]*CheckSnapshot{},
+			// Always empty: the Go schema DSL has no way to declare an
+			// index or a trigger. Only Introspect fills these.
+			Indexes:  map[string]*IndexSnapshot{},
+			Triggers: map[string]*TriggerSnapshot{},
 		}
 		// Composite primary key.
 		if pk := t.CompositePrimaryKey(); len(pk) > 0 {
@@ -260,6 +303,12 @@ func UnmarshalSnapshot(data []byte) (*Snapshot, error) {
 		}
 		if t.CheckConstraints == nil {
 			t.CheckConstraints = map[string]*CheckSnapshot{}
+		}
+		if t.Indexes == nil {
+			t.Indexes = map[string]*IndexSnapshot{}
+		}
+		if t.Triggers == nil {
+			t.Triggers = map[string]*TriggerSnapshot{}
 		}
 	}
 	return &s, nil

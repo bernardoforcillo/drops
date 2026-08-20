@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 )
 
 // AuditLog records who-changed-what-when for every Create / Update
@@ -151,14 +150,18 @@ func (e *Entity[T]) recordAudit(tx *DB, ctx context.Context, op string, row *T, 
 	})
 }
 
-// pkValue returns r's primary-key field via reflection. Used by
-// audit + tenant scopes that need the PK without going through the
-// builder.
+// pkValue returns r's primary key as the single value the audit
+// trail's rowID column holds. Used by audit + tenant scopes that need
+// the key without going through the builder.
+//
+// A composite key is joined rather than truncated to its first
+// column: an audit row that identified only half a key would point at
+// a set of rows instead of the one that changed.
 func (e *Entity[T]) pkValue(r *T) any {
-	if e.pkField == nil {
+	if len(e.pkFields) == 0 {
 		return nil
 	}
-	return reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
+	return auditKey(e.pkValuesOf(r))
 }
 
 // ErrAuditTableMissing is returned when an audit operation fails

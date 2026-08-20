@@ -55,6 +55,20 @@ Early. Two dialects ship today:
   the distance operators (`<->` L2, `<#>` inner product, `<=>` cosine,
   `<+>` L1) for similarity search in Postgres. HNSW/IVFFlat indexes
   with the right operator class via `Index.OpClass(...)`.
+- **`drops/mysql`** — MySQL / MariaDB. Backtick identifiers, `?`
+  placeholders, AUTO_INCREMENT, `ON DUPLICATE KEY UPDATE`, prefix
+  indexes, and `ORDER BY`/`LIMIT` on UPDATE and DELETE for batched
+  maintenance. Because MySQL has no `RETURNING`, `Entity.Create` reads
+  a generated key back through the driver's `LastInsertId`.
+- **`drops/mirror`** — one Postgres table, mirrored into ClickHouse for
+  analytics and Qdrant for search. The ClickHouse schema is *derived*
+  from the pg one rather than declared twice, and changes flow through
+  the durable outbox so the copies cannot silently diverge. It also
+  covers what an operator has to do to a running mirror: `Reseeder`
+  replays history into a mirror that never had it, `Verifier` answers
+  whether the copies are actually equal, and `Evolver` walks the
+  mirror's schema forward when the source's moves — adding and widening
+  on its own, refusing a drop or a narrowing by name.
 - **`drops/clickhouse`** — ClickHouse. Engine-bound tables
   (MergeTree family + replicated/distributed via `Raw`), CH-specific
   types (`Array`, `Nullable`, `LowCardinality`, `Decimal`,
@@ -75,6 +89,23 @@ go get github.com/bernardoforcillo/drops
 To use the bundled `database/sql` adapter (`drops/stdlib`) you also need
 a driver — for PostgreSQL, `github.com/jackc/pgx/v5/stdlib`; for
 ClickHouse, `github.com/ClickHouse/clickhouse-go/v2`.
+
+## Documentation
+
+The [docs](docs/) directory has the explanations: a
+[getting-started tutorial](docs/getting-started.md), how to
+[declare a schema](docs/schema.md) without it drifting from your
+structs, [entities and relations](docs/entities.md),
+[which dialect gives you what](docs/dialects.md),
+[portable vector search](docs/vector-search.md), and
+[mirroring one table across all three engines](docs/mirror.md), and
+[how the two test suites divide the work](docs/testing.md).
+
+Package reference is on
+[pkg.go.dev](https://pkg.go.dev/github.com/bernardoforcillo/drops);
+every package ships runnable examples.
+
+The rest of this page is the tour.
 
 ## Quick start
 
@@ -1083,8 +1114,11 @@ drops/sqlite/                SQLite schema, query builders, entities,
                              relations, migrations, pagination, soft delete
 drops/clickhouse/            ClickHouse schema, engines, query builder,
                              analytical aggregates
+drops/mysql/                 MySQL / MariaDB schema, query builders, entities
 drops/qdrant/                Qdrant vector-database HTTP client
 drops/vector/                portable vector search shared by pg/CH/Qdrant
+drops/mirror/                keeps a pg table mirrored into ClickHouse + Qdrant
+integration/                 separate module: the suite that runs against real servers
 drops/cache/                 Cache interface + sentinels
 drops/cache/memory/          in-process cache backend
 drops/cache/redis/           Redis cache backend (own RESP2 client)

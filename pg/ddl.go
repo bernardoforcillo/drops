@@ -9,20 +9,17 @@ import (
 // CreateTable returns a CREATE TABLE statement for t.
 //
 // The generated SQL covers column types, NOT NULL, DEFAULT, UNIQUE,
-// PRIMARY KEY (single-column only), and inline FOREIGN KEY references.
-// More elaborate DDL — composite keys, indexes, partitioning — is out of
-// scope; emit it via raw SQL.
+// PRIMARY KEY (composite included), CHECK constraints, and inline
+// FOREIGN KEY references. What it cannot carry is what PostgreSQL will
+// not accept inside CREATE TABLE: the indexes registered with AddIndex
+// and the multi-column foreign keys declared with ForeignKeyN, both of
+// which are separate statements — see CreateTableWithIndexes.
 func CreateTable(t *Table) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("CREATE TABLE ")
 		t.writeName(b)
 		b.WriteString(" (\n  ")
-		for i, c := range t.Columns() {
-			if i > 0 {
-				b.WriteString(",\n  ")
-			}
-			writeColumnDef(b, c)
-		}
+		writeTableBody(b, t)
 		b.WriteString("\n)")
 	})
 }
@@ -33,14 +30,62 @@ func CreateTableIfNotExists(t *Table) drops.Expression {
 		b.WriteString("CREATE TABLE IF NOT EXISTS ")
 		t.writeName(b)
 		b.WriteString(" (\n  ")
-		for i, c := range t.Columns() {
-			if i > 0 {
-				b.WriteString(",\n  ")
-			}
-			writeColumnDef(b, c)
-		}
+		writeTableBody(b, t)
 		b.WriteString("\n)")
 	})
+}
+
+// CreateTableWithIndexes returns every statement a table needs, in
+// order: the CREATE TABLE, one ALTER TABLE ADD CONSTRAINT per
+// multi-column foreign key, and one CREATE INDEX per index registered
+// with AddIndex.
+//
+// CreateTable alone renders only what fits inside the parentheses, so
+// a table carrying either of those silently loses them.
+func CreateTableWithIndexes(t *Table) []drops.Expression {
+	out := []drops.Expression{CreateTable(t)}
+	for _, fk := range t.CompositeForeignKeys() {
+		out = append(out, addCompositeFK(t, fk))
+	}
+	for _, idx := range t.Indexes() {
+		out = append(out, CreateIndex(idx))
+	}
+	return out
+}
+
+// addCompositeFK renders the ALTER TABLE ADD CONSTRAINT that carries a
+// multi-column foreign key.
+func addCompositeFK(t *Table, fk *CompositeFK) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteString("ALTER TABLE ")
+		t.writeName(b)
+		b.WriteString(" ADD CONSTRAINT ")
+		b.WriteIdent(fk.Name)
+		b.WriteString(" FOREIGN KEY (")
+		writeBareColumns(b, fk.Columns)
+		b.WriteString(") REFERENCES ")
+		fk.Target.writeName(b)
+		b.WriteString(" (")
+		writeBareColumns(b, fk.TargetColumns)
+		b.WriteByte(')')
+		if fk.OnDelete != "" {
+			b.WriteString(" ON DELETE ")
+			b.WriteString(fk.OnDelete)
+		}
+		if fk.OnUpdate != "" {
+			b.WriteString(" ON UPDATE ")
+			b.WriteString(fk.OnUpdate)
+		}
+	})
+}
+
+func writeBareColumns(b *drops.Builder, cols []*Column) {
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteIdent(c.Name())
+	}
 }
 
 // DropTable returns a DROP TABLE statement.
@@ -226,30 +271,43 @@ func DropSequenceIfExists(name string) drops.Expression {
 // NextVal returns the SQL expression nextval('"name"'::regclass).
 func NextVal(name string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(`nextval('`)
-		b.WriteString(name)
-		b.WriteString(`'::regclass)`)
+		b.WriteString(`nextval(`)
+		b.WriteString(sequenceLiteral(name))
+		b.WriteString(`::regclass)`)
 	})
 }
 
 // CurrVal returns currval('"name"').
 func CurrVal(name string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(`currval('`)
-		b.WriteString(name)
-		b.WriteString(`')`)
+		b.WriteString(`currval(`)
+		b.WriteString(sequenceLiteral(name))
+		b.WriteByte(')')
 	})
 }
 
 // SetVal returns setval('"name"', value).
 func SetVal(name string, value any) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(`setval('`)
-		b.WriteString(name)
-		b.WriteString(`', `)
+		b.WriteString(`setval(`)
+		b.WriteString(sequenceLiteral(name))
+		b.WriteString(`, `)
 		writeOperand(b, value)
 		b.WriteByte(')')
 	})
+}
+
+// sequenceLiteral renders a sequence name as the string literal the
+// nextval/currval/setval family takes.
+//
+// The literal is parsed as an identifier, so an unquoted one is
+// case-folded: a sequence created as "orderSeq" — CreateSequence
+// quotes it — is looked up as orderseq and reported missing
+// (SQLSTATE 42P01). Quoting it inside the literal is what makes the
+// two spellings agree, which matters here because drops schemas are
+// camelCase throughout.
+func sequenceLiteral(name string) string {
+	return quoteLiteral(drops.StdQuoteIdent(name))
 }
 
 // --- Views ------------------------------------------------------------
@@ -455,14 +513,19 @@ func DropTriggerIfExists(name string, table *Table) drops.Expression {
 
 // --- Comments ---------------------------------------------------------
 
-// CommentOnTable returns COMMENT ON TABLE <t> IS 'text'. text must not
-// contain unsanitised single quotes.
+// CommentOnTable returns COMMENT ON TABLE <t> IS 'text'.
+//
+// The text is rendered as a literal rather than bound as a parameter:
+// COMMENT is a utility statement and PostgreSQL's grammar has no place
+// for a placeholder there, so "IS $1" is a syntax error before the
+// argument is ever looked at. Embedded quotes are doubled by
+// quoteLiteral.
 func CommentOnTable(t *Table, text string) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("COMMENT ON TABLE ")
 		t.writeName(b)
 		b.WriteString(" IS ")
-		b.AddArg(text)
+		b.WriteString(quoteLiteral(text))
 	})
 }
 
@@ -477,22 +540,88 @@ func CommentOnColumn(c ColRef, text string) drops.Expression {
 		}
 		b.WriteIdent(col.Name())
 		b.WriteString(" IS ")
-		b.AddArg(text)
+		b.WriteString(quoteLiteral(text))
 	})
 }
 
 // --- Helpers for column definitions inside CREATE TABLE --------------
 
-func writeColumnDef(b *drops.Builder, c *Column) {
+// writeTableBody renders the column definitions plus the table-level
+// PRIMARY KEY clause a composite key needs.
+//
+// A key spanning one column can be declared inline on it. A key
+// spanning two cannot: an inline PRIMARY KEY on each renders two of
+// them, and PostgreSQL rejects the statement with "multiple primary
+// keys for table are not allowed". The table-level form is the only
+// one that works for both, so the choice is made here from the number
+// of key columns, rather than at each column.
+//
+// The key itself comes from Table.primaryKeyColumns, so a table that
+// declared it with PrimaryKey(cols...) and one that marked each
+// column render the same clause.
+func writeTableBody(b *drops.Builder, t *Table) {
+	keys := t.primaryKeyColumns()
+	// Keyed by Column.key, because the two sides can be two handles on
+	// one column: primaryKeyColumns answers from compositePK while the
+	// loop walks Columns(). On an aliased table those are different
+	// pointers, and a set that missed them would emit a CREATE TABLE
+	// with no PRIMARY KEY at all — which PostgreSQL accepts.
+	inKey := make(map[*Column]bool, len(keys))
+	for _, c := range keys {
+		inKey[c.key()] = true
+	}
+	composite := len(keys) > 1
+
+	for i, c := range t.Columns() {
+		if i > 0 {
+			b.WriteString(",\n  ")
+		}
+		member := inKey[c.key()]
+		writeColumnDefKey(b, c, member && !composite, member)
+	}
+	if composite {
+		b.WriteString(",\n  PRIMARY KEY (")
+		writeBareColumns(b, keys)
+		b.WriteByte(')')
+	}
+	writeTableConstraints(b, t)
+}
+
+// writeTableConstraints renders the named UNIQUE and CHECK constraints
+// declared on the table. Both are keyed by name, so they are emitted in
+// name order to keep the statement stable across runs.
+func writeTableConstraints(b *drops.Builder, t *Table) {
+	for _, name := range sortedKeys(t.CompositeUniques()) {
+		b.WriteString(",\n  CONSTRAINT ")
+		b.WriteIdent(name)
+		b.WriteString(" UNIQUE (")
+		writeBareColumns(b, t.CompositeUniques()[name])
+		b.WriteByte(')')
+	}
+	for _, name := range sortedKeys(t.Checks()) {
+		b.WriteString(",\n  CONSTRAINT ")
+		b.WriteIdent(name)
+		b.WriteString(" CHECK (")
+		b.WriteString(t.Checks()[name])
+		b.WriteByte(')')
+	}
+}
+
+// writeColumnDefKey renders one column. inlineKey asks for the inline
+// PRIMARY KEY; it is false when the table declares a composite key, in
+// which case a key column carries NOT NULL here and its key membership
+// is stated once, table-level. keyMember says whether the column is
+// part of the key at all, which is what suppresses a redundant UNIQUE.
+func writeColumnDefKey(b *drops.Builder, c *Column, inlineKey, keyMember bool) {
 	b.WriteIdent(c.Name())
 	b.WriteByte(' ')
-	b.WriteString(c.Type().TypeSQL())
-	if c.IsPrimaryKey() {
+	b.WriteString(ddlTypeSQL(c.Type()))
+	if inlineKey {
 		b.WriteString(" PRIMARY KEY")
 	} else if c.IsNotNull() {
 		b.WriteString(" NOT NULL")
 	}
-	if c.IsUnique() && !c.IsPrimaryKey() {
+	if c.IsUnique() && !keyMember {
 		b.WriteString(" UNIQUE")
 	}
 	if c.HasDefault() {

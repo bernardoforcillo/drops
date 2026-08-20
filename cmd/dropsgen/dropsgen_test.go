@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -114,4 +115,61 @@ type Plain struct { ID int }
 	if err := run(in, ""); err == nil {
 		t.Error("expected error when no entities found")
 	}
+}
+
+// An embedded struct contributes columns to pg's reflection scanner
+// but is invisible to a generator reading the AST: Cols / Bind / Scan
+// come out one column short, and the first Entity.Get then fails with
+// "expected 3 destination arguments in Scan, not 2" — a message that
+// points at nothing.
+func TestParseRejectsEmbeddedFields(t *testing.T) {
+	tmp := t.TempDir()
+	src := `package x
+
+//drops:entity table=Users
+type User struct {
+	ID int64 ` + "`drop:\"id\"`" + `
+	Timestamps
+}
+
+type Timestamps struct {
+	CreatedAt string ` + "`drop:\"createdAt\"`" + `
+}
+`
+	path := filepath.Join(tmp, "users.go")
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := parseFile(path)
+	if err == nil {
+		t.Fatal("an embedded field should be refused, not silently dropped from the column list")
+	}
+	if !strings.Contains(err.Error(), "Timestamps") {
+		t.Errorf("the error should name the embedded type: %v", err)
+	}
+}
+
+// Two runs over the same input must be byte-identical, or the
+// checked-in generated file churns in every diff and people stop
+// rerunning the generator.
+func TestBindScanIsDeterministic(t *testing.T) {
+	first := generateOnce(t)
+	for i := 0; i < 20; i++ {
+		if got := generateOnce(t); got != first {
+			t.Fatalf("run %d differs from the first:\n--- first ---\n%s\n--- got ---\n%s", i, first, got)
+		}
+	}
+}
+
+func generateOnce(t *testing.T) string {
+	t.Helper()
+	entities, pkg, err := parseFile("testdata/input/users.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := emit(pkg, entities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(src)
 }

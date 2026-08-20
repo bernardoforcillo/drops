@@ -596,6 +596,16 @@ func diffIndexes(prev, cur *TableSnapshot, safe bool) []string {
 	}
 	for _, k := range sortedKeys(cur.Indexes) {
 		curIdx := cur.Indexes[k]
+		if len(curIdx.Columns) == 0 {
+			// At least one element was an expression, so the
+			// snapshot kept none of them and there is nothing to put
+			// between the parentheses. Rendering `ON "t" ()` is not a
+			// migration,
+			// it is a syntax error that takes the rest of the file
+			// down with it. Push names the index it skipped here in
+			// its notices; declare it with pg.CreateIndex instead.
+			continue
+		}
 		prevIdx, present := prev.Indexes[k]
 		if !present {
 			out = append(out, createIndexSQL(cur.Name, curIdx, safe))
@@ -611,37 +621,82 @@ func diffIndexes(prev, cur *TableSnapshot, safe bool) []string {
 // diffCompositePKs emits ALTER TABLE ADD/DROP PRIMARY KEY.
 // Single-column PKs continue to live on the column definition
 // and are handled by the column diff.
+//
+// The two sides are matched by their column list, not by their name: a
+// table has at most one PRIMARY KEY, and the name it wears is whatever
+// created it — "members_pkey" when PostgreSQL chose it,
+// compositePKName's camelCase when drops did. Matching by name would
+// have a push against a server-named key drop and recreate it, every
+// time, for no change at all.
 func diffCompositePKs(prev, cur *TableSnapshot, safe bool) []string {
-	var out []string
-	for _, k := range sortedKeys(prev.CompositePrimaryKeys) {
-		if _, ok := cur.CompositePrimaryKeys[k]; !ok {
-			out = append(out, dropConstraintSQL(cur.Name, k, safe))
+	prevPK := tableCompositePK(prev)
+	curPK := tableCompositePK(cur)
+	switch {
+	case prevPK == nil && curPK == nil:
+		return nil
+	case curPK == nil:
+		return []string{dropConstraintSQL(cur.Name, prevPK.Name, safe)}
+	case prevPK == nil:
+		return []string{addPrimaryKeySQL(cur.Name, curPK)}
+	case sameStrings(prevPK.Columns, curPK.Columns):
+		return nil
+	}
+	return []string{
+		dropConstraintSQL(cur.Name, prevPK.Name, safe),
+		addPrimaryKeySQL(cur.Name, curPK),
+	}
+}
+
+// tableCompositePK returns the table's multi-column PRIMARY KEY, or
+// nil when it has none. The snapshot format keys them by name for
+// drizzle-kit compatibility, but PostgreSQL permits only one; the
+// lowest name wins so a hand-written snapshot carrying more than one
+// still diffs deterministically.
+func tableCompositePK(t *TableSnapshot) *CompositePKSnapshot {
+	for _, k := range sortedKeys(t.CompositePrimaryKeys) {
+		return t.CompositePrimaryKeys[k]
+	}
+	return nil
+}
+
+func addPrimaryKeySQL(table string, pk *CompositePKSnapshot) string {
+	return fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s PRIMARY KEY (%s);`,
+		quoteIdent(table), quoteIdent(pk.Name), strings.Join(quoteIdents(pk.Columns), ", "))
+}
+
+// sameStrings reports whether two ordered identifier lists match.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
-	for _, k := range sortedKeys(cur.CompositePrimaryKeys) {
-		if _, ok := prev.CompositePrimaryKeys[k]; ok {
-			continue
-		}
-		pk := cur.CompositePrimaryKeys[k]
-		cols := strings.Join(quoteIdents(pk.Columns), ", ")
-		out = append(out, fmt.Sprintf(
-			`ALTER TABLE %s ADD CONSTRAINT %s PRIMARY KEY (%s);`,
-			quoteIdent(cur.Name), quoteIdent(pk.Name), cols))
-	}
-	return out
+	return true
 }
 
 // diffChecks emits ALTER TABLE ADD/DROP CONSTRAINT for CHECK
 // constraints.
+//
+// A constraint whose expression changed under an unchanged name is
+// dropped and re-added: PostgreSQL has no ALTER CONSTRAINT for a
+// CHECK, and matching on the name alone — which is all this did —
+// meant tightening `age >= 0` to `age >= 18` produced no migration at
+// all. The same caveat as indexEqual applies to the comparison: the
+// two Values have to be spelled alike, which against a live server is
+// Push's job, not Diff's.
 func diffChecks(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.CheckConstraints) {
-		if _, ok := cur.CheckConstraints[k]; !ok {
+		curC, ok := cur.CheckConstraints[k]
+		if !ok || curC.Value != prev.CheckConstraints[k].Value {
 			out = append(out, dropConstraintSQL(cur.Name, k, safe))
 		}
 	}
 	for _, k := range sortedKeys(cur.CheckConstraints) {
-		if _, ok := prev.CheckConstraints[k]; ok {
+		if prevC, ok := prev.CheckConstraints[k]; ok && prevC.Value == cur.CheckConstraints[k].Value {
 			continue
 		}
 		c := cur.CheckConstraints[k]
@@ -673,6 +728,9 @@ func createIndexSQL(table string, idx *IndexSnapshot, safe bool) string {
 	b.WriteString(" (")
 	b.WriteString(strings.Join(quoteIdents(idx.Columns), ", "))
 	b.WriteByte(')')
+	if len(idx.Include) > 0 {
+		fmt.Fprintf(&b, " INCLUDE (%s)", strings.Join(quoteIdents(idx.Include), ", "))
+	}
 	if idx.Where != "" {
 		fmt.Fprintf(&b, " WHERE %s", idx.Where)
 	}
@@ -690,22 +748,30 @@ func dropIndexSQL(name string, safe bool) string {
 
 // indexEqual reports whether two index snapshots describe the
 // same logical index.
+//
+// Concurrently is not part of the comparison: it says how an index was
+// built, not what it is, and the catalogue cannot report it — comparing
+// it would have every push drop and rebuild an index declared
+// Concurrently. Everything else is compared literally, the predicate
+// included.
+//
+// Comparing the predicate as text is only honest because both sides
+// arrive spelled the same way. Two snapshots built from Go schemas are
+// spelled by drops; a snapshot read back from a server is spelled by
+// pg_get_expr, which renormalises ("age" >= 18) to (age >= 18) and
+// would churn forever against a declared index. Push closes that gap
+// by asking the server to respell the declared side before it diffs —
+// see renormaliseExpressions. A caller diffing Introspect against
+// BuildSnapshot directly does not get that and should expect the
+// predicate to compare unequal.
 func indexEqual(a, b *IndexSnapshot) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	if a.IsUnique != b.IsUnique || a.Method != b.Method || a.Where != b.Where || a.Concurrently != b.Concurrently {
+	if a.IsUnique != b.IsUnique || a.Method != b.Method || a.Where != b.Where {
 		return false
 	}
-	if len(a.Columns) != len(b.Columns) {
-		return false
-	}
-	for i := range a.Columns {
-		if a.Columns[i] != b.Columns[i] {
-			return false
-		}
-	}
-	return true
+	return sameStrings(a.Columns, b.Columns) && sameStrings(a.Include, b.Include)
 }
 
 func sameStringPtr(a, b *string) bool {

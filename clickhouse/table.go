@@ -48,11 +48,65 @@ func (t *Table) Name() string     { return t.name }
 func (t *Table) Database() string { return t.database }
 func (t *Table) Alias() string    { return t.alias }
 
-// As returns a shallow copy bound to alias.
+// As returns a copy of the table under an alias, for self-joins.
+//
+// The copy carries its own columns, bound to the aliased table, so a
+// reference reached through it — e := events.As("e"); e.Col("id") —
+// qualifies with the alias while the original package-level handles go
+// on qualifying with the table name. That is what makes both sides of a
+// self-join addressable at once, and it is why the copy is not a
+// shallow one: sharing the column slice would leave every reference
+// pointing at the un-aliased table, which ClickHouse cannot resolve
+// once the alias has shadowed the name.
+//
+// Default filters are not rewritten. They were built against the
+// un-aliased columns and would name a relation the aliased query no
+// longer has in scope, so an aliased SELECT wants Unscoped plus an
+// explicit predicate. Dropping them instead would turn a tenant or
+// soft-delete guard into silence; leaving them makes the server reject
+// the query, which is the failure worth having.
+//
+// The engine clauses — ORDER BY, PARTITION BY, PRIMARY KEY, SAMPLE BY —
+// keep pointing at the original's columns. Every one of them renders
+// under bare identifiers (see writeTableSuffix), so the alias cannot
+// reach them and rebinding would change no output.
+//
+// The alias is validated like any other identifier and a bad one —
+// including the empty string, which used to pass through and hand back
+// an un-aliased copy — panics with ErrInvalidIdentifier.
+//
+// The column list is a snapshot: a column added to the table after this
+// call is absent from the alias. Alias at query time, which is where a
+// self-join is written anyway, not at declaration time.
+//
+// Each copy remembers the column it came from, so the two handles stay
+// interchangeable everywhere a column is identified rather than
+// rendered — INSERT column lists and hook bookkeeping (see
+// (*Column).key). Only the qualifier they render differs.
 func (t *Table) As(alias string) *Table {
+	mustIdent("alias", alias)
 	cp := *t
 	cp.alias = alias
+	cp.columns = make([]*Column, len(t.columns))
+	cp.byName = make(map[string]*Column, len(t.byName))
+	for i, c := range t.columns {
+		aliased := *c
+		aliased.table = &cp
+		aliased.origin = c.key()
+		cp.columns[i] = &aliased
+		cp.byName[aliased.name] = &aliased
+	}
 	return &cp
+}
+
+// OrderByColumns returns the names of the table's sorting key, in
+// declaration order. Empty when no ORDER BY was set.
+func (t *Table) OrderByColumns() []string {
+	out := make([]string, 0, len(t.orderBy))
+	for _, c := range t.orderBy {
+		out = append(out, c.col().Name())
+	}
+	return out
 }
 
 // Col looks up a column by name.

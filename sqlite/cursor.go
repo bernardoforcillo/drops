@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bernardoforcillo/drops"
@@ -404,7 +405,20 @@ func keysetStrict(k OrderKey, v any, forward bool) drops.Expression {
 func cursorErrExpr(err error) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) {
 		b.WriteString("FALSE /* drops cursor: ")
-		b.WriteString(err.Error())
+		b.WriteString(defuseCommentEnd(err.Error()))
 		b.WriteString(" */")
 	})
+}
+
+// defuseCommentEnd blunts the only sequence that can end a block
+// comment early.
+//
+// A cursor is designed to travel through a query string, so its bytes
+// come from the client, and the decode error quotes them back: an
+// unknown type tag is reported as `cursor value type "..." unknown`.
+// A tag of `*/ OR 1=1 --` therefore closed the comment and left the
+// rest standing as SQL, turning the guaranteed-false guard into a
+// predicate that matched every row.
+func defuseCommentEnd(s string) string {
+	return strings.ReplaceAll(s, "*/", "* /")
 }

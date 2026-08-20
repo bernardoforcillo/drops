@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 )
 
 // AuditLog records who-changed-what-when for every Create / Update /
@@ -120,10 +119,10 @@ func (e *Entity[T]) recordAudit(tx *DB, ctx context.Context, op string, row *T, 
 
 // pkValue returns r's primary-key field via reflection.
 func (e *Entity[T]) pkValue(r *T) any {
-	if e.pkField == nil {
+	if len(e.pkFields) == 0 {
 		return nil
 	}
-	return reflect.ValueOf(r).Elem().FieldByIndex(e.pkField).Interface()
+	return auditKey(e.pkValuesOf(r))
 }
 
 // ErrAuditTableMissing is returned when an audit operation fails because

@@ -11,6 +11,7 @@ import (
 func main() {
 	var (
 		file     = flag.String("file", "", "Go source file to scan for entities (bind/scan mode)")
+		schema   = flag.String("schema", "", "Go source file to scan for //drops:schema structs (schema mode)")
 		outName  = flag.String("o", "", "output file (bind/scan mode; default: <input>_drops_gen.go)")
 		snapshot = flag.String("snapshot", "", "drops snapshot JSON to introspect into Go structs")
 		sqlDir   = flag.String("sql", "", "directory of .sql files to compile into typed Go funcs")
@@ -26,6 +27,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Introspect mode:")
 		fmt.Fprintln(os.Stderr, "  dropsgen -snapshot meta/0001_snapshot.json -out models/ [-pkg models]")
 		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Schema mode (typed table + column declarations from a struct):")
+		fmt.Fprintln(os.Stderr, "  dropsgen -schema users.go [-o out.go]")
+		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "SQL mode (typed sqlc-style queries):")
 		fmt.Fprintln(os.Stderr, "  dropsgen -sql queries/ -out queries/ [-pkg queries]")
 		flag.PrintDefaults()
@@ -33,6 +37,11 @@ func main() {
 	flag.Parse()
 
 	switch {
+	case *schema != "":
+		if err := runSchema(*schema, *outName); err != nil {
+			fmt.Fprintf(os.Stderr, "dropsgen: %v\n", err)
+			os.Exit(1)
+		}
 	case *sqlDir != "":
 		if err := runSQL(*sqlDir, *outDir, *pkg); err != nil {
 			fmt.Fprintf(os.Stderr, "dropsgen: %v\n", err)

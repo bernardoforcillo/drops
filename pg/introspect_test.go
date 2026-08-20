@@ -184,10 +184,10 @@ func introspectFake() *fakeDriver {
 			}, nil
 		case strings.Contains(q, "PRIMARY KEY"):
 			return &fakeRows{
-				cols: []string{"table_schema", "table_name", "column_name"},
+				cols: []string{"table_schema", "table_name", "constraint_name", "column_name"},
 				data: [][]any{
-					{"public", "users", "id"},
-					{"public", "posts", "id"},
+					{"public", "users", "users_pkey", "id"},
+					{"public", "posts", "posts_pkey", "id"},
 				},
 			}, nil
 		case strings.Contains(q, "constraint_type = 'UNIQUE'"):

@@ -196,7 +196,9 @@ func TestClickhouseEntityRespectsDefaultFilter(t *testing.T) {
 		UserID uint64 `drop:"userId"`
 		Kind   string `drop:"kind"`
 	}
-	ent := clickhouse.NewEntity[ev](tbl)
+	// deletedAt exists to be filtered on, not to be written by the
+	// application, so the drift check has to be told that on purpose.
+	ent := clickhouse.NewEntity[ev](tbl, clickhouse.AllowUnmappedColumns("deletedAt"))
 	fd := &entFakeDriver{}
 	db := clickhouse.New(fd)
 	_, _ = ent.Query(db).All(context.Background())

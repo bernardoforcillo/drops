@@ -221,6 +221,31 @@ func TestPatch(t *testing.T) {
 	}
 }
 
+// [number] admits the unsigned types, so building Dec as Inc(-delta)
+// wraps: the rendered statement is a perfect addition of an enormous
+// number, and the counter climbs instead of falling.
+func TestPatchDecSubtracts(t *testing.T) {
+	tbl := sqlite.NewTable("seatmaps")
+	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
+	seats := sqlite.Add(tbl, sqlite.Custom[uint32]("seats", "INTEGER"))
+	ent := sqlite.NewEntity[struct {
+		ID    int64  `drop:"id"`
+		Seats uint32 `drop:"seats"`
+	}](tbl)
+
+	drv := &entDriver{}
+	db := sqlite.New(drv)
+	if _, err := ent.Patch(db, context.Background(), int64(1), sqlite.Dec(seats, uint32(5))); err != nil {
+		t.Fatal(err)
+	}
+	if want := `"seats" = "seatmaps"."seats" - ?`; !strings.Contains(drv.queries[0], want) {
+		t.Errorf("Dec must render a subtraction, missing %q in:\n%s", want, drv.queries[0])
+	}
+	if got := drv.args[0][0]; got != uint32(5) {
+		t.Errorf("Dec bound %v, want the delta itself", got)
+	}
+}
+
 // --- tenant -----------------------------------------------------------
 
 type tRow struct {

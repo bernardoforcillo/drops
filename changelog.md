@@ -8,6 +8,328 @@ once a 1.0 is cut.
 
 ## [Unreleased]
 
+### Added
+- **Version bands in `drops/mirror`** — `Change.Version` decides which
+  of two writes to a row the mirror keeps, and a `ReplacingMergeTree`
+  never revisits that decision. Two incomparable spaces were in play
+  at once and the live one was the application's wall clock: two hosts
+  five milliseconds apart inverted two updates one millisecond apart,
+  permanently and silently. The `uint64` line is cut into three bands
+  instead — a seed band, a clock band for a source with no sequence of
+  its own, and a live band that is the outbox event id offset to
+  `1<<63`. A `ReplacingMergeTree` written by an older version of this
+  package needs no migration: every version it ever stamped was a
+  nanosecond reading, so every row it holds sits below every sequenced
+  change.
+- **`mirror.VersionAwareSink`** — a fill-mode reseed is safe because
+  seeded rows lose on version, which is a claim only a sink that reads
+  versions can honour. `QdrantSink` cannot: Qdrant's upsert is
+  last-write-wins with no compare-and-set. `NewFillReseeder` now
+  refuses such a sink by name rather than corrupting it quietly.
+
+- **Typed ad-hoc queries** (`drops.All[T]` / `drops.One[T]`) — an
+  entity query was already typed, but an entity is exactly what a
+  join, an aggregate or a projection does not have, so the interesting
+  queries went through `All(ctx, dest any)` and reported a mismatched
+  destination at run time. Both are generic over `drops.RowSource`,
+  which is the `Rows(ctx)` method `pg`, `mysql` and `clickhouse`
+  builders already carry, so no dialect gained a line of code. `T` may
+  be a struct, a `*struct` or — for a single-column result — a scalar,
+  `drops.All[int64]`; `One` reports an empty result as
+  `drops.ErrNoRows`. See `docs/entities.md`.
+- **Scalar slices in `drops.ScanAll`** — `ScanOne` learned scalar
+  destinations earlier in this cycle and `ScanAll` did not, so
+  `SELECT id` into a `*[]int64` was still "slice element must be
+  struct or *struct".
+- **Mirror operations** (`drops/mirror`) — a mirror could be started
+  and stopped; everything an operator actually has to do to one was
+  missing. `Reseeder` replays the source into the sinks, cursored and
+  resumable, in a fill mode that only closes holes and a repair mode
+  that goes through the outbox and can overwrite a wrong value.
+  `Verifier` answers whether the mirror is equal to the source, by
+  range digests that narrow only where they disagree and that encode
+  both sides in Go rather than trusting two engines to agree on the
+  text of a value. `Evolver` reconciles the mirror's *shape* with the
+  source's — columns, sorting key and partitioning — adding and
+  widening on its own and refusing a drop, a narrowing, a key column,
+  a moved sorting key or an unprovable cast by name. See
+  `docs/mirror.md`.
+- **Scalar destinations in `One`/`All`** — `One(ctx, &n)` for a
+  `COUNT(*)` failed with "requires a pointer to struct". A
+  single-column query is the most common query there is, and drops
+  could not consume its own result.
+- **Integration suite against real servers** (`integration/`) — a
+  separate Go module, so the drivers it needs cannot reach a user's
+  build and drops keeps its zero-dependency property. SQLite's driver
+  is pure Go and runs anywhere; Postgres, MySQL, ClickHouse and Qdrant
+  run against the bundled compose services and skip with a clear
+  message when absent, except in CI where `DROPS_REQUIRE_ALL` turns a
+  missing server into a failure. New CI job. See `docs/testing.md` for
+  what belongs in which suite.
+- **`clickhouse.Dialect`** — pg, sqlite and mysql all exported one;
+  without it `drops.StringWithDialect` could not render ClickHouse SQL.
+- **`sqlite.Column.Asc/Desc/As`** and **`sqlite.EntityQuery.Unscoped`**
+  — both existed in the other dialects. Without Unscoped a
+  soft-deleted row was unreachable through the entity at all, so the
+  restore flow could not be written.
+- **OLTP → OLAP → vector mirroring** (`drops/mirror`) —
+  `DeriveClickHouse` makes the analytics schema a function of the
+  transactional one rather than a second declaration; `ClickHouseSink`
+  and `QdrantSink` apply changes idempotently; `Pump` moves them from a
+  durable outbox source, refusing to acknowledge a batch any sink
+  rejected. See `docs/mirror.md`.
+- **MySQL / MariaDB dialect** (`drops/mysql`) — schema, DDL, indexes,
+  the four statement builders, operators, and Entity CRUD with the
+  drift check, composite keys and relation handles. Generated keys come
+  back through `LastInsertId` because MySQL has no `RETURNING`.
+- **Composite primary keys in Entity** (`drops/pg`, `drops/sqlite`) —
+  `Get`/`Delete` take the key variadically, `PatchKey` takes it as a
+  slice, and wrong arity is `ErrKeyArity` rather than a partial match
+  that would address every row sharing a column.
+- **Relation handles** (`drops/pg`) — `Table.Rel` resolves a relation
+  name once at declaration; `Load`/`LoadRel` take the handle so an
+  eager-load is compile-checked, alongside the string-taking
+  `With`/`WithRel` for relation sets that arrive from outside the
+  program.
+- **Schema generation from structs** (`cmd/dropsgen -schema`) — emits
+  the typed `Col[T]` declarations from `//drops:schema` tags, so the
+  struct is the single source of truth and drift is unrepresentable
+  rather than merely detected. Worked example in `examples/schemagen`.
+- **Documentation tree** (`docs/`) — getting started, schema, entities,
+  dialect comparison, vector search, mirroring. Runnable examples added
+  for `drops/mysql` and `drops/sqlite`.
+- **Bare-identifier mode on `drops.Builder`** — `BareIdents` /
+  `SetBareIdents`, so DDL that defines a table can render unqualified
+  column references even when they are nested inside an expression.
+- Smaller additions: `pg.SmallSerial`, `sqlite.Column.Asc/Desc/As`,
+  `clickhouse.Bind`, `clickhouse.Table.OrderByColumns`,
+  `(*Col[T]).Managed` on pg/sqlite/clickhouse.
+
+### Changed
+- **`NewEntity` now rejects a column bound to no struct field**
+  (`drops/pg`, `drops/sqlite`, `drops/clickhouse`). It used to skip it
+  silently, so a renamed field or a mistyped `drop:` tag removed the
+  column from every INSERT and UPDATE while everything still compiled
+  and every test that did not assert on that column still passed.
+  Columns drops itself writes are exempt automatically; the rest must
+  be mapped or named through `AllowUnmappedColumns`.
+
+### Fixed
+- **`Dec` added a negated delta, so an unsigned counter climbed.** In
+  all three dialects. The constraint behind `Inc`/`Dec` admits the
+  unsigned types, and negating an unsigned value wraps, so
+  `Dec(seats, uint32(5))` bound 4294967291 and rendered a flawless
+  addition of it: a counter at 100 asked to fall by five stored
+  4294967391. No engine objects — the statement is correct SQL, it just
+  computes the opposite of the method's name. `Dec` renders a
+  subtraction now.
+- **`pg.Table.As` handed back the table's own columns, so a PostgreSQL
+  self-join could not be written.** The copy was one struct assignment
+  deep: the alias shared its column slice, its `byName` map and every
+  other map with the table it was aliased from, so `users.As("u").
+  Col("id")` was the package-level handle and still rendered
+  `"users"."id"`. A join whose `FROM` names only the alias was rejected
+  with 42P01; a self-join was accepted and read both sides from the
+  un-aliased instance. The shared maps leaked in the other direction
+  too — a relation, `CHECK`, `UNIQUE` or policy declared against the
+  alias was written into the base table.
+
+  `As` now copies the columns and binds them to the alias, and gives
+  the copy its own maps, with the near side of each relation and the
+  table-level key, unique and foreign-key column lists rebound. So that
+  the copy stays *the same column* everywhere identity is what is being
+  asked, a column carries the one it was copied from (`Column.origin`)
+  and every consumer that matched on the handle now matches on that:
+  the INSERT column list and row alignment, both hook contexts' `Has` /
+  `Set` / `SetExpr`, `Entity`'s key columns, `ScopeByTenant`, `Page`'s
+  ordering columns and cursor, the `CREATE TABLE` body and
+  `BuildSnapshot`. Left unmatched, each of those failed in its own way
+  and most of them quietly: a row bound through an alias rendered as
+  all-`DEFAULT` and stored `NULL`s, a `CREATE TABLE` came out with no
+  `PRIMARY KEY` and the server took it, a snapshot recorded the key
+  column as nullable and fed that to `Diff` and `Push`. `As` also
+  validates its argument now, like every other identifier entry point
+  in the package.
+
+  Two things `As` deliberately does not do, both now in its doc
+  comment. Nothing the caller built and drops only re-emits is
+  rewritten — a predicate, and a `Patch` operation: a default filter
+  installed by `SoftDeleteMixin`, or an `authz` guard built from the
+  package-level columns, is an already-built expression closed over the
+  handles it was given, so an aliased query needs `Unscoped` and an
+  explicit predicate, and an aliased entity needs a `Patch` built from
+  the alias's handles. And the copy is a snapshot — a column or
+  relation declared after `As` returned does not reach the alias, which
+  matters because Go initialises package-level vars before it runs
+  `init`.
+- **`pg.Entity.Page` ordered by the handle it was handed, not by the
+  one the query names.** `Asc` / `Desc` are free functions, so an
+  ordering column arrives as whichever handle the caller held, and it
+  is rendered twice — into the `ORDER BY` and into the cursor guard's
+  row comparison. An entity on an alias paged by the package-level
+  column, or an entity on the base table paged by an alias handle,
+  emitted a statement naming a relation with no `FROM` entry, and
+  PostgreSQL answered 42P01. `Page` now restates each ordering column
+  as the handle its own table hands out, the way `ScopeByTenant`
+  already did with the tenant axis. An ordering column with no struct
+  field is also rejected before the query runs rather than at the first
+  page boundary: a cursor is built out of the row's field values, so
+  such a column could never produce one.
+- **An aliased `mysql` column was a stranger to the column it names.**
+  `mysql.Table.As` copied its columns and bound them to the alias, so
+  the rendering was right, but nothing recorded that the copy *is* the
+  declared column. Every site that decided by pointer therefore
+  answered wrong, and the worst of them silently: `alignRow` matched a
+  row's bindings against the INSERT column list through a
+  `map[*Column]`, so a row bound through an alias fell to the `DEFAULT`
+  fill — on a defaulted column MariaDB accepts the statement and writes
+  `('anon', 0)`, and on a `NOT NULL` column with no default the same
+  statement is error 1364, which is to say one schema change separates
+  a silent corruption from a hard failure. A column now carries the one
+  it was copied from (`Column.origin`) and a `*Table` carries the same
+  (`Table.origin`), and `alignRow`, `Entity`'s key columns and
+  `Table.AddIndex` match on that — `AddIndex`'s panic also names the
+  alias, having printed the base name on both sides of "cannot be added
+  to".
+
+  Where such a handle is *rendered* rather than looked up, identity is
+  not enough and the reference is restated. `Entity.Page` ordered by
+  the handle it was handed, into both the `ORDER BY` and the cursor
+  guard; a `CursorSpec` driven through `SelectBuilder` did the same,
+  and its `FROM` may arrive after the spec, so that one is restated at
+  render time — and left alone whenever drops cannot be sure the
+  statement names one instance of the table. A self-join names two on
+  purpose. So can a source added with `FromExpr`, which drops re-emits
+  without reading: a comma join on the alias is a second instance it
+  cannot count. Restating there picks the wrong instance and picks it
+  silently, because both relations exist and the statement stays valid
+  SQL over the wrong rows. `Patch` and `(*UpdateBuilder).Set` render an
+  operation's column on the right of the assignment —
+  `SET age = age + ?` — as does `ON DUPLICATE KEY UPDATE`; each is now
+  restated against the relation the statement names, which for an
+  `INSERT` is always the table, its `INTO` clause having no `AS` to
+  carry. Every one of these was error 1054 on the live server, in both
+  directions: once a `FROM` carries an alias the base name stops being
+  a legal qualifier, and without one the alias never was. Cursor tokens
+  are unaffected — the ordering fingerprint identifies a column by
+  name, so a token stamped under one handle still spends under the
+  other.
+
+  `As` also copies what it used to share. The `checks` map was shared
+  by reference, so a check added to either handle appeared on both and
+  the doc's "the copy is a snapshot" was false; `indexes` and
+  `defaultFilters` were copied as slice headers at full capacity, so
+  two aliases of one table appended into the same spare slot and the
+  second overwrote the first.
+
+- **`qdrant.HasID()` with an empty id set matched every point.** The
+  field carries `omitempty`, so an empty set left a condition with no
+  clauses in it, and Qdrant reads a condition that constrains nothing
+  as one that matches everything. The route is the shortest there is —
+  look up ids, find none, delete what you found — and it empties the
+  collection while reporting success. `In` and `NotIn` had the same
+  hole in milder form.
+- **A SQLite table rebuild destroyed every index and trigger on the
+  table.** SQLite cannot `ALTER` most things, so `drops/sqlite` renders
+  those changes as a rebuild — create the new shape, copy, `DROP
+  TABLE`, rename — and `DROP TABLE` takes the table's indexes and
+  triggers with it. `TableSnapshot` carried no record of either, so
+  they were gone, silently, and a migration that dropped the index a
+  hot query depends on reported success. `Introspect` now reads the
+  stored `CREATE INDEX` / `CREATE TRIGGER` text out of `sqlite_master`
+  and the rebuild replays it after the rename. What a rebuild cannot
+  preserve is now said out loud rather than assumed: an index keyed on
+  a removed column is dropped with the column and reported
+  (`rebuild-drops-index`); an index that reaches a removed column
+  through a partial predicate or an expression is replayed and the
+  engine's rejection fails the migration; a trigger is replayed
+  verbatim, because SQLite does not resolve a trigger body until it
+  fires, and one naming a removed column is reported
+  (`rebuild-stale-trigger`). `Diff` still emits no `CREATE INDEX` or
+  `DROP INDEX` of its own — the schema DSL cannot declare an index, so
+  every index in a database is undeclared and diffing them would drop
+  all of them. The replay reaches as far as the previous snapshot does,
+  which means `Push` and `DetectDrift`, both of which diff against a
+  live `Introspect`. `GenerateMigration` diffs two snapshot files and a
+  snapshot file records no index, so a generated rebuild still destroys
+  them — and introspecting at generation time would only be a guess
+  about the server the file is applied to later. That rebuild now
+  carries a comment saying so, reported as `rebuild-loses-indexes`.
+  `DetectDrift` correspondingly does not report a hand-made index as an
+  unauthorised change; it used to report a hand-made *unique* index and
+  not a plain one, and its proposed remedy was a rebuild that would
+  have destroyed it.
+- **Every SQLite table with a `UNIQUE` constraint rebuilt itself on
+  every push.** SQLite does not store a `UNIQUE` constraint's name — an
+  inline `email TEXT UNIQUE`, a `UNIQUE (email)` and a `CONSTRAINT c
+  UNIQUE (email)` all leave one anonymous index, which `PRAGMA
+  index_list` reports as `sqlite_autoindex_users_1`. Comparing names
+  therefore reported a constraint change against the table's own
+  declaration, forever, and on SQLite a constraint change means a full
+  table rebuild. Unique constraints are now compared as a set of column
+  tuples, which is the only part the engine remembers. `Introspect` also
+  stops filing a standalone `CREATE UNIQUE INDEX` as a table
+  constraint; it is an index, and it is preserved as one.
+- **The shared scanner mapped a column to the wrong field whenever two
+  fields could claim it**, and which one won depended on declaration
+  order. An embedded `Key.ID` displaced the outer `ID` when the
+  embedded field was declared second; a field's camelCase form
+  displaced another field's explicit `drop:` tag when it came later.
+  Names now resolve by depth first — the shallower field wins, as it
+  does for ordinary Go field access — and, at equal depth, tag before
+  field name before camelCase form, with a genuine tie going to the
+  field declared first.
+- **The shared scanner skipped every field promoted out of an
+  unexported embedded struct**, so a row type that factors its
+  bookkeeping columns into an `audit` mixin silently scanned none of
+  them. Those fields are exported and settable through reflection; they
+  are now walked, as `encoding/json` walks them. An embedded
+  `time.Time` or `sql.Scanner`, conversely, is no longer walked into:
+  it receives a column, which is what `IsScalarDest` already claimed.
+- **`ScanOne` sent a `**struct` down the single-column path**, where it
+  became either "needs a single-column result" or a driver-level
+  conversion error, neither of which names the mistake. `IsScalarDest`
+  now looks through pointers, so a pointer to a struct is a struct.
+- **Composite primary keys could not create their own table**
+  (`drops/pg`, `drops/sqlite`) — an inline `PRIMARY KEY` was emitted on
+  every marked column, so a two-column key rendered two of them.
+  PostgreSQL rejects that outright and so does SQLite. The support
+  added earlier in this cycle could query such a table but never build
+  one. Both now emit the table-level clause MySQL already did.
+- **SQLite `Entity.Create` bound the zero primary key**, so every row
+  claimed id 0 and the second insert failed on the key; and it never
+  read the generated key back, leaving the caller holding a row it
+  could not address. Zero auto-increment and defaulted columns are now
+  omitted, and the key comes back through `RETURNING`.
+- **A SQLite primary key was not `NOT NULL`** — treated as redundant
+  next to `PRIMARY KEY`, which PostgreSQL implies and SQLite does not.
+  Measured against the engine: a `TEXT PRIMARY KEY` without it accepts
+  and stores a NULL key.
+- **SQLite introspection never detected `AUTOINCREMENT`**, so every
+  declared auto-increment column diffed against the live table forever.
+- **A SQLite table with no `CHECK` constraints diffed against itself** —
+  `BuildSnapshot` initialises the constraint maps, `Introspect` left
+  one nil, and `reflect.DeepEqual` reports nil and empty as different.
+  On SQLite a constraint change means a full table rebuild, so a schema
+  that already matched its declaration copied itself on every deploy.
+- **ClickHouse `CREATE TABLE` emitted table-qualified column names** in
+  ORDER BY / PRIMARY KEY / PARTITION BY, which the server rejects — it
+  cannot resolve `"docs"."id"` against a table that does not exist yet.
+  The existing test had pinned the broken output.
+- **ClickHouse's event store and matview interpolated table names into
+  a literal `"%s"`** instead of quoting them as identifiers.
+- **CI had been red since PR #5.** `.golangci.yml` was still v1 format
+  while the action installs v2, so the linter failed on config load and
+  never ran; gocritic ran with a `style` tag this codebase does not
+  follow; `sloppyReassign` was actively wrong against the named-return
+  pattern the hooks depend on. Now green, with the two real findings it
+  had been hiding fixed.
+- **SQLite entity queries never used the attached cache** — `queryKey`
+  was dead code because the query-result caching pg has was never
+  wired up. `All`/`One` now read through it with the same single-flight
+  stampede protection the PK path had.
+
+
 ## [0.6.0] - 2026-08-16
 
 ### Added

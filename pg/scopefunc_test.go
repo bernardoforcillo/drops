@@ -1320,6 +1320,200 @@ func (p *pgSyntax) fieldsRead(recv string, seeds ...string) map[string]bool {
 	return read
 }
 
+// fieldsResolved returns the fields of the receiver type that the
+// closure of methods reachable from seeds actually hands to the ctx —
+// as an argument of a call that also receives the ctx, or as the
+// receiver of one.
+//
+// It exists because reading a field is not resolving it. The round-6
+// check asked only whether the resolve closure mentioned the field, and
+// a mention is cheap: a field the resolver merely LOOKS at — a length
+// test, a validation branch, a nil check — passed the check while its
+// contents went to the renderer unwalked. That is the same fail-open
+// one layer up, and this is what closes it: the field has to reach a
+// call that has the ctx in its hands, because a call with no ctx cannot
+// resolve anything against one.
+//
+// "Reaches" is a taint walk rather than a syntactic match, because the
+// resolvers do not hand fields to calls directly. SelectBuilder.resolveCtx
+// builds a slice of {src, dst} structs from seven fields and passes
+// l.src; resolveJoins ranges s.joins and calls j.table.resolveContextFilters(ctx);
+// InsertBuilder.resolveCtx takes cols and rows through two locals and a
+// helper before stampTenantColumn(ctx, ...) sees them. So a local
+// carries the taint of everything assigned into it, a range variable
+// the taint of what is ranged over, and the result of a call to another
+// method on the same receiver the taint of every field that method
+// reads.
+//
+// That last rule is deliberately generous: it credits a field with
+// flowing out of a helper that merely read it. The alternative — no
+// cross-method taint — fails honest resolvers, and this check is here
+// to catch a field nobody walks at all, not to trace which byte came
+// out of which helper.
+func (p *pgSyntax) fieldsResolved(recv string, seeds ...string) map[string]bool {
+	st := p.structs[recv]
+	if st == nil {
+		return nil
+	}
+	fields := map[string]bool{}
+	for _, f := range st.Fields.List {
+		for _, n := range f.Names {
+			fields[n.Name] = true
+		}
+	}
+
+	resolved, seen := map[string]bool{}, map[string]bool{}
+	queue := append([]string(nil), seeds...)
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		fn := p.methods[recv][name]
+		if fn == nil || len(fn.Recv.List[0].Names) == 0 {
+			continue
+		}
+		self := fn.Recv.List[0].Names[0].Name
+		for _, called := range p.methodsCalledOn(fn, self, recv) {
+			queue = append(queue, called)
+		}
+
+		ctxName := ""
+		for _, param := range fn.Type.Params.List {
+			if isContextType(param.Type) && len(param.Names) == 1 {
+				ctxName = param.Names[0].Name
+			}
+		}
+		if ctxName == "" {
+			continue
+		}
+
+		// taint maps a local name to the receiver fields whose contents
+		// can have reached it. Three passes, because a loop body can
+		// read a local the loop itself assigns and ast.Inspect walks the
+		// source once, in order.
+		taint := map[string]map[string]bool{}
+		for pass := 0; pass < 3; pass++ {
+			ast.Inspect(fn, func(n ast.Node) bool {
+				switch v := n.(type) {
+				case *ast.AssignStmt:
+					var from map[string]bool
+					for _, r := range v.Rhs {
+						from = unionFields(from, p.taintOf(r, self, recv, fields, taint))
+					}
+					for _, l := range v.Lhs {
+						if id, ok := l.(*ast.Ident); ok && id.Name != "_" {
+							taint[id.Name] = unionFields(taint[id.Name], from)
+						}
+					}
+				case *ast.RangeStmt:
+					from := p.taintOf(v.X, self, recv, fields, taint)
+					for _, l := range []ast.Expr{v.Key, v.Value} {
+						if id, ok := l.(*ast.Ident); ok && id.Name != "_" {
+							taint[id.Name] = unionFields(taint[id.Name], from)
+						}
+					}
+				case *ast.CallExpr:
+					if !mentionsIdent(v, ctxName) {
+						return true
+					}
+					var reached map[string]bool
+					if sel, ok := v.Fun.(*ast.SelectorExpr); ok {
+						reached = unionFields(reached, p.taintOf(sel.X, self, recv, fields, taint))
+					}
+					for _, a := range v.Args {
+						if id, ok := a.(*ast.Ident); ok && id.Name == ctxName {
+							continue
+						}
+						reached = unionFields(reached, p.taintOf(a, self, recv, fields, taint))
+					}
+					for f := range reached {
+						resolved[f] = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	return resolved
+}
+
+// taintOf returns the receiver fields whose contents can have reached
+// the value e denotes.
+func (p *pgSyntax) taintOf(e ast.Expr, self, recv string, fields map[string]bool, taint map[string]map[string]bool) map[string]bool {
+	var out map[string]bool
+	ast.Inspect(e, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.SelectorExpr:
+			if base, ok := v.X.(*ast.Ident); ok && base.Name == self && fields[v.Sel.Name] {
+				out = unionFields(out, map[string]bool{v.Sel.Name: true})
+			}
+		case *ast.Ident:
+			out = unionFields(out, taint[v.Name])
+		case *ast.CallExpr:
+			sel, ok := v.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			base, ok := sel.X.(*ast.Ident)
+			if !ok || base.Name != self || p.methods[recv][sel.Sel.Name] == nil {
+				return true
+			}
+			out = unionFields(out, p.fieldsRead(recv, sel.Sel.Name))
+		}
+		return true
+	})
+	return out
+}
+
+// methodsCalledOn lists the methods of recv that fn calls on its own
+// receiver, so the walk follows a resolver that delegates.
+func (p *pgSyntax) methodsCalledOn(fn *ast.FuncDecl, self, recv string) []string {
+	var out []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		base, ok := sel.X.(*ast.Ident)
+		if !ok || base.Name != self || p.methods[recv][sel.Sel.Name] == nil {
+			return true
+		}
+		out = append(out, sel.Sel.Name)
+		return true
+	})
+	return out
+}
+
+func unionFields(a, b map[string]bool) map[string]bool {
+	if len(b) == 0 {
+		return a
+	}
+	if a == nil {
+		a = map[string]bool{}
+	}
+	for k := range b {
+		a[k] = true
+	}
+	return a
+}
+
+// mentionsIdent reports whether n contains a bare reference to name —
+// which for the ctx parameter is the question "does this call have the
+// ctx in its hands?".
+func mentionsIdent(n ast.Node, name string) bool {
+	found := false
+	ast.Inspect(n, func(x ast.Node) bool {
+		if id, ok := x.(*ast.Ident); ok && id.Name == name {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
 // statementBuilders are the four builders this invariant is about, with
 // the method each one renders through. Every one of them renders from
 // WriteSQL and resolves in resolveCtx; the pair is spelled out rather
@@ -1365,6 +1559,15 @@ var resolverOwnedFields = map[string]string{
 // having never looked inside it — which is precisely how a scoped
 // subquery in a DISTINCT ON list went out with another tenant's rows
 // in it.
+//
+// Reading it is necessary and it is not sufficient, which is the second
+// assertion in the loop below and the round-7 addition. The check as it
+// first shipped asked only whether the resolve closure MENTIONED the
+// field, and a mention is cheap: a field the resolver merely looks at —
+// a length test, a validation branch, a nil check — passed while its
+// contents went to the renderer unwalked. So the field must also flow
+// into a call that holds the ctx (fieldsResolved), because a call
+// without a ctx cannot resolve anything against one.
 func TestNoRenderedExpressionListIsInvisibleToTheResolver(t *testing.T) {
 	p := loadPgSyntax(t)
 	rendered := map[string]bool{}
@@ -1376,9 +1579,14 @@ func TestNoRenderedExpressionListIsInvisibleToTheResolver(t *testing.T) {
 		}
 		renders := p.fieldsRead(b.name, b.render)
 		resolves := p.fieldsRead(b.name, b.resolve)
+		resolved := p.fieldsResolved(b.name, b.resolve)
 		if len(renders) == 0 || len(resolves) == 0 {
 			t.Fatalf("%s: %s or %s reads no field at all — the closure walk has gone stale",
 				b.name, b.render, b.resolve)
+		}
+		if len(resolved) == 0 {
+			t.Fatalf("%s: %s hands no field to the ctx at all — the taint walk has gone stale",
+				b.name, b.resolve)
 		}
 		for _, f := range st.Fields.List {
 			if !p.bearsExpression(f.Type) {
@@ -1390,6 +1598,10 @@ func TestNoRenderedExpressionListIsInvisibleToTheResolver(t *testing.T) {
 					continue
 				}
 				rendered[key] = true
+				if resolves[n.Name] && !resolved[n.Name] && resolverOwnedFields[key] == "" {
+					t.Errorf("%s: %s: %s reads it but never hands it to the ctx — a field the resolver only LOOKS at is a field the renderer alone walks",
+						p.fset.Position(n.Pos()), key, b.resolve)
+				}
 				if resolves[n.Name] || resolverOwnedFields[key] != "" {
 					continue
 				}

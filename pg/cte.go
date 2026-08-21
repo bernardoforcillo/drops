@@ -49,21 +49,24 @@ func (c *CTE) identity() *CTE {
 
 // CTEDef returns a CTE definition with optional column aliasing.
 //
-// When query is a *SelectBuilder the body is scoped like any other
-// statement: the executor resolves its FROM table's context filters —
-// the tenant axis, an authz guard — before the WITH clause is rendered,
-// so WITH recent AS (SELECT ... FROM posts) restricts the same rows a
-// bare SELECT from posts would. That matters more here than almost
-// anywhere else, because WITH ... AS (SELECT ... FROM <table>) is the
-// shape a real multi-tenant analytics query is written in, and an
-// unscoped CTE body reaches every tenant's rows however carefully the
-// outer SELECT is scoped.
+// When query is a statement drops built — a SELECT, an UPDATE, an
+// INSERT or a DELETE, bare or wrapped in [Subquery] — the body is
+// scoped like the statement it is: the executor resolves the context
+// filters of every table it names — the tenant axis, an authz guard —
+// before the WITH clause is rendered, so WITH recent AS (SELECT ...
+// FROM posts) restricts the same rows a bare SELECT from posts would,
+// and WITH moved AS (DELETE FROM posts RETURNING ...) removes the same
+// rows a bare DELETE would. That matters more here than almost anywhere
+// else, because WITH ... AS (<statement over a table>) is the shape a
+// real multi-tenant analytics query and a real archive-these-rows write
+// are both written in, and an unscoped body reaches every tenant's rows
+// however carefully the outer SELECT is scoped.
 //
 // A CTE built from any other drops.Expression — a Raw fragment, a
-// hand-assembled expression, an INSERT ... RETURNING — cannot be: there
-// is no ctx inside WriteSQL and nothing to resolve against. Its
-// filtering is the caller's, exactly as with a subquery body drops did
-// not build — see [Exists].
+// hand-assembled expression — cannot be: there is no ctx inside
+// WriteSQL and nothing to resolve against. Its filtering is the
+// caller's, exactly as with a subquery body drops did not build — see
+// [Exists].
 func CTEDef(name string, query drops.Expression, columns ...string) *CTE {
 	return &CTE{name: name, columns: columns, query: query}
 }
@@ -88,12 +91,13 @@ func (c *CTE) Col(col string) drops.Expression {
 
 // With prepends a WITH clause to the SELECT. Multiple calls accumulate.
 //
-// Each body whose query is a *SelectBuilder is resolved against the
-// executing ctx before it is rendered, so a CTE selecting from a scoped
-// table carries that table's context filters — see [CTEDef]. The outer
-// SELECT's Unscoped() does not reach into a body: a CTE is a statement
-// of its own and keeps its own scoping, which is also how to unscope
-// one relation of a query and no other.
+// Each body that is a statement drops built is resolved against the
+// executing ctx before it is rendered, so a CTE selecting from — or
+// writing to — a scoped table carries that table's context filters and
+// its tenant stamp — see [CTEDef]. The outer SELECT's Unscoped() does
+// not reach into a body: a CTE is a statement of its own and keeps its
+// own scoping, which is also how to unscope one relation of a query and
+// no other.
 func (s *SelectBuilder) With(ctes ...*CTE) *SelectBuilder {
 	s.ctes = append(s.ctes, ctes...)
 	return s
@@ -112,9 +116,20 @@ func (s *SelectBuilder) WithRecursive(ctes ...*CTE) *SelectBuilder {
 	return s
 }
 
-// resolveCTEs resolves the bodies that are *SelectBuilders against ctx,
-// returning a rebuilt list — or nil when nothing needed resolving, so
-// the caller can keep the builder it already had.
+// resolveCTEs resolves each body against ctx, returning a rebuilt list
+// — or nil when nothing needed resolving, so the caller can keep the
+// builder it already had.
+//
+// The walk is resolveExpr, which is the point. This function used to
+// type-assert *SelectBuilder itself, and a local type assertion is a
+// second copy of resolveExpr's decision about what a statement is — one
+// that was already staler than the original. It saw a bare SELECT body
+// and nothing else: not a body wrapped in [Subquery] or
+// [SelectBuilder.AsSubquery], which resolveExpr has walked into since
+// round 4, and not a data-modifying body, which is the shape that made
+// WITH moved AS (DELETE FROM scoped_table RETURNING ...) a cross-tenant
+// write. One call closes all of them, and keeps closing whatever
+// resolveExpr learns next.
 //
 // Both the list and the *CTE are copied before anything is replaced.
 // The CTE the caller holds is a value they can attach to a second
@@ -123,15 +138,11 @@ func (s *SelectBuilder) WithRecursive(ctes ...*CTE) *SelectBuilder {
 func resolveCTEs(ctx context.Context, ctes []*CTE) ([]*CTE, error) {
 	var out []*CTE
 	for i, c := range ctes {
-		body, ok := c.query.(*SelectBuilder)
-		if !ok {
-			continue
-		}
-		resolved, err := body.resolveCtx(ctx)
+		resolved, changed, err := resolveExpr(ctx, c.query)
 		if err != nil {
 			return nil, err
 		}
-		if resolved == body {
+		if !changed {
 			continue
 		}
 		if out == nil {

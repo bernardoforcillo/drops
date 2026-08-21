@@ -706,6 +706,19 @@ func (s *SelectBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 // subquery are statements of their own and keep their own scoping,
 // which is also how to unscope one relation of a query and no other.
 func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) {
+	// A deferred error — a cursor that failed to decode — is reported
+	// here rather than only by the executors, because resolution is the
+	// one step every path to a server goes through and this statement
+	// may be somebody else's CTE body. AfterCursor fails closed by
+	// appending a false predicate, so rendering it anyway sends a
+	// statement that matches nothing and returns no error at all: the
+	// caller reads "the page was empty" where the truth is "the cursor
+	// was corrupt". Before the check moved here it was a type assertion
+	// in renderForCtx, which saw the statement handed to ExecExpr and no
+	// statement inside it.
+	if s.err != nil {
+		return nil, s.err
+	}
 	// Resolution is not idempotent, and a resolved statement is reachable
 	// twice whenever it is embedded in another one — find.go builds the
 	// per-parent-limit rewrite that way. Resolving it again would bind
@@ -839,12 +852,61 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 	return out, nil
 }
 
+// resolveStatement implements [ctxResolvable]: it is resolveCtx behind
+// the interface resolveExpr dispatches on, so a SELECT nested in
+// another statement is resolved as the statement it is.
+func (s *SelectBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := s.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != s, nil
+}
+
 // subqueryResolver is implemented by the expressions this package wraps
 // around another statement. It is unexported on purpose: an expression
 // a caller assembled themselves cannot implement it, which is the
 // honest statement of what drops can and cannot reach into.
 type subqueryResolver interface {
 	resolveSubqueries(ctx context.Context) (drops.Expression, bool, error)
+}
+
+// ctxResolvable is a [ctxStatement] that can hand back the statement
+// VALUE to render for a ctx, rather than only its rendered text. Every
+// statement builder in this package implements it, and resolveExpr
+// dispatches on it.
+//
+// It is an interface rather than a list of type names because a list of
+// type names is the defect this round exists to end. resolveExpr used
+// to name *SelectBuilder and nothing else, so the other three builders
+// — which satisfy drops.Expression exactly as it does, and are what a
+// CTE body or a subquery operand is typed as — were invisible to it:
+// WITH moved AS (DELETE FROM ax_rows RETURNING name) rendered with no
+// WHERE clause on a tenant-scoped table and refused nothing on a ctx
+// with no tenant. A cross-tenant write, through the exported API,
+// because the resolver's idea of what a statement is had gone one
+// builder out of date. Dispatching on a method means the next builder
+// is resolved on the day it is written or fails the check in
+// TestEveryStatementBearingExpressionIsReachableByTheResolver.
+//
+// It carries a second method rather than resting on ToSQLCtx alone
+// because a nested statement has to render INTO the statement around
+// it: a Builder assigns placeholder numbers in write order, so the
+// finished text ToSQLCtx returns — numbered from $1, quoted for its own
+// dialect — cannot be spliced into a statement that already has
+// arguments without renumbering it by parsing SQL. resolveExpr
+// therefore asks for the resolved statement itself and lets the
+// surrounding Builder render it.
+//
+// The signature is resolveSubqueries' — the resolved expression,
+// whether it differs, and an error — rather than a predicate producer's
+// (ctx) (drops.Expression, error), which it would otherwise be mistaken
+// for by the census in TestEveryPredicateProducerIsCensused. Reporting
+// the change is also what saves resolveExpr from comparing two
+// Expressions itself; see there for why that is not safe in general.
+type ctxResolvable interface {
+	ctxStatement
+	resolveStatement(ctx context.Context) (drops.Expression, bool, error)
 }
 
 // resolveExpr resolves the statements reachable from e against ctx,
@@ -854,16 +916,32 @@ type subqueryResolver interface {
 // because an Expression is not reliably comparable: the closures this
 // package and its callers build are func values, and == on two of those
 // panics at run time.
+//
+// Every arm is an interface. That is the invariant — this function is
+// the one place that decides what a statement is, and it decides by
+// what a value can DO, never by what it is called. A type assertion on
+// a builder name anywhere else is a second copy of this decision that
+// nobody will remember to update; see
+// TestNoResolutionEntryPointNamesAStatementType.
 func resolveExpr(ctx context.Context, e drops.Expression) (drops.Expression, bool, error) {
 	switch v := e.(type) {
 	case nil:
 		return nil, false, nil
-	case *SelectBuilder:
-		r, err := v.resolveCtx(ctx)
-		if err != nil {
+	case ctxResolvable:
+		return v.resolveStatement(ctx)
+	case ctxStatement:
+		// A statement drops did not build. Its ToSQLCtx is the only way
+		// in, and its output cannot be spliced into the statement being
+		// built — see ctxResolvable — so it is still rendered by its own
+		// WriteSQL. Asking it for its ctx form anyway is what keeps the
+		// nesting fail-closed: a filter that refuses for want of a
+		// tenant reports there, and the whole statement is refused
+		// rather than sent with a foreign statement inside it that
+		// nobody scoped.
+		if _, _, err := v.ToSQLCtx(ctx); err != nil {
 			return nil, false, err
 		}
-		return r, r != v, nil
+		return e, false, nil
 	case subqueryResolver:
 		return v.resolveSubqueries(ctx)
 	}

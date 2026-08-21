@@ -306,14 +306,13 @@ type ctxStatement interface {
 // cases can be read as three cases.
 func renderForCtx(ctx context.Context, e drops.Expression) (string, []any, error) {
 	// A SELECT can carry a deferred error — a cursor that failed to
-	// decode — which Rows/All/One report and rendering does not.
-	// AfterCursor fails closed by appending a false predicate, so
-	// rendering one anyway sends a statement that matches nothing and
-	// returns no error at all: the caller reads "the page was empty"
-	// where the truth is "the cursor was corrupt".
-	if s, ok := e.(*SelectBuilder); ok && s.err != nil {
-		return "", nil, s.err
-	}
+	// decode — which Rows/All/One report and rendering does not. It is
+	// checked in SelectBuilder.resolveCtx, which both branches below
+	// reach, rather than here: this function used to assert
+	// *SelectBuilder for it, and that assertion saw the statement handed
+	// to ExecExpr and no statement inside it, so a corrupt cursor in a
+	// CTE body still rendered — as the false predicate AfterCursor fails
+	// closed with, which matches nothing and reports nothing.
 	if st, ok := e.(ctxStatement); ok {
 		return st.ToSQLCtx(ctx)
 	}

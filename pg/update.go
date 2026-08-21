@@ -29,6 +29,17 @@ type UpdateBuilder struct {
 	// list. WriteSQL runs them itself when it is false — that is the
 	// ToSQL path, which has no ctx to walk against.
 	hooked bool
+
+	// resolved marks a builder resolveCtx has already produced, and is
+	// the same discipline [SelectBuilder.resolved] states: resolution is
+	// not idempotent — the target table still has its context filters
+	// afterwards, so a second pass appends the tenant predicate a second
+	// time and binds its value twice. Nothing fails; the rows come back
+	// right and only an argument limit or a query log shows it. A
+	// resolved statement became reachable a second time the moment
+	// resolveExpr learned to walk into the write builders, since a
+	// resolved body is what a resolved CTE or operand holds.
+	resolved bool
 }
 
 // Set adds one or more assignments. Use (*Col[T]).Val(v) to bind a typed
@@ -254,6 +265,9 @@ func (u *UpdateBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 // [UpdateBuilder.WriteSQL], which still runs them itself on the ToSQL
 // path where there is no ctx to walk against.
 func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) {
+	if u.resolved {
+		return u, nil
+	}
 	cp := *u
 	changed := false
 
@@ -325,7 +339,20 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	if !changed {
 		return u, nil
 	}
+	cp.resolved = true
 	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable]: it is resolveCtx behind
+// the interface resolveExpr dispatches on, so an UPDATE written as a
+// CTE body or a subquery operand is resolved as the statement it is
+// rather than rendered blind.
+func (u *UpdateBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := u.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != u, nil
 }
 
 // contextPreds resolves the context filters of every table the
@@ -359,20 +386,20 @@ func (u *UpdateBuilder) contextPreds(ctx context.Context) ([]drops.Expression, e
 // subquery three combinators down as much as one written directly.
 //
 // Only a binding that holds an expression has anything to walk, which
-// is what the type assertion is: [ColumnValue] is closed to this
-// package — its methods are unexported, so no caller can implement it —
-// and every other implementation binds a Go value that becomes a
-// parameter. A binding kind added later that holds a caller-supplied
-// drops.Expression has to be resolved here too, or a statement can hide
-// inside it exactly as it hid inside this one.
+// is what [exprValue] is: [ColumnValue] is closed to this package — its
+// methods are unexported, so no caller can implement it — and every
+// other implementation binds a Go value that becomes a parameter. The
+// test is the interface rather than the name *exprBinding so that a
+// binding kind added later is walked by having the methods, instead of
+// by somebody remembering this line.
 func resolveSets(ctx context.Context, sets []ColumnValue) ([]ColumnValue, error) {
 	var out []ColumnValue
 	for i, s := range sets {
-		eb, ok := s.(*exprBinding)
+		eb, ok := s.(exprValue)
 		if !ok {
 			continue
 		}
-		resolved, changed, err := resolveExpr(ctx, eb.expr)
+		resolved, changed, err := resolveExpr(ctx, eb.boundExpr())
 		if err != nil {
 			return nil, err
 		}
@@ -382,13 +409,11 @@ func resolveSets(ctx context.Context, sets []ColumnValue) ([]ColumnValue, error)
 		if out == nil {
 			out = append([]ColumnValue(nil), sets...)
 		}
-		// The binding is copied for the reason the builder is: a caller
-		// may hold it and use it in a second statement, and a resolved
-		// body written back into it would pin the first request's tenant
-		// into every later use.
-		cpb := *eb
-		cpb.expr = resolved
-		out[i] = &cpb
+		// withBoundExpr copies for the reason the builder is copied: a
+		// caller may hold the binding and use it in a second statement,
+		// and a resolved body written back into it would pin the first
+		// request's tenant into every later use.
+		out[i] = eb.withBoundExpr(resolved)
 	}
 	return out, nil
 }

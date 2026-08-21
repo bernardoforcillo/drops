@@ -29,6 +29,17 @@ type InsertBuilder struct {
 	// tenant axis like any other value. WriteSQL runs them itself only
 	// when it is reached without a ctx.
 	hooked bool
+
+	// resolved marks a builder resolveCtx has already produced, and is
+	// the same discipline [SelectBuilder.resolved] states: resolution is
+	// not idempotent — the target table still has its context filters
+	// afterwards, so a second pass appends the tenant predicate a second
+	// time and binds its value twice. Nothing fails; the rows come back
+	// right and only an argument limit or a query log shows it. A
+	// resolved statement became reachable a second time the moment
+	// resolveExpr learned to walk into the write builders, since a
+	// resolved body is what a resolved CTE or operand holds.
+	resolved bool
 }
 
 type conflictClause struct {
@@ -459,6 +470,9 @@ func (i *InsertBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 // no assignments is a syntax error, so the branch becomes DO NOTHING,
 // which is what an update with nothing left to write means anyway.
 func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) {
+	if i.resolved {
+		return i, nil
+	}
 	cp := *i
 
 	cols, rows := i.cols, i.rows
@@ -521,7 +535,20 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 	}
 
 	cp.cols, cp.rows, cp.conflict = cols, rows, conflict
+	cp.resolved = true
 	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable]: it is resolveCtx behind
+// the interface resolveExpr dispatches on, so an INSERT written as a
+// CTE body or a subquery operand is stamped with the ctx tenant like
+// any other INSERT instead of writing a row that belongs to nobody.
+func (i *InsertBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := i.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != i, nil
 }
 
 // writeAxis returns the tenant column this INSERT stamps, or nil when

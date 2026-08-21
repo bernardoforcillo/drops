@@ -21,6 +21,17 @@ type DeleteBuilder struct {
 	// read by autoWheres through defaults.of, which falls back to the
 	// unresolved list so the ToSQL path renders unchanged.
 	defaults resolvedDefaults
+
+	// resolved marks a builder resolveCtx has already produced, and is
+	// the same discipline [SelectBuilder.resolved] states: resolution is
+	// not idempotent — the target table still has its context filters
+	// afterwards, so a second pass appends the tenant predicate a second
+	// time and binds its value twice. Nothing fails; the rows come back
+	// right and only an argument limit or a query log shows it. A
+	// resolved statement became reachable a second time the moment
+	// resolveExpr learned to walk into the write builders, since a
+	// resolved body is what a resolved CTE or operand holds.
+	resolved bool
 }
 
 // Table returns the target table.
@@ -265,6 +276,9 @@ func (d *DeleteBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 // the render path than this round is making; nothing a caller writes
 // lands there, since a DELETE has no SET list of its own.
 func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) {
+	if d.resolved {
+		return d, nil
+	}
 	cp := *d
 	changed := false
 
@@ -315,7 +329,21 @@ func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) 
 	if !changed {
 		return d, nil
 	}
+	cp.resolved = true
 	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable]: it is resolveCtx behind
+// the interface resolveExpr dispatches on, so a DELETE written as a CTE
+// body or a subquery operand is resolved as the statement it is rather
+// than rendered blind — which for a DELETE means rendered with no WHERE
+// clause at all.
+func (d *DeleteBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != d, nil
 }
 
 // contextPreds resolves the context filters of every table the

@@ -304,12 +304,19 @@ type Session struct {
 // stream as the statements they govern: a query log shows the identity
 // immediately above the work it authorised.
 //
-// Nesting depends on the driver. InTxAs on a *DB already bound to a
-// transaction asks that driver for a nested transaction; database/sql
-// refuses (use a SAVEPOINT), and a driver that allows it gets an inner
-// SET LOCAL scoped to the inner transaction, reverted when the inner
-// one ends. Either way the outer identity is unaffected by the inner
-// one having been asked for.
+// Nesting depends on the driver, and is the one place where "the
+// identity dies with the transaction" needs reading carefully. InTxAs
+// on a *DB already bound to a transaction asks that driver for a
+// nested transaction; database/sql refuses outright (use a SAVEPOINT),
+// so on the drivers most callers use the inner call fails and sends
+// nothing at all. A driver that implements nesting implements it as a
+// subtransaction, and PostgreSQL undoes a SET LOCAL when a
+// subtransaction ROLLS BACK but keeps it when the subtransaction
+// COMMITS — so an inner identity that succeeds replaces the outer one
+// for the remainder of the outer transaction, rather than being handed
+// back at the inner boundary. What is unchanged is the promise this
+// method actually makes: nothing survives the OUTER transaction, which
+// is the boundary the connection returns to the pool across.
 func (db *DB) InTxAs(ctx context.Context, s Session, fn func(*DB) error) error {
 	keys, err := s.check()
 	if err != nil {

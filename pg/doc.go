@@ -88,6 +88,16 @@
 //     Hand the builder over as an operand instead and it is walked like
 //     any other.
 //
+//   - A relation drops did not declare. Every FROM, JOIN and USING
+//     entry that is a *Table carries that table's filters, wherever it
+//     entered from — [SelectBuilder.From], any of the four joins,
+//     [DeleteBuilder.Using], [UpdateBuilder.From], and
+//     [SelectBuilder.FromExpr], which takes a drops.Expression and
+//     recognises a table among them as the relation it is. A FROM
+//     source that is NOT a table — a raw fragment naming one, a
+//     set-returning function — has no filter list to carry and nothing
+//     is added for it.
+//
 //   - View bodies. [CreateView], [CreateOrReplaceView] and
 //     [CreateMaterializedView] deliberately do not resolve theirs, and it
 //     is the one place leaving a statement unresolved is the right

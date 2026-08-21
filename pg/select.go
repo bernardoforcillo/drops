@@ -190,12 +190,85 @@ func andWith(on drops.Expression, extra []drops.Expression) drops.Expression {
 	})
 }
 
+// fromRelation is implemented by a FROM source that is a RELATION this
+// package declared, as opposed to an expression a caller composed.
+//
+// It exists because the resolver walks EXPRESSIONS and does not walk
+// RELATIONS, and the two meet in exactly one place: FromExpr takes a
+// drops.Expression, and a *Table is one. A table handed to the
+// documented way of comma-joining therefore entered the statement as an
+// expression, was offered to resolveExpr, matched none of its arms —
+// none of them is about relations — and was rendered as a bare relation
+// name. Its tenant axis and its authz guard reached nothing:
+// SELECT ... FROM "orders", "accounts" read every tenant's accounts, on
+// a ctx carrying no tenant at all and without refusing.
+//
+// It is an interface, and unexported, for the reason resolveExpr's arms
+// are: the question is what a value IS in the statement — a relation or
+// an expression — and a type assertion on *Table somewhere in the
+// resolver would be one more list to keep current. A caller outside the
+// package cannot implement it, which is the honest statement that drops
+// can scope the relations it declared and no others.
+type fromRelation interface {
+	drops.Expression
+
+	// fromTable returns the table this source names, so the statement
+	// can scope it the way it scopes its From table.
+	fromTable() *Table
+}
+
+// fromRelations returns every relation the FROM clause names directly:
+// the From table, then every FromExpr source that is one.
+//
+// They share one placement decision because they share one position. A
+// comma join IS an inner join, so its side is neither preserved nor
+// nullable, and joinKind.filterPlacement's INNER arm already says where
+// such a predicate goes: the WHERE clause. What decides otherwise is
+// the same thing that decides it for the From table — a RIGHT JOIN
+// later in the statement makes the whole comma-joined left side
+// nullable — which is fromFilterJoin's question, asked once for all of
+// them. A FULL JOIN leaves nowhere correct, and resolveCtx refuses each
+// of them alike.
+//
+// It hands back a slice rather than taking a callback, and that is not
+// a style choice: a callback would carry s.from and s.fromExprs into
+// the ctx inside a closure, where the taint walk in
+// TestNoRenderedExpressionListIsInvisibleToTheResolver cannot follow
+// them, and the resolver would look — mechanically — as though it only
+// glanced at the fields the renderer walks. The check said so the first
+// time this was written with a callback.
+func (s *SelectBuilder) fromRelations() []*Table {
+	out := make([]*Table, 0, 1+len(s.fromExprs))
+	if s.from != nil {
+		out = append(out, s.from)
+	}
+	for _, e := range s.fromExprs {
+		if r, ok := e.(fromRelation); ok {
+			if t := r.fromTable(); t != nil {
+				out = append(out, t)
+			}
+		}
+	}
+	return out
+}
+
 // From sets the FROM clause. Required before execution.
 func (s *SelectBuilder) From(t *Table) *SelectBuilder { s.from = t; return s }
 
 // FromExpr appends an arbitrary FROM source — a subquery, CTE
 // reference, set-returning function, etc. Multiple FROMs are
 // comma-joined (i.e. cross-joined).
+//
+// A *Table handed here is a RELATION and is scoped as one: its
+// DefaultFilters and its ContextFilters are carried by the statement
+// exactly as [SelectBuilder.From]'s are, because a comma join is an
+// inner join and the two sources are in the same position — see
+// fromRelation for why that had to be said in code rather than left to
+// the reader.
+//
+// Anything else is an expression the caller composed, and drops scopes
+// what is inside it (a subquery is resolved as the statement it is) and
+// nothing about the relation it names.
 func (s *SelectBuilder) FromExpr(e drops.Expression) *SelectBuilder {
 	s.fromExprs = append(s.fromExprs, e)
 	return s
@@ -569,7 +642,18 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 	var fromDefaults, fromCtx []drops.Expression
 	fromOn := -1
 	if !s.unscoped {
-		fromDefaults, fromCtx = s.defaults.of(s.from), s.ctxFrom
+		fromCtx = s.ctxFrom
+		for _, rel := range s.fromRelations() {
+			switch dfs := s.defaults.of(rel); {
+			case len(dfs) == 0:
+			case fromDefaults == nil:
+				// The single-relation statement keeps the list it
+				// always rendered, byte for byte.
+				fromDefaults = dfs
+			default:
+				fromDefaults = append(append([]drops.Expression(nil), fromDefaults...), dfs...)
+			}
+		}
 		if len(fromDefaults) > 0 || len(fromCtx) > 0 {
 			fromOn = s.fromFilterJoin()
 		}
@@ -584,7 +668,6 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		b.WriteString(string(j.kind))
 		b.WriteByte(' ')
 		j.table.writeFrom(b)
-		b.WriteString(" ON ")
 		on := j.on
 		if !s.unscoped {
 			switch dfs := s.defaults.of(j.table); j.kind.filterPlacement() {
@@ -597,6 +680,19 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		if i == fromOn {
 			on = andWith(on, append(append([]drops.Expression(nil), fromDefaults...), fromCtx...))
 		}
+		// A join with no condition left — Join(t, nil) against a table
+		// that contributed no automatic predicate — renders ON TRUE
+		// rather than a dangling "ON". Every join kind PostgreSQL has
+		// requires a condition, so the bare keyword was a 42601 the
+		// server rejected outright, and it was reachable in three of
+		// the five shapes: any INNER or RIGHT join, and any join whose
+		// table has no filters to fill the clause. TRUE is what a nil
+		// condition says — join everything — so the statement now
+		// means what the caller wrote.
+		if on == nil {
+			on = drops.Raw("TRUE")
+		}
+		b.WriteString(" ON ")
 		b.Append(on)
 	}
 	// The FROM table's go in front of them, and the whole lot in front
@@ -730,14 +826,25 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 	cp := *s
 	changed := false
 
-	if !s.unscoped && s.from.hasContextFilters() {
-		if i := s.firstJoinOfKind(fullJoin); i >= 0 {
-			return nil, fmt.Errorf("drops/pg: %w: %q is FULL JOINed to the scoped FROM table %q; join a pre-filtered subquery, or say Unscoped",
-				ErrFullJoinScoped, s.joins[i].table.Name(), s.from.Name())
-		}
-		preds, err := s.from.resolveContextFilters(ctx)
-		if err != nil {
-			return nil, err
+	if !s.unscoped {
+		// Every relation the FROM clause names, not only the From
+		// table: a *Table handed to FromExpr is comma-joined, which is
+		// an inner join, and it is scoped in the same position and by
+		// the same rules. See fromRelations.
+		var preds []drops.Expression
+		for _, rel := range s.fromRelations() {
+			if !rel.hasContextFilters() {
+				continue
+			}
+			if i := s.firstJoinOfKind(fullJoin); i >= 0 {
+				return nil, fmt.Errorf("%w: %q is FULL JOINed to the scoped FROM table %q; join a pre-filtered subquery, or say Unscoped",
+					ErrFullJoinScoped, s.joins[i].table.Name(), rel.Name())
+			}
+			p, err := rel.resolveContextFilters(ctx)
+			if err != nil {
+				return nil, err
+			}
+			preds = append(preds, p...)
 		}
 		if len(preds) > 0 {
 			cp.ctxFrom, changed = preds, true
@@ -751,8 +858,7 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 		// renderer adds on the statement's own account is still a
 		// predicate a caller wrote, and a caller can write a subquery
 		// into it.
-		tables := make([]*Table, 0, 1+len(s.joins))
-		tables = append(tables, s.from)
+		tables := s.fromRelations()
 		for _, j := range s.joins {
 			tables = append(tables, j.table)
 		}
@@ -1017,7 +1123,7 @@ func (s *SelectBuilder) resolveJoins(ctx context.Context) ([]joinClause, []drops
 			continue
 		}
 		if j.kind.filterPlacement() == placeNowhere {
-			return nil, nil, fmt.Errorf("drops/pg: %w: %q; join it pre-filtered, or say Unscoped",
+			return nil, nil, fmt.Errorf("%w: %q; join it pre-filtered, or say Unscoped",
 				ErrFullJoinScoped, j.table.Name())
 		}
 		jp, err := j.table.resolveContextFilters(ctx)

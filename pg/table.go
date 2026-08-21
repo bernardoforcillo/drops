@@ -53,33 +53,73 @@ type Table struct {
 	// SECURITY. Policies are only enforced when this is true.
 	rlsEnabled bool
 
-	// insertHooks / updateHooks / deleteHooks are the optional
-	// lifecycle hooks registered on this table. They are invoked by
-	// the corresponding builders during WriteSQL. Empty by default —
-	// a table with no hooks behaves exactly as it did before this
-	// feature shipped.
-	insertHooks []InsertHook
-	updateHooks []UpdateHook
-	deleteHooks []DeleteHook
+	// scope carries every automatic predicate and lifecycle hook the
+	// table declares. It is a pointer, and an alias taken off this
+	// table SHARES it rather than copying it — see tableScope, and see
+	// Table.As for the write that went out unscoped while it was a
+	// snapshot.
+	scope *tableScope
+}
+
+// tableScope is the automatic-predicate state of a table: the two
+// filter lists, the write-side tenant column and the lifecycle hooks.
+// It lives behind a pointer so that a table and every alias taken off
+// it share ONE of them.
+//
+// Sharing is the whole point, and it was learned from a destructive
+// bug. While As copied these lists, an alias was a snapshot of the
+// table's scoping at the instant As was called — and the spelling this
+// package invites is exactly the one that loses:
+//
+//	var Users = pg.NewTable("users")   // package scope
+//	var U     = Users.As("u")          // package scope, before init
+//
+//	func init() { Users.ContextFilter(pg.TenantFilter(UserTenantID)) }
+//
+// Go initialises package-level variables before it runs init, so U was
+// taken while the table had no tenant axis and never gained one. A
+// statement written against the alias then rendered, on a ctx carrying
+// no tenant at all and without refusing, DELETE FROM "users" AS "u" —
+// no predicate, every tenant's rows, and nothing walks a DELETE back.
+// The same snapshot dropped a soft-delete DeleteHook applied after the
+// alias was taken, turning the rewrite-to-UPDATE into a hard DELETE.
+//
+// It also contradicted the invariant [Table.As] is written around and
+// pg/alias_test.go spends its length on: an aliased handle IS the
+// column it was copied from, an aliased table IS the table. A snapshot
+// makes that true of the columns and false of the scoping, which is the
+// half where being wrong destroys data.
+//
+// One consequence to state plainly, because it follows from sharing and
+// is not a bug: registering a filter or a hook ON an alias registers it
+// on the table, and so on every other alias of it. That is what "the
+// same table" means. Where two genuinely different scopings are wanted,
+// they are two tables.
+//
+// The mutex guards every field, and it is the same mutex the base table
+// and all its aliases lock — which is the other half of what sharing
+// has to mean. An alias with a lock of its own would serialise against
+// nothing while another goroutine replaced the list it was reading.
+// Registration is a supported thing to do while queries are in flight
+// (see ctxFilter for why), so the lists are REPLACED rather than edited
+// in place: a reader takes the slice header under the read lock and
+// walks it with the lock released, which is only sound while no writer
+// touches an element a reader may already be holding.
+type tableScope struct {
+	mu sync.RWMutex
 
 	// defaultFilters are predicates applied automatically by
 	// SelectBuilder / UpdateBuilder / DeleteBuilder unless the caller
 	// opts out with Unscoped(). Used to implement default scopes
 	// (e.g. SoftDelete's "deleted_at IS NULL" guard). Declaration-time
-	// only — see DefaultFilter.
+	// only — see Table.DefaultFilter.
 	defaultFilters []drops.Expression
 
 	// ctxFilters are the request-scoped twins of defaultFilters:
 	// predicates that cannot be built until a ctx is in hand. They are
 	// resolved by the executors rather than by WriteSQL — see
 	// Table.ContextFilter.
-	//
-	// Guarded by ctxFiltersMu, and replaced rather than edited in
-	// place: a reader takes the slice header under the read lock and
-	// then walks it with the lock released, which is only sound while
-	// no writer touches an element a reader may already be holding.
-	ctxFilters   []ctxFilter
-	ctxFiltersMu *sync.RWMutex
+	ctxFilters []ctxFilter
 
 	// tenantCol is the column an INSERT into this table stamps from the
 	// ctx tenant — the write-side half of the tenant axis, declared by
@@ -87,11 +127,31 @@ type Table struct {
 	//
 	// It is a column rather than a predicate because an INSERT has no
 	// WHERE clause for a predicate to reach: see
-	// InsertBuilder.ToSQLCtx. Guarded by ctxFiltersMu, which already
-	// exists to make declaring the axis on a table other goroutines are
-	// querying a supported thing to do — the two halves are registered
-	// by the same call and are read by statements in flight.
+	// InsertBuilder.ToSQLCtx.
 	tenantCol *Column
+
+	// insertHooks / updateHooks / deleteHooks are the optional
+	// lifecycle hooks registered on the table. They are invoked by the
+	// corresponding builders during WriteSQL. Empty by default — a
+	// table with no hooks behaves exactly as it did before this
+	// feature shipped.
+	insertHooks []InsertHook
+	updateHooks []UpdateHook
+	deleteHooks []DeleteHook
+}
+
+// appendShared appends v to a list other goroutines may be walking
+// right now, copying at exactly len rather than appending in place.
+//
+// The caller holds the write lock, but a reader does not: it took the
+// slice header under the read lock and released it before walking. An
+// in-place append into spare capacity would write an element that
+// reader's header already spans. Copying at length is what keeps the
+// list a value nobody else can see change under them.
+func appendShared[T any](list []T, v T) []T {
+	out := make([]T, len(list), len(list)+1)
+	copy(out, list)
+	return append(out, v)
 }
 
 // ctxFilter pairs a context filter with the key it was registered
@@ -137,10 +197,10 @@ type ContextFilterFunc func(context.Context) (drops.Expression, error)
 func NewTable(name string) *Table {
 	mustIdent("table", name)
 	return &Table{
-		name:         name,
-		byName:       map[string]*Column{},
-		relations:    map[string]*Relation{},
-		ctxFiltersMu: new(sync.RWMutex),
+		name:      name,
+		byName:    map[string]*Column{},
+		relations: map[string]*Relation{},
+		scope:     new(tableScope),
 	}
 }
 
@@ -149,11 +209,11 @@ func NewSchemaTable(schema, name string) *Table {
 	mustIdent("schema", schema)
 	mustIdent("table", name)
 	return &Table{
-		schema:       schema,
-		name:         name,
-		byName:       map[string]*Column{},
-		relations:    map[string]*Relation{},
-		ctxFiltersMu: new(sync.RWMutex),
+		schema:    schema,
+		name:      name,
+		byName:    map[string]*Column{},
+		relations: map[string]*Relation{},
+		scope:     new(tableScope),
 	}
 }
 
@@ -227,15 +287,33 @@ func (t *Table) Alias() string { return t.alias }
 // The automatic predicates a table carries — a default filter
 // registered by SoftDeleteMixin, a context filter registered by
 // ContextFilter or ScopeByTenant, an authz guard built from the
-// package-level columns — move with it, and the alias renders them
-// qualified with the alias. They cannot be rewritten, being closures
-// over the handles they were given, so they are rendered inside a
-// relation rename instead: see resolveFilterExprs. Without it an
-// aliased query against a scoped table could not run at all —
-// "notes"."tenantId" against FROM "notes" AS "n" is 42P01, not a
-// widened result — which made the one table shape that must never lose
-// its tenant axis the one shape that could not be queried under an
-// alias.
+// package-level columns — are SHARED with it rather than copied, and
+// the alias renders them qualified with the alias. They cannot be
+// rewritten, being closures over the handles they were given, so they
+// are rendered inside a relation rename instead: see
+// resolveFilterExprs. Without it an aliased query against a scoped
+// table could not run at all — "notes"."tenantId" against
+// FROM "notes" AS "n" is 42P01, not a widened result — which made the
+// one table shape that must never lose its tenant axis the one shape
+// that could not be queried under an alias.
+//
+// Shared, and not a snapshot, because the alias is the same table: a
+// filter or a lifecycle hook registered on either handle at any time
+// applies to both, in whichever order the two happen. That ordering is
+// not hypothetical. Go initialises package-level variables before it
+// runs init, so an alias declared beside its table is taken before any
+// init or constructor that calls ScopeByTenant, AuthorizeWith or
+// ApplyMixins — and while the lists were copied, that alias was
+// unscoped for ever. It rendered DELETE FROM "users" AS "u" with no
+// predicate, on a ctx carrying no tenant, without refusing; and it lost
+// a soft-delete hook applied after it was taken, so the DELETE was
+// hard. See tableScope. The consequence in the other direction is that
+// registering on an alias registers on the table, which is what "the
+// same table" has to mean — so register over the DECLARED column
+// handles even when the call goes through an alias, since the base
+// table renders the same predicate and an alias handle would qualify
+// with a relation its statement never names. That is the rule
+// [TenantFilter] already states, now reaching one more caller.
 //
 // What is still not rewritten is anything else the caller built and
 // drops only re-emits: a Patch operation, and any predicate handed to
@@ -249,24 +327,20 @@ func (t *Table) Alias() string { return t.alias }
 // renders an index through an alias, since CREATE INDEX takes no AS
 // clause.
 //
-// The copy is a snapshot. A column, relation or constraint added to
-// the base table after As returned does not reach the alias, which
-// matters because Go initialises package-level variables before it
-// runs init: an alias declared as a var beside its table is taken
-// before any init that declares relations. Take the alias at the query
-// site, or after the schema is complete.
+// The SHAPE of the table is still a snapshot, and only the shape: a
+// column, relation or constraint added to the base table after As
+// returned does not reach the alias, for the same package-level-var
+// reason described above. Take the alias at the query site, or after
+// the schema is complete. Scoping is exempt from that caveat because
+// scoping is the half where being a snapshot destroys data.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
-	// The whole-struct copy reads ctxFilters, which a request-scoped
-	// ScopeByTenant may be writing right now, so it is taken under the
-	// read lock. The alias then gets a lock of its own: its filter list
-	// is its own from here, and two independent handles have no reason
-	// to serialise against each other.
-	t.ctxFiltersMu.RLock()
+	// The whole-struct copy carries the scope POINTER across, so the
+	// alias reads and writes the same filter lists, the same tenant
+	// column, the same hooks and the same lock as the table it names.
+	// Nothing here needs that lock: the copy reads no field the lock
+	// guards.
 	cp := *t
-	cp.ctxFilters = append([]ctxFilter(nil), t.ctxFilters...)
-	t.ctxFiltersMu.RUnlock()
-	cp.ctxFiltersMu = new(sync.RWMutex)
 	cp.alias = alias
 	cp.columns = make([]*Column, len(t.columns))
 	cp.byName = make(map[string]*Column, len(t.byName))
@@ -349,17 +423,13 @@ func (t *Table) As(alias string) *Table {
 		f.Columns = rebindAll(fk.Columns)
 		cp.compositeFKs[i] = &f
 	}
-	// The remaining slices are shared by value but not by array: a
-	// copy taken at full capacity would let an append through the
-	// alias land in the base table's spare capacity, and the next
-	// append through the base overwrite it.
+	// The index list is shared by value but not by array: a copy taken
+	// at full capacity would let an append through the alias land in
+	// the base table's spare capacity, and the next append through the
+	// base overwrite it. It is the last slice here that is copied at
+	// all — the filter lists and the hook lists live in the shared
+	// tableScope, which cp already points at.
 	cp.indexes = append([]*Index(nil), t.indexes...)
-	cp.insertHooks = append([]InsertHook(nil), t.insertHooks...)
-	cp.updateHooks = append([]UpdateHook(nil), t.updateHooks...)
-	cp.deleteHooks = append([]DeleteHook(nil), t.deleteHooks...)
-	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
-	// ctxFilters was copied at the top instead, because reading it
-	// needs the read lock this far down no longer holds.
 	return &cp
 }
 
@@ -494,13 +564,17 @@ func Add[T any](t *Table, c *Col[T]) *Col[T] {
 // hook can fill column values the caller didn't explicitly bind; user
 // values always win.
 func (t *Table) OnInsert(h InsertHook) *Table {
-	t.insertHooks = append(t.insertHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.insertHooks = appendShared(t.scope.insertHooks, h)
 	return t
 }
 
 // OnUpdate registers a hook invoked by UpdateBuilder.WriteSQL.
 func (t *Table) OnUpdate(h UpdateHook) *Table {
-	t.updateHooks = append(t.updateHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.updateHooks = appendShared(t.scope.updateHooks, h)
 	return t
 }
 
@@ -508,26 +582,68 @@ func (t *Table) OnUpdate(h UpdateHook) *Table {
 // may return a non-nil expression to replace the rendered DELETE
 // entirely — used by SoftDelete to flip DELETE into UPDATE.
 func (t *Table) OnDelete(h DeleteHook) *Table {
-	t.deleteHooks = append(t.deleteHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.deleteHooks = appendShared(t.scope.deleteHooks, h)
 	return t
+}
+
+// insertHookList, updateHookList and deleteHookList return the hooks
+// registered on the table — through the shared scope, so an alias
+// answers with the table's own rather than with whatever list existed
+// when As was called. A soft-delete rewrite lost that way turns into a
+// hard DELETE; see tableScope.
+//
+// The slice is taken under the read lock and walked with it released,
+// which the appendShared discipline makes sound.
+func (t *Table) insertHookList() []InsertHook {
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.insertHooks
+}
+
+func (t *Table) updateHookList() []UpdateHook {
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.updateHooks
+}
+
+func (t *Table) deleteHookList() []DeleteHook {
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.deleteHooks
 }
 
 // DefaultFilter appends a predicate applied to every Select / Update /
 // Delete against the table, unless the builder is marked Unscoped().
 // Filters compose with AND.
 //
-// The predicate is fixed at declaration time, and so is registration:
-// unlike [Table.ContextFilter] this list is not locked, because nothing
-// in the package registers a default filter per request — mixins apply
-// theirs where the schema is declared. Register from the goroutine that
-// builds the schema, before the first query.
+// The predicate is fixed at declaration time, but registration is not
+// assumed to be: the list lives in the shared [tableScope] under the
+// same lock [Table.ContextFilter] takes, so declaring a default filter
+// on a table other goroutines are querying is as supported here as it
+// is there — and so an alias taken before ApplyMixins still carries the
+// soft-delete guard the mixin registers.
 //
 // When the predicate depends on the request — the tenant, the acting
 // subject — use [Table.ContextFilter], whose predicate is built per
 // execution from a ctx.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.defaultFilters = appendShared(t.scope.defaultFilters, e)
 	return t
+}
+
+// defaultFilterList returns the table's render-time filters through the
+// shared scope. Nil-safe so a statement with no table can ask.
+func (t *Table) defaultFilterList() []drops.Expression {
+	if t == nil {
+		return nil
+	}
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.defaultFilters
 }
 
 // ContextFilter registers a predicate resolved at execution time and
@@ -559,9 +675,9 @@ func (t *Table) ContextFilter(fn ContextFilterFunc) *Table {
 	if fn == nil {
 		return t
 	}
-	t.ctxFiltersMu.Lock()
-	defer t.ctxFiltersMu.Unlock()
-	t.ctxFilters = append(t.copyCtxFilters(), ctxFilter{fn: fn})
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.ctxFilters = appendShared(t.scope.ctxFilters, ctxFilter{fn: fn})
 	return t
 }
 
@@ -602,9 +718,9 @@ func (t *Table) ScopeWritesByTenant(col ColRef) *Table {
 // ScopeWritesByTenant and by Entity.ScopeByTenant, which registers the
 // read-side filter in the same breath.
 func (t *Table) setTenantAxis(c *Column) {
-	t.ctxFiltersMu.Lock()
-	defer t.ctxFiltersMu.Unlock()
-	t.tenantCol = c
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.tenantCol = c
 }
 
 // tenantAxis returns the column an INSERT into the table stamps, or nil
@@ -614,52 +730,51 @@ func (t *Table) tenantAxis() *Column {
 	if t == nil {
 		return nil
 	}
-	t.ctxFiltersMu.RLock()
-	defer t.ctxFiltersMu.RUnlock()
-	return t.tenantCol
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.tenantCol
 }
 
 // setContextFilter registers fn under key, replacing any filter
 // previously registered under the same key. See ctxFilter for why the
 // entity-owned filters are keyed and the exported ones are not.
 func (t *Table) setContextFilter(key string, fn ContextFilterFunc) {
-	t.ctxFiltersMu.Lock()
-	defer t.ctxFiltersMu.Unlock()
-	for i := range t.ctxFilters {
-		if t.ctxFilters[i].key == key {
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	for i := range t.scope.ctxFilters {
+		if t.scope.ctxFilters[i].key == key {
 			// Replaced by swapping in a new slice rather than by
 			// assigning through the old one: a reader is walking that
 			// backing array right now with the lock released, and an
 			// entity rebuilt per request replaces its own filter on
 			// every single request.
-			next := t.copyCtxFilters()
+			next := make([]ctxFilter, len(t.scope.ctxFilters))
+			copy(next, t.scope.ctxFilters)
 			next[i].fn = fn
-			t.ctxFilters = next
+			t.scope.ctxFilters = next
 			return
 		}
 	}
-	t.ctxFilters = append(t.copyCtxFilters(), ctxFilter{key: key, fn: fn})
+	t.scope.ctxFilters = appendShared(t.scope.ctxFilters, ctxFilter{key: key, fn: fn})
 }
 
-// copyCtxFilters returns a fresh copy of the filter list at exactly its
-// own length. The caller holds the write lock. Copying at length rather
-// than appending in place is what keeps an append out of the spare
-// capacity a reader's slice header still spans.
-func (t *Table) copyCtxFilters() []ctxFilter {
-	out := make([]ctxFilter, len(t.ctxFilters))
-	copy(out, t.ctxFilters)
-	return out
+// ctxFilterList returns the table's request-scoped filters through the
+// shared scope, so an alias resolves the axis its table carries now
+// rather than the one it carried when As was called. See tableScope for
+// the cross-tenant DELETE that answer prevents.
+func (t *Table) ctxFilterList() []ctxFilter {
+	if t == nil {
+		return nil
+	}
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.ctxFilters
 }
 
 // hasContextFilters reports whether the table has any context filter to
 // resolve. Nil-safe so a SELECT with no FROM table can ask.
 func (t *Table) hasContextFilters() bool {
-	if t == nil {
-		return false
-	}
-	t.ctxFiltersMu.RLock()
-	defer t.ctxFiltersMu.RUnlock()
-	return len(t.ctxFilters) > 0
+	return len(t.ctxFilterList()) > 0
 }
 
 // resolveContextFilters builds every registered predicate against ctx,
@@ -709,9 +824,7 @@ func (t *Table) resolveContextFilters(ctx context.Context) ([]drops.Expression, 
 	if t == nil {
 		return nil, nil
 	}
-	t.ctxFiltersMu.RLock()
-	filters := t.ctxFilters
-	t.ctxFiltersMu.RUnlock()
+	filters := t.ctxFilterList()
 	if len(filters) == 0 {
 		return nil, nil
 	}
@@ -835,7 +948,7 @@ func renderFilterCycle(chain *filterChain, ref string) string {
 
 // hasDefaultFilters reports whether the table carries any render-time
 // default filter. Nil-safe, like hasContextFilters.
-func (t *Table) hasDefaultFilters() bool { return t != nil && len(t.defaultFilters) > 0 }
+func (t *Table) hasDefaultFilters() bool { return len(t.defaultFilterList()) > 0 }
 
 // resolveDefaultFilters returns the render-time filters, restated
 // against this instance of the table.
@@ -847,10 +960,11 @@ func (t *Table) hasDefaultFilters() bool { return t != nil && len(t.defaultFilte
 // see [Table.resolveDefaultFilterExprs]. This function stays the
 // answer on the ToSQL path, which has no ctx to do better with.
 func (t *Table) resolveDefaultFilters() []drops.Expression {
-	if !t.hasDefaultFilters() {
+	filters := t.defaultFilterList()
+	if len(filters) == 0 {
 		return nil
 	}
-	return t.resolveFilterExprs(t.defaultFilters)
+	return t.resolveFilterExprs(filters)
 }
 
 // resolveDefaultFilterExprs walks the statements written inside the
@@ -880,14 +994,15 @@ func (t *Table) resolveDefaultFilters() []drops.Expression {
 // soft-delete guard would otherwise cost one allocation on every query
 // against every table that has one.
 func (t *Table) resolveDefaultFilterExprs(ctx context.Context) ([]drops.Expression, error) {
-	if !t.hasDefaultFilters() || !mayHoldStatements(t.defaultFilters) {
+	filters := t.defaultFilterList()
+	if len(filters) == 0 || !mayHoldStatements(filters) {
 		return nil, nil
 	}
 	inner, err := enterFilterResolution(ctx, t)
 	if err != nil {
 		return nil, err
 	}
-	resolved, err := resolveExprs(inner, t.defaultFilters)
+	resolved, err := resolveExprs(inner, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -1135,8 +1250,8 @@ func (t *Table) Policies() map[string]*Policy { return t.policies }
 // hasHooks reports whether the table has any lifecycle hooks
 // registered — used by builders to skip the hook pipeline when
 // nothing is wired up.
-func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
-func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
+func (t *Table) hasInsertHooks() bool { return len(t.insertHookList()) > 0 }
+func (t *Table) hasUpdateHooks() bool { return len(t.updateHookList()) > 0 }
 
 // writeName writes only the (schema-qualified) table name, with no alias.
 // Used by DDL where AS clauses are not permitted.
@@ -1175,3 +1290,9 @@ func (t *Table) writeRef(b *drops.Builder) {
 
 // WriteSQL writes the FROM/JOIN form. Implements drops.Expression.
 func (t *Table) WriteSQL(b *drops.Builder) { t.writeFrom(b) }
+
+// fromTable implements fromRelation, which is how a table handed to
+// [SelectBuilder.FromExpr] is recognised as a RELATION rather than as
+// one more expression and gets the scoping its From-clause twin gets.
+// Being a drops.Expression is exactly what let it in unscoped.
+func (t *Table) fromTable() *Table { return t }

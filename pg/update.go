@@ -155,7 +155,7 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 // Two things about it are load-bearing.
 //
 // The filters are taken through resolvedDefaults.of rather than read
-// off Table.defaultFilters, which is what restates them against the
+// off the table's own filter list, which is what restates them against the
 // instance of the table the statement actually names, and what walks
 // the statements written inside them for the ctx being resolved. A
 // filter is an opaque tree of closures over the declared column
@@ -189,7 +189,7 @@ func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
 	for _, s := range u.sets {
 		ctx.bound[s.column().key()] = true
 	}
-	for _, h := range u.table.updateHooks {
+	for _, h := range u.table.updateHookList() {
 		h.BeforeUpdate(ctx)
 	}
 	if len(ctx.add) == 0 {

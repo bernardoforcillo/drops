@@ -113,7 +113,7 @@ func (d *DeleteBuilder) Unscoped() *DeleteBuilder {
 // statement entirely — used by SoftDelete to flip DELETE into UPDATE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 	if !d.unscoped {
-		for _, h := range d.table.deleteHooks {
+		for _, h := range d.table.deleteHookList() {
 			if rep := h.BeforeDelete(d); rep != nil {
 				d.carryUsing(rep).WriteSQL(b)
 				return

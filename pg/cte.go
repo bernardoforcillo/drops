@@ -243,7 +243,7 @@ func (s *SelectBuilder) checkCTENames() error {
 	seen := make(map[string]*CTE, len(ctes))
 	for _, c := range ctes {
 		if prev, ok := seen[c.name]; ok && prev.identity() != c.identity() {
-			return fmt.Errorf("drops/pg: %w: %q", ErrCTENameConflict, c.name)
+			return fmt.Errorf("%w: %q", ErrCTENameConflict, c.name)
 		}
 		seen[c.name] = c
 	}

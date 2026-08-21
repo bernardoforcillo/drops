@@ -299,7 +299,7 @@ func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]ColumnValue) {
 	for _, c := range i.cols {
 		ctx.bound[c.key()] = true
 	}
-	for _, h := range i.table.insertHooks {
+	for _, h := range i.table.insertHookList() {
 		h.BeforeInsert(ctx)
 	}
 	if len(ctx.addCols) == 0 {
@@ -474,11 +474,18 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 		return i, nil
 	}
 	cp := *i
+	// changed is the discipline the other three builders keep, and it
+	// is not only about this statement: resolveStatement reports
+	// "resolved differs from the original" from the pointer, so an
+	// INSERT that had nothing to resolve told every enclosing
+	// resolveExprs it had changed, and each of them copied a slice to
+	// hold a value identical to the one it already had.
+	changed := false
 
 	cols, rows := i.cols, i.rows
 	if i.table.hasInsertHooks() {
 		cols, rows = i.applyInsertHooks()
-		cp.hooked = true
+		cp.hooked, changed = true, true
 	}
 
 	rowsCopied := false
@@ -491,7 +498,7 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 			continue
 		}
 		if !rowsCopied {
-			rows, rowsCopied = append([][]ColumnValue(nil), rows...), true
+			rows, rowsCopied, changed = append([][]ColumnValue(nil), rows...), true, true
 		}
 		rows[r] = resolved
 	}
@@ -514,7 +521,7 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 			if wheres != nil {
 				c.where = wheres
 			}
-			conflict = &c
+			conflict, changed = &c, true
 		}
 	}
 
@@ -523,17 +530,23 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 		return nil, err
 	}
 	if returning != nil {
-		cp.returning = returning
+		cp.returning, changed = returning, true
 	}
 
 	if axis := i.writeAxis(); axis != nil {
+		// Stamping rebuilds the column list and every row, so an
+		// INSERT into a table with a tenant axis has always changed by
+		// the time it gets here.
 		cols, rows, err = stampTenantColumn(ctx, axis, cols, rows)
 		if err != nil {
 			return nil, err
 		}
-		conflict = scopeConflict(axis, conflict)
+		conflict, changed = scopeConflict(axis, conflict), true
 	}
 
+	if !changed {
+		return i, nil
+	}
 	cp.cols, cp.rows, cp.conflict = cols, rows, conflict
 	cp.resolved = true
 	return &cp, nil

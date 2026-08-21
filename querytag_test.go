@@ -236,3 +236,20 @@ func commentBody(s string) (string, bool) {
 	}
 	return s[i+2 : len(s)-2], true
 }
+
+// The separator exists to keep the comment off the end of the
+// statement; with no statement there is nothing to separate it from,
+// and the leading space is just a byte nobody asked for. Reachable
+// from every dialect's DB.Exec, which hands whatever text it was given
+// straight to TagStatement.
+func TestTagStatementOfNothingHasNoLeadingSpace(t *testing.T) {
+	ctx := drops.WithQueryTag(context.Background(), "controller", "users")
+	if got := drops.TagStatement(ctx, ""); got != "/*controller='users'*/" {
+		t.Errorf("got %q", got)
+	}
+	// Whitespace-only is the same statement with the same answer:
+	// TrimRight has already reduced it to nothing.
+	if got := drops.TagStatement(ctx, "  \n"); got != "/*controller='users'*/" {
+		t.Errorf("whitespace-only: got %q", got)
+	}
+}

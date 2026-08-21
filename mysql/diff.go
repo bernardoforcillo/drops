@@ -33,14 +33,36 @@ type DiffOptions struct {
 	// batching a table's changes into a single statement. See Diff for
 	// what batching buys and what it costs.
 	SplitAlters bool
+
+	// Renames names the objects that changed name rather than being
+	// dropped and re-added. Diff cannot work this out — see rename.go —
+	// so an unstated rename comes out as a DROP COLUMN and an ADD
+	// COLUMN, which on a server with no transactional DDL is data gone
+	// with nothing to roll back. Each entry turns its pair into a
+	// rename, and the diff that follows is computed as if the rename had
+	// already happened.
+	//
+	// Diff trusts what it is given: a rename naming an object that is
+	// not there is emitted anyway and fails at the server.
+	// GenerateMigration checks first.
+	Renames []Rename
 }
 
 // DiffDown returns the SQL that reverses the migration from cur back to
 // prev — applying it after the corresponding Diff(prev, cur) restores
 // the original schema, as far as anything can: a dropped column's data
 // is gone, and re-adding the column brings back nothing.
+//
+// DiffOptions.Renames is inverted along with the arguments, so a
+// migration that renames "email" to "emailAddress" rolls back by
+// renaming it the other way rather than by dropping it.
 func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
-	return Diff(cur, prev, opts...)
+	if len(opts) == 0 {
+		return Diff(cur, prev)
+	}
+	down := opts[0]
+	down.Renames = invertRenames(down.Renames)
+	return Diff(cur, prev, down)
 }
 
 // Diff returns the ordered list of SQL statements that evolve a
@@ -50,13 +72,16 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 //
 // Operation order:
 //
-//  1. DROP FOREIGN KEY on any constraint pointing at a table about to
+//  1. the renames DiffOptions.Renames states, tables before columns, so
+//     everything below is computed against a previous schema in which
+//     they have already run;
+//  2. DROP FOREIGN KEY on any constraint pointing at a table about to
 //     go, because InnoDB refuses to drop a table something references;
-//  2. DROP TABLE for tables removed entirely;
-//  3. CREATE TABLE for new tables, carrying their columns and PRIMARY
+//  3. DROP TABLE for tables removed entirely;
+//  4. CREATE TABLE for new tables, carrying their columns and PRIMARY
 //     KEY only;
-//  4. per-table column changes, then index and CHECK changes;
-//  5. FOREIGN KEY changes last, once every table and column they name
+//  5. per-table column changes, then index and CHECK changes;
+//  6. FOREIGN KEY changes last, once every table and column they name
 //     exists.
 //
 // # Why the PRIMARY KEY is inline and nothing else is
@@ -93,6 +118,11 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	if cur == nil {
 		cur = EmptySnapshot()
 	}
+	// The renames go in front, and everything below is computed against
+	// a previous schema in which they have already run — so a rename is
+	// a rename and not a drop and an add.
+	renames := renameStatements(prev, opt.Renames, opt)
+	prev = applyRenames(prev, opt.Renames)
 	var out []string
 
 	dropped := map[string]bool{}
@@ -158,7 +188,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 		}
 		out = append(out, diffForeignKeys(prevT, curT, preDropped)...)
 	}
-	return out
+	return append(renames, out...)
 }
 
 // ----------------------------------------------------------------------

@@ -9,6 +9,55 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **A rename is a rename, and drops stops rather than guess.** A
+  structural diff can see that `email` is gone and `emailAddress` has
+  arrived. It cannot see whether that was one rename or a drop and an
+  add, and until now it picked the second — `DROP COLUMN "email"` and
+  `ADD COLUMN "emailAddress"`, which is not a migration but data loss
+  with a green checkmark. `AnalyzeMigration` flagged the DROP as
+  destructive, which told the operator the migration was dangerous
+  rather than that it was wrong.
+
+  `DetectRenames` now finds the ambiguous pairs — a dropped column and
+  an added one on the same table whose types are in the same family, a
+  dropped table and an added one carrying the same columns — and
+  `GenerateMigration` returns `*RenameAmbiguityError` and writes
+  nothing while any of them is unanswered. That refusal is the part
+  that matters: CI has no terminal, and the answer drops would have to
+  invent without one is the `DROP COLUMN`. The family test is the
+  middle of the two useless extremes: identical types would miss a
+  rename that widened the column in the same step, and no test at all
+  would ask whether a dropped timestamp had become a boolean.
+
+  An answer is a `RenameDecision`, given through `GenerateOptions.Renames`
+  or on the command line — `--rename-column users.email=emailAddress`,
+  `--rename-table users=people`, `--drop-column users.email`,
+  `--drop-table users` — or, under `drops generate --interactive`, one
+  question per pair on stdin. Prompting is opt-in rather than inferred
+  from whether stdin looks like a terminal, because the portable form of
+  that question says yes to `/dev/null`, which is what a program with no
+  stdin is handed. Every answer is recorded in
+  `<dir>/meta/_renames.json`, next to the snapshots and the journal, so
+  the question is asked once and replayed after that: a colleague
+  generating from the same directory gets the same migration, and CI
+  finds an answer already there. drizzle-kit reads the journal and the
+  snapshots by name and ignores everything else, so the directory stays
+  shared.
+
+  The answer, once given, is applied by rewriting the previous snapshot
+  as if the rename had already run and diffing that, so a rename
+  combined with a type change comes out as the `RENAME` and the type
+  change rather than as a drop and an add. `DiffOptions.Renames` carries
+  it in all three dialects: PostgreSQL emits `ALTER TABLE ... RENAME
+  COLUMN`, MySQL emits `RENAME COLUMN` on a server that has it (8.0,
+  MariaDB 10.5.2) and `CHANGE COLUMN` on one that does not, and SQLite
+  emits `RENAME COLUMN` in front of everything else — including a
+  rebuild, whose `INSERT ... SELECT` then finds the column under the
+  name it is copying. SQLite was the worst of the three: a rebuild that
+  had not been told about a rename copied the table without that
+  column and dropped the original in the same breath, with no `DROP
+  COLUMN` anywhere in the file to warn anybody.
+
 - **`drops lint`: three query mistakes, caught before the query
   runs.** Drizzle ships an ESLint plugin whose flagship rule is
   "delete without a where clause", and it is the single most-cited
@@ -897,6 +946,59 @@ once a 1.0 is cut.
   was dead code because the query-result caching pg has was never
   wired up. `All`/`One` now read through it with the same single-flight
   stampede protection the PK path had.
+- **`pg`'s scanner disagreed with the root one about embedded
+  unexported structs.** `pg/scan.go` carried a fork of the reflection
+  walk that skipped unexported fields before it reached the anonymous
+  ones, so a row type factoring its timestamps into an unexported
+  `audit` lost those columns — scanned into a discard sink, zero values
+  in the struct, no error. The root scanner walks the embedded type
+  first and explains why. `pg` now uses `drops.StructFields` rather
+  than a second copy of the rules, which also brings pg the root's
+  collision rule: a name reachable at two depths belongs to the
+  shallower field, and an embedded `time.Time` or `sql.Scanner`
+  receives a column instead of lending its fields. `sqlite` and
+  `mysql` were already on the root scanner; `clickhouse` still carries
+  the same fork.
+- **A keyset cursor sitting on a NULL paged nothing, forever.**
+  `pg.EncodeCursor(spec, nil, …)` rendered `note > $1` bound to nil,
+  which under three-valued logic matches no row — so every page after
+  the first came back empty and looked exactly like the end of the
+  result set. The keyset guard is now NULL-aware, as `mysql`'s already
+  was: it is written against the `NULLS FIRST` / `NULLS LAST`
+  placement the spec asks for, the equality on leading keys uses
+  `IS NULL`, and paging backward reverses the placement along with the
+  direction. `EncodeCursor` also follows a pointer, since a nullable
+  column arrives from the last row of a page as a `*T`.
+- **Two racing migrators failed inside PostgreSQL's catalogue.**
+  `CREATE TABLE IF NOT EXISTS` and `CREATE SCHEMA IF NOT EXISTS` are
+  not atomic against a concurrent `CREATE`, so a rolling deploy that
+  ran the migrator once per replica reported a duplicate key on
+  `pg_type_typname_nsp_index` or `pg_namespace_nspname_index` — names
+  that tell an operator nothing. `Migrator.Up`/`Down` and
+  `DrizzleMigrator.Up` now hold a PostgreSQL advisory lock for the
+  whole run, so the loser waits and then finds nothing to do. It
+  matters most for the drizzle migrator, whose history is keyed by
+  hash with no unique constraint: unsynchronised, two runs would both
+  apply a pending file and both record it. `WithLockTimeout` turns the
+  wait into `ErrMigrationLocked`, `WithoutLock` opts out for a pool too
+  small to lend the lock a connection, and `LockKey` names the key to
+  look for in `pg_locks`.
+- **The outbox's per-aggregate worker delivered events out of order.**
+  `OrderingPerAggregate` ended each tick by falling through to the
+  unordered drain, which selects every pending row regardless of
+  aggregate — so the two cases where the ordered pass delivers nothing,
+  an aggregate whose advisory lock another worker holds and an
+  aggregate parked behind a failed event, were exactly the cases where
+  the same tick delivered that aggregate's events anyway. The fallback
+  is now `DrainUnaggregated`, which sees only the events that carry no
+  aggregate and therefore no ordering promise. `DrainAggregate` also
+  stops at the first event that is not available yet rather than
+  stepping over it, since a failed event pushed into the future by its
+  backoff was letting the events emitted behind it go first.
+  `mysql/outbox.go` is a copy of the same design and still has both.
+- **`drops.TagStatement(ctx, "")` returned `" /*…*/"`.** The separator
+  keeps the comment off the end of the statement; with no statement
+  there is nothing to separate it from.
 
 
 ## [0.6.0] - 2026-08-16

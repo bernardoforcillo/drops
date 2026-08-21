@@ -12,6 +12,18 @@ type DiffOptions struct {
 	// the migration can be re-run without errors. ALTER COLUMN does not
 	// have an IF EXISTS form in PostgreSQL, so it is emitted unchanged.
 	Safe bool
+
+	// Renames names the objects that changed name rather than being
+	// dropped and re-added. Diff cannot work this out — see rename.go —
+	// so an unstated rename comes out as a DROP COLUMN and an ADD
+	// COLUMN, which is what the data loss looks like. Each entry turns
+	// its pair into an ALTER TABLE ... RENAME, and the diff that follows
+	// is computed as if the rename had already happened.
+	//
+	// Diff trusts what it is given: a rename naming an object that is
+	// not there is emitted anyway and fails at the server.
+	// GenerateMigration checks first.
+	Renames []Rename
 }
 
 // DiffDown returns the SQL that reverses the migration from cur
@@ -23,8 +35,17 @@ type DiffOptions struct {
 //
 //	up := pg.Diff(prev, cur, opts)
 //	down := pg.DiffDown(prev, cur, opts) // = Diff(cur, prev, opts)
+//
+// DiffOptions.Renames is inverted along with the arguments, so a
+// migration that renames "email" to "emailAddress" rolls back by
+// renaming it the other way rather than by dropping it.
 func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
-	return Diff(cur, prev, opts...)
+	if len(opts) == 0 {
+		return Diff(cur, prev)
+	}
+	down := opts[0]
+	down.Renames = invertRenames(down.Renames)
+	return Diff(cur, prev, down)
 }
 
 // Diff returns the ordered list of SQL statements that, applied in
@@ -55,6 +76,11 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 //  10. CREATE / CREATE OR REPLACE VIEW, once the tables a view selects
 //     from are in their final shape
 //  11. ROW LEVEL SECURITY and its policies, table by table
+//
+// ALTER TABLE ... RENAME comes in front of all of it, when
+// DiffOptions.Renames says a rename is what happened; everything below
+// is then computed against a previous schema in which the rename has
+// already run, so a rename is a RENAME and not a drop and an add.
 func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	var opt DiffOptions
 	if len(opts) > 0 {
@@ -66,6 +92,8 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	if cur == nil {
 		cur = EmptySnapshot()
 	}
+	renames := renameStatements(opt.Renames)
+	prev = applyRenames(prev, opt.Renames)
 	var out []string
 
 	for _, key := range sortedKeys(prev.Tables) {
@@ -163,7 +191,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 		out = append(out, diffPolicies(prevT, curT, opt.Safe)...)
 	}
 
-	return out
+	return append(renames, out...)
 }
 
 // diffEnumsDrop emits DROP TYPE for every enum cur no longer declares.

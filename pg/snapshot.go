@@ -63,8 +63,14 @@ type PolicySnapshot struct {
 	WithCheck string   `json:"withCheck"`
 }
 
-// SnapshotMeta carries rename-tracking annotations. drops never sets
-// these; the field is present for drizzle-kit compatibility.
+// SnapshotMeta carries drizzle-kit's rename-tracking annotations. drops
+// never sets these; the field is present so a snapshot round-trips
+// through drizzle-kit with what that tool wrote still in it.
+//
+// drops records its own rename decisions in meta/_renames.json instead —
+// see RenameLogFile, which says why a second dialect of somebody else's
+// bookkeeping in the same key is the change most likely to break the
+// interoperability the format exists for.
 type SnapshotMeta struct {
 	Columns map[string]any `json:"columns"`
 	Schemas map[string]any `json:"schemas"`

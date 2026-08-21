@@ -3,11 +3,14 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -2689,4 +2692,353 @@ func policyUsingPG(t *testing.T, db *pg.DB, schema, table, policy string) string
 		t.Fatalf("scan: %v", err)
 	}
 	return out
+}
+
+// Two deploys racing to migrate the same database is the ordinary
+// case, not the exotic one: a rolling restart runs the migrator once
+// per replica, at the same second, against the same server. Without a
+// lock the loser fails somewhere inside PostgreSQL's own catalogue —
+// CREATE TABLE IF NOT EXISTS is not atomic against a concurrent
+// CREATE, so it reports a duplicate key on pg_type_typname_nsp_index,
+// which names nothing an operator has ever heard of.
+func TestPGRacingMigratorsDoNotCollide(t *testing.T) {
+	first, second := openPG(t), openPG(t)
+	ctx := context.Background()
+
+	history := integration.UniqueName(t, "hist")
+	target := integration.UniqueName(t, "target")
+	t.Cleanup(func() {
+		_, _ = first.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, target))
+		_, _ = first.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, history))
+	})
+
+	migrator := func(db *pg.DB) *pg.Migrator {
+		return pg.NewMigrator(db).WithTable(history).AddSQL("0001", "create",
+			fmt.Sprintf(`CREATE TABLE %q (id bigint)`, target),
+			fmt.Sprintf(`DROP TABLE %q`, target))
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, db := range []*pg.DB{first, second} {
+		wg.Add(1)
+		go func(i int, db *pg.DB) {
+			defer wg.Done()
+			errs[i] = migrator(db).Up(ctx)
+		}(i, db)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("migrator %d: %v", i, err)
+		}
+	}
+	// One run applied it; the other waited, saw it applied, and did
+	// nothing. Either way the history holds exactly one row.
+	var applied int64
+	if err := pg.ScanOne(mustQueryPG(t, first,
+		fmt.Sprintf(`SELECT count(*) FROM %q WHERE version = '0001'`, history)), &applied); err != nil {
+		t.Fatalf("count history: %v", err)
+	}
+	if applied != 1 {
+		t.Errorf("history holds %d rows for 0001, want 1", applied)
+	}
+}
+
+// A run that will not wait says so in its own words.
+func TestPGMigratorLockTimeoutNamesTheMigrationLock(t *testing.T) {
+	db, holder := openPG(t), openPG(t)
+	ctx := context.Background()
+
+	history := integration.UniqueName(t, "hist")
+	target := integration.UniqueName(t, "target")
+	t.Cleanup(func() {
+		_, _ = db.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, target))
+		_, _ = db.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, history))
+	})
+
+	m := pg.NewMigrator(db).WithTable(history).
+		WithLockTimeout(500*time.Millisecond).
+		AddSQL("0001", "create", fmt.Sprintf(`CREATE TABLE %q (id bigint)`, target), "")
+
+	// Hold the migrator's lock from another session, the way a
+	// migration already in flight would.
+	held, tx, err := holder.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := held.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", m.LockKey()); err != nil {
+		t.Fatalf("take the lock: %v", err)
+	}
+
+	err = m.Up(ctx)
+	if !errors.Is(err, pg.ErrMigrationLocked) {
+		t.Fatalf("want ErrMigrationLocked, got %v", err)
+	}
+	if strings.Contains(err.Error(), "pg_type_typname_nsp_index") {
+		t.Errorf("the error still names a catalogue index: %v", err)
+	}
+}
+
+// mustQueryPG runs sql and hands back the cursor, failing the test if
+// the server rejects it.
+func mustQueryPG(t *testing.T, db *pg.DB, sql string, args ...any) drops.Rows {
+	t.Helper()
+	rows, err := db.Query(context.Background(), sql, args...)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	return rows
+}
+
+// The drizzle migrator races harder than the plain one. Its history is
+// keyed by hash with no unique constraint, so two runs that both find a
+// migration pending both apply it and both record it — a migration
+// whose SQL is not idempotent runs twice against the same database.
+// Before either gets that far they collide creating the drizzle schema:
+// CREATE SCHEMA IF NOT EXISTS is not atomic either, and the loser
+// reports a duplicate key on pg_namespace_nspname_index.
+func TestPGRacingDrizzleMigratorsApplyEachFileOnce(t *testing.T) {
+	first, second := openPG(t), openPG(t)
+	ctx := context.Background()
+
+	schema := integration.UniqueName(t, "dz")
+	counter := integration.UniqueName(t, "dzcount")
+	t.Cleanup(func() {
+		_, _ = first.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %q CASCADE`, schema))
+		_, _ = first.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS %q`, counter))
+	})
+	if _, err := first.Exec(ctx, fmt.Sprintf(`CREATE TABLE %q (n bigint NOT NULL)`, counter)); err != nil {
+		t.Fatalf("create counter: %v", err)
+	}
+
+	// The migration appends a row. Applied once the table holds one
+	// row; applied twice it holds two, and no error anywhere says so.
+	fsys := fstest.MapFS{
+		"meta/_journal.json": &fstest.MapFile{Data: []byte(
+			`{"version":"7","dialect":"postgresql","entries":[{"idx":0,"version":"7","when":1,"tag":"0000_seed","breakpoints":true}]}`)},
+		"0000_seed.sql": &fstest.MapFile{Data: []byte(
+			fmt.Sprintf("INSERT INTO %q (n) VALUES (1);", counter))},
+	}
+	migrator := func(db *pg.DB) *pg.DrizzleMigrator {
+		return pg.NewDrizzleMigrator(db, fsys, ".").WithSchema(schema)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, db := range []*pg.DB{first, second} {
+		wg.Add(1)
+		go func(i int, db *pg.DB) {
+			defer wg.Done()
+			errs[i] = migrator(db).Up(ctx)
+		}(i, db)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("migrator %d: %v", i, err)
+		}
+	}
+	var rows int64
+	if err := pg.ScanOne(mustQueryPG(t, first,
+		fmt.Sprintf(`SELECT count(*) FROM %q`, counter)), &rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("the migration ran %d times, want 1", rows)
+	}
+}
+
+// pgOutboxFixture creates an outbox table and emits kinds for one
+// aggregate, in the order given.
+func pgOutboxFixture(t *testing.T, aggType, aggID string, kinds ...string) (*pg.DB, *pg.Outbox) {
+	t.Helper()
+	db := openPG(t)
+	name := integration.UniqueName(t, "ob")
+	tbl := pg.NewOutboxTable(name)
+	dropPG(t, db, tbl)
+	execPG(t, db, pg.CreateTable(tbl))
+
+	ob := pg.NewOutbox(db, name)
+	if err := db.InTx(context.Background(), func(tx *pg.DB) error {
+		for _, k := range kinds {
+			if err := ob.EmitWith(tx, context.Background(), k, map[string]string{},
+				pg.EmitOptions{AggregateType: aggType, AggregateID: aggID}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	return db, ob
+}
+
+// runOutboxBriefly runs w until ctx expires or the recorder says stop.
+func runOutboxBriefly(w *pg.OutboxWorker, d time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	_ = w.Run(ctx)
+}
+
+// OrderingPerAggregate promises emission order within an aggregate.
+// The per-aggregate tick ended by falling through to the unordered
+// drain, which selects every pending row regardless of aggregate — so
+// once the ordered pass stopped at a failed event, the same tick went
+// on to deliver the events behind it.
+func TestPGOutboxPerAggregateDoesNotOvertakeAFailedEvent(t *testing.T) {
+	_, ob := pgOutboxFixture(t, "match", "abc", "e1", "e2", "e3")
+
+	var mu sync.Mutex
+	var seen []string
+	w := pg.NewOutboxWorker(ob).
+		WithOrdering(pg.OrderingPerAggregate).
+		WithInterval(20 * time.Millisecond).
+		OnEvent(func(_ context.Context, e pg.OutboxEvent) error {
+			mu.Lock()
+			seen = append(seen, e.Kind)
+			mu.Unlock()
+			if e.Kind == "e2" {
+				return errors.New("handler refused e2")
+			}
+			return nil
+		})
+	// The default backoff puts e2's retry a second or more out, so
+	// nothing legitimate can reach e3 inside this window.
+	runOutboxBriefly(w, 300*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, k := range seen {
+		if k == "e3" {
+			t.Fatalf("e3 was delivered while e2 was still pending: %v", seen)
+		}
+	}
+	if len(seen) < 2 || seen[0] != "e1" || seen[1] != "e2" {
+		t.Errorf("expected the walk to stop at e2, got %v", seen)
+	}
+}
+
+// The other way into the same fallthrough: another worker already holds
+// the aggregate's advisory lock, so the ordered pass delivers nothing —
+// and the unordered drain behind it delivered everything, concurrently
+// with whatever the lock holder was doing.
+func TestPGOutboxPerAggregateSkipsALockedAggregate(t *testing.T) {
+	db, ob := pgOutboxFixture(t, "match", "abc", "e1", "e2", "e3")
+	ctx := context.Background()
+
+	// Hold the lock DrainAggregate takes, the way a sibling worker
+	// mid-delivery would.
+	holder, tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_xact_lock($1)",
+		pg.AdvisoryLockKey("outbox:match:abc")); err != nil {
+		t.Fatalf("take the aggregate lock: %v", err)
+	}
+
+	var mu sync.Mutex
+	var seen []string
+	w := pg.NewOutboxWorker(ob).
+		WithOrdering(pg.OrderingPerAggregate).
+		WithInterval(20 * time.Millisecond).
+		OnEvent(func(_ context.Context, e pg.OutboxEvent) error {
+			mu.Lock()
+			seen = append(seen, e.Kind)
+			mu.Unlock()
+			return nil
+		})
+	runOutboxBriefly(w, 300*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 0 {
+		t.Errorf("delivered %v behind the lock holder's back", seen)
+	}
+}
+
+// An event with no aggregate has no order to keep, so the per-aggregate
+// worker still has to drain it.
+func TestPGOutboxPerAggregateStillDrainsEventsWithNoAggregate(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "ob")
+	tbl := pg.NewOutboxTable(name)
+	dropPG(t, db, tbl)
+	execPG(t, db, pg.CreateTable(tbl))
+
+	ob := pg.NewOutbox(db, name)
+	if err := db.InTx(ctx, func(tx *pg.DB) error {
+		return ob.Emit(tx, ctx, "loose", map[string]string{})
+	}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	done := make(chan string, 4)
+	w := pg.NewOutboxWorker(ob).
+		WithOrdering(pg.OrderingPerAggregate).
+		WithInterval(20 * time.Millisecond).
+		OnEvent(func(_ context.Context, e pg.OutboxEvent) error {
+			select {
+			case done <- e.Kind:
+			default:
+			}
+			return nil
+		})
+	runOutboxBriefly(w, 300*time.Millisecond)
+
+	select {
+	case got := <-done:
+		if got != "loose" {
+			t.Errorf("delivered %q, want loose", got)
+		}
+	default:
+		t.Error("an event with no aggregate was never delivered")
+	}
+}
+
+// Stopping the stream at a failed event is only right if it starts
+// again: once the retry lands, the aggregate's remaining events have to
+// follow it, in order.
+func TestPGOutboxPerAggregateResumesAfterTheRetryLands(t *testing.T) {
+	_, ob := pgOutboxFixture(t, "match", "abc", "e1", "e2", "e3")
+
+	var mu sync.Mutex
+	var seen []string
+	failedOnce := false
+	w := pg.NewOutboxWorker(ob).
+		WithOrdering(pg.OrderingPerAggregate).
+		WithInterval(20 * time.Millisecond).
+		WithBackoff(func(int) time.Duration { return 50 * time.Millisecond }).
+		OnEvent(func(_ context.Context, e pg.OutboxEvent) error {
+			mu.Lock()
+			seen = append(seen, e.Kind)
+			first := e.Kind == "e2" && !failedOnce
+			if first {
+				failedOnce = true
+			}
+			mu.Unlock()
+			if first {
+				return errors.New("handler refused e2 once")
+			}
+			return nil
+		})
+	runOutboxBriefly(w, 2*time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 4 {
+		t.Fatalf("want e1,e2,e2,e3 — got %v", seen)
+	}
+	want := []string{"e1", "e2", "e2", "e3"}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("delivery order %v, want %v", seen, want)
+		}
+	}
 }

@@ -274,12 +274,16 @@ func appendTagComment(sql string, tags []Tag) string {
 	// statement.
 	b.Grow(len(sql) + 4 + 16*len(tags))
 	b.WriteString(sql)
-	if endsInLineComment(sql) {
+	switch {
+	case sql == "":
+		// Nothing to separate the comment from. A statement that is
+		// only whitespace has already been trimmed to this.
+	case endsInLineComment(sql):
 		// A statement whose last line opened a -- comment would
 		// swallow the tag and silently lose the attribution. Cheaper
 		// to start a new line than to explain the missing comment.
 		b.WriteByte('\n')
-	} else {
+	default:
 		b.WriteByte(' ')
 	}
 	b.WriteString("/*")

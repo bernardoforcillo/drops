@@ -1131,3 +1131,168 @@ func TestCancellationReachesTheServer(t *testing.T) {
 		t.Fatalf("a cancelled query reported %v, which is not a cancellation", err)
 	}
 }
+
+// ----------------------------------------------------------------------
+// generate and renames
+// ----------------------------------------------------------------------
+
+// schemaRenamed is schemaV1 with one column under a different name —
+// the change a structural diff cannot tell from a drop and an add.
+const schemaRenamed = `package schema
+
+import "github.com/bernardoforcillo/drops/pg"
+
+var (
+	Users     = pg.NewTable("users")
+	UserID    = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
+	UserEmail = pg.Add(Users, pg.Text("emailAddress").NotNull().Unique())
+)
+
+func Schema() *pg.Schema { return pg.NewSchema(Users) }
+`
+
+// The whole loop, through the CLI and the program it compiles: a rename
+// stops a run nobody can answer, the answer on the command line lets it
+// through, the answer is recorded, and the row that was in the column
+// is still there under the new name afterwards.
+//
+// The CLI runs here with its stdin attached to a pipe, which is the
+// case that matters: no terminal, so nothing to ask, so the only two
+// options are to stop or to guess.
+func TestCLIGenerateRefusesARenameAndThenTakesTheAnswer(t *testing.T) {
+	dsn := freshDatabase(t)
+	db := openDB(t, dsn)
+	p := newProject(t, dsn)
+	p.schema(schemaV1)
+	p.mustRun("generate", "--schema", "./schema", "--name", "init")
+	applyGeneratedSQL(t, db, filepath.Join(p.dir, "drizzle", "0000_init.sql"))
+
+	if _, err := db.Exec(context.Background(),
+		`INSERT INTO users (email) VALUES ($1)`, "ada@example.com"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	p.schema(schemaRenamed)
+	stdout, stderr, code := p.run("generate", "--schema", "./schema", "--name", "rename")
+	if code != 3 {
+		t.Fatalf("generate exited %d, want 3 (refused)\n%s%s", code, stdout, stderr)
+	}
+	out := stdout + stderr
+	for _, want := range []string{
+		"could be a rename or a drop-and-add",
+		"--rename-column users.email=emailAddress",
+		"--drop-column users.email",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the refusal does not say %q:\n%s", want, out)
+		}
+	}
+	if matches, _ := filepath.Glob(filepath.Join(p.dir, "drizzle", "0001_*.sql")); len(matches) > 0 {
+		t.Fatalf("a refused generate wrote %v", matches)
+	}
+
+	p.mustRun("generate", "--schema", "./schema", "--name", "rename",
+		"--rename-column", "users.email=emailAddress")
+	body, err := os.ReadFile(filepath.Join(p.dir, "drizzle", "0001_rename.sql"))
+	if err != nil {
+		t.Fatalf("generate did not write the migration: %v", err)
+	}
+	if !strings.Contains(string(body), `RENAME COLUMN "email" TO "emailAddress"`) {
+		t.Fatalf("migration:\n%s", body)
+	}
+	log, err := os.ReadFile(filepath.Join(p.dir, "drizzle", "meta", "_renames.json"))
+	if err != nil {
+		t.Fatalf("the answer was not recorded: %v", err)
+	}
+	if !strings.Contains(string(log), `"emailAddress"`) {
+		t.Fatalf("meta/_renames.json:\n%s", log)
+	}
+
+	applyGeneratedSQL(t, db, filepath.Join(p.dir, "drizzle", "0001_rename.sql"))
+	if cols := columnsOf(t, db, "users"); cols["emailAddress"] != "text" || cols["email"] != "" {
+		t.Fatalf("users after the rename = %v", cols)
+	}
+	if got := scalar(t, db, `SELECT "emailAddress" FROM users`); got != "ada@example.com" {
+		t.Fatalf("the row did not survive the rename: emailAddress = %q", got)
+	}
+
+	// And the recorded answer means the same run, with no flags at all,
+	// now has nothing to ask about and nothing to do.
+	if out := p.mustRun("generate", "--schema", "./schema", "--name", "again"); !strings.Contains(out, "no changes") {
+		t.Errorf("a settled schema still generated something:\n%s", out)
+	}
+}
+
+// The other way to answer: --interactive, with the answers on stdin.
+// A prompt drops decided to show on its own would be one a scripted run
+// could receive by accident, so the flag is the whole of what turns it
+// on.
+func TestCLIGenerateAsksWhenToldTo(t *testing.T) {
+	dsn := freshDatabase(t)
+	p := newProject(t, dsn)
+	p.schema(schemaV1)
+	p.mustRun("generate", "--schema", "./schema", "--name", "init")
+
+	p.schema(schemaRenamed)
+	stdout, stderr, code := p.runWithStdin("y\n",
+		"generate", "--schema", "./schema", "--name", "rename", "--interactive")
+	if code != 0 {
+		t.Fatalf("generate exited %d\n%s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "is users.emailAddress a rename of users.email?") {
+		t.Errorf("no question was asked:\n%s", stdout)
+	}
+	body, err := os.ReadFile(filepath.Join(p.dir, "drizzle", "0001_rename.sql"))
+	if err != nil {
+		t.Fatalf("generate did not write the migration: %v", err)
+	}
+	if !strings.Contains(string(body), `RENAME COLUMN "email" TO "emailAddress"`) {
+		t.Fatalf("migration:\n%s", body)
+	}
+	if _, err := os.ReadFile(filepath.Join(p.dir, "drizzle", "meta", "_renames.json")); err != nil {
+		t.Fatalf("the prompted answer was not recorded: %v", err)
+	}
+}
+
+// runWithStdin is run with something for the command to read, which is
+// what the prompt needs and nothing else in this file does.
+func (p *project) runWithStdin(input string, args ...string) (stdout, stderr string, code int) {
+	p.t.Helper()
+	cmd := osexec.Command(cliBinary(p.t), args...)
+	cmd.Dir = p.dir
+	cmd.Env = append(os.Environ(), "DROPS_PG_DSN="+p.dsn)
+	cmd.Stdin = strings.NewReader(input)
+	var out, errb strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	if exit, ok := err.(*osexec.ExitError); ok {
+		code = exit.ExitCode()
+	} else if err != nil {
+		p.t.Fatalf("running drops %s: %v", strings.Join(args, " "), err)
+	}
+	p.t.Logf("drops %s → exit %d\n%s%s", strings.Join(args, " "), code, out.String(), errb.String())
+	return out.String(), errb.String(), code
+}
+
+// applyGeneratedSQL runs a generated migration file statement by
+// statement.
+//
+// "drops migrate" would do the same thing and is covered by
+// TestCLIGenerateThenMigrate; what the rename test is about is what
+// generate wrote, and running that is the only way to find out whether
+// the row is still in the column afterwards.
+func applyGeneratedSQL(t *testing.T, db *pg.DB, path string) {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	for _, stmt := range strings.Split(string(body), pg.StatementBreakpoint) {
+		if stmt = strings.TrimSpace(stmt); stmt == "" {
+			continue
+		}
+		if _, err := db.Exec(context.Background(), stmt); err != nil {
+			t.Fatalf("PostgreSQL rejected %q: %v", stmt, err)
+		}
+	}
+}

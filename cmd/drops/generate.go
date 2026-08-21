@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +19,15 @@ func runGenerate(ctx context.Context, args []string) error {
 	name := fs.String("name", "", "name for the migration; a random one is chosen when empty")
 	safe := fs.Bool("safe", false, "wrap creative and destructive DDL in IF [NOT] EXISTS so the migration can be re-run")
 	noDown := fs.Bool("no-down", false, "skip the paired <tag>.down.sql rollback script")
+	interactive := fs.Bool("interactive", false,
+		"ask on stdin about each change that could be a rename, instead of refusing")
+	answers := &renameAnswers{}
+	answers.register(fs)
 	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	decisions, err := answers.decisions()
+	if err != nil {
 		return err
 	}
 
@@ -30,19 +39,48 @@ func runGenerate(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	reply, err := runBridge(ctx, pkg, bridgeRequest{
-		Mode:     bridgeGenerate,
-		Dir:      migrationDir,
-		Name:     *name,
-		Safe:     *safe,
-		WithDown: !*noDown,
-	})
+	generate := func(renames []bridgeRename) (*bridgeGenerated, error) {
+		reply, err := runBridge(ctx, pkg, bridgeRequest{
+			Mode:     bridgeGenerate,
+			Dir:      migrationDir,
+			Name:     *name,
+			Safe:     *safe,
+			WithDown: !*noDown,
+			Renames:  renames,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if reply.Generate == nil {
+			return nil, fmt.Errorf("the generated program returned no migration")
+		}
+		return reply.Generate, nil
+	}
+
+	res, err := generate(decisions)
 	if err != nil {
 		return err
 	}
-	res := reply.Generate
-	if res == nil {
-		return fmt.Errorf("the generated program returned no migration")
+	// A change that could be a rename generated nothing. Ask, if the
+	// command line asked to be asked; otherwise stop, because the
+	// alternative is the DROP COLUMN that loses the column.
+	if len(res.RenameCandidates) > 0 {
+		if !*interactive {
+			// Exit 3, the code for a run that worked and refused: the
+			// schema was read, the diff was computed, and the answer to
+			// what it means is the one thing that was missing.
+			return findingError{errors.New(res.RenameMessage + interactiveHint)}
+		}
+		answered, err := promptRenames(os.Stdin, os.Stdout, res.RenameCandidates)
+		if err != nil {
+			return err
+		}
+		if res, err = generate(append(decisions, answered...)); err != nil {
+			return err
+		}
+		if len(res.RenameCandidates) > 0 {
+			return findingError{errors.New(res.RenameMessage)}
+		}
 	}
 	if res.NoOp {
 		fmt.Println("no changes: the Go schema and the last snapshot in", *dir, "agree")
@@ -55,6 +93,9 @@ func runGenerate(ctx context.Context, args []string) error {
 		fmt.Printf("wrote %s\n", filepath.Join(*dir, res.Tag+".down.sql"))
 	}
 	fmt.Printf("wrote %s\n", filepath.Join(*dir, "meta", fmt.Sprintf("%04d_snapshot.json", res.Idx)))
+	if res.RenameLog {
+		fmt.Printf("wrote %s\n", filepath.Join(*dir, "meta", "_renames.json"))
+	}
 	for _, s := range statements {
 		fmt.Println("  " + oneLine(s))
 	}

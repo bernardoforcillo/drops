@@ -90,6 +90,47 @@ journal. It touches no database. `--safe` wraps the DDL in
 Destructive statements are reported, not refused: generating a
 migration is the review step, and the file is there to be read.
 
+#### Renames
+
+A diff compares two snapshots. It can see that `email` is gone and
+`emailAddress` has arrived; it cannot see whether that was one rename or
+a drop and an add, and the two produce migrations that differ by the
+whole contents of the column. So `generate` stops:
+
+```
+drops/pg: this schema change could be a rename or a drop-and-add and drops will not guess:
+  column "email" on table "users" is gone and "emailAddress" (text) has appeared
+    rename it:      --rename-column users.email=emailAddress
+    or drop it:     --drop-column users.email
+```
+
+Stopping is the default, and it is not conditional on anything: a
+script, a hook and CI all get the refusal and an exit code of 3, because
+the answer drops would otherwise have to invent is the `DROP COLUMN`.
+`--interactive` asks instead, one question per pair on stdin, and
+anything that is not a `y` is a no.
+
+State the answer on the command line and the run goes through without
+either:
+
+- `--rename-column users.email=emailAddress`
+- `--rename-table users=people`
+- `--drop-column users.email` — no, it really is going
+- `--drop-table users`
+
+Every answer, typed or prompted, is written to
+`<dir>/meta/_renames.json` alongside the snapshots. The next run reads
+it, so the question is asked once; committing the file is what makes a
+colleague's `generate` — and CI's — produce the same migration as
+yours. drizzle-kit reads the journal and the snapshots by name and
+ignores the rest, so the two tools still share a directory.
+
+A pair is only offered when the types are in the same family, so a
+rename that widens `varchar(120)` to `text` is still recognised while an
+unrelated dropped timestamp and added boolean are not. A rename that
+also changes the type produces the `RENAME` and the type change, in that
+order.
+
 ### `drops migrate`
 
 Applies every migration in the journal that the database has not

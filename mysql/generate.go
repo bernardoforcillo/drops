@@ -74,17 +74,32 @@ type GenerateOptions struct {
 	// nothing rolls back on its own: review a generated down script
 	// before relying on it.
 	WithDown bool
+
+	// Renames answers the rename questions this run raises, for a caller
+	// that already knows the answer — a command line, a prompt, a test.
+	// Answers are merged over the ones already recorded in
+	// RenameLogFile, with these winning, and the merged set is written
+	// back so the next run does not ask again.
+	//
+	// A candidate left unanswered by both is not guessed at: the run
+	// returns *RenameAmbiguityError and writes nothing. See rename.go.
+	Renames []RenameDecision
 }
 
 // GenerateResult describes what a run produced.
 type GenerateResult struct {
-	Tag      string // e.g. "0003_warm_harbor"; empty when NoOp
-	Idx      int    // sequence index for the new migration
-	SQL      string // statement-breakpoint-joined migration SQL (up)
-	DownSQL  string // rollback SQL; empty unless WithDown was set
-	NoOp     bool   // true when prev and cur are equivalent
-	Snapshot []byte // bytes written to meta/<idx>_snapshot.json
-	Journal  []byte // bytes written to meta/_journal.json
+	Tag      string   // e.g. "0003_warm_harbor"; empty when NoOp
+	Idx      int      // sequence index for the new migration
+	SQL      string   // statement-breakpoint-joined migration SQL (up)
+	DownSQL  string   // rollback SQL; empty unless WithDown was set
+	NoOp     bool     // true when prev and cur are equivalent
+	Snapshot []byte   // bytes written to meta/<idx>_snapshot.json
+	Journal  []byte   // bytes written to meta/_journal.json
+	Renames  []Rename // the renames this migration performs, if any
+
+	// RenameLog is what was written to RenameLogFile, or nil when
+	// there was no rename decision to record.
+	RenameLog []byte
 }
 
 // GenerateMigration computes the schema diff and writes a new migration
@@ -100,6 +115,12 @@ type GenerateResult struct {
 // be rolled back, so the statements have to be readable by whoever
 // works out what state the database is in. That is a file, not a diff
 // computed at deploy time.
+//
+// It refuses, returning *RenameAmbiguityError and writing nothing, when
+// the change could be a rename and nothing on disk or in the options
+// says whether it is. Answer with GenerateOptions.Renames; the answer
+// is recorded in RenameLogFile and replayed from then on. See rename.go
+// for why guessing is not on the list of options.
 func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	if opts.Schema == nil {
 		return nil, errors.New("drops/mysql: Schema is required")
@@ -135,7 +156,28 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	cur := BuildSnapshot(opts.Schema)
 	cur.PrevID = prev.ID
 
-	diffOpts := DiffOptions{Safe: opts.Safe, Server: opts.Server, SplitAlters: opts.SplitAlters}
+	recorded, err := loadRenameLog(opts.FS, opts.Dir)
+	if err != nil {
+		return nil, err
+	}
+	decisions := mergeDecisions(recorded, opts.Renames)
+	renames, unresolved := ResolveRenames(prev, cur, decisions)
+	if len(unresolved) > 0 {
+		// Nothing is written. A migration that turns a rename into a
+		// DROP COLUMN is worse than no migration at all, and this is the
+		// only point at which drops can still say so.
+		return nil, &RenameAmbiguityError{Candidates: unresolved}
+	}
+	if err := validateRenames(prev, cur, renames); err != nil {
+		return nil, err
+	}
+
+	diffOpts := DiffOptions{
+		Safe:        opts.Safe,
+		Server:      opts.Server,
+		SplitAlters: opts.SplitAlters,
+		Renames:     renames,
+	}
 	statements := Diff(prev, cur, diffOpts)
 	if len(statements) == 0 {
 		return &GenerateResult{NoOp: true}, nil
@@ -178,6 +220,13 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 		}
 	}
 
+	var renameLogBytes []byte
+	if len(decisions) > 0 {
+		if renameLogBytes, err = marshalRenameLog(decisions); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := opts.Write(tag+".sql", []byte(sql)); err != nil {
 		return nil, fmt.Errorf("drops/mysql: write migration SQL: %w", err)
 	}
@@ -192,14 +241,21 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	if err := opts.Write("meta/_journal.json", journalBytes); err != nil {
 		return nil, fmt.Errorf("drops/mysql: write journal: %w", err)
 	}
+	if renameLogBytes != nil {
+		if err := opts.Write(RenameLogFile, renameLogBytes); err != nil {
+			return nil, fmt.Errorf("drops/mysql: write rename log: %w", err)
+		}
+	}
 
 	return &GenerateResult{
-		Tag:      tag,
-		Idx:      idx,
-		SQL:      sql,
-		DownSQL:  downSQL,
-		Snapshot: snapshotBytes,
-		Journal:  journalBytes,
+		Tag:       tag,
+		Idx:       idx,
+		SQL:       sql,
+		DownSQL:   downSQL,
+		Snapshot:  snapshotBytes,
+		Journal:   journalBytes,
+		Renames:   renames,
+		RenameLog: renameLogBytes,
 	}, nil
 }
 

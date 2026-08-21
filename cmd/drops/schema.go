@@ -70,6 +70,31 @@ type bridgeRequest struct {
 	WithDown             bool       `json:"withDown,omitempty"`
 	DryRun               bool       `json:"dryRun,omitempty"`
 	DropUnmanagedIndexes bool       `json:"dropUnmanagedIndexes,omitempty"`
+
+	// Renames answers the rename questions generate would otherwise
+	// stop on. See rename.go.
+	Renames []bridgeRename `json:"renames,omitempty"`
+}
+
+// bridgeRename is one answer, in the shape pg.RenameDecision has. An
+// answer of "no" may leave To empty, and then it covers every pair the
+// diff offered for that object.
+type bridgeRename struct {
+	Kind     string `json:"kind"`
+	Table    string `json:"table,omitempty"`
+	From     string `json:"from"`
+	To       string `json:"to,omitempty"`
+	IsRename bool   `json:"rename"`
+}
+
+// bridgeCandidate is one question, as pg.RenameCandidate poses it.
+type bridgeCandidate struct {
+	Kind     string `json:"kind"`
+	Table    string `json:"table,omitempty"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	FromType string `json:"fromType,omitempty"`
+	ToType   string `json:"toType,omitempty"`
 }
 
 // bridgeReply is the JSON the generated program prints. Only the
@@ -86,6 +111,21 @@ type bridgeGenerated struct {
 	SQL     string `json:"sql"`
 	DownSQL string `json:"downSql"`
 	NoOp    bool   `json:"noOp"`
+
+	// Renames is what the migration renamed rather than dropped, and
+	// RenameLog says whether the answers were written to
+	// meta/_renames.json — which happens whenever there was a decision
+	// to record, including one that declined a rename.
+	Renames   []bridgeRename `json:"renames,omitempty"`
+	RenameLog bool           `json:"renameLog,omitempty"`
+
+	// RenameCandidates is non-empty when nothing was generated because
+	// the change could be a rename and no answer was on hand.
+	// RenameMessage is what drops/pg said about it, passed through
+	// whole so the CLI reports the library's wording rather than a
+	// second version of it.
+	RenameCandidates []bridgeCandidate `json:"renameCandidates,omitempty"`
+	RenameMessage    string            `json:"renameMessage,omitempty"`
 }
 
 type bridgePushResult struct {
@@ -295,6 +335,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
@@ -312,6 +353,13 @@ type request struct {
 	WithDown             bool   ` + "`json:\"withDown\"`" + `
 	DryRun               bool   ` + "`json:\"dryRun\"`" + `
 	DropUnmanagedIndexes bool   ` + "`json:\"dropUnmanagedIndexes\"`" + `
+	Renames              []struct {
+		Kind     string ` + "`json:\"kind\"`" + `
+		Table    string ` + "`json:\"table\"`" + `
+		From     string ` + "`json:\"from\"`" + `
+		To       string ` + "`json:\"to\"`" + `
+		IsRename bool   ` + "`json:\"rename\"`" + `
+	} ` + "`json:\"renames\"`" + `
 }
 
 func main() {
@@ -342,19 +390,58 @@ func run() error {
 		reply["snapshot"] = json.RawMessage(body)
 
 	case "generate":
+		decisions := make([]pg.RenameDecision, 0, len(req.Renames))
+		for _, r := range req.Renames {
+			decisions = append(decisions, pg.RenameDecision{
+				Rename: pg.Rename{
+					Kind:  pg.RenameKind(r.Kind),
+					Table: r.Table,
+					From:  r.From,
+					To:    r.To,
+				},
+				IsRename: r.IsRename,
+			})
+		}
 		res, err := pg.GenerateMigration(pg.GenerateOptions{
 			Schema:   schema,
 			Dir:      req.Dir,
 			Name:     req.Name,
 			Safe:     req.Safe,
 			WithDown: req.WithDown,
+			Renames:  decisions,
 		})
 		if err != nil {
-			return err
+			// An ambiguous rename is a question, not a failure: it
+			// travels back as data so the CLI can put it to whoever is
+			// there, or report it and stop when nobody is.
+			var amb *pg.RenameAmbiguityError
+			if !errors.As(err, &amb) {
+				return err
+			}
+			cands := make([]map[string]any, 0, len(amb.Candidates))
+			for _, c := range amb.Candidates {
+				cands = append(cands, map[string]any{
+					"kind": string(c.Kind), "table": c.Table,
+					"from": c.From, "to": c.To,
+					"fromType": c.FromType, "toType": c.ToType,
+				})
+			}
+			reply["generate"] = map[string]any{
+				"renameCandidates": cands, "renameMessage": amb.Error(),
+			}
+			break
+		}
+		renamed := make([]map[string]any, 0, len(res.Renames))
+		for _, r := range res.Renames {
+			renamed = append(renamed, map[string]any{
+				"kind": string(r.Kind), "table": r.Table,
+				"from": r.From, "to": r.To, "rename": true,
+			})
 		}
 		reply["generate"] = map[string]any{
 			"tag": res.Tag, "idx": res.Idx, "sql": res.SQL,
-			"downSql": res.DownSQL, "noOp": res.NoOp,
+			"downSql": res.DownSQL, "noOp": res.NoOp, "renames": renamed,
+			"renameLog": len(res.RenameLog) > 0,
 		}
 
 	case "push":

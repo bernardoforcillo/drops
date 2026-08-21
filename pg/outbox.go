@@ -227,11 +227,41 @@ func (o *Outbox) Drain(ctx context.Context, limit int) ([]OutboxEvent, error) {
 	return scanOutboxRows(rows)
 }
 
+// DrainUnaggregated is Drain restricted to events that carry no
+// aggregate ID. Those are the events no ordering promise covers, so
+// they are the only ones the per-aggregate worker may drain outside an
+// aggregate's lock — see [OrderingPerAggregate].
+func (o *Outbox) DrainUnaggregated(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	sql := fmt.Sprintf(`
+		SELECT "id", "kind", "aggregateType", "aggregateID", "payload", "headers", "attempts", "lastError", "createdAt"
+		FROM %s
+		WHERE "publishedAt" IS NULL
+		  AND "failedAt" IS NULL
+		  AND "availableAt" <= now()
+		  AND "aggregateID" IS NULL
+		ORDER BY "id"
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, quoteIdent(o.table))
+	rows, err := o.db.Query(ctx, sql, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOutboxRows(rows)
+}
+
 // DrainAggregate fetches events for a single aggregate in id order,
 // under a transaction-scoped advisory lock keyed on the aggregate ID.
 // Parallel workers calling DrainAggregate for the same aggregate skip
 // silently (the lock is non-blocking), so per-aggregate order is
 // preserved without serialising the whole worker pool.
+//
+// The batch stops at the first event that is not available yet — one
+// waiting out a retry backoff — rather than stepping over it, because
+// stepping over it would deliver the events emitted behind it first.
 //
 // The callback executes within the lock-holding transaction; the
 // lock auto-releases when the transaction ends. Returning an error
@@ -267,14 +297,30 @@ func (o *Outbox) DrainAggregate(ctx context.Context, aggregateType, aggregateID 
 		if !got {
 			return nil
 		}
+		// The events available now, up to but not past the first one
+		// that is not.
+		//
+		// "availableAt <= now()" alone is not enough for an ordered
+		// stream: an event whose handler failed is pushed into the
+		// future by its backoff, and a drain that merely skipped it
+		// would deliver the events emitted after it first — the
+		// ordering this whole path exists to preserve, broken by the
+		// one case it was built for.
 		sql := fmt.Sprintf(`
 			SELECT "id", "kind", "aggregateType", "aggregateID", "payload", "headers", "attempts", "lastError", "createdAt"
-			FROM %s
+			FROM %[1]s
 			WHERE "publishedAt" IS NULL
 			  AND "failedAt" IS NULL
 			  AND "availableAt" <= now()
 			  AND "aggregateType" IS NOT DISTINCT FROM $1
 			  AND "aggregateID" = $2
+			  AND "id" < coalesce((
+			        SELECT min("id") FROM %[1]s
+			        WHERE "publishedAt" IS NULL
+			          AND "failedAt" IS NULL
+			          AND "availableAt" > now()
+			          AND "aggregateType" IS NOT DISTINCT FROM $1
+			          AND "aggregateID" = $2), 9223372036854775807)
 			ORDER BY "id"
 			LIMIT $3`, quoteIdent(o.table))
 		eventRows, err := tx.Query(ctx, sql, outboxNullableString(aggregateType), aggregateID, limit)
@@ -469,7 +515,14 @@ const (
 	// OrderingPerAggregate preserves emission order within each
 	// (AggregateType, AggregateID) by routing each aggregate
 	// through a single worker at a time via advisory locks.
-	// Events that lack an AggregateID fall back to OrderingNone.
+	//
+	// Events that lack an AggregateID have no order to keep, so
+	// they are drained separately, exactly as under OrderingNone.
+	// Nothing else is: an event that carries an aggregate is
+	// delivered only from inside that aggregate's lock, so an
+	// aggregate another worker is holding, or one whose stream is
+	// parked behind a failed event, is left for a later tick
+	// rather than drained around.
 	OrderingPerAggregate
 )
 
@@ -645,6 +698,22 @@ func (w *OutboxWorker) tickNone(ctx context.Context) error {
 	if err != nil || len(events) == 0 {
 		return err
 	}
+	return w.deliver(ctx, events)
+}
+
+// tickUnaggregated drains only the events that carry no aggregate,
+// which is what the per-aggregate mode may deliver outside a lock.
+func (w *OutboxWorker) tickUnaggregated(ctx context.Context) error {
+	events, err := w.ob.DrainUnaggregated(ctx, w.batch)
+	if err != nil || len(events) == 0 {
+		return err
+	}
+	return w.deliver(ctx, events)
+}
+
+// deliver hands a drained batch to whichever handler is attached,
+// outside any transaction. Shared by the two unordered drains.
+func (w *OutboxWorker) deliver(ctx context.Context, events []OutboxEvent) error {
 	if w.batchHandler != nil {
 		return w.runBatch(ctx, events)
 	}
@@ -662,9 +731,17 @@ func (w *OutboxWorker) tickNone(ctx context.Context) error {
 
 // tickPerAggregate processes one aggregate at a time inside its
 // advisory lock so per-aggregate order is preserved even when many
-// workers are running in parallel. Events without an AggregateID
-// fall through to the unordered path so the worker still drains
-// everything.
+// workers are running in parallel.
+//
+// The pass that follows drains only the events with no aggregate. It
+// used to be the plain unordered drain, which selects every pending
+// row — so the two cases where the ordered pass delivers nothing, an
+// aggregate whose lock another worker holds and an aggregate parked
+// behind a failed event, were exactly the cases where the same tick
+// went on to deliver that aggregate's events anyway: concurrently with
+// the lock holder in the first, and ahead of the event they were
+// emitted after in the second. Both break the only promise this mode
+// makes.
 func (w *OutboxWorker) tickPerAggregate(ctx context.Context) error {
 	aggs, err := w.ob.PendingAggregates(ctx, w.batch)
 	if err != nil {
@@ -681,9 +758,9 @@ func (w *OutboxWorker) tickPerAggregate(ctx context.Context) error {
 			w.onError(err)
 		}
 	}
-	// Fall back to the unordered drain so events without an
-	// aggregate ID still flow.
-	return w.tickNone(ctx)
+	// Events with no aggregate have no order to keep, so they flow
+	// on this tick regardless of what the ordered pass could reach.
+	return w.tickUnaggregated(ctx)
 }
 
 // runBatch publishes a whole batch via the OnBatch handler. On
@@ -728,7 +805,9 @@ func (w *OutboxWorker) runBatchInTx(ctx context.Context, tx *DB, events []Outbox
 // runSequentialInTx delivers events one by one in id order. Stops
 // at the first failure so per-aggregate order is preserved — the
 // stuck event blocks the queue for its aggregate until it's
-// resolved (or hits MaxAttempts and is parked).
+// resolved (or hits MaxAttempts and is parked, which releases the
+// queue: a terminally failed event is no longer pending, so the
+// stream resumes at the one behind it).
 func (w *OutboxWorker) runSequentialInTx(ctx context.Context, tx *DB, events []OutboxEvent) error {
 	for _, e := range events {
 		if herr := w.handler(ctx, e); herr != nil {

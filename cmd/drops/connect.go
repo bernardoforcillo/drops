@@ -76,13 +76,23 @@ func openPostgres(ctx context.Context, dsn string) (*sql.DB, error) {
 		fmt.Fprintf(os.Stderr, "drops: server notice: %s\n", n.Message)
 	}
 	db := pgxstdlib.OpenDB(*cfg)
-	// One connection, as the wire client this replaced had. Everything
-	// the CLI does is one operator doing one thing at a time, and a
-	// pool would let the second statement of a pair land on a
-	// connection that never saw the first — which for a migration
-	// holding a lock, or a session that has SET anything, is a
-	// difference that only shows up under load.
-	db.SetMaxOpenConns(1)
+	// Two, and the second one is not slack.
+	//
+	// A migration run holds the advisory lock in a transaction of its
+	// own for the whole run — see pg.withMigrationLock, which explains
+	// why the lock can be neither session-scoped nor folded into a
+	// migration's own transaction. That transaction pins one
+	// connection and does not release it until the last migration has
+	// applied, so the migrations themselves need a second. Capped at
+	// one, the run deadlocks: the lock holder waits for the migrations
+	// and the migrations wait for a connection.
+	//
+	// Statement affinity, which is what a cap of one was reaching for,
+	// comes from Begin pinning a connection for its transaction rather
+	// than from the size of the pool. So the rule is the number of
+	// connections held at once, and anything that grows that number
+	// has to grow this.
+	db.SetMaxOpenConns(2)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("%w\ncheck the connection string and that the server is reachable", err)

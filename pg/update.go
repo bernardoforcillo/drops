@@ -373,51 +373,6 @@ func (u *UpdateBuilder) contextPreds(ctx context.Context) ([]drops.Expression, e
 	return preds, nil
 }
 
-// resolveSets resolves the statements reachable from a SET list,
-// returning a rebuilt list — or nil when nothing needed resolving, so
-// the caller keeps the list it already had.
-//
-// The assigned value is an operand position like any other, and the one
-// that decides what gets written rather than which rows do:
-// SET "ownerId" = (SELECT ... FROM "accounts") used to render its body
-// through WriteSQL and so read every tenant's accounts to compute a
-// value stored in this tenant's row. Handing the held expression to
-// resolveExpr is what makes the whole tree under it resolve — a
-// subquery three combinators down as much as one written directly.
-//
-// Only a binding that holds an expression has anything to walk, which
-// is what [exprValue] is: [ColumnValue] is closed to this package — its
-// methods are unexported, so no caller can implement it — and every
-// other implementation binds a Go value that becomes a parameter. The
-// test is the interface rather than the name *exprBinding so that a
-// binding kind added later is walked by having the methods, instead of
-// by somebody remembering this line.
-func resolveSets(ctx context.Context, sets []ColumnValue) ([]ColumnValue, error) {
-	var out []ColumnValue
-	for i, s := range sets {
-		eb, ok := s.(exprValue)
-		if !ok {
-			continue
-		}
-		resolved, changed, err := resolveExpr(ctx, eb.boundExpr())
-		if err != nil {
-			return nil, err
-		}
-		if !changed {
-			continue
-		}
-		if out == nil {
-			out = append([]ColumnValue(nil), sets...)
-		}
-		// withBoundExpr copies for the reason the builder is copied: a
-		// caller may hold the binding and use it in a second statement,
-		// and a resolved body written back into it would pin the first
-		// request's tenant into every later use.
-		out[i] = eb.withBoundExpr(resolved)
-	}
-	return out, nil
-}
-
 // Exec runs the UPDATE.
 func (u *UpdateBuilder) Exec(ctx context.Context) (drops.Result, error) {
 	if len(u.sets) == 0 && !u.table.hasUpdateHooks() {

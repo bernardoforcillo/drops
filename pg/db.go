@@ -332,46 +332,6 @@ func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, e
 	return db.Exec(ctx, sql, args...)
 }
 
-// ctxStatement is a statement that renders for one particular request:
-// the four builders in this package, whose ToSQLCtx resolves the
-// context filters of every table the statement names before rendering.
-//
-// It is satisfied structurally rather than declared, which is the point
-// of stating it as an interface at all: a caller's own statement type
-// that exposes the same method is rendered for its ctx on the same
-// terms, instead of being rendered blind because it is not one of ours.
-type ctxStatement interface {
-	drops.Expression
-	ToSQLCtx(ctx context.Context) (sql string, args []any, err error)
-}
-
-// renderForCtx renders e as the statement ctx names, and is where
-// ExecExpr's promise is kept. Split out from ExecExpr so the three
-// cases can be read as three cases.
-func renderForCtx(ctx context.Context, e drops.Expression) (string, []any, error) {
-	// A SELECT can carry a deferred error — a cursor that failed to
-	// decode — which Rows/All/One report and rendering does not. It is
-	// checked in SelectBuilder.resolveCtx, which both branches below
-	// reach, rather than here: this function used to assert
-	// *SelectBuilder for it, and that assertion saw the statement handed
-	// to ExecExpr and no statement inside it, so a corrupt cursor in a
-	// CTE body still rendered — as the false predicate AfterCursor fails
-	// closed with, which matches nothing and reports nothing.
-	if st, ok := e.(ctxStatement); ok {
-		return st.ToSQLCtx(ctx)
-	}
-	// Not a statement, but possibly an expression with one inside:
-	// resolveExpr walks to any statement this package wrapped and
-	// returns e unchanged when there is none, which is what keeps an
-	// opaque expression rendering byte-identically.
-	resolved, _, err := resolveExpr(ctx, e)
-	if err != nil {
-		return "", nil, err
-	}
-	sql, args := drops.String(resolved)
-	return sql, args, nil
-}
-
 // emit invokes the hook, if any, with the provided event. Uses
 // drops.CallHook so a panicking user-supplied hook can't crash the
 // request goroutine.

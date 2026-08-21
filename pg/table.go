@@ -1012,37 +1012,6 @@ func (t *Table) resolveDefaultFilterExprs(ctx context.Context) ([]drops.Expressi
 	return t.resolveFilterExprs(resolved), nil
 }
 
-// mayHoldStatements reports whether any expression in list could
-// resolve to something different — that is, whether walking it can do
-// anything at all.
-//
-// It is resolveExpr's type switch, asked in advance and without
-// building anything, and every arm of it is therefore an INTERFACE, for
-// the reason [ctxResolvable] gives. Written as a list of type names it
-// went stale the same way the switch itself did: it admitted
-// *SelectBuilder and subqueryResolver and knew nothing of the
-// ctxStatement arm, so a default filter whose predicate was a statement
-// drops did not build was never offered to the resolver at all — and
-// that arm is what keeps a foreign statement FAIL-CLOSED, by asking it
-// for its ctx form so a filter refusing for want of a tenant refuses
-// the statement around it. It rendered, and was sent, with the guard's
-// inner statement carrying none of its context filters.
-//
-// ctxStatement covers every builder in this package, since
-// ctxResolvable embeds it, and covers a caller's own statement type on
-// the same terms. The two must agree: an arm resolveExpr learns to
-// enter has to be admitted here as well, or the walk is skipped for the
-// one shape it was extended to reach.
-func mayHoldStatements(list []drops.Expression) bool {
-	for _, e := range list {
-		switch e.(type) {
-		case ctxStatement, subqueryResolver:
-			return true
-		}
-	}
-	return false
-}
-
 // resolvedDefaults holds, per table a statement names, the default
 // filters resolved for one execution of that statement.
 //

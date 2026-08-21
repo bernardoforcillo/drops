@@ -19,23 +19,6 @@ type valueBinding[T any] struct {
 func (v *valueBinding[T]) column() *Column             { return v.col }
 func (v *valueBinding[T]) writeValue(b *drops.Builder) { b.AddArg(v.val) }
 
-// exprValue is a ColumnValue that binds an expression rather than a Go
-// value — the one kind of binding a statement can hide in, and so the
-// one kind resolveSets has anything to walk.
-//
-// It is an interface for the reason [ctxResolvable] is one: resolveSets
-// used to type-assert *exprBinding, and a named type in a resolution
-// path is a list of one that nobody will remember to extend. A binding
-// kind added later that holds a caller-supplied expression implements
-// these two methods and is walked, or implements neither and is a
-// parameter — there is no third answer where a statement renders
-// unresolved because the walk had never heard of the type holding it.
-type exprValue interface {
-	ColumnValue
-	boundExpr() drops.Expression
-	withBoundExpr(e drops.Expression) ColumnValue
-}
-
 // exprBinding holds an arbitrary SQL expression for the column.
 type exprBinding struct {
 	col  *Column

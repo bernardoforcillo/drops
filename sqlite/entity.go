@@ -522,7 +522,25 @@ func rowsMatchColumns(rows [][]ColumnValue, cols []*Column) bool {
 // the tenant scope and authorization guard, records an audit row in the
 // same transaction (when audited), and refreshes the PK cache — or, for
 // a scoped entity, clears it. See hasRowScope.
+//
+// The tenant column is an axis, never an assignment: Create stamps it,
+// Update stamps it, both refuse a mismatch, and neither ever takes the
+// value from the struct as an instruction.
+//
+// On a tenant-scoped entity the tenant column is one of those non-key
+// columns, so the row's own tenant is stamped from ctx before the
+// assignments are taken. Without that an Update of a struct whose
+// tenant field is zero — one built from a form, or from a decoded
+// request body — would write that zero over a row it is otherwise
+// allowed to touch, and hand it to no tenant at all; a struct carrying
+// somebody else's tenant is [ErrTenantMismatch] rather than a
+// transfer of ownership. Which row is addressed is a separate
+// question, and the table's context filter answers it: the WHERE
+// clause carries the ctx tenant like every other statement's.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	var err error
 	rv := reflect.ValueOf(r).Elem()
 	sets := e.bindings(rv, true)

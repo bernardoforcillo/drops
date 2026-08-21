@@ -77,15 +77,36 @@ func TestMembershipGuardInjectsSubquery(t *testing.T) {
 		t.Fatalf("All: %v", err)
 	}
 	sql := fd.queries[0]
+	// The junction subquery is composed as a *SelectBuilder rather than
+	// written out as SQL text, so its columns are qualified and its
+	// predicate is parenthesised the way every other predicate in the
+	// package is. That is what these two fragments say now, and it is
+	// what makes the junction table's own DefaultFilters and
+	// ContextFilters apply to the membership check — see
+	// MembershipGuard.Predicate, and authzscope_test.go for a junction
+	// table that has some.
 	wantFragments := []string{
 		`"invoices"."organizationId" IN`,
-		`SELECT "organizationId" FROM "org_members"`,
-		`WHERE "userId" = $`,
+		`SELECT "org_members"."organizationId" FROM "org_members"`,
+		`WHERE ("org_members"."userId" = $`,
 	}
 	for _, w := range wantFragments {
 		if !strings.Contains(sql, w) {
 			t.Errorf("missing fragment %q in:\n%s", w, sql)
 		}
+	}
+	// The whole statement and the argument bound with it. The fragments
+	// say the membership check is present; this says nothing else is,
+	// and that what was bound is the subject rather than something that
+	// merely renders like one.
+	want := `SELECT * FROM "invoices" WHERE ("invoices"."organizationId" IN (` +
+		`SELECT "org_members"."organizationId" FROM "org_members" ` +
+		`WHERE ("org_members"."userId" = $1)))`
+	if sql != want {
+		t.Errorf("got = %v, want %v", sql, want)
+	}
+	if !sameArgs(fd.args[0], []any{int64(42)}) {
+		t.Errorf("args = %v, want %v", fd.args[0], []any{int64(42)})
 	}
 }
 

@@ -28,16 +28,24 @@ import (
 //	ctx = pg.WithSubject(ctx, currentUserID)
 //	inv, err := Invoices.Get(db, ctx, invoiceID)
 //	// SELECT ... WHERE id = $1 AND (
-//	//     "invoices"."createdBy" = $2
-//	//     OR "invoices"."organizationId" IN (
-//	//         SELECT "organizationId" FROM "org_members"
-//	//         WHERE "userId" = $2
-//	//     )
+//	//     ("invoices"."createdBy" = $2)
+//	//     OR ("invoices"."organizationId" IN (
+//	//         SELECT "org_members"."organizationId" FROM "org_members"
+//	//         WHERE ("org_members"."userId" = $2)
+//	//     ))
 //	// )
 //
 // Composition primitives AnyOf / AllOf let policy authors model
 // "owner OR org member", "tenant AND role", etc. without
 // recoding the SQL fan-out.
+//
+// A guard's predicate is a statement's worth of SQL and is treated as
+// one: every operand it holds is walked before the statement is
+// rendered, so a subquery inside a guard carries the scoping of the
+// table it reads. That is why the membership subquery above is built as
+// a [SelectBuilder] and not as text — the junction table's own
+// DefaultFilters and ContextFilters have to apply to it, or a revoked
+// membership row goes on authorising. See [MembershipGuard.Predicate].
 
 // Guard is the interface drops calls to materialise an
 // authorization predicate. Implementations are stateless — every
@@ -121,10 +129,17 @@ func (g OwnerGuard) Predicate(ctx context.Context) (drops.Expression, error) {
 //	    JunctionResource: OrgMembersTable.Col("organizationId"),
 //	    ResourceOwner:    InvoicesTable.Col("organizationId"),
 //	}
-//	// emits:  WHERE "invoices"."organizationId" IN (
-//	//             SELECT "organizationId" FROM "org_members"
-//	//             WHERE "userId" = $subject
-//	//         )
+//	// emits:  WHERE ("invoices"."organizationId" IN (
+//	//             SELECT "org_members"."organizationId" FROM "org_members"
+//	//             WHERE ("org_members"."userId" = $subject)
+//	//         ))
+//
+// The subquery is a statement drops composed, so the junction table's
+// own automatic predicates are resolved into it: a soft-delete filter
+// on the membership table means a revoked membership stops authorising,
+// and a tenant filter on it means one customer's membership rows cannot
+// authorise another customer's. Junction is therefore the table handle
+// and not a name — the filters live on the handle.
 type MembershipGuard struct {
 	// Junction is the table that proves membership (e.g.
 	// organization_members, project_collaborators).
@@ -142,6 +157,45 @@ type MembershipGuard struct {
 }
 
 // Predicate implements Guard.
+//
+// The membership check is composed as the statement it is — a
+// *SelectBuilder over the junction table — rather than written out as
+// SQL text, and that is the whole of what keeps it honest.
+//
+// It used to be a drops.ExprFunc that wrote "<owner> IN (SELECT <res>
+// FROM <junction> WHERE <subj> = $1)" by hand, naming the junction
+// table as a string. A membership table is precisely the kind that
+// carries automatic predicates of its own — a tenant column on a shared
+// schema, a soft-delete column so a revoked membership is kept for
+// audit rather than deleted — and none of them reached a subquery drops
+// had never been told was a subquery. So a soft-deleted membership row
+// still authorised, and a membership row belonging to another tenant
+// authorised as well. Everywhere else in the package a widened read
+// returns rows the caller should not see; on a guard it also grants a
+// permission the subject does not have.
+//
+// Being a closure made it unreachable from the outside as well. A
+// table's filters now have the predicates they answer with walked for
+// the ctx being resolved — see [Table.resolveContextFilters] — so a
+// policy shaped as "the rows this subject may see are the ones some
+// other scoped table names" gets that other table scoped. The walk
+// arrived here and stopped at the drops.ExprFunc, which made this guard
+// the one predicate in the package that the fix for exactly this
+// failure mode could not reach. Held as a statement, it is walked like
+// any other: the junction table's DefaultFilters and ContextFilters are
+// resolved into the subquery, and a junction table whose axis cannot be
+// resolved refuses the whole statement instead of authorising without
+// it. TestNoAutomaticPredicateIsOpaqueToTheResolver enforces the shape
+// against the package source so the next predicate producer written as
+// a closure fails on the day it is written.
+//
+// The builder is composed directly rather than through [DB.Select]
+// because a guard is asked for a predicate, not for a result set, and
+// has no *DB to ask. A SelectBuilder needs one only to execute; as an
+// operand it renders and resolves without one.
+//
+// The subject is read before any of that, so a ctx with no subject
+// still fails closed with [ErrSubjectMissing] and builds nothing.
 func (g MembershipGuard) Predicate(ctx context.Context) (drops.Expression, error) {
 	if g.Junction == nil || g.JunctionSubject == nil || g.JunctionResource == nil || g.ResourceOwner == nil {
 		return nil, errors.New("drops/pg: MembershipGuard is missing one of Junction / JunctionSubject / JunctionResource / ResourceOwner")
@@ -150,18 +204,10 @@ func (g MembershipGuard) Predicate(ctx context.Context) (drops.Expression, error
 	if !ok {
 		return nil, ErrSubjectMissing
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		g.ResourceOwner.WriteSQL(b)
-		b.WriteString(" IN (SELECT ")
-		b.WriteIdent(g.JunctionResource.Name())
-		b.WriteString(" FROM ")
-		g.Junction.writeName(b)
-		b.WriteString(" WHERE ")
-		b.WriteIdent(g.JunctionSubject.Name())
-		b.WriteString(" = ")
-		b.AddArg(s)
-		b.WriteByte(')')
-	}), nil
+	memberships := (&SelectBuilder{columns: []drops.Expression{g.JunctionResource}}).
+		From(g.Junction).
+		Where(Eq(g.JunctionSubject, s))
+	return In(g.ResourceOwner, memberships), nil
 }
 
 // CustomGuard wraps a function so application code can compose

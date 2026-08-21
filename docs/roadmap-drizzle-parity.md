@@ -145,6 +145,28 @@ Nessun tag viene tagliato finché non è chiuso.**
 
 ### Blocco A — Gate di correttezza
 
+> **Nota del 2026-08-21 — questa sezione è la specifica originale, non la
+> documentazione dell'API.**
+>
+> Blocco A è stato scritto prima di implementare qualunque cosa, e sei round di
+> lavoro sul dialetto pg lo hanno superato: gli sketch qui sotto in più punti
+> nominano firme, tipi e nomi di funzione che non esistono o che si sono spostati
+> (`writeOperand`, cancellato nel round 5, è solo il caso più visibile). Restano
+> qui **apposta**: il valore del documento sta anche nel registrare che cosa era
+> stato previsto, e riscriverli a posteriori cancellerebbe l'unica traccia di
+> quali problemi erano stati visti in anticipo e quali no.
+>
+> Per sapere che cosa fa il codice **oggi** si leggono i doc comment del package,
+> che sono la fonte di verità e vengono aggiornati insieme al codice:
+> `pg/doc.go` per la mappa, `pg/tenant.go` per l'asse tenant (`ScopeByTenant`,
+> `TenantFilter`, `ScopeWritesByTenant`), `pg/authz.go` per i `Guard`,
+> `pg/table.go` per `DefaultFilter` / `ContextFilter` e per come vengono risolti,
+> `pg/op.go` per la regola sugli operandi e `pg/select.go` (`resolveCtx`,
+> `resolveExpr`) per il walk che porta lo scoping dentro le sotto-query.
+>
+> Gli **esiti utente** di ogni voce, invece, sono tuttora la specifica: sono
+> formulati in termini di righe restituite, non di API, e non sono invecchiati.
+
 #### P0-1. Il tenant scoping non arriva alle relazioni
 
 **Esito utente.** Se un'entità dichiara `ScopeByTenant`, ogni riga che quell'operazione
@@ -952,7 +974,7 @@ Legenda effort: S ≤ 1 giorno, M ≈ 2–4 giorni, L ≈ 1–2 settimane.
 |---|---|---|---|---|
 | **Q1** P1 | `Clone()` su ogni builder | Copia profonda: ogni slice copiata, `*DB` e `*Table` condivisi (read-only), `err` riportato. `Apply()` **non** si fa: è zucchero su un loop di due righe. Correggere `pg/doc.go:9` che promette il contrario | S | una slice nuova dimenticata in `Clone` reintroduce l'aliasing su una sola clausola. Guardia: test a reflection che fallisce quando `SelectBuilder` guadagna un campo non copiato |
 | **Q2** P1 | JOIN su Expression | `joinClause.table *Table` → `src drops.Expression` (una riga: `*Table` implementa già `writeFrom`), + `JoinExpr`/`LeftJoinExpr`/`RightJoinExpr`/`FullJoinExpr`/`CrossJoin` e `Lateral` | S | verificare che `pg/find.go` e il tenant scoping non leggano `joins[].table`; se sì tenere un `tbl *Table` accanto |
-| **Q3** P1 | `drops.Exprf` / `Ident` / `Join` | `?` consuma un argomento con la regola di `writeOperand`; `??` è il `?` letterale (gli operatori jsonb ne hanno bisogno). **Mismatch di arity = deferred error**, non panic: si scrive dentro un handler, non in `init` | S | il `?` di jsonb va in testa al doc comment |
+| **Q3** P1 | `drops.Exprf` / `Ident` / `Join` | Ogni `?` consuma un argomento e lo **tiene in un campo**, adattato una volta sola alla costruzione — la regola di `operandExpr`, non più quella di `writeOperand`, che il round 5 ha cancellato insieme al render-time. Un operando deciso al render è un operando che nessun walk raggiunge: la decisione "è un'Expression o un valore?" va presa quando l'espressione si costruisce, così un `*SelectBuilder` passato a un `?` resta un nodo visitabile e porta lo scoping della tabella che legge (vedi i doc comment di `opExpr` e `funcExpr` in `pg/op.go`). Ne segue che `Exprf` **non** può essere una `drops.ExprFunc` che formatta al volo: serve un nodo che tenga testo e operandi separati, come `opExpr`. `??` è il `?` letterale (gli operatori jsonb ne hanno bisogno). **Mismatch di arity = deferred error**, non panic: si scrive dentro un handler, non in `init` | S | il `?` di jsonb va in testa al doc comment |
 | **Q4** P1 | `FromSelect` + CTE sui write builder | `ctes` estratto in un `cteHolder` embeddabile, dato a Insert/Update/Delete. La lista colonne è **esplicita**, mai inferita dalla proiezione | M | referenziare le colonne di una CTE rompe la catena tipizzata proprio dove serve; accoppiare con un handle di colonna CTE tipizzato |
 | **Q5** P1 | `InSavepoint` | vedi sketch sotto | M | l'interazione con `RetryPolicy` è il punto sottile |
 | **Q6** P1 | ORDER BY: NULLS + espressioni | **Due tipi, non uno.** `OrderingColumn` resta cursor-safe (solo `ColRef`); un tipo separato per l'ordinamento generale in `SelectBuilder.OrderBy`. Fondere e restituire un deferred error quando `col` è nil converte un errore di compilazione in uno di runtime | S | — |

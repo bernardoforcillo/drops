@@ -220,9 +220,30 @@ func (n SchemaNotice) String() string {
 //     it against one the database already has. It is reported as an
 //     "unrepresentable-index" notice; emit pg.CreateIndex for it;
 //   - a multi-column FOREIGN KEY, which Introspect skips;
-//   - a change to a sequence's attributes: Introspect reads them and
-//     Diff compares sequences by name only, so a START WITH or an
-//     INCREMENT BY that moved is neither applied nor reported;
+//   - where a sequence has got to. Its declared attributes are
+//     compared and an ALTER SEQUENCE states the ones that moved, but
+//     the value it is handing out next is not part of the declaration
+//     and no push restarts a live sequence. So a declaration that
+//     raises MINVALUE above that value, or lowers MAXVALUE below it,
+//     is not a push drops can apply: PostgreSQL refuses the ALTER
+//     (SQLSTATE 22023) rather than move the sequence, and the push
+//     rolls back whole. Where the sequence should resume is a
+//     question only the operator can answer — ALTER SEQUENCE ...
+//     RESTART it by hand, then push;
+//   - which columns a view reads, so a push that drops or retypes a
+//     column takes down every view the schema declares and builds it
+//     again, whether that view was in the way or not. See Diff. A view
+//     the Go schema does not declare is left standing instead: it will
+//     refuse the column change itself (SQLSTATE 2BP01), and if it
+//     selects from a view that is being rebuilt Push refuses the whole
+//     plan up front and names it. Declare it with Schema.AddView so it
+//     is rebuilt too, or set DropUnmanagedObjects to have it removed;
+//   - a view body that resolves against the table it selects from,
+//     SELECT * above all. The probe respells the declared body before
+//     the table DDL runs, so the * is expanded against the shape the
+//     table has now; a migration that drops a column from under such a
+//     view fails on the rebuilt CREATE VIEW naming the column that has
+//     just gone. Name the columns.
 //   - an enum label that was removed or reordered. PostgreSQL cannot
 //     drop a label at all, and can only reorder one by rewriting every
 //     column of the type, so Diff appends new labels and leaves the
@@ -287,6 +308,12 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		var withheld []SchemaNotice
 		stmts, withheld = withhold(stmts, unmanagedObjectDrops(current, desired, opt.Safe))
 		notices = append(notices, withheld...)
+		// Before anything runs, and on a DryRun too: a view Push may
+		// not drop, standing on one it is about to rebuild, is a plan
+		// the server will refuse halfway through.
+		if err := checkUndeclaredViewDependents(current, desired); err != nil {
+			return nil, err
+		}
 	}
 	sortNotices(notices)
 
@@ -318,6 +345,50 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		}
 	}
 	return &PushResult{Statements: stmts, Applied: true, Notices: notices}, nil
+}
+
+// checkUndeclaredViewDependents refuses a push that would walk into
+// SQLSTATE 2BP01 on a view.
+//
+// A migration that drops or retypes a column takes every view the Go
+// schema declares down around it and builds them again — see Diff. The
+// drops are plain, not CASCADE, so a view the database holds and the
+// schema does not, selecting from one of those, stops the drop dead.
+// PostgreSQL's message names the view it could not drop, which is the
+// declared one, and says only that "other objects depend on it": the
+// object worth naming is the one nobody declared, and Push is the half
+// that knows which views those are.
+//
+// It does not run under DropUnmanagedObjects, where such a view is
+// dropped along with the rest and there is nothing left to block.
+func checkUndeclaredViewDependents(current, desired *Snapshot) error {
+	if !columnWorkAViewCanBlock(current, desired) {
+		return nil
+	}
+	for _, key := range sortedKeys(current.Views) {
+		if _, declared := desired.Views[key]; !declared {
+			continue
+		}
+		rebuilt := current.Views[key]
+		for _, other := range sortedKeys(current.Views) {
+			if other == key {
+				continue
+			}
+			if _, declared := desired.Views[other]; declared {
+				continue // coming down too, in dependency order
+			}
+			dependent := current.Views[other]
+			if !mentionsIdent(dependent.Definition, rebuilt.Name) {
+				continue
+			}
+			return fmt.Errorf("drops/pg: view %q selects from %q and is declared by no Schema.AddView. "+
+				"This push changes a column PostgreSQL will not change while a view reads it, so %[2]q has to be "+
+				"dropped and rebuilt around the change — which %[1]q blocks (SQLSTATE 2BP01). Declare %[1]q with "+
+				"Schema.AddView so it is rebuilt too, drop it by hand, or set PushOptions.DropUnmanagedObjects",
+				dependent.Name, rebuilt.Name)
+		}
+	}
+	return nil
 }
 
 // resolvePushRenames settles the rename questions this push raises, or

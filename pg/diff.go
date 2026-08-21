@@ -59,8 +59,9 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 //
 //  1. DROP VIEW / DROP MATERIALIZED VIEW for views removed entirely,
 //     ahead of the table drops that would CASCADE them away first
-//  2. CREATE TYPE, CREATE SEQUENCE for enums and sequences the schema
-//     newly declares, ahead of the CREATE TABLE naming them
+//  2. CREATE TYPE and CREATE SEQUENCE for the enums and sequences the
+//     schema newly declares, ahead of the CREATE TABLE naming them,
+//     plus ALTER TYPE / ALTER SEQUENCE for those that moved
 //  3. DROP CONSTRAINT for foreign keys that are going, ahead of the
 //     DROP TABLEs that would CASCADE them away first
 //  4. DROP TABLE   for tables removed entirely
@@ -106,17 +107,31 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 // PostgreSQL's dependency graph — including the expressions the
 // snapshot deliberately does not record. Ordering needs none of that.
 //
-// A view that survives the migration is the dependent kind this order
-// does not reach. Step 1 drops the views the schema stopped declaring;
-// one it still declares is left standing while the columns move, so a
-// migration dropping a column any surviving view selects is refused
-// with the same SQLSTATE 2BP01 — whether the view's body changed or
-// not, since a body that did not change emits no statement at all.
-// Ordering alone cannot close it: the view would have to be dropped
-// up front and rebuilt afterwards, in view-on-view dependency order,
-// and drops does not record which columns a view names. Until then,
-// change such a view in its own migration, ahead of the one that drops
-// the column.
+// A view that survives the migration is the one dependent ordering
+// alone cannot reach. PostgreSQL refuses to drop a column a view reads
+// (SQLSTATE 2BP01) and refuses to retype one (SQLSTATE 0A000) whether
+// the view's body changed or not, and a body that did not change emits
+// no statement to put anywhere. So the view is not reordered, it is
+// rebuilt: when the migration drops or retypes any column of any
+// table, step 1 takes down every view both sides declare and step 13
+// states each of them again — dependents first coming down,
+// dependencies first going back up.
+//
+// It is rebuilt whether or not it was in the way, because which
+// columns a view reads is exactly what the snapshot does not record.
+// That is the conservative half, and it is cheap: a view holds no rows,
+// so the cost of rebuilding one that would have been fine is a DROP
+// and a CREATE where nothing would have done. Two things it is not
+// free of — a GRANT on the view does not survive the rebuild, and a
+// materialised view is repopulated by its CREATE — so a schema whose
+// matviews are expensive should push column drops on their own.
+//
+// A view the Go schema does not declare is not rebuilt, because Push
+// will not drop what the schema never claimed. One selecting from a
+// view that is being rebuilt would block that rebuild, so Push refuses
+// the plan and names it rather than letting the server answer with a
+// 2BP01 about the wrong view; see checkUndeclaredViewDependents and
+// PushOptions.DropUnmanagedObjects.
 //
 // ALTER TABLE ... RENAME comes in front of all of it, when
 // DiffOptions.Renames says a rename is what happened; everything below
@@ -137,6 +152,11 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	prev = applyRenames(prev, opt.Renames)
 	var out []string
 
+	// Whether a view could stand in the way of the column work below,
+	// which decides whether the views that survive are rebuilt around
+	// it or left where they are.
+	rebuildViews := columnWorkAViewCanBlock(prev, cur)
+
 	// A view that is going away goes in front of everything: DROP
 	// TABLE is emitted CASCADE, which takes every view selecting from
 	// the table with it, and the DROP VIEW that followed then named an
@@ -144,7 +164,10 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	// the migration halfway. Dropping the view first is always legal —
 	// nothing depends on a view being there — and leaves the CASCADE
 	// with nothing left to take.
-	out = append(out, diffViewsDrop(prev, cur, opt.Safe)...)
+	//
+	// A view that survives goes here too when the migration drops or
+	// retypes a column; it is built again in step 13. See diffViewsDrop.
+	out = append(out, diffViewsDrop(prev, cur, opt.Safe, rebuildViews)...)
 
 	// A type or a sequence a column references has to exist before the
 	// CREATE TABLE that names it, and cannot be dropped until the last
@@ -154,7 +177,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	// column produced a migration whose CREATE TABLE named a type
 	// three statements before it existed.
 	out = append(out, diffEnumsCreate(prev, cur, opt.Safe)...)
-	out = append(out, diffSequencesCreate(prev, cur, opt.Safe)...)
+	out = append(out, diffSequences(prev, cur, opt.Safe)...)
 
 	// Foreign keys that are going, ahead of the DROP TABLEs: a key
 	// pointing at a table that is going is removed by that table's
@@ -187,7 +210,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 		prevT, curT := prevTable(prev, key), cur.Tables[key]
 		out = append(out, dropPolicies(prevT, curT, opt.Safe)...)
 		out = append(out, dropUniques(prevT, curT, opt.Safe)...)
-		out = append(out, dropCompositePK(prevT, curT, opt.Safe)...)
+		out = append(out, dropPrimaryKey(prevT, curT, opt.Safe)...)
 		out = append(out, dropChecks(prevT, curT, opt.Safe)...)
 		out = append(out, dropIndexes(prevT, curT, opt.Safe)...)
 	}
@@ -208,7 +231,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	for _, key := range sortedKeys(cur.Tables) {
 		prevT, curT := prevTable(prev, key), cur.Tables[key]
 		out = append(out, addUniques(prevT, curT)...)
-		out = append(out, addCompositePK(prevT, curT)...)
+		out = append(out, addPrimaryKey(prevT, curT)...)
 		out = append(out, addChecks(prevT, curT)...)
 	}
 	// Foreign keys after the CREATE TABLEs so cross-table references
@@ -227,7 +250,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	// Views that survive are built last of all: a view selects from
 	// the tables, so it can only be built once they are in their final
 	// shape.
-	out = append(out, diffViewsCreate(prev, cur, opt.Safe, len(opt.Renames) > 0)...)
+	out = append(out, diffViewsCreate(prev, cur, opt.Safe, len(opt.Renames) > 0, rebuildViews)...)
 
 	// RLS and the policies it governs, table-scoped. The drops ran
 	// with the other dependent objects; only the creates are left, and
@@ -298,22 +321,111 @@ func diffEnumsCreate(prev, cur *Snapshot, safe bool) []string {
 	return out
 }
 
-// diffSequencesCreate emits CREATE SEQUENCE for every sequence cur
-// declares and prev does not.
+// diffSequences emits CREATE SEQUENCE for every sequence cur
+// declares and prev does not, and ALTER SEQUENCE for every one both
+// sides carry whose attributes moved.
 //
-// A sequence present on both sides is left alone whatever its
-// attributes say. Introspect reads the attributes back, but only the
-// ones the declaration named — see readIntrospectSequences — and
-// PostgreSQL's ALTER SEQUENCE ... RESTART is not a migration anybody
-// should get by accident, so a moved START WITH is neither applied nor
-// reported. Push's doc comment lists it among what Push cannot see.
-func diffSequencesCreate(prev, cur *Snapshot, safe bool) []string {
+// The attributes were the third place the snapshot recorded a value
+// the diff never read, alongside a UNIQUE's column list and a foreign
+// key's referential actions: Introspect reads seqincrement, seqmin,
+// seqmax, seqstart, seqcache and seqcycle back from pg_sequence,
+// BuildSnapshot records whatever SequenceOptions named, and matching
+// on the name alone meant a declaration that moved INCREMENT BY 1 to
+// INCREMENT BY 10 produced no statement and no notice.
+//
+// One ALTER SEQUENCE carries every clause that moved, rather than one
+// statement each: MINVALUE and MAXVALUE have to widen together or the
+// first of them can be rejected for crossing the other.
+//
+// START WITH is stated with the rest and is not RESTART: it sets the
+// value a future ALTER SEQUENCE ... RESTART would return to, and moves
+// nothing the sequence is handing out today. Restarting a live
+// sequence is not a migration anybody should get from editing a
+// declaration, and drops does not emit one.
+//
+// That choice has a cost, and it is a refusal rather than a silence:
+// PostgreSQL will not accept a MINVALUE above the value the sequence
+// is currently sitting on, or a MAXVALUE below it, without a RESTART
+// to go with it — it answers 22023 and names both numbers. Diff has
+// no server to ask where the sequence has got to, so it states the
+// declaration and lets the server refuse; the push rolls back whole
+// and the operator restarts the sequence by hand. See Push's "What
+// Push cannot see".
+func diffSequences(prev, cur *Snapshot, safe bool) []string {
 	var out []string
 	for _, key := range sortedKeys(cur.Sequences) {
-		if _, ok := prev.Sequences[key]; ok {
+		prevS, ok := prev.Sequences[key]
+		if !ok {
+			out = append(out, createSequenceSQL(cur.Sequences[key], safe))
 			continue
 		}
-		out = append(out, createSequenceSQL(cur.Sequences[key], safe))
+		if alter := alterSequenceSQL(prevS, cur.Sequences[key]); alter != "" {
+			out = append(out, alter)
+		}
+	}
+	return out
+}
+
+// alterSequenceSQL renders the ALTER SEQUENCE that brings prev into
+// line with cur, or "" when the two describe the same sequence.
+//
+// The two sides are compared on the values the server would end up
+// with, not on the pointers: Introspect leaves an attribute nil when
+// it holds the default PostgreSQL would have chosen anyway, while a
+// declaration that spells that same default out records it. Comparing
+// the pointers would have every push restate a sequence declared
+// START WITH 1.
+func alterSequenceSQL(prev, cur *SequenceSnapshot) string {
+	p, c := effectiveSequence(prev), effectiveSequence(cur)
+	var b strings.Builder
+	if p.increment != c.increment {
+		fmt.Fprintf(&b, " INCREMENT BY %d", c.increment)
+	}
+	if p.minValue != c.minValue {
+		fmt.Fprintf(&b, " MINVALUE %d", c.minValue)
+	}
+	if p.maxValue != c.maxValue {
+		fmt.Fprintf(&b, " MAXVALUE %d", c.maxValue)
+	}
+	if p.start != c.start {
+		fmt.Fprintf(&b, " START WITH %d", c.start)
+	}
+	if p.cache != c.cache {
+		fmt.Fprintf(&b, " CACHE %d", c.cache)
+	}
+	if prev.Cycle != cur.Cycle {
+		if cur.Cycle {
+			b.WriteString(" CYCLE")
+		} else {
+			b.WriteString(" NO CYCLE")
+		}
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`ALTER SEQUENCE %s%s;`, quoteIdent(cur.Name), b.String())
+}
+
+// effectiveSequence resolves a snapshot's attributes to the numbers
+// the sequence actually carries, filling each unstated one with the
+// default CREATE SEQUENCE would have picked for that direction.
+func effectiveSequence(s *SequenceSnapshot) seqDefaults {
+	out := sequenceDefaults(1)
+	if s.Increment != nil {
+		out = sequenceDefaults(*s.Increment)
+		out.increment = *s.Increment
+	}
+	if s.Start != nil {
+		out.start = *s.Start
+	}
+	if s.MinValue != nil {
+		out.minValue = *s.MinValue
+	}
+	if s.MaxValue != nil {
+		out.maxValue = *s.MaxValue
+	}
+	if s.Cache != nil {
+		out.cache = *s.Cache
 	}
 	return out
 }
@@ -330,12 +442,31 @@ func diffSequencesDrop(prev, cur *Snapshot, safe bool) []string {
 	return out
 }
 
-// diffViewsDrop emits the DROP for every view cur no longer declares.
-// It is emitted ahead of the table DDL; see Diff.
-func diffViewsDrop(prev, cur *Snapshot, safe bool) []string {
+// diffViewsDrop emits the DROP for every view cur no longer declares,
+// and — when rebuild says so — for the ones it still declares too, the
+// ones diffViewsCreate builds again once the table DDL has run. Both
+// go ahead of that DDL; see Diff.
+//
+// They are emitted dependents first, which is viewOrder read backwards:
+// PostgreSQL will not drop a view another view selects from, so the
+// order that creates them is the reverse of the order that removes
+// them. That holds for the views the schema stopped declaring as much
+// as for the ones coming back — two stacked views removed together
+// were already an SQLSTATE 2BP01 in sorted order.
+//
+// No CASCADE. It would make the order unnecessary and is the wrong
+// trade: a CASCADE from a declared view takes an undeclared one
+// selecting from it along, silently and for good, and Push does not
+// drop what the Go schema never claimed. Without it PostgreSQL refuses
+// and names the view, which is an answer an operator can act on —
+// declare it with Schema.AddView so it is rebuilt too, or take it down
+// by hand.
+func diffViewsDrop(prev, cur *Snapshot, safe, rebuild bool) []string {
 	var out []string
-	for _, key := range sortedKeys(prev.Views) {
-		if _, ok := cur.Views[key]; !ok {
+	order := viewOrder(prev.Views)
+	for i := len(order) - 1; i >= 0; i-- {
+		key := order[i]
+		if _, declared := cur.Views[key]; !declared || rebuild {
 			out = append(out, dropViewSQL(prev.Views[key], safe))
 		}
 	}
@@ -347,13 +478,19 @@ func diffViewsDrop(prev, cur *Snapshot, safe bool) []string {
 //
 // renamed says a rename is part of this migration, which decides how a
 // changed view is replaced: see the comment on the branch that uses it.
-func diffViewsCreate(prev, cur *Snapshot, safe, renamed bool) []string {
+// rebuild says diffViewsDrop has already taken down every view both
+// sides carry, so each of them is stated afresh whether its body moved
+// or not.
+//
+// The views are emitted in dependency order rather than by name, so a
+// view selecting from another is created after the one it reads.
+func diffViewsCreate(prev, cur *Snapshot, safe, renamed, rebuild bool) []string {
 	var out []string
-	for _, key := range sortedKeys(cur.Views) {
+	for _, key := range viewOrder(cur.Views) {
 		curV := cur.Views[key]
 		prevV, ok := prev.Views[key]
 		switch {
-		case !ok:
+		case !ok, rebuild:
 			out = append(out, createViewSQL(curV, false))
 		case prevV.Materialized != curV.Materialized:
 			// A view and a materialised view are different kinds of
@@ -568,6 +705,122 @@ func dropViewSQL(v *ViewSnapshot, safe bool) string {
 	return fmt.Sprintf(`DROP %s %s;`, kind, quoteIdent(v.Name))
 }
 
+// columnWorkAViewCanBlock reports whether this migration changes a
+// column in one of the two ways PostgreSQL refuses while a view reads
+// it: dropping the column, which comes back as SQLSTATE 2BP01
+// ("cannot drop column ... because other objects depend on it"), and
+// changing its type, which comes back as SQLSTATE 0A000 ("cannot alter
+// type of a column used by a view or rule"). Neither has a way around
+// it that leaves the view standing.
+//
+// A rename is not one of them — a view follows a renamed column,
+// because it holds the column's number and not its name — and neither
+// is a NOT NULL or a DEFAULT.
+//
+// It is deliberately a question about the whole migration rather than
+// about one view: which columns a view reads is exactly what the
+// snapshot does not record, so the only honest answers are "no view
+// can be in the way" and "one might be".
+func columnWorkAViewCanBlock(prev, cur *Snapshot) bool {
+	for _, key := range survivingTables(prev, cur) {
+		prevT, curT := prev.Tables[key], cur.Tables[key]
+		for name, prevC := range prevT.Columns {
+			curC, ok := curT.Columns[name]
+			if !ok || prevC.Type != curC.Type {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// viewOrder returns the keys of views in an order it is safe to CREATE
+// them in: a view another one selects from comes first.
+//
+// PostgreSQL records what a view reads, but Diff has no server to ask
+// and the snapshot holds only the body, so the dependency is read out
+// of that text — a view whose body names another view's identifier,
+// quoted or bare, is taken to select from it. A false positive, say a
+// column sharing a view's name, only moves a CREATE earlier than it
+// needed to be. A genuine cycle cannot exist in the catalogue, so
+// anything the sort cannot place is appended in name order rather than
+// dropped on the floor.
+func viewOrder(views map[string]*ViewSnapshot) []string {
+	keys := sortedKeys(views)
+	reads := make(map[string][]string, len(keys))
+	pending := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		pending[k] = true
+		for _, other := range keys {
+			if other != k && mentionsIdent(views[k].Definition, views[other].Name) {
+				reads[k] = append(reads[k], other)
+			}
+		}
+	}
+	out := make([]string, 0, len(keys))
+	for len(pending) > 0 {
+		placed := false
+		for _, k := range keys {
+			if !pending[k] {
+				continue
+			}
+			ready := true
+			for _, dep := range reads[k] {
+				if pending[dep] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				out = append(out, k)
+				delete(pending, k)
+				placed = true
+			}
+		}
+		if !placed {
+			for _, k := range keys {
+				if pending[k] {
+					out = append(out, k)
+					delete(pending, k)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// mentionsIdent reports whether sql names ident as an identifier of
+// its own rather than as part of a longer word. The double quotes
+// around a quoted identifier are not identifier bytes, so one spelling
+// of the test answers for both.
+func mentionsIdent(sql, ident string) bool {
+	if ident == "" {
+		return false
+	}
+	for i := 0; i+len(ident) <= len(sql); {
+		j := strings.Index(sql[i:], ident)
+		if j < 0 {
+			return false
+		}
+		start := i + j
+		if !identByteAt(sql, start-1) && !identByteAt(sql, start+len(ident)) {
+			return true
+		}
+		i = start + 1
+	}
+	return false
+}
+
+// identByteAt reports whether sql[i] is a byte an SQL identifier may
+// carry. An index outside the string is not.
+func identByteAt(sql string, i int) bool {
+	if i < 0 || i >= len(sql) {
+		return false
+	}
+	c := sql[i]
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$'
+}
+
 func createPolicySQL(table string, p *PolicySnapshot) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `CREATE POLICY "%s" ON "%s"`, p.Name, table)
@@ -715,9 +968,12 @@ func columnDefSQL(c *ColumnSnapshot) string {
 	b.WriteString(c.Name)
 	b.WriteString(`" `)
 	b.WriteString(snapshotTypeSQL(c.Type))
-	if c.PrimaryKey {
-		b.WriteString(" PRIMARY KEY")
-	}
+	// ColumnSnapshot.PrimaryKey is deliberately not rendered. The key
+	// is stated once, by addPrimaryKey, whether it spans one column or
+	// five: inlining the one-column case here meant a new table got its
+	// key from the CREATE TABLE and a widened key got it from an ALTER,
+	// which is two code paths for one constraint and the reason
+	// narrowing a key emitted a DROP with no ADD behind it.
 	if c.NotNull {
 		b.WriteString(" NOT NULL")
 	}
@@ -795,23 +1051,35 @@ func alterColumns(prev, cur *TableSnapshot) []string {
 }
 
 // dropUniques emits DROP CONSTRAINT for every UNIQUE cur no longer
-// declares.
+// declares, and for every one whose columns changed under a name that
+// did not.
+//
+// PostgreSQL has no ALTER for a UNIQUE constraint's column list, so a
+// re-scoped one is dropped and re-added — the same treatment dropChecks
+// gives an expression that moved, for the same reason. Comparing the
+// names alone, which is all this did, meant widening
+// UNIQUE(email) to UNIQUE(email, orgId) under the name it already had
+// produced no statement at all: pg.Diff returned the empty string, and
+// the rule the schema declared and the rule the database enforced
+// disagreed for ever with nothing to say so.
 func dropUniques(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.UniqueConstraints) {
-		if _, ok := cur.UniqueConstraints[k]; !ok {
+		curU, ok := cur.UniqueConstraints[k]
+		if !ok || !uniqueEqual(prev.UniqueConstraints[k], curU) {
 			out = append(out, dropConstraintSQL(cur.Name, k, safe))
 		}
 	}
 	return out
 }
 
-// addUniques emits ADD CONSTRAINT ... UNIQUE for every one cur newly
-// declares.
+// addUniques is dropUniques's other half: the ADD CONSTRAINT for every
+// UNIQUE cur newly declares and every one dropUniques took down
+// because its columns moved.
 func addUniques(prev, cur *TableSnapshot) []string {
 	var out []string
 	for _, k := range sortedKeys(cur.UniqueConstraints) {
-		if _, ok := prev.UniqueConstraints[k]; ok {
+		if prevU, ok := prev.UniqueConstraints[k]; ok && uniqueEqual(prevU, cur.UniqueConstraints[k]) {
 			continue
 		}
 		u := cur.UniqueConstraints[k]
@@ -821,29 +1089,81 @@ func addUniques(prev, cur *TableSnapshot) []string {
 	return out
 }
 
+// uniqueEqual reports whether two UNIQUE constraints span the same
+// columns in the same order.
+//
+// Order is compared, though uniqueness does not depend on it: the
+// constraint is backed by an index, and (email, orgId) and
+// (orgId, email) are the same rule enforced by two indexes that serve
+// different lookups. Introspect reads the columns back in key order,
+// so the two sides are comparable and a reorder is a real change.
+//
+// NullsNotDistinct is not compared. Neither producer records it —
+// BuildSnapshot has no way to declare it and Introspect writes false —
+// and addUniques cannot render it, so comparing it would drop and
+// re-add such a constraint on every push without ever making it true.
+func uniqueEqual(a, b *UniqueSnapshot) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return sameStrings(a.Columns, b.Columns)
+}
+
 // dropForeignKeys emits DROP CONSTRAINT for every foreign key cur no
-// longer declares. It runs ahead of the DROP TABLEs; see Diff.
+// longer declares, and for every one whose definition changed under a
+// name that did not. It runs ahead of the DROP TABLEs; see Diff.
+//
+// The referential actions are the half that moves without the name
+// moving: fkName is built from the columns and the target, so a key
+// that starts pointing somewhere else arrives under a new name and is
+// an add and a drop already — but ON DELETE CASCADE becoming ON DELETE
+// RESTRICT keeps every part of that name. Compared by name alone, as
+// this was, the change produced no statement, and the database went on
+// deleting the children of a deleted parent that the schema said it
+// should refuse to delete. PostgreSQL has no ALTER for the action of a
+// non-deferrable constraint, so the key is dropped and re-added.
 func dropForeignKeys(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.ForeignKeys) {
-		if _, ok := cur.ForeignKeys[k]; !ok {
+		curFK, ok := cur.ForeignKeys[k]
+		if !ok || !foreignKeyEqual(prev.ForeignKeys[k], curFK) {
 			out = append(out, dropConstraintSQL(cur.Name, k, safe))
 		}
 	}
 	return out
 }
 
-// addForeignKeys emits ADD CONSTRAINT ... FOREIGN KEY for every one
-// cur newly declares.
+// addForeignKeys is dropForeignKeys's other half: the ADD CONSTRAINT
+// for every key cur newly declares and every one dropForeignKeys took
+// down because its definition moved.
 func addForeignKeys(prev, cur *TableSnapshot) []string {
 	var out []string
 	for _, k := range sortedKeys(cur.ForeignKeys) {
-		if _, ok := prev.ForeignKeys[k]; ok {
+		if prevFK, ok := prev.ForeignKeys[k]; ok && foreignKeyEqual(prevFK, cur.ForeignKeys[k]) {
 			continue
 		}
 		out = append(out, fkAddSQL(cur.Name, cur.ForeignKeys[k]))
 	}
 	return out
+}
+
+// foreignKeyEqual reports whether two foreign keys describe the same
+// constraint: the same columns pointing at the same columns of the
+// same table, under the same referential actions.
+//
+// SchemaTo is left out. Introspect fills it from the catalogue and
+// BuildSnapshot from the target Table's declared schema, which is
+// empty for a table that never named one — the common case — so
+// comparing it would have every push drop and re-add every key on the
+// default schema. fkAddSQL does not render it either.
+func foreignKeyEqual(a, b *ForeignKeySnapshot) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.TableTo != b.TableTo || a.OnDelete != b.OnDelete || a.OnUpdate != b.OnUpdate {
+		return false
+	}
+	return sameStrings(a.ColumnsFrom, b.ColumnsFrom) && sameStrings(a.ColumnsTo, b.ColumnsTo)
 }
 
 // dropConstraintSQL emits DROP CONSTRAINT [IF EXISTS] "name".
@@ -911,10 +1231,9 @@ func addIndexes(prev, cur *TableSnapshot, safe bool) []string {
 	return out
 }
 
-// dropCompositePK emits ALTER TABLE DROP CONSTRAINT for a composite
-// PRIMARY KEY that is going or whose columns changed. Single-column
-// PKs continue to live on the column definition and are handled by the
-// column diff.
+// dropPrimaryKey emits ALTER TABLE DROP CONSTRAINT for a PRIMARY KEY
+// that is going or whose columns changed — at any arity, a key of one
+// column included.
 //
 // The two sides are matched by their column list, not by their name: a
 // table has at most one PRIMARY KEY, and the name it wears is whatever
@@ -922,38 +1241,54 @@ func addIndexes(prev, cur *TableSnapshot, safe bool) []string {
 // compositePKName's camelCase when drops did. Matching by name would
 // have a push against a server-named key drop and recreate it, every
 // time, for no change at all.
-func dropCompositePK(prev, cur *TableSnapshot, safe bool) []string {
-	prevPK := tableCompositePK(prev)
+func dropPrimaryKey(prev, cur *TableSnapshot, safe bool) []string {
+	prevPK := tablePrimaryKey(prev)
 	if prevPK == nil {
 		return nil
 	}
-	if curPK := tableCompositePK(cur); curPK != nil && sameStrings(prevPK.Columns, curPK.Columns) {
+	if curPK := tablePrimaryKey(cur); curPK != nil && sameStrings(prevPK.Columns, curPK.Columns) {
 		return nil
 	}
 	return []string{dropConstraintSQL(cur.Name, prevPK.Name, safe)}
 }
 
-// addCompositePK is dropCompositePK's other half: the ADD CONSTRAINT
-// for the key cur declares, matched the same way.
-func addCompositePK(prev, cur *TableSnapshot) []string {
-	curPK := tableCompositePK(cur)
+// addPrimaryKey is dropPrimaryKey's other half: the ADD CONSTRAINT for
+// the key cur declares, matched the same way.
+func addPrimaryKey(prev, cur *TableSnapshot) []string {
+	curPK := tablePrimaryKey(cur)
 	if curPK == nil {
 		return nil
 	}
-	if prevPK := tableCompositePK(prev); prevPK != nil && sameStrings(prevPK.Columns, curPK.Columns) {
+	if prevPK := tablePrimaryKey(prev); prevPK != nil && sameStrings(prevPK.Columns, curPK.Columns) {
 		return nil
 	}
 	return []string{addPrimaryKeySQL(cur.Name, curPK)}
 }
 
-// tableCompositePK returns the table's multi-column PRIMARY KEY, or
-// nil when it has none. The snapshot format keys them by name for
-// drizzle-kit compatibility, but PostgreSQL permits only one; the
-// lowest name wins so a hand-written snapshot carrying more than one
-// still diffs deterministically.
-func tableCompositePK(t *TableSnapshot) *CompositePKSnapshot {
+// tablePrimaryKey returns the table's PRIMARY KEY, or nil when it has
+// none. The snapshot format keys them by name for drizzle-kit
+// compatibility, but PostgreSQL permits only one; the lowest name wins
+// so a hand-written snapshot carrying more than one still diffs
+// deterministically.
+//
+// A single-column key is read off the column when the map is empty.
+// BuildSnapshot and Introspect both fill the map at every arity now,
+// so that fallback is for the snapshots they did not write: the ones
+// drizzle-kit wrote, which spell a one-column key only on the column,
+// and the ones drops itself wrote before the map covered every width.
+// Without it a migration generated against such a file would read the
+// table as having no key at all and state the declared one afresh.
+func tablePrimaryKey(t *TableSnapshot) *CompositePKSnapshot {
 	for _, k := range sortedKeys(t.CompositePrimaryKeys) {
 		return t.CompositePrimaryKeys[k]
+	}
+	for _, k := range sortedKeys(t.Columns) {
+		if t.Columns[k].PrimaryKey {
+			return &CompositePKSnapshot{
+				Name:    compositePKName(t.Name, []string{k}),
+				Columns: []string{k},
+			}
+		}
 	}
 	return nil
 }
@@ -1057,8 +1392,13 @@ func dropIndexSQL(name string, safe bool) string {
 // Concurrently is not part of the comparison: it says how an index was
 // built, not what it is, and the catalogue cannot report it — comparing
 // it would have every push drop and rebuild an index declared
-// Concurrently. Everything else is compared literally, the predicate
-// included.
+// Concurrently. NullsNotDistinct and With are not part of it either,
+// for the opposite reason: the two fields are in IndexSnapshot for
+// drizzle-kit's format and neither BuildSnapshot nor Introspect ever
+// puts a value in one, so there is nothing to compare and
+// createIndexSQL could not render the difference if there were. See
+// Push's "What Push cannot see". Everything else is compared
+// literally, the predicate included.
 //
 // Comparing the predicate as text is only honest because both sides
 // arrive spelled the same way. Two snapshots built from Go schemas are

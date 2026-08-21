@@ -526,9 +526,14 @@ func (t *Table) AddIndex(idx *Index) *Table {
 // Indexes returns the indexes registered with AddIndex.
 func (t *Table) Indexes() []*Index { return t.indexes }
 
-// PrimaryKey declares a composite PRIMARY KEY spanning cols. Call
-// only when the PK has more than one column; single-column PKs
-// continue to be declared on the column via *Col[T].PrimaryKey().
+// PrimaryKey declares the table's PRIMARY KEY spanning cols.
+//
+// It is the spelling for a key of more than one column, which cannot
+// ride on a column definition, and it accepts a key of one — the
+// snapshot, the CREATE TABLE and the diff all treat that identically
+// to the same key declared with (*Col[T]).PrimaryKey(), so a schema
+// that narrows a two-column key to one by editing this call is a
+// migration and not a silent divergence.
 func (t *Table) PrimaryKey(cols ...ColRef) *Table {
 	t.compositePK = make([]*Column, len(cols))
 	for i, c := range cols {

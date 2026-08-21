@@ -92,7 +92,11 @@ func TestPGPushDropsEveryDependentShapeInOneMigration(t *testing.T) {
 	if cols := columnsOf(t, db, "orgs"); cols["code"] != "" {
 		t.Fatalf("orgs after the push = %v", cols)
 	}
-	if cons := constraintsOf(t, db, "users"); len(cons) != 1 || cons["users_pkey"] != "p" {
+	// The key wears drops's name, not PostgreSQL's: seedBefore built
+	// this database with a push, and a push states the PRIMARY KEY as
+	// its own ALTER TABLE ADD CONSTRAINT whatever its width, so nothing
+	// is left for the server to invent a name for.
+	if cons := constraintsOf(t, db, "users"); len(cons) != 1 || cons["usersIdPk"] != "p" {
 		t.Fatalf("users kept a constraint it stopped declaring: %v", cons)
 	}
 	if idx := indexNamesOf(t, db, "users"); idx["usersAgeIdx"] {

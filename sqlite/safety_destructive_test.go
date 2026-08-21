@@ -102,3 +102,115 @@ func TestDestructiveChangesFollowsAStatedRename(t *testing.T) {
 		t.Fatalf("stated: got %v, want nothing", rules(got))
 	}
 }
+
+// The two tightening rules, as far as the snapshots can settle them:
+// which candidates come out, under which names. Whether the rows
+// actually contradict them is the live half, and it is in the
+// integration suite — this is the part that would still be true with no
+// database in the room.
+func TestDestructiveChangesReportsNewConstraintsAsCandidates(t *testing.T) {
+	before := sqlite.NewTable("seats")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("code"))
+	sqlite.Add(before, sqlite.Text("row"))
+	sqlite.Add(before, sqlite.BigInt("number"))
+
+	after := sqlite.NewTable("seats")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.Text("code").Unique())
+	row := sqlite.Add(after, sqlite.Text("row"))
+	number := sqlite.Add(after, sqlite.BigInt("number"))
+	after.AddUnique("seats_row_number", row, number)
+	after.AddCheck("seats_number_positive", `"number" > 0`)
+
+	got := sqlite.DestructiveChanges(snapshotOf(before), snapshotOf(after))
+	want := []string{
+		"add-unique-constraint code",
+		"add-unique-constraint seats_row_number",
+		"add-check-constraint seats_number_positive",
+	}
+	if strings.Join(rules(got), ",") != strings.Join(want, ",") {
+		t.Fatalf("got %v, want %v", rules(got), want)
+	}
+	// The suggestion is the query that finds the rows in the way, so a
+	// reader can settle it themselves rather than only being told no.
+	if !strings.Contains(got[1].Suggestion, `GROUP BY "row", "number"`) {
+		t.Errorf("the composite suggestion does not name both columns: %s", got[1].Suggestion)
+	}
+	if !strings.Contains(got[2].Suggestion, `WHERE NOT ("number" > 0)`) {
+		t.Errorf("the check suggestion does not carry the expression: %s", got[2].Suggestion)
+	}
+}
+
+// A constraint that was already there is not a new one, and a CHECK
+// re-declared with the same expression is the same CHECK. Otherwise
+// every push of an unchanged schema would carry a candidate and the
+// probes would be run for nothing.
+func TestDestructiveChangesIgnoresConstraintsThatWereAlreadyThere(t *testing.T) {
+	tbl := func() *sqlite.Table {
+		t := sqlite.NewTable("seats")
+		sqlite.Add(t, sqlite.BigInt("id").PrimaryKey())
+		sqlite.Add(t, sqlite.Text("code").Unique())
+		row := sqlite.Add(t, sqlite.Text("row"))
+		number := sqlite.Add(t, sqlite.BigInt("number"))
+		t.AddUnique("seats_row_number", row, number)
+		t.AddCheck("seats_number_positive", `"number" > 0`)
+		return t
+	}
+	if got := sqlite.DestructiveChanges(snapshotOf(tbl()), snapshotOf(tbl())); len(got) != 0 {
+		t.Fatalf("got %v, want nothing", rules(got))
+	}
+}
+
+// A CHECK whose expression changed under an unchanged name is a new
+// CHECK: the rows that satisfied the old one say nothing about the new
+// one.
+func TestDestructiveChangesReportsARewrittenCheck(t *testing.T) {
+	mk := func(expr string) *sqlite.Table {
+		t := sqlite.NewTable("readings")
+		sqlite.Add(t, sqlite.BigInt("id").PrimaryKey())
+		sqlite.Add(t, sqlite.BigInt("celsius"))
+		t.AddCheck("readings_sane", expr)
+		return t
+	}
+	got := sqlite.DestructiveChanges(snapshotOf(mk(`"celsius" >= -273`)), snapshotOf(mk(`"celsius" >= 0`)))
+	if len(got) != 1 || got[0].Rule != "add-check-constraint" {
+		t.Fatalf("got %v, want one add-check-constraint", rules(got))
+	}
+}
+
+// A UNIQUE constraint is compared by the columns it spans, not by its
+// name.
+//
+// SQLite stores one as an anonymous index and reports it back under a
+// generated name, so a snapshot read out of a database never carries
+// the name the schema gave it — which is why Diff compares the column
+// tuples (see sameUniqueKeys) and why this has to as well. Reading the
+// two names as two constraints would call a constraint that has been
+// enforced all along a new one, on a snapshot pair a caller of
+// DestructiveChanges gets simply by introspecting.
+func TestDestructiveChangesMatchesAUniqueByItsColumnsNotItsName(t *testing.T) {
+	introspected := &sqlite.Snapshot{Tables: map[string]*sqlite.TableSnapshot{
+		"seats": {
+			Name: "seats",
+			Columns: map[string]*sqlite.ColumnSnapshot{
+				"id":     {Name: "id", Type: "INTEGER", PrimaryKey: true, NotNull: true},
+				"row":    {Name: "row", Type: "TEXT"},
+				"number": {Name: "number", Type: "INTEGER"},
+			},
+			UniqueConstraints: map[string]*sqlite.UniqueSnapshot{
+				"sqlite_autoindex_seats_1": {Name: "sqlite_autoindex_seats_1", Columns: []string{"row", "number"}},
+			},
+		},
+	}}
+
+	declared := sqlite.NewTable("seats")
+	sqlite.Add(declared, sqlite.BigInt("id").PrimaryKey())
+	row := sqlite.Add(declared, sqlite.Text("row"))
+	number := sqlite.Add(declared, sqlite.BigInt("number"))
+	declared.AddUnique("seats_row_number", row, number)
+
+	if got := sqlite.DestructiveChanges(introspected, snapshotOf(declared)); len(got) != 0 {
+		t.Fatalf("got %v, want nothing: the constraint is the one already there under the name SQLite gave it", rules(got))
+	}
+}

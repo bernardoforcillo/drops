@@ -115,6 +115,22 @@ type IndexSnapshot struct {
 }
 
 // CompositePKSnapshot is one entry in TableSnapshot.CompositePrimaryKeys.
+// PostgreSQL allows a table only one PRIMARY KEY, so the map holds at
+// most one — under whatever name created it — and it holds the key
+// whether it spans one column or several. The "composite" in the name
+// is drizzle-kit's; the arity is not a condition.
+//
+// A key of one column is therefore written twice: here, because this
+// is the list Diff compares, and as ColumnSnapshot.PrimaryKey, because
+// that is the spelling drizzle-kit reads. That is a duplication the v7
+// format has no way to mark, and it is the one place a drops snapshot
+// stretches the round trip this file's doc comment claims: a consumer
+// that renders both would state one key twice and PostgreSQL would
+// refuse the pair (42P16). Everything in drops that reads a snapshot
+// collapses them — tablePrimaryKey prefers this map and falls back to
+// the column only when it is empty, and `drops pull` skips the
+// table-level form when the column already carries it — but a consumer
+// outside drops has to do the same.
 type CompositePKSnapshot struct {
 	Name    string   `json:"name"`
 	Columns []string `json:"columns"`
@@ -208,15 +224,29 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 				WithCheck: p.WithCheckExpr(),
 			}
 		}
-		// The PRIMARY KEY, however the schema spelled it.
+		// The PRIMARY KEY, however the schema spelled it, and whatever
+		// its arity.
 		//
-		// A key spanning one column rides on the column definition;
-		// a key spanning two cannot, because PostgreSQL rejects a
-		// second inline PRIMARY KEY, so it is recorded table-level.
-		// That is the same rule writeTableBody applies to the CREATE
-		// TABLE, and the two have to agree: a key the snapshot puts
-		// in both places is emitted twice, and one it puts in
-		// neither never reaches Diff at all.
+		// CompositePrimaryKeys holds it at every width, one column
+		// included. The map used to be filled only past two, on the
+		// reasoning that a one-column key rides on the column
+		// definition and needs no second home — but the column
+		// definition carries a bool, and a bool cannot say which
+		// columns a key spans. Diff compares the two sides of a key by
+		// their column lists, so a key that reached it only as a bool
+		// was a key it could not compare: narrowing (orgId, userId) to
+		// (userId) emitted the DROP CONSTRAINT with no ADD behind it
+		// and the table silently lost its key, and widening the other
+		// way emitted the ADD with no DROP in front of it and
+		// PostgreSQL refused the lot (SQLSTATE 42P16).
+		//
+		// ColumnSnapshot.PrimaryKey stays true for a one-column key
+		// because that is drizzle-kit's spelling of it and what
+		// `drops pull` reads to write `.PrimaryKey()` back out. It is
+		// no longer what emits the key: columnDefSQL leaves it out of
+		// the CREATE TABLE and addPrimaryKey states it as an ALTER
+		// TABLE, the same statement a two-column key gets, so the two
+		// arities travel one path.
 		keys := t.primaryKeyColumns()
 		// Keyed by Column.key: primaryKeyColumns can answer from
 		// compositePK while the column loop below walks Columns(), and
@@ -227,8 +257,7 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 		for _, c := range keys {
 			inKey[c.key()] = true
 		}
-		compositeKey := len(keys) > 1
-		if compositeKey {
+		if len(keys) > 0 {
 			cols := make([]string, len(keys))
 			for i, c := range keys {
 				cols[i] = c.Name()
@@ -285,7 +314,7 @@ func BuildSnapshot(schema *Schema) *Snapshot {
 			cs := &ColumnSnapshot{
 				Name:       c.Name(),
 				Type:       c.Type().TypeSQL(),
-				PrimaryKey: inKey[c.key()] && !compositeKey,
+				PrimaryKey: inKey[c.key()] && len(keys) == 1,
 				// A key column is NOT NULL whether or not the schema
 				// said so — PostgreSQL sets attnotnull when the key is
 				// created and Introspect reads it back that way, so a

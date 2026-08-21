@@ -554,3 +554,413 @@ func TestSQLitePushCountsNullsBeforeTheTableIsRenamed(t *testing.T) {
 		t.Fatalf("the refused push touched the table: email = %q, present = %v", got, ok)
 	}
 }
+
+// A UNIQUE added over rows that already hold duplicates. Like the NOT
+// NULL rule, nothing is lost when it goes wrong — SQLite rejects the
+// rebuild's copy and the transaction rolls back whole — and like the
+// NOT NULL rule, what the guard buys is a refusal that names the
+// column and counts the rows in the way, instead of a constraint
+// message from halfway through a rebuild.
+func TestSQLitePushRefusesUniqueOverDuplicateRows(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("members")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("email"))
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "members" (id, email) VALUES (1, 'ada@example.com'), (2, 'ada@example.com'), (3, 'grace@example.com')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("members")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.Text("email").Unique())
+
+	_, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	refusal := mustRefuse(t, err)
+	if !hasRule(refusal, "add-unique-constraint", "email") {
+		t.Errorf("the refusal did not name the column: %v", refusal.Changes)
+	}
+	// Counted off the rows, which is the point of asking the database.
+	// Two rows share one value, so one group is in the way.
+	if !strings.Contains(refusal.Error(), "1 group") {
+		t.Errorf("the refusal does not say how much duplication is in the way:\n%s", refusal.Error())
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "members"`); n != 3 {
+		t.Fatalf("the refused push touched the table: %d rows", n)
+	}
+
+	// Permitted, the old behaviour is what you get: the engine refuses
+	// the copy and the whole rebuild rolls back.
+	_, err = sqlite.Push(ctx, db, sqlite.NewSchema(after), sqlite.PushOptions{AllowDestructive: true})
+	if err == nil {
+		t.Fatal("SQLite accepted a UNIQUE over duplicate rows; the rule's premise is stale")
+	}
+	if errors.As(err, new(*sqlite.DestructiveChangeError)) {
+		t.Errorf("AllowDestructive did not get past the guard: %v", err)
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "members"`); n != 3 {
+		t.Errorf("the failed rebuild did not roll back: %d rows", n)
+	}
+}
+
+// The same UNIQUE over rows that are already distinct is not refused.
+//
+// This is the case that keeps the option meaning something, and it is
+// why the rule probes rather than assumes: declaring a column unique
+// that has been unique all along is an ordinary change, and a guard
+// that stopped it would teach setting AllowDestructive by reflex.
+func TestSQLitePushAllowsUniqueWhereValuesAreDistinct(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("members")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("email"))
+	exec(t, db, sqlite.CreateTable(before))
+	// The NULLs are deliberate. SQLite counts NULLs as distinct from
+	// one another in a UNIQUE index, so two of them are not a
+	// duplicate, and a probe that grouped them would refuse this push.
+	if _, err := db.Exec(ctx, `INSERT INTO "members" (id, email) VALUES (1, 'ada@example.com'), (2, 'grace@example.com'), (3, NULL), (4, NULL)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("members")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.Text("email").Unique())
+
+	res, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	if err != nil {
+		t.Fatalf("a UNIQUE no row contradicts was refused: %v", err)
+	}
+	if len(res.Destructive) != 0 {
+		t.Errorf("the push reported a loss it did not have: %v", res.Destructive)
+	}
+	// And the constraint is really there afterwards.
+	if _, err := db.Exec(ctx, `INSERT INTO "members" (id, email) VALUES (5, 'ada@example.com')`); err == nil {
+		t.Error("the rebuild did not apply the UNIQUE it was pushed for")
+	}
+}
+
+// A multi-column UNIQUE, where the duplication is in the pair rather
+// than in either column.
+func TestSQLitePushRefusesACompositeUniqueOverDuplicatePairs(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("seats")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("row"))
+	sqlite.Add(before, sqlite.BigInt("number"))
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "seats" (id, "row", "number") VALUES (1, 'A', 1), (2, 'A', 2), (3, 'B', 1), (4, 'A', 1)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("seats")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	row := sqlite.Add(after, sqlite.Text("row"))
+	number := sqlite.Add(after, sqlite.BigInt("number"))
+	after.AddUnique("seats_row_number", row, number)
+
+	_, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	refusal := mustRefuse(t, err)
+	if !hasRule(refusal, "add-unique-constraint", "seats_row_number") {
+		t.Errorf("the refusal did not name the constraint: %v", refusal.Changes)
+	}
+	// Neither column is duplicated on its own — 'A' appears three
+	// times and 1 twice — so a per-column probe would have acquitted
+	// this and a per-pair one does not.
+	if !strings.Contains(refusal.Error(), "1 group") {
+		t.Errorf("the refusal does not count the duplicated pairs:\n%s", refusal.Error())
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "seats"`); n != 4 {
+		t.Fatalf("the refused push touched the table: %d rows", n)
+	}
+}
+
+// A CHECK added over rows that break it. Same shape again: the rebuild
+// dies partway on a constraint error and rolls back, and the guard
+// turns that into a refusal that names the constraint and counts the
+// rows.
+func TestSQLitePushRefusesACheckOverViolatingRows(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("readings")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.BigInt("celsius"))
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "readings" (id, celsius) VALUES (1, 20), (2, -300), (3, NULL)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("readings")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.BigInt("celsius"))
+	after.AddCheck("readings_above_absolute_zero", `"celsius" >= -273`)
+
+	_, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	refusal := mustRefuse(t, err)
+	if !hasRule(refusal, "add-check-constraint", "readings_above_absolute_zero") {
+		t.Errorf("the refusal did not name the constraint: %v", refusal.Changes)
+	}
+	// One row breaks it. The NULL does not: a CHECK fails only on a
+	// value of false, and NULL is not false — so a probe that counted
+	// "not satisfied" rather than "violated" would say two here.
+	if !strings.Contains(refusal.Error(), "1 row(s)") {
+		t.Errorf("the refusal does not count the offending rows:\n%s", refusal.Error())
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "readings"`); n != 3 {
+		t.Fatalf("the refused push touched the table: %d rows", n)
+	}
+
+	_, err = sqlite.Push(ctx, db, sqlite.NewSchema(after), sqlite.PushOptions{AllowDestructive: true})
+	if err == nil {
+		t.Fatal("SQLite accepted a CHECK its rows break; the rule's premise is stale")
+	}
+	if errors.As(err, new(*sqlite.DestructiveChangeError)) {
+		t.Errorf("AllowDestructive did not get past the guard: %v", err)
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "readings"`); n != 3 {
+		t.Errorf("the failed rebuild did not roll back: %d rows", n)
+	}
+}
+
+// A CHECK every row already satisfies is not refused — including the
+// row holding NULL, which SQLite's CHECK lets through because the
+// expression is NULL rather than false.
+func TestSQLitePushAllowsACheckEveryRowSatisfies(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("readings")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.BigInt("celsius"))
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "readings" (id, celsius) VALUES (1, 20), (2, -100), (3, NULL)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("readings")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.BigInt("celsius"))
+	after.AddCheck("readings_above_absolute_zero", `"celsius" >= -273`)
+
+	res, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	if err != nil {
+		t.Fatalf("a CHECK no row breaks was refused: %v", err)
+	}
+	if len(res.Destructive) != 0 {
+		t.Errorf("the push reported a loss it did not have: %v", res.Destructive)
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "readings"`); n != 3 {
+		t.Fatalf("rows after the push = %d", n)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO "readings" (id, celsius) VALUES (4, -400)`); err == nil {
+		t.Error("the rebuild did not apply the CHECK it was pushed for")
+	}
+}
+
+// sqliteCount runs a one-row, one-column count query.
+func sqliteCount(t *testing.T, db *sqlite.DB, query string) int64 {
+	t.Helper()
+	rows, err := db.Query(context.Background(), query)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("%s: no row", query)
+	}
+	var n int64
+	if err := rows.Scan(&n); err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	return n
+}
+
+// The probes run against the live table, and the live table does not
+// have the names the new schema uses. Three tests for that, because
+// getting it wrong is silent both ways.
+//
+// SQLite re-reads a double-quoted identifier that matches no column as
+// a string literal rather than failing, so a probe naming a column the
+// database does not have yet asks a different question and gets a
+// confident answer to it: a GROUP BY over the literal puts every row in
+// one group and refuses a push nothing is wrong with, and a CHECK over
+// the literal compares two constants and acquits one that is.
+
+// A UNIQUE on a column this same push renames, over values that are
+// distinct. The right answer is to let it through — and a probe that
+// grouped by a name the live table does not have would refuse it.
+func TestSQLitePushChecksUniquenessUnderTheNameTheDatabaseStillHas(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("members")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("mail"))
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "members" (id, mail) VALUES (1, 'ada@example.com'), (2, 'grace@example.com')`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("members")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.Text("email").Unique().RenamedFrom("mail"))
+
+	res, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	if err != nil {
+		t.Fatalf("a UNIQUE no row contradicts was refused: %v", err)
+	}
+	if len(res.Destructive) != 0 {
+		t.Errorf("the push reported a loss it did not have: %v", res.Destructive)
+	}
+	if got, ok := sqliteColumn(t, db, "members", "email"); !ok || got != "ada@example.com" {
+		t.Fatalf("email = %q, present = %v", got, ok)
+	}
+}
+
+// A CHECK on a column this same push renames, over a row that breaks
+// it. This is the dangerous direction: a probe naming a column the
+// database does not have compares the literal 'celsius' against -273,
+// which in SQLite's type ordering is true for every row, so the finding
+// is acquitted and the push then dies inside the rebuild on the very
+// constraint the probe was asked about.
+func TestSQLitePushChecksRowsUnderTheNameTheDatabaseStillHas(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("readings")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.BigInt("temp"))
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "readings" (id, temp) VALUES (1, 20), (2, -300)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("readings")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.BigInt("celsius").RenamedFrom("temp"))
+	after.AddCheck("readings_above_absolute_zero", `"celsius" >= -273`)
+
+	_, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	refusal := mustRefuse(t, err)
+	if !hasRule(refusal, "add-check-constraint", "readings_above_absolute_zero") {
+		t.Errorf("the refusal did not name the constraint: %v", refusal.Changes)
+	}
+	if !strings.Contains(refusal.Error(), "1 row(s)") {
+		t.Errorf("the refusal does not count the offending rows:\n%s", refusal.Error())
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "readings"`); n != 2 {
+		t.Fatalf("the refused push touched the table: %d rows", n)
+	}
+}
+
+// A UNIQUE on a column this same push adds. The column is not in the
+// live table at all; the rebuild's INSERT ... SELECT leaves it out, so
+// every existing row arrives holding the declared default and they
+// collide with each other. The probe has to see the same thing the
+// rebuild will.
+func TestSQLitePushChecksUniquenessOnAColumnItIsAdding(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("members")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "members" (id) VALUES (1), (2)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("members")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.Text("handle").Unique().Default("'unset'"))
+
+	_, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	refusal := mustRefuse(t, err)
+	if !hasRule(refusal, "add-unique-constraint", "handle") {
+		t.Errorf("the refusal did not name the column: %v", refusal.Changes)
+	}
+	if !strings.Contains(refusal.Error(), "1 group") {
+		t.Errorf("the refusal does not count the collisions:\n%s", refusal.Error())
+	}
+	if n := sqliteCount(t, db, `SELECT count(*) FROM "members"`); n != 2 {
+		t.Fatalf("the refused push touched the table: %d rows", n)
+	}
+
+	// One row cannot collide with itself, so the same change against a
+	// one-row table is not refused. The probe is looking at the data,
+	// not at the shape of the change.
+	db2 := openSQLite(t)
+	exec(t, db2, sqlite.CreateTable(before))
+	if _, err := db2.Exec(ctx, `INSERT INTO "members" (id) VALUES (1)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := sqlite.Push(ctx, db2, sqlite.NewSchema(after)); err != nil {
+		t.Fatalf("a default that collides with nothing was refused: %v", err)
+	}
+
+	// And the same column with no default at all arrives NULL in every
+	// row, which SQLite counts as distinct — so adding a nullable
+	// unique column to a populated table is not refused either. This is
+	// the half that only comes out right if the probe supplies the
+	// column the way the rebuild will; reading the live table alone
+	// would find no such column, take the quoted name for a string
+	// literal, and refuse.
+	db3 := openSQLite(t)
+	exec(t, db3, sqlite.CreateTable(before))
+	if _, err := db3.Exec(ctx, `INSERT INTO "members" (id) VALUES (1), (2)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	nullable := sqlite.NewTable("members")
+	sqlite.Add(nullable, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(nullable, sqlite.Text("handle").Unique())
+	if _, err := sqlite.Push(ctx, db3, sqlite.NewSchema(nullable)); err != nil {
+		t.Fatalf("a nullable unique column added to a populated table was refused: %v", err)
+	}
+	if n := sqliteCount(t, db3, `SELECT count(*) FROM "members" WHERE "handle" IS NULL`); n != 2 {
+		t.Errorf("rows holding NULL in the new column = %d, want 2", n)
+	}
+}
+
+// A probe that cannot be answered is not an acquittal.
+//
+// The rows settle these rules, and where the question cannot be put to
+// the database the finding stands rather than being discarded — because
+// discarding it means the failure the guard exists to prevent happens
+// anyway, silently, in the middle of a rebuild.
+func TestSQLitePushKeepsACheckItCannotPutToTheRows(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+
+	before := sqlite.NewTable("readings")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.BigInt("celsius"))
+	exec(t, db, sqlite.CreateTable(before))
+	if _, err := db.Exec(ctx, `INSERT INTO "readings" (id, celsius) VALUES (1, 20)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("readings")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.BigInt("celsius"))
+	after.AddCheck("readings_sane", `no_such_function("celsius") > 0`)
+
+	_, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	refusal := mustRefuse(t, err)
+	if !hasRule(refusal, "add-check-constraint", "readings_sane") {
+		t.Fatalf("the refusal did not name the constraint: %v", refusal.Changes)
+	}
+	if !strings.Contains(refusal.Error(), "reported unconfirmed") {
+		t.Errorf("the refusal does not say the rows could not settle it:\n%s", refusal.Error())
+	}
+	// And it was right to stand its ground: the rebuild it was in front
+	// of does not work either.
+	_, err = sqlite.Push(ctx, db, sqlite.NewSchema(after), sqlite.PushOptions{AllowDestructive: true})
+	if err == nil {
+		t.Error("SQLite accepted a CHECK calling a function it does not have")
+	}
+}

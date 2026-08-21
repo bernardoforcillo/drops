@@ -869,6 +869,34 @@ once a 1.0 is cut.
   through untouched. `DryRun` reports rather than refusing, in
   `PushResult.Destructive`.
 
+- **The same guard now covers a `UNIQUE` added over duplicate rows and
+  a `CHECK` added over rows that break it.** Two more rules,
+  `add-unique-constraint` and `add-check-constraint`, of the same shape
+  as `alter-column-set-not-null` and failing the same way: the
+  rebuild's `INSERT … SELECT` dies partway on a constraint error and
+  the transaction rolls back. No data is lost, which is why they were
+  left out — and leaving them out is exactly the failure the NOT NULL
+  rule exists to turn into a readable refusal, with the documentation
+  claiming the rule set covered what a rebuild costs.
+
+  Like the NOT NULL rule they are probed rather than assumed, so
+  declaring a column unique that has held distinct values all along is
+  not a refusal demanding the override by reflex. The probes follow
+  SQLite's own semantics: NULLs are distinct in a unique index, so a
+  column of them is not a duplicate, and a `CHECK` fails only on a
+  value of false, so a row the expression is NULL for passes.
+
+  They read the table as the rebuild will present it rather than as it
+  stands — a column this push renames supplied under its new name, one
+  it adds under its default. That is not tidiness. SQLite re-reads a
+  double-quoted identifier matching no column as a string literal, so a
+  probe against the raw table asks a different question and answers it
+  confidently: a `GROUP BY` over the literal puts every row in one
+  group and refuses a push nothing is wrong with, and a `CHECK` over
+  the literal compares two constants and acquits one that is — a silent
+  acquittal, after which the push dies on the very constraint the probe
+  was asked about. All three shapes are pinned against a live engine.
+
 - **`NewEntity` now refuses a nullable column bound to a field that
   cannot hold NULL, and it refuses at package-var init time — so an
   upgraded program does not start until the schema says what it
@@ -928,6 +956,195 @@ once a 1.0 is cut.
   transaction carrying the bump is the one that commits.
 
 ### Fixed
+- **Four PostgreSQL schema changes the diff could not see, and a view
+  it could not order around.** Each of the first three was the same
+  shape: the snapshot recorded a value, both producers filled it in,
+  and `pg.Diff` compared the name it hung under and nothing else. A
+  declared change therefore became a change the database never
+  received, with `DetectDrift` — which is two `Diff`s — reporting the
+  two sides in sync for ever after.
+
+  **The PRIMARY KEY, at one column.** `BuildSnapshot` recorded a key in
+  `CompositePrimaryKeys` only past two columns, on the reasoning that a
+  narrower one rides on the column definition; `Introspect` mirrored
+  that, and `alterColumns` never compared primary-key-ness at all. The
+  column definition carries a bool, and a bool cannot say which columns
+  a key spans — so a key that reached the diff only as a bool was a key
+  the diff could not compare. Narrowing `(orgId, userId)` to `(userId)`
+  emitted the `DROP CONSTRAINT` with no `ADD` behind it and the table
+  lost its key silently; widening the other way emitted the `ADD` with
+  no `DROP` in front of it and PostgreSQL refused the migration whole
+  (42P16). The map now holds the key at every width, from both
+  producers, and `dropPrimaryKey`/`addPrimaryKey` match the two sides
+  by column list as they always did for a wide key — so a key
+  PostgreSQL named `users_pkey` and the same key drops names
+  `usersIdPk` are still one key and still no work.
+
+  Two consequences worth stating. `ColumnSnapshot.PrimaryKey` stays
+  true for a one-column key, because that is drizzle-kit's spelling and
+  what `drops pull` reads to write `.PrimaryKey()` back out, but it is
+  no longer what emits the key: `columnDefSQL` leaves `PRIMARY KEY` out
+  of the `CREATE TABLE` and the key is stated as its own `ALTER TABLE
+  ... ADD CONSTRAINT` at every width, which is what `Diff`'s doc
+  comment already claimed for every other constraint. And a snapshot
+  drizzle-kit wrote, which spells a narrow key only on the column, is
+  read back rather than mistaken for a table with no key.
+
+  The cost of keeping both spellings is that a snapshot now states a
+  one-column key twice, which the v7 format has no way to mark. Every
+  reader inside drops collapses the pair — `tablePrimaryKey` prefers
+  the map and reads the column only when it is empty, `drops pull`
+  skips the table-level form when the column already carries it — but
+  a consumer outside drops that rendered both would declare one key
+  twice and PostgreSQL would refuse the pair (42P16). It is noted on
+  `CompositePKSnapshot`, since it is the one place a drops snapshot
+  stretches the round trip the format exists for.
+
+  **A UNIQUE re-scoped under an unchanged name.** Widening
+  `UNIQUE(email)` to `UNIQUE(email, orgId)` produced no statement at
+  all — `pg.Diff` returned the empty list — so the rule the schema
+  declared and the rule the database enforced disagreed with nothing to
+  say so. `dropUniques`/`addUniques` now compare the column list and
+  drop and re-add the constraint, as `dropChecks` already did for an
+  expression that moved.
+
+  **A foreign key's referential actions.** `fkName` is built from the
+  columns and the target, so a key that starts pointing somewhere else
+  arrives under a new name and was already a drop and an add — but `ON
+  DELETE CASCADE` becoming `ON DELETE RESTRICT` keeps every part of that
+  name, produced nothing, and left the database deleting the children
+  of a deleted parent the schema said it should refuse to delete.
+  Compared by value now; `SchemaTo` is deliberately left out of the
+  comparison, since `Introspect` fills it and `BuildSnapshot` leaves it
+  empty for a table that never named a schema.
+
+  **A sequence's attributes**, found by auditing the rest of the
+  snapshot for the same shape. `Introspect` reads `seqincrement`,
+  `seqmin`, `seqmax`, `seqstart`, `seqcache` and `seqcycle` back and
+  `BuildSnapshot` records whatever `SequenceOptions` named, and neither
+  reached a comparison: `INCREMENT BY 1` becoming `INCREMENT BY 10` was
+  applied by nothing and reported by nothing. One `ALTER SEQUENCE`
+  carries every clause that moved — one statement rather than one each,
+  because `MINVALUE` and `MAXVALUE` have to widen together. The two
+  sides are compared on the values the server would end up with rather
+  than on the pointers, so a declaration spelling out a default
+  `Introspect` leaves unset is not churn. `START WITH` is stated and is
+  not `RESTART`: it sets the value a future restart would return to and
+  moves nothing the sequence is handing out today. That last choice has
+  a cost, now listed under "What Push cannot see": a declaration that
+  raises `MINVALUE` above the value the sequence is sitting on, or
+  lowers `MAXVALUE` below it, cannot be applied without moving it, so
+  PostgreSQL refuses the `ALTER` (22023) and the push rolls back whole.
+  A refusal naming the sequence and both numbers is the honest answer —
+  the alternative reading of "leave the live sequence alone" would be
+  to go on reporting success and changing nothing, which is the failure
+  this entry exists to close — but where a sequence should resume is a
+  question only an operator can answer, with an `ALTER SEQUENCE ...
+  RESTART` of their own. The rest of the
+  audit came back clean — a CHECK's expression, a policy's clauses and
+  an index's shape are all compared; `IndexSnapshot.NullsNotDistinct`
+  and `.With` are in the struct for drizzle-kit's format and are filled
+  by neither producer, which `indexEqual`'s doc comment now says
+  instead of claiming everything else is compared.
+
+  **And the view.** A view the schema still declares stood through the
+  whole migration, so a column any surviving view reads could not be
+  dropped (2BP01) or retyped (0A000) — and the unchanged view was the
+  worse half, because a body that did not move emits no statement for
+  any ordering rule to reach. Ordering cannot close it, so the view is
+  no longer ordered, it is rebuilt: a migration that drops or retypes
+  any column of any table now takes down every view both sides declare,
+  ahead of the table DDL, and states each of them again afterwards in
+  view-on-view dependency order. That order is
+  read out of the bodies, since the snapshot records what a view says
+  and not what it reads, and it fixes a second bug on the way: a schema
+  declaring a view over a view could not be created at all when the
+  names sorted the wrong way round.
+
+  The rebuild happens whether or not the view was in the way, because
+  which columns a view reads is exactly what the snapshot does not
+  record — and it is cheap, since a view holds no rows. Two things it
+  is not free of, both now on `Diff`: a `GRANT` on the view does not
+  survive it, and a materialised view is repopulated by its `CREATE`.
+
+  The drops are plain, not `CASCADE`, and that is the deliberate half:
+  a `CASCADE` from a declared view would take an undeclared one
+  selecting from it along with it, silently and for good, against the
+  rule that `Push` does not drop what the Go schema never claimed.
+  Without it PostgreSQL refuses — naming the view it could not drop,
+  which is the declared one, and saying only that "other objects depend
+  on it". The object worth naming is the one nobody declared, and
+  `Push` is the half that knows which those are, so it now checks
+  before anything runs and refuses with both names and the three ways
+  out: declare the view with `Schema.AddView` so it is rebuilt too,
+  drop it by hand, or set `DropUnmanagedObjects`.
+
+  Two limits are listed under "What Push cannot see": an undeclared
+  view still refuses a column change on its own account, and a view
+  body that resolves against the table it selects from — `SELECT *`
+  above all — is respelled by the probe before the table DDL runs, so
+  the expansion names the column that is about to go.
+
+  Every case is proved against live PostgreSQL 16 in
+  `integration/pgdiffvalue_test.go`, asserting the catalogue rather than
+  the statement list — for the narrowed key in particular, since the
+  bug there was the statement that was absent — with the diff-level half
+  in `pg/diff_values_test.go`.
+- **A MySQL migration that dropped a column and something naming it
+  could not be applied either, and its order was worse than
+  PostgreSQL's.** `mysql.Diff` emitted the column changes in the middle
+  and the foreign keys at the end, so a `DROP COLUMN` on a referenced
+  table came out ahead of the `DROP FOREIGN KEY` on the table pointing
+  at it: InnoDB refused the column drop with 1553 before any of the
+  stale-name errors could fire. And with no transactional DDL, a
+  migration that fails part way stays part way applied.
+
+  The rules are not PostgreSQL's, and the differences are the work. Read
+  off MariaDB 10.11: a secondary index over the dropped column alone is
+  removed with the column (1091 afterwards) while one over several
+  columns is **narrowed** to the columns that remain and stays — so the
+  PostgreSQL rule that a dependent goes whole when any of its columns
+  goes is false here, and suppressing the `DROP INDEX` on that
+  reasoning would leave a narrowed index standing and the next push
+  asking for the same drop for ever. A `UNIQUE` key over the column
+  alone goes with it, but a multi-column one is not narrowed and the
+  column drop is refused with 1072. A `CHECK` naming only that column
+  goes with it on MariaDB and is refused on MySQL 8.0.16+ with 3959;
+  one naming a surviving column too is refused on both with 1054.
+  Either side of a foreign key refuses with 1553, the index the key
+  needs included. A single-column `PRIMARY KEY` goes with its column, a
+  composite one refuses with 1072.
+
+  Every one of them points the same way, so `Diff` now emits the
+  foreign-key drops first across every table — they are the only kind
+  that reaches across tables, and dropping the key is what lets the
+  `UNIQUE` or `PRIMARY KEY` it pointed at be dropped at all — then the
+  indexes, `CHECK`s and primary keys table by table, then the columns,
+  with the adds behind them. The column changes stay batched into one
+  `ALTER TABLE` per table, because splitting them would copy the table
+  twice. Nine shapes are pinned against live MariaDB in
+  `integration/mysqldropdeps_test.go`, the last putting every one into
+  a single migration, and `mysql/diff_droporder_test.go` guards the
+  order without a server.
+
+  One hazard is not an ordering problem and is unchanged: `DROP PRIMARY
+  KEY` on a table whose key covers an `AUTO_INCREMENT` column is 1075
+  wherever the statement is put — the safety analyser flags it.
+
+  Ordering is not the whole of it under the default options, which is
+  where most pushes run. `Push` withholds the drop of an index the Go
+  schema never declared, since it cannot tell one the schema stopped
+  declaring from one somebody made by hand — and a withheld statement
+  is never ordered at all. Where the index keys a column the push
+  drops, that left a narrowed index standing under a notice saying the
+  index had been left alone, which by then was false, or stopped the
+  push on 1072 or 1553 with nothing to explain it. MySQL will not leave
+  such an index as it is whatever Push does, so withholding preserved
+  nothing; the drop now goes through by default, under a notice naming
+  the index and the departing column. An unmanaged index over columns
+  the push does not touch is still left alone, which is what the option
+  is for. Both halves are pinned in
+  `integration/mysqldropdeps_test.go`.
 - **A PostgreSQL migration that dropped a column and something naming
   it could not be applied.** `pg.Diff` emitted the column drop first
   and the constraint, index or policy drop after it, and PostgreSQL had

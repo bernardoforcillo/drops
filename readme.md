@@ -989,7 +989,7 @@ A runnable in-memory walkthrough is in [examples/generate/main.go](examples/gene
 
 What `GenerateMigration` covers (today): CREATE TABLE, DROP TABLE, ADD/DROP COLUMN, ALTER COLUMN type/NOT NULL/DEFAULT, UNIQUE and FOREIGN KEY (single- and multi-column, with ON DELETE/ON UPDATE), composite primary keys, CHECK constraints, indexes, enums, sequences, views and materialised views, row-level security (enabled and forced) and policies. `BuildSnapshot` fills all of those, and `Diff` renders DDL for them.
 
-What it does not cover: renames, which a structural diff cannot tell from a drop plus an add; an index's operator class, storage parameters, column ordering or `NULLS NOT DISTINCT`, none of which reach the snapshot; an index over an expression rather than a column, which the snapshot cannot describe at all; a change to a sequence's attributes, since sequences are compared by name; and removing or reordering an enum's labels, which PostgreSQL cannot do in place. `pg.Push`'s doc comment lists the same limits from the live-database side, along with the notices Push raises for the ones it can see but not act on.
+What it does not cover: renames, which a structural diff cannot tell from a drop plus an add; an index's operator class, storage parameters, column ordering or `NULLS NOT DISTINCT`, none of which reach the snapshot; an index over an expression rather than a column, which the snapshot cannot describe at all; which columns a view reads, so a migration that drops or retypes a column rebuilds every declared view rather than working out which ones were in the way; and removing or reordering an enum's labels, which PostgreSQL cannot do in place. `pg.Push`'s doc comment lists the same limits from the live-database side, along with the notices Push raises for the ones it can see but not act on.
 
 #### Pushing directly (`pg.Push`)
 
@@ -1587,12 +1587,16 @@ list, and each line says what it costs you.
 
 - Postgres introspection reads enums (labels in order), sequences,
   views, materialised views, RLS (enabled and forced) and policies, so
-  `Push` reaches a steady state for a schema declaring them. Two gaps
-  remain inside those objects: a sequence whose attributes moved is
-  neither applied nor reported — `Diff` compares sequences by name —
-  and an enum whose labels were reordered or removed is reported as a
-  notice and left alone, because PostgreSQL cannot do either in place.
-  `pg/push.go`'s "What Push cannot see" lists the rest.
+  `Push` reaches a steady state for a schema declaring them. One gap
+  remains inside those objects: an enum whose labels were reordered or
+  removed is reported as a notice and left alone, because PostgreSQL
+  cannot do either in place. A sequence whose attributes moved does get
+  its `ALTER SEQUENCE`, but where the sequence has got to is not part
+  of the declaration and no push restarts a live one — so raising
+  `MINVALUE` above the value it is sitting on, or lowering `MAXVALUE`
+  below it, is refused by PostgreSQL (22023) and rolls the push back
+  rather than resetting the sequence for you. `pg/push.go`'s "What Push
+  cannot see" lists the rest.
 - `DetectDrift` does not reach that steady state, and neither does
   `drops drift`. Both are pure snapshot arithmetic with no server to
   ask, so every expression — a CHECK body, a partial index's

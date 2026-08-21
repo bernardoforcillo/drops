@@ -541,6 +541,7 @@ type DestructiveChange struct {
 	// wherever the meaning is the same, so drop-column means here what
 	// it means there: "drop-table", "drop-column",
 	// "alter-column-type", "alter-column-set-not-null",
+	// "add-unique-constraint", "add-check-constraint",
 	// "rebuild-drops-index", "rebuild-stale-trigger".
 	Rule string
 
@@ -570,12 +571,15 @@ func (c DestructiveChange) String() string { return c.Rule + ": " + c.Message }
 // compared. Pass exactly what you pass Diff and the two agree on what
 // the migration means.
 //
-// The alter-column-set-not-null rule is the one whose answer this
-// function cannot finish. Whether a column that gains NOT NULL has any
-// NULL to carry is a fact about the rows, not about either schema, so
-// the rule reports every such column and leaves confirming it to the
-// caller that holds a database — see Push, which asks and discards the
-// ones the data acquits.
+// Three rules are ones whose answer this function cannot finish:
+// alter-column-set-not-null, add-unique-constraint and
+// add-check-constraint. Whether a column that gains NOT NULL has any
+// NULL to carry, whether one that gains UNIQUE holds a value twice,
+// whether a new CHECK has a row that breaks it — each is a fact about
+// the rows and not about either schema. The rules report every such
+// candidate and leave confirming it to the caller that holds a
+// database — see Push, which asks and discards the ones the data
+// acquits.
 func DestructiveChanges(prev, cur *Snapshot, opts ...DiffOptions) []DestructiveChange {
 	var opt DiffOptions
 	if len(opts) > 0 {
@@ -661,6 +665,7 @@ func tableLosses(prev, cur *TableSnapshot) []DestructiveChange {
 			})
 		}
 	}
+	out = append(out, tightenings(prev, cur)...)
 	if len(dropped) == 0 {
 		return out
 	}
@@ -704,6 +709,96 @@ func tableLosses(prev, cur *TableSnapshot) []DestructiveChange {
 		})
 	}
 	return out
+}
+
+// tightenings reports the constraints cur adds that the rows already in
+// the table may not satisfy: a UNIQUE over values that repeat, a CHECK
+// over rows that break it.
+//
+// They are the same shape as alter-column-set-not-null and they fail
+// the same way. Nothing is destroyed — SQLite refuses the rebuild's
+// INSERT ... SELECT and the transaction rolls back whole — but the
+// push dies partway through a rebuild on a constraint message, which
+// is precisely the failure the NOT NULL rule exists to turn into a
+// readable refusal. Leaving these two out left the rule set covering
+// less than what a rebuild costs while the documentation said it
+// covered it.
+//
+// Like that rule, these are candidates rather than findings: whether
+// the data actually contradicts the constraint is not in either
+// snapshot. Push puts each one to the database and drops the ones the
+// rows acquit, so declaring a column unique that has held distinct
+// values all along is not a refusal demanding the override by reflex.
+func tightenings(prev, cur *TableSnapshot) []DestructiveChange {
+	var out []DestructiveChange
+	// A single-column UNIQUE renders inline on the column, a
+	// multi-column one as a table-level constraint, and the two are
+	// the same constraint as far as the rows are concerned — so both
+	// arrive under one rule, named by the column and by the constraint
+	// respectively, and both are matched against the same set.
+	//
+	// That set is column tuples rather than names, for the reason
+	// sameUniqueKeys gives: SQLite stores a UNIQUE constraint as an
+	// anonymous index and reports it under a generated name, so a
+	// snapshot read out of a database never carries the name the schema
+	// gave it. Matching by name would call a constraint that has been
+	// enforced all along a new one, on every push.
+	was := map[string]bool{}
+	for _, tuple := range uniqueKeyTuples(prev) {
+		was[tuple] = true
+	}
+	for _, k := range sortedMapKeys(cur.Columns) {
+		c := cur.Columns[k]
+		if !c.Unique || c.PrimaryKey || was[k] {
+			continue
+		}
+		out = append(out, uniqueTightening(cur.Name, k, []string{k}))
+	}
+	for _, name := range sortedMapKeys(cur.UniqueConstraints) {
+		u := cur.UniqueConstraints[name]
+		if was[strings.Join(u.Columns, "\x00")] {
+			continue
+		}
+		out = append(out, uniqueTightening(cur.Name, name, u.Columns))
+	}
+	// A CHECK has no such trouble with names, and a different trouble
+	// instead: Introspect does not read SQLite's catalogue for CHECK
+	// constraints at all, so against a live database prev never has
+	// one and every declared CHECK arrives here as a candidate on every
+	// push. The probe settles it — a constraint the table already
+	// enforces has no row that breaks it — at the cost of one count
+	// query per push.
+	for _, name := range sortedMapKeys(cur.CheckConstraints) {
+		c := cur.CheckConstraints[name]
+		if prevC, ok := prev.CheckConstraints[name]; ok && prevC.Value == c.Value {
+			continue
+		}
+		out = append(out, DestructiveChange{
+			Rule:   "add-check-constraint",
+			Table:  cur.Name,
+			Object: name,
+			Message: "CHECK " + quoteIdent(name) + " on " + quoteIdent(cur.Name) + " is new; the rebuild's INSERT ... SELECT " +
+				"carries every existing row through it, so a row that breaks it fails the push partway rather than converging.",
+			Suggestion: "Find the rows first — SELECT * FROM " + quoteIdent(cur.Name) + " WHERE NOT (" + c.Value + ") — and fix or delete them before pushing.",
+		})
+	}
+	return out
+}
+
+func uniqueTightening(table, object string, columns []string) DestructiveChange {
+	spans := quoteIdent(columns[0])
+	if len(columns) > 1 {
+		spans = "(" + strings.Join(quoteIdentList(columns), ", ") + ")"
+	}
+	return DestructiveChange{
+		Rule:   "add-unique-constraint",
+		Table:  table,
+		Object: object,
+		Message: "UNIQUE " + quoteIdent(object) + " on " + quoteIdent(table) + " is new over " + spans +
+			"; the rebuild's INSERT ... SELECT carries every existing row through it, so a value already held twice fails the push partway rather than converging.",
+		Suggestion: "Find the duplicates first — SELECT " + strings.Join(quoteIdentList(columns), ", ") + ", count(*) FROM " + quoteIdent(table) +
+			" GROUP BY " + strings.Join(quoteIdentList(columns), ", ") + " HAVING count(*) > 1 — and resolve them before pushing.",
+	}
 }
 
 // narrowsAffinity reports whether re-declaring a column from to to

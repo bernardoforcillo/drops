@@ -18,7 +18,7 @@ func TestDiffSafeIfNotExistsCreateTable(t *testing.T) {
 	pg.Add(users, pg.Text("name").NotNull())
 
 	stmts := pg.Diff(pg.EmptySnapshot(), pg.BuildSnapshot(pg.NewSchema(users)), pg.DiffOptions{Safe: true})
-	if len(stmts) != 1 || !strings.HasPrefix(stmts[0], `CREATE TABLE IF NOT EXISTS "users"`) {
+	if len(stmts) == 0 || !strings.HasPrefix(stmts[0], `CREATE TABLE IF NOT EXISTS "users"`) {
 		t.Errorf("expected CREATE TABLE IF NOT EXISTS, got: %v", stmts)
 	}
 }

@@ -302,12 +302,18 @@ func hasSequenceDefault(def string) bool {
 
 // readIntrospectPrimaryKeys records each table's PRIMARY KEY.
 //
-// Where the key lands mirrors BuildSnapshot: a single-column key on the
-// column, a multi-column one in CompositePrimaryKeys under the name the
-// catalogue holds. Marking every column of a two-column key
-// PrimaryKey=true instead would describe a table PostgreSQL cannot
-// have — two inline primary keys — and would leave the composite map
-// empty, so Diff saw the declared key as new work on every push.
+// Where the key lands mirrors BuildSnapshot: in CompositePrimaryKeys
+// under the name the catalogue holds, whatever its arity, and
+// additionally as PrimaryKey=true on the column when it spans exactly
+// one — the spelling drizzle-kit uses and `drops pull` reads.
+// Marking every column of a two-column key PrimaryKey=true instead
+// would describe a table PostgreSQL cannot have: two inline primary
+// keys.
+//
+// The column list is what Diff compares, so a one-column key has to
+// arrive as a list too. Recording it only as a bool left the width of
+// the key unsayable, and a key that narrowed from two columns to one
+// was dropped and never re-added.
 //
 // Key columns are NOT NULL either way; PostgreSQL sets attnotnull when
 // the key is created.
@@ -359,11 +365,9 @@ func readIntrospectPrimaryKeys(ctx context.Context, db *DB, schemas []string, ta
 				col.PrimaryKey = len(columns) == 1
 			}
 		}
-		if len(columns) > 1 {
-			ts.CompositePrimaryKeys[k.name] = &CompositePKSnapshot{
-				Name:    k.name,
-				Columns: columns,
-			}
+		ts.CompositePrimaryKeys[k.name] = &CompositePKSnapshot{
+			Name:    k.name,
+			Columns: columns,
 		}
 	}
 	return nil

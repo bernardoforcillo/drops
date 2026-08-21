@@ -75,14 +75,59 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 //  1. the renames DiffOptions.Renames states, tables before columns, so
 //     everything below is computed against a previous schema in which
 //     they have already run;
-//  2. DROP FOREIGN KEY on any constraint pointing at a table about to
-//     go, because InnoDB refuses to drop a table something references;
+//  2. DROP FOREIGN KEY for every key that is going — whether because
+//     the schema stopped declaring it, or because a table it names is
+//     about to go;
 //  3. DROP TABLE for tables removed entirely;
 //  4. CREATE TABLE for new tables, carrying their columns and PRIMARY
 //     KEY only;
-//  5. per-table column changes, then index and CHECK changes;
-//  6. FOREIGN KEY changes last, once every table and column they name
-//     exists.
+//  5. DROP INDEX, DROP CONSTRAINT and DROP PRIMARY KEY for everything
+//     else on a surviving table that names a column and is going;
+//  6. the column changes — DROP COLUMN, ADD COLUMN, MODIFY COLUMN —
+//     once nothing names the columns leaving;
+//  7. ADD PRIMARY KEY, CREATE INDEX and ADD CONSTRAINT … CHECK, once
+//     the columns they span are there;
+//  8. ADD CONSTRAINT … FOREIGN KEY last, once every table, column and
+//     key they name exists.
+//
+// # What MySQL does to a dependent when its column goes
+//
+// Steps 2, 5 and 6 are one rule, and it is not PostgreSQL's. There, a
+// dependent goes whole whenever any column it names goes, so the only
+// hazard is a statement that names it afterwards. MySQL answers
+// differently for each kind, and the answers were read off a live
+// server rather than off the manual:
+//
+//   - a secondary index over the dropped column alone is removed with
+//     the column, so a DROP INDEX afterwards names nothing (1091);
+//   - a secondary index over several columns is narrowed to the ones
+//     that remain, and stays. Nothing was removed, so the DROP INDEX
+//     is not stale — it is the only thing that gets rid of the index.
+//     This is why the drops are emitted rather than suppressed on the
+//     grounds that the column drop took them: suppressing here would
+//     leave a narrowed index standing and the next push asking for the
+//     same drop for ever;
+//   - a UNIQUE key over the dropped column alone is removed with it,
+//     but MariaDB will not narrow one spanning several columns and
+//     refuses the column drop outright (1072);
+//   - a CHECK naming only the dropped column is removed with it on
+//     MariaDB and refused on MySQL 8.0.16+ (3959); one naming a
+//     surviving column too is refused on both (1054);
+//   - a column on either side of a foreign key cannot be dropped while
+//     the key stands, and neither can the index the key needs (1553);
+//   - a PRIMARY KEY over the dropped column alone goes with it, and a
+//     composite one is refused (1072).
+//
+// Every one of them points the same way — the dependent goes before
+// the column — so that is the order, and the differences show up only
+// in which error the wrong order produces. The foreign keys go ahead
+// of the rest because they are the one kind that reaches across
+// tables: it is dropping the key first that lets the UNIQUE or the
+// PRIMARY KEY it pointed at be dropped at all.
+//
+// The one hazard ordering does not reach is a PRIMARY KEY covering an
+// AUTO_INCREMENT column: DROP PRIMARY KEY on its own is 1075 whatever
+// order it comes in. See dropPrimaryKey.
 //
 // # Why the PRIMARY KEY is inline and nothing else is
 //
@@ -140,9 +185,9 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	// it. Ordering the drops by dependency would do instead, until two
 	// tables reference each other — which InnoDB permits. Clearing
 	// every cross-reference first makes the order of the drops below
-	// irrelevant, cycles included. The per-table pass further down
-	// would have dropped the ones on surviving tables anyway, so it is
-	// told which are already gone.
+	// irrelevant, cycles included. The per-table pass just after would
+	// have dropped the ones on surviving tables anyway, so it is told
+	// which are already gone.
 	preDropped := map[string]bool{}
 	for _, key := range sortedKeys(prev.Tables) {
 		pt := prev.Tables[key]
@@ -153,6 +198,13 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 				preDropped[pt.Name+"."+name] = true
 			}
 		}
+	}
+	// The rest of the keys that are going, still ahead of everything
+	// else: a key is the one dependent that reaches across tables, and
+	// while it stands neither of the two columns it joins can be
+	// dropped, nor the index on the referenced side (1553).
+	for _, key := range sortedKeys(cur.Tables) {
+		out = append(out, dropForeignKeys(prevTable(prev, key), cur.Tables[key], preDropped)...)
 	}
 	for _, key := range sortedKeys(prev.Tables) {
 		if dropped[key] {
@@ -165,30 +217,65 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 		}
 	}
 
-	for _, key := range sortedKeys(cur.Tables) {
-		curT := cur.Tables[key]
-		prevT, exists := prev.Tables[key]
-		if !exists {
-			// The CREATE TABLE above already carried this table's
-			// columns and its primary key; only the objects it does
-			// not carry are left to emit.
-			prevT = newTableSnapshot(curT.Name)
-		} else {
-			out = append(out, diffColumns(prevT, curT, opt)...)
-			out = append(out, diffPrimaryKey(prevT, curT)...)
-		}
-		out = append(out, diffIndexes(prevT, curT)...)
-		out = append(out, diffChecks(prevT, curT, opt)...)
+	// What is left that names a column, before the columns go. A table
+	// this migration creates has nothing on its old side, so only the
+	// tables both snapshots have can contribute a drop.
+	surviving := survivingTables(prev, cur)
+	for _, key := range surviving {
+		prevT, curT := prev.Tables[key], cur.Tables[key]
+		out = append(out, dropIndexes(prevT, curT)...)
+		out = append(out, dropChecks(prevT, curT, opt)...)
+		out = append(out, dropPrimaryKey(prevT, curT)...)
+	}
+	// The columns themselves, batched per table: the drops the pass
+	// above cleared the way for, and the adds and restatements, which
+	// are in the same ALTER TABLE because splitting them would copy
+	// the table twice. See Batching.
+	for _, key := range surviving {
+		out = append(out, diffColumns(prev.Tables[key], cur.Tables[key], opt)...)
+	}
+
+	// Everything the columns now support. A table cur creates already
+	// carries its columns and its PRIMARY KEY from the CREATE TABLE;
+	// its indexes and CHECK constraints are still to come.
+	for _, key := range surviving {
+		out = append(out, addPrimaryKey(prev.Tables[key], cur.Tables[key])...)
 	}
 	for _, key := range sortedKeys(cur.Tables) {
-		curT := cur.Tables[key]
-		prevT, exists := prev.Tables[key]
-		if !exists {
-			prevT = newTableSnapshot(curT.Name)
-		}
-		out = append(out, diffForeignKeys(prevT, curT, preDropped)...)
+		prevT, curT := prevTable(prev, key), cur.Tables[key]
+		out = append(out, addIndexes(prevT, curT)...)
+		out = append(out, addChecks(prevT, curT)...)
+	}
+	// Foreign keys after the CREATE TABLEs so cross-table references
+	// resolve, and after the indexes because a key can only point at a
+	// column an index covers.
+	for _, key := range sortedKeys(cur.Tables) {
+		out = append(out, addForeignKeys(prevTable(prev, key), cur.Tables[key])...)
 	}
 	return append(renames, out...)
+}
+
+// prevTable returns the table's previous shape, or an empty one when
+// this migration creates it. Every pass below is written against two
+// sides; handing a new table an empty old side keeps each pass from
+// needing its own special case.
+func prevTable(prev *Snapshot, name string) *TableSnapshot {
+	if t, ok := prev.Tables[name]; ok {
+		return t
+	}
+	return newTableSnapshot(name)
+}
+
+// survivingTables lists, in sorted order, the tables both snapshots
+// have — the ones a column diff is about.
+func survivingTables(prev, cur *Snapshot) []string {
+	var out []string
+	for _, key := range sortedKeys(cur.Tables) {
+		if _, ok := prev.Tables[key]; ok {
+			out = append(out, key)
+		}
+	}
+	return out
 }
 
 // ----------------------------------------------------------------------
@@ -385,7 +472,14 @@ func onlyDefaultDiffers(a, b *ColumnSnapshot, server ServerInfo) bool {
 // Keys, indexes, checks and foreign keys
 // ----------------------------------------------------------------------
 
-// diffPrimaryKey emits DROP PRIMARY KEY / ADD PRIMARY KEY.
+// dropPrimaryKey emits DROP PRIMARY KEY when the key is going or is
+// about to be restated, and addPrimaryKey is its other half. The two
+// are emitted a long way apart — the drop with the other dependents,
+// the add once the columns are in their final shape — because a
+// primary key over a column that is leaving refuses to be narrowed:
+// MariaDB answers 1072 to a DROP COLUMN naming one column of a
+// composite key, and takes a single-column key away with its column,
+// which makes the DROP PRIMARY KEY that came afterwards a 1091.
 //
 // The two sides are matched by their column list, never by name: MySQL
 // calls every primary key PRIMARY, so the name carries no information
@@ -395,24 +489,30 @@ func onlyDefaultDiffers(a, b *ColumnSnapshot, server ServerInfo) bool {
 // key covers an AUTO_INCREMENT column cannot have it dropped — error
 // 1075, "there can be only one auto column and it must be defined as a
 // key" — and the ADD that would have restored it never runs, because
-// the DROP failed and there is no transaction. The safety analyser
-// flags it.
-func diffPrimaryKey(prev, cur *TableSnapshot) []string {
-	prevPK, curPK := prev.PrimaryKey, cur.PrimaryKey
-	switch {
-	case prevPK == nil && curPK == nil:
-		return nil
-	case curPK == nil:
-		return []string{fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quoteIdent(cur.Name))}
-	case prevPK == nil:
-		return []string{addPrimaryKeySQL(cur.Name, curPK)}
-	case sameStrings(prevPK.Columns, curPK.Columns) && sameInts(prevPK.Prefixes, curPK.Prefixes):
+// the DROP failed and there is no transaction. Ordering does not reach
+// that one: the statement fails wherever it is put, and it is what the
+// safety analyser flags.
+func dropPrimaryKey(prev, cur *TableSnapshot) []string {
+	if prev.PrimaryKey == nil || primaryKeyEqual(prev.PrimaryKey, cur.PrimaryKey) {
 		return nil
 	}
-	return []string{
-		fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quoteIdent(cur.Name)),
-		addPrimaryKeySQL(cur.Name, curPK),
+	return []string{fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY;", quoteIdent(cur.Name))}
+}
+
+// addPrimaryKey emits ADD PRIMARY KEY for a key cur declares and prev
+// did not have in that shape.
+func addPrimaryKey(prev, cur *TableSnapshot) []string {
+	if cur.PrimaryKey == nil || primaryKeyEqual(prev.PrimaryKey, cur.PrimaryKey) {
+		return nil
 	}
+	return []string{addPrimaryKeySQL(cur.Name, cur.PrimaryKey)}
+}
+
+func primaryKeyEqual(a, b *PrimaryKeySnapshot) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return sameStrings(a.Columns, b.Columns) && sameInts(a.Prefixes, b.Prefixes)
 }
 
 func addPrimaryKeySQL(table string, pk *PrimaryKeySnapshot) string {
@@ -420,9 +520,16 @@ func addPrimaryKeySQL(table string, pk *PrimaryKeySnapshot) string {
 		quoteIdent(table), keyPartList(pk.Columns, pk.Prefixes))
 }
 
-// diffIndexes emits CREATE INDEX / DROP INDEX. An index is never
-// altered in place: any structural change drops and recreates it.
-func diffIndexes(prev, cur *TableSnapshot) []string {
+// dropIndexes emits DROP INDEX for every index cur no longer declares
+// and every one whose shape changed — an index is never altered in
+// place, so any structural change drops and recreates it.
+//
+// The drop is emitted even for an index whose every column is about to
+// go. On MariaDB such an index is sometimes removed with the column
+// and sometimes only narrowed, and the two cases are not distinguished
+// here: a drop naming an index the server already took is a 1091, but
+// it never comes to that, because the drop is emitted first. See Diff.
+func dropIndexes(prev, cur *TableSnapshot) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.Indexes) {
 		curIdx, present := cur.Indexes[k]
@@ -430,6 +537,13 @@ func diffIndexes(prev, cur *TableSnapshot) []string {
 			out = append(out, dropIndexSQL(cur.Name, k))
 		}
 	}
+	return out
+}
+
+// addIndexes emits CREATE INDEX for every index cur newly declares or
+// restates.
+func addIndexes(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.Indexes) {
 		curIdx := cur.Indexes[k]
 		if len(curIdx.Columns) == 0 {
@@ -509,14 +623,15 @@ func dropIndexSQL(table, name string) string {
 	return fmt.Sprintf("DROP INDEX %s ON %s;", quoteIdent(name), quoteIdent(table))
 }
 
-// diffChecks emits ADD / DROP CONSTRAINT for CHECK constraints. A
-// constraint whose expression changed under an unchanged name is
-// dropped and re-added: neither server can alter one in place.
+// dropChecks emits DROP CONSTRAINT for every CHECK cur no longer
+// declares, and for every one whose expression changed under an
+// unchanged name: neither server can alter one in place, so a changed
+// constraint is dropped and re-added.
 //
 // The comparison is textual, so both sides have to be spelled alike.
 // Against a live server that is Push's job — see probeCheckExpressions
 // — not Diff's.
-func diffChecks(prev, cur *TableSnapshot, opt DiffOptions) []string {
+func dropChecks(prev, cur *TableSnapshot, opt DiffOptions) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.CheckConstraints) {
 		curC, ok := cur.CheckConstraints[k]
@@ -524,6 +639,13 @@ func diffChecks(prev, cur *TableSnapshot, opt DiffOptions) []string {
 			out = append(out, dropCheckSQL(cur.Name, k, opt.Server))
 		}
 	}
+	return out
+}
+
+// addChecks is dropChecks's other half, emitted once the columns the
+// expressions name are in place.
+func addChecks(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.CheckConstraints) {
 		if prevC, ok := prev.CheckConstraints[k]; ok && prevC.Value == cur.CheckConstraints[k].Value {
 			continue
@@ -547,10 +669,11 @@ func dropCheckSQL(table, name string, server ServerInfo) string {
 	return fmt.Sprintf("ALTER TABLE %s %s %s;", quoteIdent(table), verb, quoteIdent(name))
 }
 
-// diffForeignKeys emits the foreign-key changes for one table.
-// alreadyDropped names the constraints Diff has already emitted a drop
-// for, because they pointed at a table that is going.
-func diffForeignKeys(prev, cur *TableSnapshot, alreadyDropped map[string]bool) []string {
+// dropForeignKeys emits DROP FOREIGN KEY for one table's keys that are
+// going or being restated. alreadyDropped names the constraints Diff
+// has already emitted a drop for, because they pointed at a table that
+// is going.
+func dropForeignKeys(prev, cur *TableSnapshot, alreadyDropped map[string]bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.ForeignKeys) {
 		if alreadyDropped[cur.Name+"."+k] {
@@ -561,6 +684,13 @@ func diffForeignKeys(prev, cur *TableSnapshot, alreadyDropped map[string]bool) [
 			out = append(out, dropForeignKeySQL(cur.Name, k))
 		}
 	}
+	return out
+}
+
+// addForeignKeys is dropForeignKeys's other half, emitted last of all
+// so every table, column and key a constraint names already exists.
+func addForeignKeys(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.ForeignKeys) {
 		if prevFK, ok := prev.ForeignKeys[k]; ok && foreignKeyEqual(prevFK, cur.ForeignKeys[k]) {
 			continue

@@ -219,6 +219,16 @@ func tableExtras(t *pg.TableSnapshot, tableVar string, colVar map[string]string)
 	}
 	for _, name := range sortedKeysOf(t.CompositePrimaryKeys) {
 		pk := t.CompositePrimaryKeys[name]
+		// The snapshot records a key of one column in both places:
+		// here, because that is the list Diff compares, and on the
+		// column, because that is drizzle-kit's spelling. columnExpr
+		// has already written the column's `.PrimaryKey()`, so writing
+		// the table-level form too would declare one key twice.
+		if len(pk.Columns) == 1 {
+			if c, ok := t.Columns[pk.Columns[0]]; ok && c.PrimaryKey {
+				continue
+			}
+		}
 		if args, ok := refList(pk.Columns, ref); ok {
 			out = append(out, fmt.Sprintf("%s.PrimaryKey(%s)", tableVar, args))
 		}

@@ -165,10 +165,19 @@ func (e *DestructiveChangeError) Error() string {
 //     numeric one, and the copy converts as it goes: '007' arrives as
 //     the integer 7.
 //   - alter-column-set-not-null — the column gains NOT NULL and the
-//     rows still hold NULLs, which the copy will not accept. Push
-//     confirms this one against the data before reporting it, so a
-//     table with no NULLs in the column is not stopped for nothing;
-//     see confirmNotNullLosses.
+//     rows still hold NULLs, which the copy will not accept.
+//   - add-unique-constraint — the column or the column list gains
+//     UNIQUE and the rows already hold a value twice.
+//   - add-check-constraint — the table gains a CHECK and a row already
+//     breaks it.
+//
+// The last three cost no data: SQLite refuses the copy and the whole
+// transaction rolls back. What they buy is a refusal that names the
+// constraint and counts the rows in the way, instead of a constraint
+// message from halfway through a rebuild. All three are put to the
+// data before they are reported, so a tightening the rows already
+// satisfy is not stopped for nothing — see confirmAgainstTheRows.
+//
 //   - rebuild-drops-index and rebuild-stale-trigger — the index that
 //     keys a departing column, which the rebuild does not put back,
 //     and the trigger that names one, which it puts back broken. Diff
@@ -208,8 +217,9 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		return &PushResult{Statements: nil, Applied: false}, nil
 	}
 
-	destructive, err := confirmNotNullLosses(ctx, db,
-		DestructiveChanges(owned, desired, DiffOptions{Renames: renames}), renames)
+	destructive, err := confirmAgainstTheRows(ctx, db,
+		DestructiveChanges(owned, desired, DiffOptions{Renames: renames}),
+		owned, desired, renames)
 	if err != nil {
 		return nil, err
 	}
@@ -233,45 +243,94 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	return &PushResult{Statements: stmts, Applied: true, Destructive: destructive}, nil
 }
 
-// confirmNotNullLosses puts the alter-column-set-not-null findings to
-// the database and keeps only the ones the rows bear out.
+// confirmAgainstTheRows puts the three findings that are not settled by
+// the schemas alone to the database, and keeps only the ones the rows
+// bear out.
 //
-// Every other rule is settled by the two schemas alone: a column either
-// is in both or is not, a declared type either changes affinity or does
-// not. This one is not. "Gains NOT NULL" is a fact about the schemas;
-// "and there are NULLs to carry" is a fact about the rows, and only the
-// second one costs anything — a table with no NULL in that column
-// rebuilds cleanly and has nothing to be stopped for.
+// Every other rule is settled by the two schemas: a column either is in
+// both or is not, a declared type either changes affinity or does not.
+// These three are half a fact each. "Gains NOT NULL", "gains UNIQUE",
+// "gains a CHECK" are facts about the schemas; "and there are NULLs to
+// carry", "and a value is already held twice", "and a row already
+// breaks it" are facts about the rows, and only the second halves cost
+// anything.
 //
 // Refusing without asking would be the more conservative choice and the
-// worse one. Tightening a column that was never actually null is an
+// worse one. Tightening a column that was never actually null, or
+// declaring one unique that has held distinct values all along, is an
 // ordinary, frequent change, and a guard that demands AllowDestructive
 // for it teaches the reflex of setting AllowDestructive — after which
 // the option is no longer protecting the drop-column case it exists
 // for.
 //
-// The lookup is by the names the database has now. The findings are
-// computed against a previous schema in which the renames have already
-// been applied, but nothing has run yet, so the live table still
-// answers to the name it had before this push.
-func confirmNotNullLosses(ctx context.Context, db *DB, changes []DestructiveChange, renames []Rename) ([]DestructiveChange, error) {
+// A probe that cannot be answered is never an acquittal, but the two
+// kinds of failure are not the same. The NOT NULL probe is a lookup of
+// one column that both snapshots agree exists, so a query that will not
+// run there is a fault rather than an awkward schema, and it comes back
+// as an error. The other two carry a column list and an expression the
+// schema wrote, and an expression SQLite will not evaluate outside a
+// CHECK is an ordinary thing to be handed — so the finding is kept and
+// says it is unconfirmed. Discarding it would mean the failure this
+// guard exists to prevent happening anyway, silently.
+func confirmAgainstTheRows(ctx context.Context, db *DB, changes []DestructiveChange, live, desired *Snapshot, renames []Rename) ([]DestructiveChange, error) {
 	out := make([]DestructiveChange, 0, len(changes))
 	for _, c := range changes {
-		if c.Rule != "alter-column-set-not-null" {
-			out = append(out, c)
-			continue
+		switch c.Rule {
+		case "alter-column-set-not-null":
+			table, column := liveNames(renames, c.Table, c.Object)
+			n, err := countRows(ctx, db,
+				"SELECT count(*) FROM "+quoteIdent(table)+" WHERE "+quoteIdent(column)+" IS NULL")
+			if err != nil {
+				return nil, fmt.Errorf("drops/sqlite: counting NULLs in %s.%s: %w", table, column, err)
+			}
+			if n == 0 {
+				continue
+			}
+			c.Message = fmt.Sprintf("column %s of %s gains NOT NULL and %d row(s) hold NULL there; "+
+				"the rebuild's INSERT ... SELECT carries those NULLs into a column that rejects them, so the push fails partway rather than converging.",
+				quoteIdent(c.Object), quoteIdent(c.Table), n)
+		case "add-unique-constraint":
+			source, columns := probeSource(live, desired, renames, c.Table), uniqueColumns(desired, c.Table, c.Object)
+			// Every column IS NOT NULL: SQLite counts NULLs as
+			// distinct from one another in a unique index, so a group
+			// of them is not a duplicate and grouping them would
+			// refuse a push nothing is wrong with.
+			var conds, keys []string
+			for _, col := range columns {
+				conds = append(conds, quoteIdent(col)+" IS NOT NULL")
+				keys = append(keys, quoteIdent(col))
+			}
+			n, err := countRows(ctx, db, "SELECT count(*) FROM (SELECT 1 FROM "+source+
+				" WHERE "+strings.Join(conds, " AND ")+" GROUP BY "+strings.Join(keys, ", ")+" HAVING count(*) > 1)")
+			if err != nil {
+				c.Message += " The rows could not be checked for duplicates (" + err.Error() + "), so this is reported unconfirmed."
+				break
+			}
+			if n == 0 {
+				continue
+			}
+			c.Message = fmt.Sprintf("UNIQUE %s on %s is new over %s, and %d group(s) of rows already share a value there; "+
+				"the rebuild's INSERT ... SELECT carries them into a constraint that rejects them, so the push fails partway rather than converging.",
+				quoteIdent(c.Object), quoteIdent(c.Table), strings.Join(quoteIdentList(columns), ", "), n)
+		case "add-check-constraint":
+			source, expr := probeSource(live, desired, renames, c.Table), checkExpression(desired, c.Table, c.Object)
+			// NOT (expr) rather than "expr is not true": SQLite fails
+			// a CHECK only on a value of false, so a row the
+			// expression is NULL for passes, and NOT (NULL) is NULL,
+			// which the WHERE also drops. The two agree by
+			// construction.
+			n, err := countRows(ctx, db, "SELECT count(*) FROM "+source+" WHERE NOT ("+expr+")")
+			if err != nil {
+				c.Message += " The rows could not be checked against it (" + err.Error() + "), so this is reported unconfirmed."
+				break
+			}
+			if n == 0 {
+				continue
+			}
+			c.Message = fmt.Sprintf("CHECK %s on %s is new and %d row(s) already break it; "+
+				"the rebuild's INSERT ... SELECT carries them into a constraint that rejects them, so the push fails partway rather than converging.",
+				quoteIdent(c.Object), quoteIdent(c.Table), n)
 		}
-		table, column := liveNames(renames, c.Table, c.Object)
-		n, err := countNulls(ctx, db, table, column)
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			continue
-		}
-		c.Message = fmt.Sprintf("column %s of %s gains NOT NULL and %d row(s) hold NULL there; "+
-			"the rebuild's INSERT ... SELECT carries those NULLs into a column that rejects them, so the push fails partway rather than converging.",
-			quoteIdent(c.Object), quoteIdent(c.Table), n)
 		out = append(out, c)
 	}
 	if len(out) == 0 {
@@ -280,21 +339,104 @@ func confirmNotNullLosses(ctx context.Context, db *DB, changes []DestructiveChan
 	return out, nil
 }
 
-// countNulls asks how many rows hold NULL in one column.
-func countNulls(ctx context.Context, db *DB, table, column string) (int64, error) {
-	rows, err := db.Query(ctx, "SELECT count(*) FROM "+quoteIdent(table)+" WHERE "+quoteIdent(column)+" IS NULL")
+// uniqueColumns returns the columns a new UNIQUE spans, under the names
+// the new schema gives them. A single-column one is named by its
+// column and renders inline; a multi-column one is named by the
+// constraint.
+func uniqueColumns(desired *Snapshot, table, object string) []string {
+	if t, ok := desired.Tables[table]; ok {
+		if u, ok := t.UniqueConstraints[object]; ok {
+			return u.Columns
+		}
+	}
+	return []string{object}
+}
+
+// checkExpression returns the SQL inside a new CHECK.
+func checkExpression(desired *Snapshot, table, object string) string {
+	if t, ok := desired.Tables[table]; ok {
+		if c, ok := t.CheckConstraints[object]; ok {
+			return c.Value
+		}
+	}
+	return "1"
+}
+
+// probeSource renders what the row probes select from: the live table,
+// presented under the names the new schema uses.
+//
+// Querying the live table directly is wrong twice over, and neither
+// mistake announces itself. A column this push renames is still there
+// under its old name, and one it adds is not there at all — and SQLite
+// re-reads a double-quoted identifier matching no column as a string
+// literal rather than failing. A GROUP BY over such a "column" puts
+// every row in one group and reports duplication that is not there; a
+// CHECK over one compares a constant and reports none that is. The
+// second is the dangerous direction: a silent acquittal, and the push
+// then dies on the constraint the probe was asked about.
+//
+// So the probes select from a projection that supplies both — the
+// renamed columns under their new names, and the added ones at the
+// value the rebuild's INSERT ... SELECT will leave them at, which is
+// their default or NULL.
+func probeSource(live, desired *Snapshot, renames []Rename, table string) string {
+	// The column argument is empty because only the table's own name
+	// is being unwound here; liveNames maps the two independently.
+	liveName, _ := liveNames(renames, table, "")
+	liveT, ok := live.Tables[liveName]
+	if !ok {
+		return quoteIdent(liveName)
+	}
+	curT, ok := desired.Tables[table]
+	if !ok {
+		return quoteIdent(liveName)
+	}
+	var extras []string
+	renamed := map[string]bool{}
+	for _, r := range renames {
+		if r.Kind != RenameColumn || r.Table != table {
+			continue
+		}
+		if _, clash := liveT.Columns[r.To]; clash {
+			continue
+		}
+		if _, from := liveT.Columns[r.From]; !from {
+			continue
+		}
+		renamed[r.To] = true
+		extras = append(extras, quoteIdent(r.From)+" AS "+quoteIdent(r.To))
+	}
+	for _, k := range sortedMapKeys(curT.Columns) {
+		if _, live := liveT.Columns[k]; live || renamed[k] {
+			continue
+		}
+		value := "NULL"
+		if d := curT.Columns[k].Default; d != nil && *d != "" {
+			value = *d
+		}
+		extras = append(extras, value+" AS "+quoteIdent(k))
+	}
+	if len(extras) == 0 {
+		return quoteIdent(liveName)
+	}
+	return "(SELECT *, " + strings.Join(extras, ", ") + " FROM " + quoteIdent(liveName) + ")"
+}
+
+// countRows runs a one-row, one-column count query.
+func countRows(ctx context.Context, db *DB, query string) (int64, error) {
+	rows, err := db.Query(ctx, query)
 	if err != nil {
-		return 0, fmt.Errorf("drops/sqlite: counting NULLs in %s.%s: %w", table, column, err)
+		return 0, err
 	}
 	defer rows.Close()
 	var n int64
 	if rows.Next() {
 		if err := rows.Scan(&n); err != nil {
-			return 0, fmt.Errorf("drops/sqlite: counting NULLs in %s.%s: %w", table, column, err)
+			return 0, err
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("drops/sqlite: counting NULLs in %s.%s: %w", table, column, err)
+		return 0, err
 	}
 	return n, nil
 }

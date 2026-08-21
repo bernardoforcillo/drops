@@ -123,15 +123,24 @@ nothing when the change would destroy any of:
 | `drop-column` | the column is in the database and not in the schema |
 | `alter-column-type` | the column moves from `TEXT` affinity to a numeric one, and the copy converts as it goes: `'007'` arrives as `7` |
 | `alter-column-set-not-null` | the column gains `NOT NULL` and rows still hold `NULL`, which the copy will not accept |
+| `add-unique-constraint` | the column or column list gains `UNIQUE` and the rows already hold a value twice |
+| `add-check-constraint` | the table gains a `CHECK` and a row already breaks it |
 | `rebuild-drops-index` | the rebuild drops an index keyed on a departing column and does not put it back |
 | `rebuild-stale-trigger` | the rebuild puts a trigger back naming a departing column; SQLite accepts it and it fails when it fires |
+
+Three of them — `alter-column-set-not-null`, `add-unique-constraint`
+and `add-check-constraint`, the tightenings — cost no data at all:
+SQLite refuses the copy and the whole transaction rolls back. They are
+in the list because without them the push dies partway through a
+rebuild on a constraint message, which is the thing this guard exists
+to turn into a readable refusal.
 
 The names are `drops/pg`'s names wherever the meaning is the same, so
 `drop-column` means here what it means there. The last two are what
 `GenerateMigration` has always warned about through `AnalyzeMigration`
 and `Push`, which prints no migration for anyone to read, did not.
 
-There is a sixth rule, `drop-table`, and `Push` never reaches it. It
+There is one more rule, `drop-table`, and `Push` never reaches it. It
 diffs only over the tables the schema declares — a table drops was
 never told about belongs to somebody else — so deleting a `NewTable`
 from the schema does not drop the table and does not raise a finding
@@ -151,10 +160,19 @@ cur, opts)` computes the same list from any pair of snapshots.
 
 Two things deliberately do not trigger it. A rebuild that only widens a
 table loses nothing and is not refused — otherwise the option would be
-needed on almost every push and would stop meaning anything. And
-`alter-column-set-not-null` is confirmed against the rows before it is
-reported: tightening a column that holds no `NULL` goes through
-untouched.
+needed on almost every push and would stop meaning anything. And the
+three tightenings are put to the rows before they are reported:
+tightening a column that holds no `NULL`, declaring one unique that has
+held distinct values all along, or adding a `CHECK` every row satisfies
+all go through untouched.
+
+The probe reads the table as the rebuild's `INSERT … SELECT` will
+present it, not as it stands: a column this push renames is supplied
+under its new name and one it adds under its default. SQLite reads a
+double-quoted identifier matching no column as a string literal rather
+than failing, so a probe against the raw table would ask a different
+question and answer it confidently — which for a `CHECK` means a
+silent acquittal and a push that then dies on that very constraint.
 
 `PushOptions.DryRun` does not refuse. It returns the plan with
 `PushResult.Destructive` filled in, because a preview that will not show
@@ -203,6 +221,40 @@ Four differences shape the API rather than the SQL:
   rather than a surprise: `Push` reports how far it got, and a single
   `ALTER TABLE` carrying several actions is atomic even though the
   migration around it is not.
+
+### What a dropped column takes with it
+
+A migration that drops a column and something naming it has one working
+order — the dependent goes first — and getting there is not a port of
+PostgreSQL's rule, because MySQL answers a different way for each kind.
+Read off MariaDB 10.11: a secondary index over the dropped column alone
+is **removed with the column**, so a `DROP INDEX` afterwards is 1091;
+one over several columns is **narrowed** to the columns that remain and
+stays, so the drop is not stale and is the only thing that gets rid of
+it. A `UNIQUE` key over the column alone goes with it, but MariaDB will
+not narrow a multi-column one and refuses the column drop with 1072. A
+`CHECK` naming only that column goes with it on MariaDB and is refused
+on MySQL 8.0.16+ with 3959; one naming a surviving column too is
+refused on both with 1054. Either side of a foreign key — the column
+the key is on, the column it points at, and the index it needs —
+refuses with 1553. A single-column `PRIMARY KEY` goes with its column;
+a composite one refuses with 1072.
+
+`Diff` emits the foreign-key drops first, across every table, then the
+indexes, `CHECK`s and primary keys on each, and only then the columns.
+One hazard is not an ordering problem and remains: `DROP PRIMARY KEY`
+on a table whose key covers an `AUTO_INCREMENT` column is 1075 wherever
+it is put.
+
+`Push` reaches the drop of an index the Go schema never declared only
+under `PushOptions.DropUnmanagedIndexes`; under the default it withholds
+it as an `unmanaged-index` notice, because it cannot tell an index the
+schema stopped declaring from one somebody made by hand. The one
+exception is an index keying a column the same push drops, which MySQL
+will not leave as it is whatever Push does — so withholding the drop
+there preserves nothing: it leaves a narrowed index nobody asked for, or
+stops the push on 1072 or 1553. That drop goes through by default, under
+a notice naming the index and the departing column.
 
 Smaller things worth knowing before you port a schema: `TEXT` cannot be
 indexed without a prefix length (`Index.Prefix`), so a column you mean

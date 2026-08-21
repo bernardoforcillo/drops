@@ -773,16 +773,38 @@ func sqlStateByReflection(err error) string {
 // ----------------------------------------------------------------------
 
 // withholdUnmanagedIndexDrops removes from stmts every DROP INDEX that
-// targets an index the database has and the Go schema never declared,
-// returning what is left and a notice for each one held back.
+// targets an index the database has, the Go schema never declared, and
+// this push can actually leave standing — returning what is left and a
+// notice for each one held back.
 //
 // The statements are matched by text rather than re-derived, because
 // the text is what Diff produced from the same two snapshots a moment
 // earlier — anything that does not match is a drop Diff emitted for a
 // different reason (an index declared on both sides whose shape
 // changed) and has to go through.
+//
+// # Why an index over a departing column is not withheld
+//
+// Withholding exists because Push cannot tell an index the schema
+// stopped declaring from one somebody built by hand, and destroying the
+// second by mistake is worse than leaving the first behind. That
+// reasoning holds only while the index can survive the migration. An
+// index spanning a column this push drops cannot: MySQL takes a
+// single-column one away with the column, narrows a multi-column one
+// to what remains, and refuses the DROP COLUMN outright when the index
+// is UNIQUE and spans more than one column (1072) or is one a foreign
+// key needs (1553). See Diff.
+//
+// So withholding there protects nothing. It either leaves a narrowed
+// index the caller never asked for — under a notice claiming the index
+// was left alone, which by then is false — or it stops the push on a
+// server error with no explanation attached. Both were reachable under
+// the default options, which is where most pushes run. The drop goes
+// through instead, and the notice says the index was dropped and why,
+// so the fact still reaches the caller.
 func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]string, []SchemaNotice) {
 	withheld := map[string]SchemaNotice{}
+	var forced []SchemaNotice
 	for _, key := range sortedKeys(current.Tables) {
 		ct := current.Tables[key]
 		dt := desired.Tables[key]
@@ -796,6 +818,18 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 				}
 			}
 			sql := dropIndexSQL(ct.Name, name)
+			if lost := departingColumns(ct.Indexes[name], ct, dt); len(lost) > 0 {
+				forced = append(forced, SchemaNotice{
+					Rule:   "unmanaged-index",
+					Table:  ct.Name,
+					Object: name,
+					Message: fmt.Sprintf(
+						"index %q on %q is declared by no table in the Go schema, but it keys column %s, which this push drops; MySQL will not leave it as it is, so Push dropped the index rather than leave a narrowed one behind or stop on the column drop",
+						name, ct.Name, strings.Join(quoteIdents(lost), ", ")),
+					SQL: sql,
+				})
+				continue
+			}
 			withheld[sql] = SchemaNotice{
 				Rule:    "unmanaged-index",
 				Table:   ct.Name,
@@ -806,10 +840,10 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 		}
 	}
 	if len(withheld) == 0 {
-		return stmts, nil
+		return stmts, forced
 	}
 	kept := make([]string, 0, len(stmts))
-	var notices []SchemaNotice
+	notices := forced
 	for _, s := range stmts {
 		if n, ok := withheld[s]; ok {
 			notices = append(notices, n)
@@ -818,6 +852,25 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 		kept = append(kept, s)
 	}
 	return kept, notices
+}
+
+// departingColumns lists, in key order, the index's columns that this
+// push drops. A table the schema no longer declares is not one Push
+// narrows, so a nil desired side means nothing is departing.
+func departingColumns(idx *IndexSnapshot, current, desired *TableSnapshot) []string {
+	if idx == nil || desired == nil {
+		return nil
+	}
+	var out []string
+	for _, c := range idx.Columns {
+		if _, live := current.Columns[c]; !live {
+			continue
+		}
+		if _, kept := desired.Columns[c]; !kept {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // unrepresentableIndexNotices reports live indexes the snapshot cannot

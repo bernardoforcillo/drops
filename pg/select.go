@@ -41,6 +41,14 @@ type SelectBuilder struct {
 	ctxFrom  []drops.Expression
 	ctxJoins []drops.Expression
 
+	// defaults carries the DefaultFilters of the tables this statement
+	// names, resolved for one execution — see resolvedDefaults. Set by
+	// resolveCtx on the per-execution copy and read by writeCore
+	// through defaults.of, which falls back to the unresolved list, so
+	// the ToSQL path and every statement whose filters hold no
+	// statement render exactly what they always did.
+	defaults resolvedDefaults
+
 	// resolved marks a builder that resolveCtx has already produced.
 	// Resolution is not idempotent — the FROM table still has its
 	// context filters, so resolving twice binds the tenant twice — and
@@ -561,7 +569,7 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 	var fromDefaults, fromCtx []drops.Expression
 	fromOn := -1
 	if !s.unscoped {
-		fromDefaults, fromCtx = s.from.resolveDefaultFilters(), s.ctxFrom
+		fromDefaults, fromCtx = s.defaults.of(s.from), s.ctxFrom
 		if len(fromDefaults) > 0 || len(fromCtx) > 0 {
 			fromOn = s.fromFilterJoin()
 		}
@@ -579,7 +587,7 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		b.WriteString(" ON ")
 		on := j.on
 		if !s.unscoped {
-			switch dfs := j.table.resolveDefaultFilters(); j.kind.filterPlacement() {
+			switch dfs := s.defaults.of(j.table); j.kind.filterPlacement() {
 			case placeInOn:
 				on = andWith(on, append(append([]drops.Expression(nil), dfs...), j.ctxOn...))
 			case placeInWhere:
@@ -722,6 +730,28 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 			cp.ctxFrom, changed = preds, true
 		}
 	}
+
+	if !s.unscoped {
+		// The DefaultFilters of every table the statement names, walked
+		// for the statements written inside them. Same list writeCore
+		// reads, same reason resolveJoins exists: a predicate the
+		// renderer adds on the statement's own account is still a
+		// predicate a caller wrote, and a caller can write a subquery
+		// into it.
+		tables := make([]*Table, 0, 1+len(s.joins))
+		tables = append(tables, s.from)
+		for _, j := range s.joins {
+			tables = append(tables, j.table)
+		}
+		defaults, err := resolveTableDefaults(ctx, tables...)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
+	}
+
 	joins, joinPreds, err := s.resolveJoins(ctx)
 	if err != nil {
 		return nil, err
@@ -739,12 +769,26 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 
 	// Every expression list the statement carries, because a subquery is
 	// a statement wherever it is written: a predicate, a select-list
-	// scalar, a FROM source, a GROUP BY or ORDER BY term.
+	// scalar, a FROM source, a DISTINCT ON key, a GROUP BY or ORDER BY
+	// term.
+	//
+	// Every list writeCore reads has to be here. distinctOn was not,
+	// for as long as DISTINCT ON has existed: writeCore rendered it and
+	// resolveCtx never looked at it, so
+	// DistinctOn(Subquery(SELECT ... FROM posts)) sent the inner
+	// statement with its DefaultFilters and none of its ContextFilters,
+	// on a ctx with no tenant at all and without refusing. That is the
+	// invariant this list exists to keep — no expression list the
+	// renderer reads may be invisible to the resolver — and
+	// TestNoRenderedExpressionListIsInvisibleToTheResolver enforces it
+	// against the package source, so the next field added to the
+	// builder and rendered fails on the day it is written.
 	lists := []struct {
 		src []drops.Expression
 		dst *[]drops.Expression
 	}{
 		{s.columns, &cp.columns},
+		{s.distinctOn, &cp.distinctOn},
 		{s.fromExprs, &cp.fromExprs},
 		{s.wheres, &cp.wheres},
 		{s.groupBys, &cp.groupBys},

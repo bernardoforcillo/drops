@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -662,12 +663,42 @@ func (t *Table) hasContextFilters() bool {
 }
 
 // resolveContextFilters builds every registered predicate against ctx,
-// each restated against this instance of the table — see
+// walks the statements written inside those predicates, and restates
+// the result against this instance of the table — see
 // resolveFilterExprs for what "this instance" buys.
+//
+// The walk is the half that was missing. A filter answers with a
+// predicate, and a predicate is a place a statement can be written:
+// AuthorizeWith(CustomGuard(...)) returning
+// In(col, Subquery(SELECT ... FROM posts)) is the ordinary spelling of
+// "the rows this subject may see are the ones some other scoped table
+// names". Handed straight to the builder, that inner statement was
+// reached only by the renderer, which has no ctx — so it wrote its
+// DefaultFilters, none of its ContextFilters, and did not refuse on a
+// ctx carrying no tenant at all. The guard meant to decide what a
+// request may see was itself the unscoped read, on SELECT, on JOIN, on
+// UPDATE and on DELETE alike, because all four reach the filters
+// through here. It is the same invariant [SelectBuilder.resolveCtx]
+// keeps for the lists a caller writes: no expression the renderer reads
+// may be invisible to the resolver, and a filter's own predicate is
+// such an expression.
+//
+// The walk runs before resolveFilterExprs rather than after, so the
+// alias rename wraps the resolved tree. The other order would resolve
+// the ExprFunc that rename returns — an opaque closure the walk
+// terminates at — which is the round-4 defect rebuilt one layer in.
+//
+// The filter function itself is called under the cycle chain, not just
+// the predicate it returns. A filter is arbitrary user code and may
+// consult a store — or run a query of its own, and a query of its own
+// against this table is the same non-terminating shape by another
+// route. Carrying the chain into it costs one allocation on a table
+// that has filters at all, which is a path already building predicates.
 //
 // The first filter to fail aborts the whole resolution and no statement
 // is sent: a filter that cannot decide what a request may see must not
-// be answered with an unfiltered query.
+// be answered with an unfiltered query. A refusal from inside the walk
+// aborts it just as hard, for the same reason.
 //
 // The filter list is snapshotted under the read lock and walked with it
 // released. Holding it across the calls would put arbitrary user code —
@@ -684,9 +715,13 @@ func (t *Table) resolveContextFilters(ctx context.Context) ([]drops.Expression, 
 	if len(filters) == 0 {
 		return nil, nil
 	}
+	inner, err := enterFilterResolution(ctx, t)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]drops.Expression, 0, len(filters))
 	for _, f := range filters {
-		e, err := f.fn(ctx)
+		e, err := f.fn(inner)
 		if err != nil {
 			return nil, err
 		}
@@ -694,7 +729,108 @@ func (t *Table) resolveContextFilters(ctx context.Context) ([]drops.Expression, 
 			out = append(out, e)
 		}
 	}
+	resolved, err := resolveExprs(inner, out)
+	if err != nil {
+		return nil, err
+	}
+	if resolved != nil {
+		out = resolved
+	}
 	return t.resolveFilterExprs(out), nil
+}
+
+// ErrContextFilterCycle is returned when resolving a table's automatic
+// predicates re-enters the same table: a context filter (or a default
+// filter) on "notes" whose predicate embeds a statement selecting from
+// "notes", directly or through another table whose filter comes back.
+//
+// Walking a filter's own predicate is what makes the cycle reachable at
+// all, and the shape has to be answered rather than followed: each turn
+// asks the filter for a fresh predicate, so there is no fixed point to
+// converge on and no builder to notice it has been here before. Left
+// alone it is not a wrong answer, it is a goroutine that never returns
+// — a hung request holding a connection, in the resolver every read and
+// every write goes through.
+//
+// Three answers were on the table and this is the third. A depth limit
+// terminates, but it turns an unrunnable declaration into a failure at
+// some arbitrary nesting depth, and picking the depth means picking
+// which legitimate nesting to break. A "resolving" flag on the *Table
+// terminates too, but the flag is shared state on a value every request
+// reads concurrently, so it needs its own lock and it reports a cycle
+// whenever two goroutines resolve the same table at the same instant —
+// a false refusal that appears only under load. The chain is carried on
+// the ctx instead: it is per-resolution by construction, needs no lock,
+// costs one allocation per table that actually has filters, and names
+// the cycle exactly — including a mutual one, A through B back to A,
+// which neither of the other answers distinguishes from depth.
+//
+// The refusal is not a dead end. A filter that has to consult its own
+// table says Unscoped() on the statement it embeds: that is the shape
+// that terminates, it is the shape the author meant (the inner read
+// selects the rows the filter is about to restrict, so restricting it
+// with the filter being built is circular in the SQL as well), and it
+// is the same escape resolveFilterExprs already documents for a filter
+// that selects from its own base table under an alias.
+var ErrContextFilterCycle = errors.New("drops/pg: a table's automatic filter selects from the table it filters")
+
+// filterChainKey is the ctx key under which the chain of tables whose
+// automatic filters are currently being resolved is carried. An
+// unexported struct type, so nothing outside this package can plant a
+// chain of its own and talk the resolver out of a refusal.
+type filterChainKey struct{}
+
+// filterChain is one link of that chain. It is a linked list rather
+// than a map because it is written once per link and read by walking:
+// an immutable list can be shared by every ctx derived from it without
+// copying, which is what makes the chain safe to carry across the
+// concurrent resolutions a single filter may fan out into.
+type filterChain struct {
+	ref  string
+	prev *filterChain
+}
+
+// enterFilterResolution returns the ctx to resolve t's automatic
+// filters under, or [ErrContextFilterCycle] when t is already being
+// resolved further up the same chain.
+//
+// Tables are identified by relation reference rather than by pointer,
+// so an alias — which Table.As gives its own *Table and its own copy of
+// the filter list — counts as the same relation it aliases. That is the
+// identity SQL uses, and the identity the recursion has: a filter on
+// "notes" that embeds SELECT ... FROM "notes" AS "n" re-enters the same
+// filter list however the inner statement spells the table.
+func enterFilterResolution(ctx context.Context, t *Table) (context.Context, error) {
+	ref := t.relRef()
+	chain, _ := ctx.Value(filterChainKey{}).(*filterChain)
+	for c := chain; c != nil; c = c.prev {
+		if c.ref == ref {
+			return nil, fmt.Errorf("%w: %s; say Unscoped on the statement the filter embeds",
+				ErrContextFilterCycle, renderFilterCycle(chain, ref))
+		}
+	}
+	return context.WithValue(ctx, filterChainKey{}, &filterChain{ref: ref, prev: chain}), nil
+}
+
+// renderFilterCycle spells the cycle out from the table it closes on,
+// as "notes -> authors -> notes". The chain is held innermost-first, so
+// it is reversed here: a caller reading the error wants the order the
+// resolver walked, not the order it unwinds.
+func renderFilterCycle(chain *filterChain, ref string) string {
+	var refs []string
+	for c := chain; c != nil; c = c.prev {
+		refs = append(refs, c.ref)
+		if c.ref == ref {
+			break
+		}
+	}
+	var b strings.Builder
+	for i := len(refs) - 1; i >= 0; i-- {
+		b.WriteString(refs[i])
+		b.WriteString(" -> ")
+	}
+	b.WriteString(ref)
+	return b.String()
 }
 
 // hasDefaultFilters reports whether the table carries any render-time
@@ -703,11 +839,140 @@ func (t *Table) hasDefaultFilters() bool { return t != nil && len(t.defaultFilte
 
 // resolveDefaultFilters returns the render-time filters, restated
 // against this instance of the table.
+//
+// Render-time is the whole of it: there is no ctx here, so a statement
+// written inside a default filter renders through WriteSQL and carries
+// none of its own context filters. That is why the executors resolve
+// the list first and hand the answer back through resolvedDefaults —
+// see [Table.resolveDefaultFilterExprs]. This function stays the
+// answer on the ToSQL path, which has no ctx to do better with.
 func (t *Table) resolveDefaultFilters() []drops.Expression {
 	if !t.hasDefaultFilters() {
 		return nil
 	}
 	return t.resolveFilterExprs(t.defaultFilters)
+}
+
+// resolveDefaultFilterExprs walks the statements written inside the
+// table's default filters against ctx, returning the restated list —
+// or nil when no default filter had a statement in it, so the caller
+// keeps rendering exactly what it rendered before.
+//
+// A default filter is declaration-time and a context filter is
+// request-time, but the predicate each of them answers with is the same
+// kind of thing, and a statement embedded in one is as invisible to the
+// renderer as a statement embedded in the other:
+// DefaultFilter(NotIn(col, Subquery(SELECT ... FROM blocked))) wrote the
+// inner statement with its own DefaultFilters and none of its
+// ContextFilters, on any ctx at all. Whatever a caller can hand a
+// filter, the resolver has to be able to walk — the invariant is about
+// what the renderer reads, not about when the list was declared.
+//
+// Returning nil for "nothing changed" is what keeps the rendering
+// promise: a filter with no statement inside it is not rebuilt, is not
+// re-wrapped, and renders the bytes it always did — which is nearly
+// every default filter there is, a soft-delete guard being the shape
+// this feature exists for.
+//
+// mayHoldStatements is checked before the chain is entered so that the
+// same near-universal case does not pay for a ctx it has no use for.
+// A default filter list is read once per statement per table, so a
+// soft-delete guard would otherwise cost one allocation on every query
+// against every table that has one.
+func (t *Table) resolveDefaultFilterExprs(ctx context.Context) ([]drops.Expression, error) {
+	if !t.hasDefaultFilters() || !mayHoldStatements(t.defaultFilters) {
+		return nil, nil
+	}
+	inner, err := enterFilterResolution(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := resolveExprs(inner, t.defaultFilters)
+	if err != nil {
+		return nil, err
+	}
+	if resolved == nil {
+		return nil, nil
+	}
+	return t.resolveFilterExprs(resolved), nil
+}
+
+// mayHoldStatements reports whether any expression in list could
+// resolve to something different — that is, whether walking it can do
+// anything at all.
+//
+// It is resolveExpr's type switch, asked in advance and without
+// building anything. The two must agree: a node type resolveExpr learns
+// to enter has to be admitted here as well, or the walk will be skipped
+// for the one shape it was extended to reach. They are two lines apart
+// in the same package for exactly that reason.
+func mayHoldStatements(list []drops.Expression) bool {
+	for _, e := range list {
+		switch e.(type) {
+		case *SelectBuilder, subqueryResolver:
+			return true
+		}
+	}
+	return false
+}
+
+// resolvedDefaults holds, per table a statement names, the default
+// filters resolved for one execution of that statement.
+//
+// It is a side table rather than a field on the *Table because the
+// resolution belongs to the execution: two requests render the same
+// table at once, and a resolved list written back onto the shared table
+// would let one request's subquery scoping decide the other's. It is
+// keyed by *Table rather than by name so that a statement naming the
+// same relation twice — a self-join, one side aliased — keeps each
+// side's own restatement, which is the distinction resolveFilterExprs
+// exists to make.
+//
+// The zero value is a nil map and answers every lookup with the
+// unresolved list, which is what the ToSQL path and every statement
+// with nothing to resolve get.
+type resolvedDefaults map[*Table][]drops.Expression
+
+// of returns the default filters to render for t: the resolved list
+// when this execution produced one, and otherwise the render-time list,
+// unchanged and byte for byte.
+func (d resolvedDefaults) of(t *Table) []drops.Expression {
+	if e, ok := d[t]; ok {
+		return e
+	}
+	return t.resolveDefaultFilters()
+}
+
+// resolveTableDefaults resolves the default filters of every table a
+// statement names, returning nil when not one of them held a statement
+// — so a builder that had nothing to resolve keeps the nil map and
+// renders through the unresolved path.
+//
+// A refusal aborts the whole statement, exactly as a refusing context
+// filter does: a default filter that embeds a read it cannot scope
+// cannot be answered with the unscoped read.
+func resolveTableDefaults(ctx context.Context, tables ...*Table) (resolvedDefaults, error) {
+	var out resolvedDefaults
+	for _, t := range tables {
+		if t == nil || !t.hasDefaultFilters() {
+			continue
+		}
+		if _, done := out[t]; done {
+			continue
+		}
+		resolved, err := t.resolveDefaultFilterExprs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if resolved == nil {
+			continue
+		}
+		if out == nil {
+			out = resolvedDefaults{}
+		}
+		out[t] = resolved
+	}
+	return out, nil
 }
 
 // relRef names the relation a column belonging to this table qualifies

@@ -16,6 +16,13 @@ type UpdateBuilder struct {
 	returning []drops.Expression
 	unscoped  bool
 
+	// defaults carries the DefaultFilters of the target table and of
+	// the FROM tables, resolved for one execution — see
+	// resolvedDefaults. Set by resolveCtx on the per-execution copy and
+	// read by autoWheres through defaults.of, which falls back to the
+	// unresolved list so the ToSQL path renders unchanged.
+	defaults resolvedDefaults
+
 	// hooked reports that the UpdateHooks have already contributed their
 	// assignments to sets, which resolveCtx does so that what they
 	// assign is walked for subqueries like anything else in the SET
@@ -136,13 +143,14 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 //
 // Two things about it are load-bearing.
 //
-// The filters are taken through Table.resolveDefaultFilters rather than
-// read off Table.defaultFilters, which is what restates them against
-// the instance of the table the statement actually names. A filter is
-// an opaque tree of closures over the declared column handles, so
-// against UPDATE "notes" AS "n" a raw read renders "notes"."deletedAt"
-// — a relation the statement has no FROM entry for, and PostgreSQL
-// answers 42P01. That is not a widened write, it is a statement that
+// The filters are taken through resolvedDefaults.of rather than read
+// off Table.defaultFilters, which is what restates them against the
+// instance of the table the statement actually names, and what walks
+// the statements written inside them for the ctx being resolved. A
+// filter is an opaque tree of closures over the declared column
+// handles, so against UPDATE "notes" AS "n" a raw read renders
+// "notes"."deletedAt" — a relation the statement has no FROM entry for,
+// and PostgreSQL answers 42P01. That is not a widened write, it is a statement that
 // cannot run, which made the tables that most need their scoping the
 // ones that could not be written under an alias at all.
 //
@@ -156,9 +164,9 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 // scoped.
 func (u *UpdateBuilder) autoWheres() []drops.Expression {
 	var out []drops.Expression
-	out = append(out, u.table.resolveDefaultFilters()...)
+	out = append(out, u.defaults.of(u.table)...)
 	for _, t := range u.from {
-		out = append(out, t.resolveDefaultFilters()...)
+		out = append(out, u.defaults.of(t)...)
 	}
 	return out
 }
@@ -290,6 +298,17 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	cp.sets = sets
 
 	if !u.unscoped {
+		// The DefaultFilters of the target and of the FROM tables,
+		// walked for the statements written inside them — the same
+		// lists autoWheres renders, resolved for the same reason the
+		// context filters below are.
+		defaults, err := resolveTableDefaults(ctx, append([]*Table{u.table}, u.from...)...)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
 		preds, err := u.contextPreds(ctx)
 		if err != nil {
 			return nil, err

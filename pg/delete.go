@@ -14,6 +14,13 @@ type DeleteBuilder struct {
 	wheres    []drops.Expression
 	returning []drops.Expression
 	unscoped  bool
+
+	// defaults carries the DefaultFilters of the target table and of
+	// the USING tables, resolved for one execution — see
+	// resolvedDefaults. Set by resolveCtx on the per-execution copy and
+	// read by autoWheres through defaults.of, which falls back to the
+	// unresolved list so the ToSQL path renders unchanged.
+	defaults resolvedDefaults
 }
 
 // Table returns the target table.
@@ -135,9 +142,10 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 // a statement reads scoping first and intent second.
 //
 // It mirrors UpdateBuilder.autoWheres exactly, and for the same two
-// reasons. The filters go through Table.resolveDefaultFilters so that
-// they are restated against the instance the statement names: read raw,
-// a filter built from the declared handles renders
+// reasons. The filters go through resolvedDefaults.of so that they are
+// restated against the instance the statement names, and so that the
+// statements written inside them are walked for the ctx being
+// resolved: read raw, a filter built from the declared handles renders
 // "notes"."archivedAt" against DELETE FROM "notes" AS "n", which is
 // 42P01 rather than a widened delete — the aliased statement cannot run
 // at all. And the USING tables are included because DELETE ... USING
@@ -146,9 +154,9 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 // retired, choose which of this tenant's rows are removed.
 func (d *DeleteBuilder) autoWheres() []drops.Expression {
 	var out []drops.Expression
-	out = append(out, d.table.resolveDefaultFilters()...)
+	out = append(out, d.defaults.of(d.table)...)
 	for _, t := range d.using {
-		out = append(out, t.resolveDefaultFilters()...)
+		out = append(out, d.defaults.of(t)...)
 	}
 	return out
 }
@@ -280,6 +288,17 @@ func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) 
 	}
 
 	if !d.unscoped {
+		// The DefaultFilters of the target and of the USING tables,
+		// walked for the statements written inside them — the same
+		// lists autoWheres renders, resolved for the same reason the
+		// context filters below are.
+		defaults, err := resolveTableDefaults(ctx, append([]*Table{d.table}, d.using...)...)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
 		preds, err := d.contextPreds(ctx)
 		if err != nil {
 			return nil, err

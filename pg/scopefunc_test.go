@@ -1039,3 +1039,888 @@ func TestNoExpressionHelperRendersOperandsAtRenderTime(t *testing.T) {
 		}
 	}
 }
+
+// ----------------------------------------------------------------------
+// The third invariant, enforced against the package source
+//
+//	No expression list the renderer reads may be invisible to the
+//	resolver.
+//
+// Round 4 said an operand a caller can hand a *SelectBuilder to must
+// not be an opaque closure. Round 5 enforced it with the census above:
+// every exported package-level constructor returning a drops.Expression
+// that takes an operand is exercised with a scoped subquery. Two leaks
+// obeyed that rule and leaked anyway, and the census structurally could
+// not see either one — it enumerates constructors, and neither leak was
+// one.
+//
+// The first sat on a builder FIELD. SelectBuilder.distinctOn was
+// written by writeCore and absent from the list resolveCtx walks, so
+// DISTINCT ON (a scoped subquery) rendered the inner statement through
+// the renderer alone — no ctx, its DefaultFilters written, its
+// ContextFilters not, and no refusal on a ctx with no tenant at all.
+//
+// The second sat on a filter's RETURN value: the predicate a
+// ContextFilter or a DefaultFilter answers with was handed to the
+// builder and rendered without ever being walked, so a Guard whose
+// predicate named another scoped table was itself the unscoped read.
+//
+// What the two have in common is not a constructor and not a closure.
+// It is a list the renderer reads that the resolver does not. The three
+// tests below say that mechanically, so the next one fails on the day
+// it is written:
+//
+//   - TestNoRenderedExpressionListIsInvisibleToTheResolver reads the
+//     four statement builders' struct fields and requires every
+//     expression-bearing field the render closure touches to be read by
+//     the resolve closure;
+//   - TestEveryBuilderOperandMethodIsCensused requires every exported
+//     builder METHOD that takes an operand — which is how a caller puts
+//     an expression into one of those fields — to be exercised with a
+//     scoped subquery;
+//   - TestEveryWidenedOperandConstructorIsCensused re-runs the round-5
+//     function census under the wider rules the narrow one missed:
+//     multi-result signatures, *SelectBuilder-typed and ColumnValue
+//     parameters, and results that are rendered without being
+//     drops.Expression themselves.
+//
+// Both exemption lists are checked in both directions, so a stale entry
+// fails as loudly as a missing one — the pattern round 5 established.
+
+// pgSyntax is the package's own source, indexed for the checks below:
+// its named types, which of them can hold a caller's expression, and
+// the methods declared on each. It is a second parse rather than a
+// refactor of the two above: those carry round 5's assertions, and this
+// work removes no test line that already passes.
+type pgSyntax struct {
+	fset    *token.FileSet
+	structs map[string]*ast.StructType
+	ifaces  map[string]*ast.InterfaceType
+	aliases map[string]ast.Expr                 // named types that are not structs or interfaces
+	methods map[string]map[string]*ast.FuncDecl // receiver type name -> method name -> decl
+	funcs   []*ast.FuncDecl                     // package-level functions
+	bearing map[string]bool                     // types that can hold a caller's expression
+}
+
+// loadPgSyntax parses the non-test sources of package pg and computes
+// which of its named types can hold an expression a caller supplied.
+//
+// "Can hold an expression" is computed rather than listed, because a
+// list is the thing that went stale after each of the previous rounds.
+// A struct bears expressions when one of its fields is a
+// drops.Expression (at any slice, array, pointer or map depth) or is
+// itself a bearing type; a named slice or map type bears them when its
+// element does; and an interface bears them when some bearing struct in
+// the package implements it — which is how ColumnValue qualifies, since
+// exprBinding holds a drops.Expression and satisfies it. The fixpoint
+// is run to convergence so a type three hops from an expression still
+// counts.
+func loadPgSyntax(t *testing.T) *pgSyntax {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parse package: %v", err)
+	}
+	p := &pgSyntax{
+		fset:    fset,
+		structs: map[string]*ast.StructType{},
+		ifaces:  map[string]*ast.InterfaceType{},
+		aliases: map[string]ast.Expr{},
+		methods: map[string]map[string]*ast.FuncDecl{},
+		bearing: map[string]bool{},
+	}
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, d := range f.Decls {
+				if fn, ok := d.(*ast.FuncDecl); ok {
+					if fn.Recv == nil {
+						p.funcs = append(p.funcs, fn)
+						continue
+					}
+					r := typeName(fn.Recv.List[0].Type)
+					if p.methods[r] == nil {
+						p.methods[r] = map[string]*ast.FuncDecl{}
+					}
+					p.methods[r][fn.Name.Name] = fn
+					continue
+				}
+				gd, ok := d.(*ast.GenDecl)
+				if !ok || gd.Tok != token.TYPE {
+					continue
+				}
+				for _, sp := range gd.Specs {
+					ts, ok := sp.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					switch u := ts.Type.(type) {
+					case *ast.StructType:
+						p.structs[ts.Name.Name] = u
+					case *ast.InterfaceType:
+						p.ifaces[ts.Name.Name] = u
+					default:
+						p.aliases[ts.Name.Name] = ts.Type
+					}
+				}
+			}
+		}
+	}
+	for {
+		changed := false
+		for name, st := range p.structs {
+			if p.bearing[name] {
+				continue
+			}
+			for _, f := range st.Fields.List {
+				if p.bearsExpression(f.Type) {
+					p.bearing[name], changed = true, true
+					break
+				}
+			}
+		}
+		for name, u := range p.aliases {
+			if !p.bearing[name] && p.bearsExpression(u) {
+				p.bearing[name], changed = true, true
+			}
+		}
+		for name, it := range p.ifaces {
+			if p.bearing[name] || it.Methods == nil {
+				continue
+			}
+			var want []string
+			for _, m := range it.Methods.List {
+				for _, n := range m.Names {
+					want = append(want, n.Name)
+				}
+			}
+			if len(want) == 0 {
+				continue
+			}
+			for impl := range p.structs {
+				if !p.bearing[impl] || !hasAllMethods(p.methods[impl], want) {
+					continue
+				}
+				p.bearing[name], changed = true, true
+				break
+			}
+		}
+		if !changed {
+			return p
+		}
+	}
+}
+
+func hasAllMethods(have map[string]*ast.FuncDecl, want []string) bool {
+	for _, w := range want {
+		if have[w] == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// bearsExpression reports whether a value of type e can carry an
+// expression a caller supplied.
+func (p *pgSyntax) bearsExpression(e ast.Expr) bool {
+	return isExpressionType(elementType(e)) || p.bearing[typeName(e)]
+}
+
+// elementType strips the wrappers a field type can put between the
+// declaration and the expression inside it.
+func elementType(e ast.Expr) ast.Expr {
+	switch v := e.(type) {
+	case *ast.StarExpr:
+		return elementType(v.X)
+	case *ast.ArrayType:
+		return elementType(v.Elt)
+	case *ast.Ellipsis:
+		return elementType(v.Elt)
+	case *ast.MapType:
+		return elementType(v.Value)
+	}
+	return e
+}
+
+// typeName returns the package-local name a type expression refers to,
+// after the same stripping, and "" for anything else.
+func typeName(e ast.Expr) string {
+	switch v := elementType(e).(type) {
+	case *ast.IndexExpr:
+		return typeName(v.X)
+	case *ast.IndexListExpr:
+		return typeName(v.X)
+	case *ast.Ident:
+		return v.Name
+	}
+	return ""
+}
+
+// fieldsRead returns the fields of the receiver type that the closure
+// of methods reachable from seeds reads off the receiver itself.
+//
+// Two things about it are deliberate.
+//
+// The closure follows calls to other methods on the same receiver, so
+// that resolveCtx delegating to resolveJoins counts as resolveCtx
+// reading s.joins. Written by hand, the seed list would have gone stale
+// the first time a helper was extracted.
+//
+// It counts only "<receiver>.<field>" — a read off the value being
+// resolved — and not a write to the per-execution copy. That is what
+// makes the check mean what it says: a resolveCtx that assigns
+// cp.distinctOn without ever looking at s.distinctOn has not resolved
+// anything, and a check that accepted the assignment would have passed
+// on the day the leak was written.
+func (p *pgSyntax) fieldsRead(recv string, seeds ...string) map[string]bool {
+	st := p.structs[recv]
+	if st == nil {
+		return nil
+	}
+	fields := map[string]bool{}
+	for _, f := range st.Fields.List {
+		for _, n := range f.Names {
+			fields[n.Name] = true
+		}
+	}
+	read, seen := map[string]bool{}, map[string]bool{}
+	queue := append([]string(nil), seeds...)
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		fn := p.methods[recv][name]
+		if fn == nil || len(fn.Recv.List[0].Names) == 0 {
+			continue
+		}
+		self := fn.Recv.List[0].Names[0].Name
+		ast.Inspect(fn, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			base, ok := sel.X.(*ast.Ident)
+			if !ok || base.Name != self {
+				return true
+			}
+			if fields[sel.Sel.Name] {
+				read[sel.Sel.Name] = true
+			}
+			if p.methods[recv][sel.Sel.Name] != nil {
+				queue = append(queue, sel.Sel.Name)
+			}
+			return true
+		})
+	}
+	return read
+}
+
+// statementBuilders are the four builders this invariant is about, with
+// the method each one renders through. Every one of them renders from
+// WriteSQL and resolves in resolveCtx; the pair is spelled out rather
+// than assumed so a fifth builder cannot be added without saying which
+// of its methods is which.
+var statementBuilders = []struct {
+	name    string
+	render  string
+	resolve string
+}{
+	{"SelectBuilder", "WriteSQL", "resolveCtx"},
+	{"UpdateBuilder", "WriteSQL", "resolveCtx"},
+	{"DeleteBuilder", "WriteSQL", "resolveCtx"},
+	{"InsertBuilder", "WriteSQL", "resolveCtx"},
+}
+
+// resolverOwnedFields names the expression-bearing builder fields the
+// renderer reads and the resolver deliberately does not read back, with
+// the reason. Every entry is a field the resolver WRITES: its contents
+// are the resolver's own output, already walked at the point they were
+// produced, and reading them again would resolve a resolved statement
+// twice — which binds the tenant twice, as SelectBuilder.resolved
+// documents.
+//
+// This is the list a leak would hide in, so an entry has to name a
+// field whose contents the resolver produced, not merely a field
+// somebody would rather not walk.
+var resolverOwnedFields = map[string]string{
+	"SelectBuilder.ctxFrom":  "written by resolveCtx from Table.resolveContextFilters, which walks the predicates it returns",
+	"SelectBuilder.ctxJoins": "written by resolveJoins from Table.resolveContextFilters, which walks the predicates it returns",
+	"SelectBuilder.defaults": "written by resolveCtx from Table.resolveDefaultFilterExprs, which walks the filters it returns",
+	"UpdateBuilder.defaults": "written by resolveCtx from Table.resolveDefaultFilterExprs, which walks the filters it returns",
+	"DeleteBuilder.defaults": "written by resolveCtx from Table.resolveDefaultFilterExprs, which walks the filters it returns",
+}
+
+// TestNoRenderedExpressionListIsInvisibleToTheResolver is the check
+// that would have caught DISTINCT ON on the day it was written.
+//
+// For each statement builder it takes every struct field that can hold
+// a caller's expression, asks whether the render closure touches it,
+// and requires the resolve closure to read it off the builder. A field
+// that is rendered and not read is a statement the executor will send
+// having never looked inside it — which is precisely how a scoped
+// subquery in a DISTINCT ON list went out with another tenant's rows
+// in it.
+func TestNoRenderedExpressionListIsInvisibleToTheResolver(t *testing.T) {
+	p := loadPgSyntax(t)
+	rendered := map[string]bool{}
+
+	for _, b := range statementBuilders {
+		st := p.structs[b.name]
+		if st == nil {
+			t.Fatalf("%s is not a struct in this package — the check has gone stale", b.name)
+		}
+		renders := p.fieldsRead(b.name, b.render)
+		resolves := p.fieldsRead(b.name, b.resolve)
+		if len(renders) == 0 || len(resolves) == 0 {
+			t.Fatalf("%s: %s or %s reads no field at all — the closure walk has gone stale",
+				b.name, b.render, b.resolve)
+		}
+		for _, f := range st.Fields.List {
+			if !p.bearsExpression(f.Type) {
+				continue
+			}
+			for _, n := range f.Names {
+				key := b.name + "." + n.Name
+				if !renders[n.Name] {
+					continue
+				}
+				rendered[key] = true
+				if resolves[n.Name] || resolverOwnedFields[key] != "" {
+					continue
+				}
+				t.Errorf("%s: %s: %s renders it and %s never reads it — a statement written there is invisible to the resolver",
+					p.fset.Position(n.Pos()), key, b.render, b.resolve)
+			}
+		}
+	}
+
+	// The other direction: an exemption naming a field that is no
+	// longer rendered, no longer holds expressions, or no longer
+	// exists, is a reason that has stopped being true.
+	for key := range resolverOwnedFields {
+		if !rendered[key] {
+			t.Errorf("exempt field %q is no longer a rendered expression-bearing field — drop the exemption", key)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------
+// The METHOD census: how a caller reaches those fields
+// ----------------------------------------------------------------------
+
+// builderMethodCase is one exported builder method, called with a
+// scoped statement in the operand position a caller can reach.
+//
+// name is the method's Go name, optionally followed by a space and a
+// note naming which operand position the case covers; the census below
+// reads the first word, exactly as operandConstructors does.
+type builderMethodCase struct {
+	name  string
+	build func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer
+}
+
+// builderFixture is the unscoped scenery the method cases build on. The
+// only scoped thing anywhere in them is the statement handed to the
+// method, so a tenant predicate in the rendered SQL can only have come
+// through the operand under test.
+type builderFixture struct {
+	db     *pg.DB
+	plain  *pg.Table
+	other  *pg.Table
+	id     *pg.Col[int64]
+	n      *pg.Col[int64]
+	otherI *pg.Col[int64]
+}
+
+func newBuilderFixture() *builderFixture {
+	f := &builderFixture{db: pg.New(nil), plain: pg.NewTable("bm_plain"), other: pg.NewTable("bm_other")}
+	f.id = pg.Add(f.plain, pg.BigSerial("id").PrimaryKey())
+	f.n = pg.Add(f.plain, pg.BigInt("n"))
+	f.otherI = pg.Add(f.other, pg.BigSerial("id").PrimaryKey())
+	return f
+}
+
+// from is the unscoped SELECT the SELECT cases hang their operand off.
+func (f *builderFixture) from() *pg.SelectBuilder {
+	return f.db.Select(f.id).From(f.plain).Unscoped()
+}
+
+// builderOperandMethods is the table the method census enforces: one
+// entry per exported method of a statement builder that takes an
+// operand a caller can hand a statement to.
+//
+// It is the missing half of round 5. That census enumerated
+// package-level constructors, so it could see pg.Coalesce and could not
+// see (*SelectBuilder).DistinctOn — and DistinctOn is where the leak
+// was. A method that stores a caller's expression into a builder field
+// is the same kind of entry point as a constructor that stores it in a
+// node, and it reaches the same renderer.
+func builderOperandMethods() []builderMethodCase {
+	return []builderMethodCase{
+		// select.go — the clause list methods.
+		{"DistinctOn", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().DistinctOn(pg.Subquery(sub()))
+		}},
+		{"FromExpr", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().FromExpr(pg.Subquery(sub()))
+		}},
+		{"Where", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().Where(pg.Exists(sub()))
+		}},
+		{"GroupBy", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().GroupBy(pg.Subquery(sub()))
+		}},
+		{"Having", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().Having(pg.Exists(sub()))
+		}},
+		{"OrderBy", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().OrderBy(pg.Subquery(sub()))
+		}},
+
+		// select.go — the join ON clauses, one per kind, because the
+		// placement rules differ per kind and the ON clause is walked
+		// by a resolution of its own.
+		{"Join", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().Join(f.other, pg.Exists(sub()))
+		}},
+		{"LeftJoin", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().LeftJoin(f.other, pg.Exists(sub()))
+		}},
+		{"RightJoin", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().RightJoin(f.other, pg.Exists(sub()))
+		}},
+		{"FullJoin", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().FullJoin(f.other, pg.Exists(sub()))
+		}},
+
+		// select.go — the set operations, whose operand is a whole
+		// statement rather than an expression. The round-5 census could
+		// not see these either: it looks for an `any` or a
+		// drops.Expression, and a *SelectBuilder is neither.
+		{"Union", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().Union(sub())
+		}},
+		{"UnionAll", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().UnionAll(sub())
+		}},
+		{"Intersect", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().Intersect(sub())
+		}},
+		{"IntersectAll", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().IntersectAll(sub())
+		}},
+		{"Except", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().Except(sub())
+		}},
+		{"ExceptAll", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.from().ExceptAll(sub())
+		}},
+
+		// update.go.
+		{"Set update", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Update(f.plain).Set(f.n.Expr(pg.Subquery(sub())))
+		}},
+		{"Where update", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Update(f.plain).Set(f.n.Val(1)).Where(pg.Exists(sub()))
+		}},
+		{"Returning update", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Update(f.plain).Set(f.n.Val(1)).Returning(pg.Subquery(sub()))
+		}},
+
+		// delete.go.
+		{"Where delete", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Delete(f.plain).Where(pg.Exists(sub()))
+		}},
+		{"Returning delete", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Delete(f.plain).Where(pg.Eq(f.id, 1)).Returning(pg.Subquery(sub()))
+		}},
+
+		// insert.go — the row values, the batch, the RETURNING list and
+		// both halves of the ON CONFLICT update.
+		{"Row", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Insert(f.plain).Row(f.n.Expr(pg.Subquery(sub())))
+		}},
+		{"Rows", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Insert(f.plain).Rows([]pg.ColumnValue{f.n.Expr(pg.Subquery(sub()))})
+		}},
+		{"Returning insert", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Insert(f.plain).Row(f.n.Val(1)).Returning(pg.Subquery(sub()))
+		}},
+		{"Set conflict", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Insert(f.plain).Row(f.n.Val(1)).
+				OnConflictUpdate(f.id).Set(f.n.Expr(pg.Subquery(sub()))).Done()
+		}},
+		{"Where conflict", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Insert(f.plain).Row(f.n.Val(1)).
+				OnConflictUpdate(f.id).Set(f.n.Val(2)).Where(pg.Exists(sub())).Done()
+		}},
+	}
+}
+
+// exemptBuilderMethods names the exported builder methods that take an
+// operand and deliberately do not resolve it, with the reason. It is
+// empty, and that is the point: every operand a caller can put into one
+// of these four statements is walked. An entry added here has to say
+// why resolving would be wrong rather than merely inconvenient — see
+// exemptConstructors for the shape of a reason that qualifies.
+var exemptBuilderMethods = map[string]string{}
+
+// TestEveryBuilderOperandMethodIsCensused reads the package source and
+// requires every exported method of a statement builder that takes an
+// operand to appear in builderOperandMethods or in
+// exemptBuilderMethods.
+//
+// Executors are excluded by taking a context.Context first — the house
+// rule that ctx comes first is what makes that mechanical rather than a
+// list of names. All(ctx, dest) does take an `any`, but dest is where
+// rows are scanned to, not an operand rendered into a statement.
+func TestEveryBuilderOperandMethodIsCensused(t *testing.T) {
+	covered := map[string]bool{}
+	for _, tc := range builderOperandMethods() {
+		covered[strings.Fields(tc.name)[0]] = true
+	}
+
+	census := censusBuilderOperandMethods(t)
+	var missing []string
+	for _, name := range census {
+		if covered[name] || exemptBuilderMethods[name] != "" {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("builder methods take an operand but are not exercised with a scoped subquery: %v", missing)
+	}
+
+	present := map[string]bool{}
+	for _, name := range census {
+		present[name] = true
+	}
+	for name := range exemptBuilderMethods {
+		if !present[name] {
+			t.Errorf("exempt builder method %q no longer takes an operand — drop the exemption", name)
+		}
+	}
+}
+
+// operandReceivers are the types whose exported methods put a caller's
+// operand into one of the four statements: the builders themselves and
+// the ON CONFLICT handle, which writes into the InsertBuilder's
+// conflict clause on its behalf.
+var operandReceivers = map[string]bool{
+	"SelectBuilder":  true,
+	"UpdateBuilder":  true,
+	"DeleteBuilder":  true,
+	"InsertBuilder":  true,
+	"ConflictUpdate": true,
+}
+
+// censusBuilderOperandMethods returns the exported methods of those
+// receivers that take at least one operand a caller could hand a
+// statement to.
+func censusBuilderOperandMethods(t *testing.T) []string {
+	t.Helper()
+	p := loadPgSyntax(t)
+	seen := map[string]bool{}
+	var out []string
+	for recv, ms := range p.methods {
+		if !operandReceivers[recv] {
+			continue
+		}
+		for name, fn := range ms {
+			if !ast.IsExported(name) || fn.Type.Params == nil || len(fn.Type.Params.List) == 0 {
+				continue
+			}
+			if isContextType(fn.Type.Params.List[0].Type) {
+				continue
+			}
+			for _, param := range fn.Type.Params.List {
+				if !isWideOperandType(param.Type) {
+					continue
+				}
+				if !seen[name] {
+					seen[name] = true
+					out = append(out, name)
+				}
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isContextType reports whether e is context.Context — the marker that
+// separates an executor from a builder method, since ctx comes first
+// everywhere in this package.
+func isContextType(e ast.Expr) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	id, ok := sel.X.(*ast.Ident)
+	return ok && id.Name == "context" && sel.Sel.Name == "Context"
+}
+
+// isWideOperandType is isOperandType widened by the two shapes the
+// round-5 census could not see.
+//
+// A *SelectBuilder parameter is an operand: Union(other *SelectBuilder)
+// takes a whole statement, and a statement is the thing that has to be
+// resolved. A ColumnValue is an operand too — (*Col[T]).Expr wraps an
+// arbitrary expression in one, which is how a subquery reaches an
+// INSERT row or an UPDATE SET list, the two places an unresolved read
+// decides what gets written rather than what gets returned.
+func isWideOperandType(e ast.Expr) bool {
+	switch v := e.(type) {
+	case *ast.Ellipsis:
+		return isWideOperandType(v.Elt)
+	case *ast.ArrayType:
+		return isWideOperandType(v.Elt)
+	case *ast.StarExpr:
+		return typeName(v.X) == "SelectBuilder"
+	case *ast.Ident:
+		return v.Name == "any" || v.Name == "ColumnValue"
+	case *ast.InterfaceType:
+		return v.Methods == nil || len(v.Methods.List) == 0
+	}
+	return isExpressionType(e)
+}
+
+// TestBuilderOperandMethodsCarryTheTenantAxis runs the whole method
+// table with a scoped statement in the operand position and asserts the
+// inner statement renders its own context filters.
+//
+// Every table in the fixture is unscoped, so the tenant predicate in
+// the SQL and the tenant in the args can only have come from the
+// statement handed to the method under test.
+func TestBuilderOperandMethodsCarryTheTenantAxis(t *testing.T) {
+	posts := reachTable("bm_posts")
+	wantInner := `SELECT "bm_posts"."id" FROM "bm_posts" ` +
+		`WHERE ("bm_posts"."deletedAt" IS NULL) AND ("bm_posts"."tenantId" = $?)`
+
+	for _, tc := range builderOperandMethods() {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBuilderFixture()
+			sub := func() *pg.SelectBuilder { return f.db.Select(posts.Col("id")).From(posts) }
+
+			got, args, err := tc.build(f, sub).ToSQLCtx(fnCtx())
+			if err != nil {
+				t.Fatalf("ToSQLCtx: %v", err)
+			}
+			if !strings.Contains(normalisePlaceholders(got), wantInner) {
+				t.Errorf("got = %v, want it to contain %v", got, wantInner)
+			}
+			if !containsArg(args, fnTenant) {
+				t.Errorf("args = %v, want them to bind the tenant %v", args, fnTenant)
+			}
+		})
+	}
+}
+
+// TestBuilderOperandMethodsFailClosedWithNoTenant is the other half:
+// with no tenant on ctx the statement must be refused rather than sent
+// with the guard silently missing from the operand.
+func TestBuilderOperandMethodsFailClosedWithNoTenant(t *testing.T) {
+	posts := reachTable("bmf_posts")
+
+	for _, tc := range builderOperandMethods() {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBuilderFixture()
+			sub := func() *pg.SelectBuilder { return f.db.Select(posts.Col("id")).From(posts) }
+
+			sql, _, err := tc.build(f, sub).ToSQLCtx(context.Background())
+			if !errors.Is(err, pg.ErrTenantMissing) {
+				t.Fatalf("got = %v (sql %q), want %v", err, sql, pg.ErrTenantMissing)
+			}
+			if sql != "" {
+				t.Errorf("got sql = %q, want no statement at all", sql)
+			}
+		})
+	}
+}
+
+// ----------------------------------------------------------------------
+// The round-5 function census, widened
+// ----------------------------------------------------------------------
+
+// statementConstructors covers the exported package-level constructors
+// that take an operand and return something the renderer writes into a
+// statement without that thing being a drops.Expression itself.
+//
+// CTEDef is the one today: it returns a *CTE, so the round-5 census —
+// which looks for a single drops.Expression result — never saw it,
+// even though the body it holds is exactly the kind of statement this
+// work is about. The behaviour is pinned in scopereach_test.go; the
+// entry here is what keeps the census from having a blind spot the
+// shape of a return type.
+func statementConstructors() []builderMethodCase {
+	return []builderMethodCase{
+		{"CTEDef", func(f *builderFixture, sub func() *pg.SelectBuilder) ctxRenderer {
+			return f.db.Select(f.id).From(f.plain).Unscoped().
+				With(pg.CTEDef("recent", sub()))
+		}},
+	}
+}
+
+// TestEveryWidenedOperandConstructorIsCensused re-runs the round-5
+// census under the wider reading of both halves of a signature.
+//
+// The narrow rule missed three shapes, and a leak only has to fit one
+// of them to be invisible: a constructor returning
+// (drops.Expression, error) rather than a bare expression; a
+// constructor taking a *SelectBuilder or a ColumnValue rather than an
+// `any`; and a constructor whose result is rendered into a statement
+// without being an expression, which is how CTEDef sat outside the
+// census while holding a whole SELECT.
+//
+// A name is covered when it appears in operandConstructors,
+// statementConstructors or builderOperandMethods — the three tables
+// that exercise an operand with a scoped subquery — or in
+// exemptConstructors with a reason.
+func TestEveryWidenedOperandConstructorIsCensused(t *testing.T) {
+	covered := map[string]bool{}
+	for _, tc := range operandConstructors(drops.Raw(`"t"."c"`)) {
+		covered[strings.Fields(tc.name)[0]] = true
+	}
+	for _, tc := range statementConstructors() {
+		covered[strings.Fields(tc.name)[0]] = true
+	}
+	for _, tc := range builderOperandMethods() {
+		covered[strings.Fields(tc.name)[0]] = true
+	}
+
+	census := censusWidenedOperandConstructors(t)
+	var missing []string
+	for _, name := range census {
+		if covered[name] || exemptConstructors[name] != "" {
+			continue
+		}
+		missing = append(missing, name)
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("constructors take an operand but are not exercised with a scoped subquery: %v", missing)
+	}
+
+	// And the reverse, so an exemption cannot outlive the constructor
+	// it excuses. The narrow census already checks this for its own
+	// reading; the widened one is a superset, so an entry that survives
+	// there survives here too — the check is repeated rather than
+	// assumed, because the two readings could drift apart.
+	present := map[string]bool{}
+	for _, name := range census {
+		present[name] = true
+	}
+	for name := range exemptConstructors {
+		if !present[name] {
+			t.Errorf("exempt constructor %q no longer takes an operand — drop the exemption", name)
+		}
+	}
+}
+
+// censusWidenedOperandConstructors returns the exported package-level
+// functions that take an operand and return something rendered into a
+// statement.
+func censusWidenedOperandConstructors(t *testing.T) []string {
+	t.Helper()
+	p := loadPgSyntax(t)
+	var out []string
+	for _, fn := range p.funcs {
+		if !fn.Name.IsExported() || fn.Type.Results == nil {
+			continue
+		}
+		if !takesWideOperand(fn.Type.Params) || !returnsRendered(fn.Type.Results) {
+			continue
+		}
+		out = append(out, fn.Name.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func takesWideOperand(fl *ast.FieldList) bool {
+	if fl == nil {
+		return false
+	}
+	for _, f := range fl.List {
+		if isWideOperandType(f.Type) {
+			return true
+		}
+	}
+	return false
+}
+
+// renderedResultTypes are the package's own types that a statement
+// renders but that are not drops.Expression: a constructor returning
+// one of these is holding a caller's expression on the way into a
+// statement, exactly as an expression constructor is.
+var renderedResultTypes = map[string]bool{
+	"CTE":            true,
+	"SelectBuilder":  true,
+	"UpdateBuilder":  true,
+	"DeleteBuilder":  true,
+	"InsertBuilder":  true,
+	"ConflictUpdate": true,
+	"ColumnValue":    true,
+}
+
+// returnsRendered reports whether any result is rendered into a
+// statement. Any result rather than the only result: a constructor that
+// answers (drops.Expression, error) is as much a constructor as one
+// that answers a bare expression, and the round-5 rule — exactly one
+// result, and that result an expression — would have let the first one
+// past without a word.
+func returnsRendered(fl *ast.FieldList) bool {
+	if fl == nil {
+		return false
+	}
+	for _, f := range fl.List {
+		if isExpressionType(f.Type) || renderedResultTypes[typeName(f.Type)] {
+			return true
+		}
+	}
+	return false
+}
+
+// TestStatementConstructorsCarryTheTenantAxis exercises the widened
+// census's own table, on both the resolved path and the refusing one.
+func TestStatementConstructorsCarryTheTenantAxis(t *testing.T) {
+	posts := reachTable("sc_posts")
+	wantInner := `SELECT "sc_posts"."id" FROM "sc_posts" ` +
+		`WHERE ("sc_posts"."deletedAt" IS NULL) AND ("sc_posts"."tenantId" = $?)`
+
+	for _, tc := range statementConstructors() {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBuilderFixture()
+			sub := func() *pg.SelectBuilder { return f.db.Select(posts.Col("id")).From(posts) }
+
+			got, args, err := tc.build(f, sub).ToSQLCtx(fnCtx())
+			if err != nil {
+				t.Fatalf("ToSQLCtx: %v", err)
+			}
+			if !strings.Contains(normalisePlaceholders(got), wantInner) {
+				t.Errorf("got = %v, want it to contain %v", got, wantInner)
+			}
+			if !containsArg(args, fnTenant) {
+				t.Errorf("args = %v, want them to bind the tenant %v", args, fnTenant)
+			}
+
+			f = newBuilderFixture()
+			sub = func() *pg.SelectBuilder { return f.db.Select(posts.Col("id")).From(posts) }
+			sql, _, err := tc.build(f, sub).ToSQLCtx(context.Background())
+			if !errors.Is(err, pg.ErrTenantMissing) {
+				t.Fatalf("bare ctx: got = %v (sql %q), want %v", err, sql, pg.ErrTenantMissing)
+			}
+			if sql != "" {
+				t.Errorf("bare ctx: got sql = %q, want no statement at all", sql)
+			}
+		})
+	}
+}

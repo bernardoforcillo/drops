@@ -100,6 +100,13 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 // installed via WithRetry, transient failures (those the policy marks
 // retryable) cause the transaction to be re-opened and fn re-run, up
 // to MaxAttempts times.
+//
+// A transaction that has to run under a particular PostgreSQL identity
+// — a role, or the session settings a row-level security policy reads
+// with current_setting — wants [DB.InTxAs] instead. It is this method
+// with the identity established inside the transaction and reverted
+// with it, and with a failure to establish it aborting rather than
+// falling back to the pool's own user.
 func (db *DB) InTx(ctx context.Context, fn func(*DB) error) error {
 	if db.retry == nil {
 		return db.inTxOnce(ctx, fn)

@@ -88,10 +88,23 @@
 // So declare RLS on every table that carries tenant rows —
 // [Table.EnableRLS] and [Table.AddPolicy] emit it into the migration —
 // write the policy against a setting the connection carries
-// (current_setting), and set that setting for the request. Then a
+// (current_setting) or against the role the statement runs as, and
+// establish that identity for the request with [DB.InTxAs]. Then a
 // statement that lost its predicate returns no rows rather than
 // somebody else's, and everything in the section below is a question of
 // defence in depth rather than a disclosure.
+//
+// That last step is the one this paragraph used to leave to the reader,
+// and leaving it there made the rest of the paragraph advice rather
+// than a design. drops could WRITE a policy and could not SATISFY one:
+// nothing in the package made a pooled connection carry a request's
+// identity, which is the thing a policy reads. [DB.InTxAs] does it with
+// SET LOCAL ROLE and set_config(k, v, true), where LOCAL is the whole
+// point — the identity is reverted by the server when the transaction
+// ends, so the connection cannot carry one request's identity to the
+// next request that draws it — and it aborts the transaction rather
+// than running the body when the identity cannot be established. See
+// pg/rls.go.
 //
 // What the predicates still buy, with RLS underneath them, is worth
 // stating: the axis is declared once per table instead of written into

@@ -16,7 +16,7 @@ err := UserEntity.Create(db, ctx, &u)          // INSERT, populates generated ke
 u, err := UserEntity.Get(db, ctx, id)          // SELECT by primary key
 err = UserEntity.Update(db, ctx, &u)           // UPDATE by primary key
 err = UserEntity.Save(db, ctx, &u)             // INSERT or UPDATE, on whether the key is set
-res, err := UserEntity.Delete(db, ctx, id)     // DELETE by primary key
+res, err := UserEntity.Delete(db, ctx, id)     // DELETE by primary key — an UPDATE, where a soft-delete hook is installed
 res, err = UserEntity.CreateMany(db, ctx, us)  // one multi-row INSERT
 res, err = UserEntity.UpsertMany(db, ctx, us)  // INSERT … ON CONFLICT UPDATE
 ```
@@ -122,9 +122,17 @@ to a struct: `One` already reports emptiness as an error, and a nil
 Which to reach for:
 
 - the entity's `Query` when the rows *are* the table — it goes through
-  the fast-scan path, the entity cache, tenant scoping and eager
-  loading, none of which an ad-hoc query has;
+  the fast-scan path, the entity cache and eager loading, none of which
+  an ad-hoc query has;
 - `drops.All` / `drops.One` when they are not.
+
+Tenant scoping is not on that list, and it used to be. The axis is
+declared on the *table*, so a statement built straight from
+`db.Select()` carries the same automatic predicates the entity's `Query`
+does — and refuses with `pg.ErrTenantMissing` the same way when the ctx
+has no tenant. That is what makes the ad-hoc query safe to reach for:
+while the predicate was injected by the entity methods, every query
+written without an entity was a query written without a tenant.
 
 The two report an empty `One` with different sentinels today —
 `pg.ErrNoRows` from the entity, `drops.ErrNoRows` from `drops.One` —
@@ -276,10 +284,30 @@ These attach to an entity and then apply to every operation:
 UserEntity.
     WithCache(cache, time.Minute).   // read-through, single-flight on misses
     WithAudit(auditLog).             // who-changed-what, same transaction
-    ScopeByTenant(UserTenantID).     // every query filtered by ctx tenant
+    ScopeByTenant(UserTenantID).     // registers the tenant axis on the table
     AuthorizeWith(guard).            // every query filtered by ctx subject
     WithBudget(budget)               // caps rows, args and duration
 ```
 
-Each is documented in its own file in the `pg` package. They are
-PostgreSQL and SQLite only today.
+Each is documented in its own file in the `pg` package. Two of them
+reach further than the entity they are spelled on:
+
+- `ScopeByTenant` registers the axis as a filter on the table, so every
+  statement that reads or writes it takes the tenant from ctx — a bare
+  `db.Select()`, an eager-loaded edge, a CTE body, a subquery — and
+  refuses when the ctx carries none. Widen one statement with
+  `Unscoped()`, one relation edge with `RelConfig.Unscoped()`.
+- `AuthorizeWith` AND-s the guard's predicate into every Get / Query /
+  Update / Delete. A `MembershipGuard`'s junction subquery is a
+  statement drops composed rather than SQL text, so the junction table's
+  own filters apply to it: a revoked — soft-deleted — membership row
+  stops authorising, and in `pg`, where a table can carry a tenant
+  filter, so does a membership row belonging to another tenant.
+
+`WithBudget` is PostgreSQL only. The other four exist in `sqlite` too —
+its `WithAudit` is a package function rather than a method — but its
+tenant scoping is the shape `pg` had before the axis moved onto
+the table — the predicate is injected by the entity methods, so a query
+built from `db.Select()` and a relation loader bypass it. `mysql` and
+`clickhouse` have neither. Treat tenant isolation outside `pg` as
+unimplemented rather than as implemented differently.

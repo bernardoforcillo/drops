@@ -42,6 +42,24 @@ import (
 // Create stamps the tenant on r automatically before insert (or
 // rejects if r already carries a different tenant) so a stray
 // background job can't silently insert into the wrong tenant.
+//
+// Two things a reader of this file has to take away with it.
+//
+// The predicate reaches every statement drops composed, to any depth —
+// a CTE body, a subquery operand, a set-operation operand, an
+// eager-loaded edge, the predicate another table's filter answers with.
+// Where it stops is listed in the package doc, under "Where the
+// automatic scoping stops"; the entries there are the shapes that stay
+// the caller's to scope, and a reviewer who has not read them will read
+// a raw fragment or a view body as scoped when it is not.
+//
+// And all of it is pg. mysql and clickhouse have no ctx-resolved filter
+// at all, and sqlite's ScopeByTenant is the shape described above as
+// the one that was learned the hard way — a
+// predicate the Entity methods inject, which a relation loader or a
+// bare db.Select goes around. A schema ported across dialects is
+// unscoped on arrival, so treat tenant isolation outside pg as
+// unimplemented rather than as implemented differently.
 
 type tenantCtxKey int
 

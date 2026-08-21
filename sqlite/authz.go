@@ -66,14 +66,68 @@ func (g OwnerGuard) Predicate(ctx context.Context) (drops.Expression, error) {
 
 // MembershipGuard authorises when the subject is a member of the
 // resource's containing group, expressed via a junction table.
+//
+//	MembershipGuard{
+//	    Junction:         orgMembers,
+//	    JunctionSubject:  orgMembers.Col("userId"),
+//	    JunctionResource: orgMembers.Col("organizationId"),
+//	    ResourceOwner:    invoices.Col("organizationId"),
+//	}
+//	// emits:  WHERE ("invoices"."organizationId" IN (
+//	//             SELECT "org_members"."organizationId" FROM "org_members"
+//	//             WHERE ("org_members"."deletedAt" IS NULL)
+//	//               AND ("org_members"."userId" = ?)
+//	//         ))
+//
+// Junction is the table handle and not a name, because the junction's
+// own DefaultFilters have to apply to the membership check — see
+// [MembershipGuard.Predicate].
 type MembershipGuard struct {
-	Junction         *Table
-	JunctionSubject  *Column
+	// Junction is the table that proves membership (e.g.
+	// organization_members, project_collaborators).
+	Junction *Table
+	// JunctionSubject is the column of Junction holding the subject
+	// identifier (the "who").
+	JunctionSubject *Column
+	// JunctionResource is the column of Junction pointing at the
+	// resource's containing group (the "what").
 	JunctionResource *Column
-	ResourceOwner    *Column
+	// ResourceOwner is the column on the GUARDED table that matches
+	// JunctionResource — e.g. invoices.organizationId when invoices
+	// belong to an organization.
+	ResourceOwner *Column
 }
 
 // Predicate implements Guard.
+//
+// The membership check is composed as the statement it is — a
+// [SelectBuilder] over the junction table — rather than written out as
+// SQL text, and that is the whole of what keeps it honest.
+//
+// It used to be a drops.ExprFunc that wrote "<owner> IN (SELECT <res>
+// FROM <junction> WHERE <subj> = ?)" by hand, naming the junction table
+// as a string. A membership table is precisely the kind that carries a
+// DefaultFilter of its own — a soft-delete column, so a revoked
+// membership is kept for audit rather than deleted — and none of it
+// reached a subquery drops had never been told was a subquery. So a
+// soft-deleted membership row still authorised. Everywhere else in the
+// package a widened read returns rows the caller should not see; on a
+// guard it also grants a permission the subject does not have.
+//
+// Held as a statement, the subquery is rendered by [SelectBuilder] like
+// any other, so the junction's DefaultFilters land in its WHERE clause
+// and a revoked membership stops authorising. The scoping is
+// statement-local, which is the property the caller needs: Unscoped on
+// the query being guarded widens that query and not the membership
+// check inside it.
+//
+// The builder is composed directly rather than through [DB.Select]
+// because a guard is asked for a predicate, not for a result set, and
+// has no *DB to ask. A SelectBuilder needs one only to execute; as an
+// operand it renders without one.
+//
+// The subject is read before any of that, so a ctx with no subject
+// still fails closed with [ErrSubjectMissing] and builds nothing.
 func (g MembershipGuard) Predicate(ctx context.Context) (drops.Expression, error) {
 	if g.Junction == nil || g.JunctionSubject == nil || g.JunctionResource == nil || g.ResourceOwner == nil {
 		return nil, errors.New("drops/sqlite: MembershipGuard is missing one of Junction / JunctionSubject / JunctionResource / ResourceOwner")
@@ -82,18 +136,10 @@ func (g MembershipGuard) Predicate(ctx context.Context) (drops.Expression, error
 	if !ok {
 		return nil, ErrSubjectMissing
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		g.ResourceOwner.WriteSQL(b)
-		b.WriteString(" IN (SELECT ")
-		b.WriteIdent(g.JunctionResource.Name())
-		b.WriteString(" FROM ")
-		g.Junction.writeName(b)
-		b.WriteString(" WHERE ")
-		b.WriteIdent(g.JunctionSubject.Name())
-		b.WriteString(" = ")
-		b.AddArg(s)
-		b.WriteByte(')')
-	}), nil
+	memberships := (&SelectBuilder{columns: []drops.Expression{g.JunctionResource}}).
+		From(g.Junction).
+		Where(Eq(g.JunctionSubject, s))
+	return In(g.ResourceOwner, memberships), nil
 }
 
 // CustomGuard wraps a function as a Guard.

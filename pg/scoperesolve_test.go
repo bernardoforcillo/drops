@@ -3,6 +3,7 @@ package pg_test
 import (
 	"fmt"
 	"go/ast"
+	"go/token"
 	"sort"
 	"testing"
 )
@@ -517,48 +518,198 @@ func TestNoPartialCopyOfTheResolversArms(t *testing.T) {
 // partialArmCopyProblems is the check body, returning what it found
 // rather than reporting it — see pg/scopecheckself_test.go, which
 // rebuilds the stale copy and requires this to name it.
+//
+// A decision is matched STRUCTURALLY, in two ways the first version was
+// not, and both were walked past by someone rewriting the same
+// decision in different syntax:
+//
+//   - a type switch is not the only way to ask. An if-assertion chain,
+//     `if _, ok := e.(subqueryResolver); ok`, is the same decision with
+//     no *ast.TypeSwitchStmt anywhere in it, and the check inspected
+//     nothing else;
+//   - an arm is not the same thing as its name. A case that spells the
+//     arm out —
+//     `case interface{ resolveSubqueries(context.Context) (drops.Expression, bool, error) }:`
+//     — dispatches on exactly what the arm dispatches on, and the check
+//     compared identifiers, so a switch full of them named no arm at
+//     all and was skipped whole.
+//
+// So an asserted type is reduced to the METHOD SET it demands, from a
+// local interface name or from an inline one alike, and the arms are
+// too. Naming an arm is demanding exactly what it demands; admitting
+// one is demanding no more than it does.
+//
+// The last part is what a copy IS, as opposed to a dispatch. A decision
+// that names an arm and then hands the value to resolveExpr anyway has
+// not skipped anything — renderForCtx asks whether e is a ctxStatement
+// and resolves it when it is not, which is a fast path with the walk
+// still behind it. A decision whose unmatched path never reaches the
+// resolver has answered the question on the resolver's behalf, and that
+// answer is the one that goes stale.
 func partialArmCopyProblems(t *testing.T, p *pgSyntax) []string {
 	t.Helper()
-	arms := resolveExprArmNames(t, p)
+	arms := resolverArmSets(t, p)
+	resolvers := p.resolverCalls()
 	var problems []string
 	for _, key := range sortedKeys(p.allFuncs()) {
 		fn := p.allFuncs()[key]
 		if fn.Name.Name == "resolveExpr" {
 			continue
 		}
-		ast.Inspect(fn, func(n ast.Node) bool {
-			sw, ok := n.(*ast.TypeSwitchStmt)
-			if !ok {
-				return true
+		for _, d := range p.armDecisions(fn) {
+			if !namesAnyArm(d.named, arms) {
+				continue
 			}
-			var named []string
-			for _, stmt := range sw.Body.List {
+			if p.reachesResolver(fn, d.end, resolvers) {
+				continue
+			}
+			for _, arm := range sortedKeys(arms) {
+				if armAdmitted(arms[arm], d.named) {
+					continue
+				}
+				problems = append(problems, fmt.Sprintf(
+					"%s: %s decides in advance what resolveExpr can enter and admits nothing that catches its %s arm — a partial copy of the arm list skips the walk for exactly the shape the arm was added for",
+					p.fset.Position(d.pos), key, arm))
+			}
+		}
+	}
+	sort.Strings(problems)
+	return problems
+}
+
+// armDecision is one place a function decides what a value is, reduced
+// to what each branch DEMANDS of it.
+type armDecision struct {
+	pos   token.Pos
+	end   token.Pos
+	named [][]string
+}
+
+// armDecisions returns the decisions a function makes: one per type
+// switch, plus one for the explicit type assertions it makes outside
+// any switch — an if-chain asks in several statements what a switch
+// asks in one, and both are the same decision.
+func (p *pgSyntax) armDecisions(fn *ast.FuncDecl) []armDecision {
+	var out []armDecision
+	var chain armDecision
+	ast.Inspect(fn, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.TypeSwitchStmt:
+			d := armDecision{pos: v.Pos(), end: v.End()}
+			for _, stmt := range v.Body.List {
 				cc, ok := stmt.(*ast.CaseClause)
 				if !ok {
 					continue
 				}
 				for _, e := range cc.List {
-					if tn := typeName(e); tn != "" && p.ifaces[tn] != nil {
-						named = append(named, tn)
+					if ms, ok := p.demandedMethods(e); ok {
+						d.named = append(d.named, ms)
 					}
 				}
 			}
-			if !namesAnyArm(named, arms) {
+			if len(d.named) > 0 {
+				out = append(out, d)
+			}
+			return false
+		case *ast.TypeAssertExpr:
+			// Type is nil for the assertion a type switch is written
+			// around; those are handled above.
+			if v.Type == nil {
 				return true
 			}
-			for _, arm := range arms {
-				if armAdmitted(p, arm, named) {
-					continue
-				}
-				problems = append(problems, fmt.Sprintf(
-					"%s: %s decides in advance what resolveExpr can enter and admits nothing that catches its %s arm — a partial copy of the arm list skips the walk for exactly the shape the arm was added for",
-					p.fset.Position(sw.Pos()), key, arm))
+			ms, ok := p.demandedMethods(v.Type)
+			if !ok {
+				return true
 			}
-			return true
-		})
+			if chain.pos == token.NoPos {
+				chain.pos = v.Pos()
+			}
+			if v.End() > chain.end {
+				chain.end = v.End()
+			}
+			chain.named = append(chain.named, ms)
+		}
+		return true
+	})
+	if len(chain.named) > 0 {
+		out = append(out, chain)
 	}
-	sort.Strings(problems)
-	return problems
+	return out
+}
+
+// demandedMethods reduces an asserted type to the method set it
+// demands, for a local interface named or written inline. Anything else
+// — a concrete type, a type from another package — is not this check's
+// business: naming a concrete statement type is what
+// TestNoResolutionEntryPointNamesAStatementType refuses.
+func (p *pgSyntax) demandedMethods(e ast.Expr) ([]string, bool) {
+	if it, ok := e.(*ast.InterfaceType); ok {
+		return p.interfaceMethodsOf(it), true
+	}
+	if tn := typeName(e); tn != "" && p.ifaces[tn] != nil {
+		return p.interfaceMethods(tn), true
+	}
+	return nil, false
+}
+
+// resolverCalls returns the package-level functions that hand an
+// expression to resolveExpr, directly or through one another. It is the
+// derived answer to "does this path still reach the walk", so that
+// resolveExprs counts without being named.
+func (p *pgSyntax) resolverCalls() map[string]bool {
+	out := map[string]bool{"resolveExpr": true}
+	for {
+		changed := false
+		for _, fn := range p.funcs {
+			if out[fn.Name.Name] {
+				continue
+			}
+			ast.Inspect(fn, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if id, ok := call.Fun.(*ast.Ident); ok && out[id.Name] {
+					out[fn.Name.Name], changed = true, true
+				}
+				return true
+			})
+		}
+		if !changed {
+			return out
+		}
+	}
+}
+
+// reachesResolver reports whether the function hands the value to the
+// resolver on a path the decision did not match — approximated by the
+// calls that come after the decision ends, which is where an unmatched
+// if-assertion and a switch with no default both continue.
+func (p *pgSyntax) reachesResolver(fn *ast.FuncDecl, after token.Pos, resolvers map[string]bool) bool {
+	found := false
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || call.Pos() < after {
+			return true
+		}
+		if id, ok := call.Fun.(*ast.Ident); ok && resolvers[id.Name] {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// resolverArmSets returns every interface resolveExpr's type switch
+// dispatches on, as the method set each demands, keyed by name for the
+// message.
+func resolverArmSets(t *testing.T, p *pgSyntax) map[string][]string {
+	t.Helper()
+	out := map[string][]string{}
+	for _, name := range resolveExprArmNames(t, p) {
+		out[name] = p.interfaceMethods(name)
+	}
+	return out
 }
 
 // resolveExprArmNames returns every interface resolveExpr's type switch
@@ -588,13 +739,14 @@ func resolveExprArmNames(t *testing.T, p *pgSyntax) []string {
 	return out
 }
 
-// namesAnyArm reports whether a switch names one of resolveExpr's arms,
-// which is what makes it a copy of the decision rather than an
-// unrelated switch.
-func namesAnyArm(named, arms []string) bool {
-	for _, n := range named {
+// namesAnyArm reports whether a decision demands exactly what one of
+// resolveExpr's arms demands, which is what makes it a copy of the
+// decision rather than an unrelated switch. Compared as method sets, so
+// the arm written out inline is the arm.
+func namesAnyArm(named [][]string, arms map[string][]string) bool {
+	for _, ms := range named {
 		for _, arm := range arms {
-			if n == arm {
+			if sameMethodSet(ms, arm) {
 				return true
 			}
 		}
@@ -602,16 +754,15 @@ func namesAnyArm(named, arms []string) bool {
 	return false
 }
 
-// armAdmitted reports whether one of the named interfaces catches
-// everything the arm catches: its method set is a subset of the arm's,
-// so every value dispatched to the arm satisfies it too.
-func armAdmitted(p *pgSyntax, arm string, named []string) bool {
+// armAdmitted reports whether one of the demanded method sets catches
+// everything the arm catches: it demands no more than the arm does, so
+// every value dispatched to the arm satisfies it too.
+func armAdmitted(arm []string, named [][]string) bool {
 	want := map[string]bool{}
-	for _, m := range p.interfaceMethods(arm) {
+	for _, m := range arm {
 		want[m] = true
 	}
-	for _, n := range named {
-		ms := p.interfaceMethods(n)
+	for _, ms := range named {
 		if len(ms) == 0 {
 			continue
 		}
@@ -627,6 +778,27 @@ func armAdmitted(p *pgSyntax, arm string, named []string) bool {
 		}
 	}
 	return false
+}
+
+// sameMethodSet compares two method sets ignoring order and repetition.
+func sameMethodSet(a, b []string) bool {
+	set := func(ms []string) map[string]bool {
+		out := map[string]bool{}
+		for _, m := range ms {
+			out[m] = true
+		}
+		return out
+	}
+	x, y := set(a), set(b)
+	if len(x) != len(y) {
+		return false
+	}
+	for m := range x {
+		if !y[m] {
+			return false
+		}
+	}
+	return true
 }
 
 // allFuncs returns every function and method in the package, keyed by

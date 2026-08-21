@@ -393,25 +393,20 @@ func TestEveryOperandConstructorIsCensused(t *testing.T) {
 // one operand a caller could hand a statement to.
 func censusOperandConstructors(t *testing.T) []string {
 	t.Helper()
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
-	if err != nil {
-		t.Fatalf("parse package: %v", err)
-	}
+	return censusOperandConstructorsIn(loadPgSyntax(t))
+}
+
+// censusOperandConstructorsIn is the census body, taking the parsed
+// package so it can be pointed at one built to slip past it — the shape
+// every check in this family has since round 8.
+func censusOperandConstructorsIn(p *pgSyntax) []string {
 	var out []string
-	for _, pkg := range pkgs {
-		for _, f := range pkg.Files {
-			for _, d := range f.Decls {
-				fn, ok := d.(*ast.FuncDecl)
-				if !ok || fn.Recv != nil || !fn.Name.IsExported() {
-					continue
-				}
-				if returnsExpression(fn.Type.Results) && takesOperand(fn.Type.Params) {
-					out = append(out, fn.Name.Name)
-				}
-			}
+	for _, fn := range p.funcs {
+		if !fn.Name.IsExported() {
+			continue
+		}
+		if returnsExpression(fn.Type.Results) && p.takesOperand(fn.Type.Params) {
+			out = append(out, fn.Name.Name)
 		}
 	}
 	sort.Strings(out)
@@ -431,12 +426,12 @@ func isExpressionType(e ast.Expr) bool {
 	return ok && id.Name == "drops" && sel.Sel.Name == "Expression"
 }
 
-func takesOperand(fl *ast.FieldList) bool {
+func (p *pgSyntax) takesOperand(fl *ast.FieldList) bool {
 	if fl == nil {
 		return false
 	}
 	for _, f := range fl.List {
-		if isOperandType(f.Type) {
+		if p.isOperandType(f.Type) {
 			return true
 		}
 	}
@@ -446,18 +441,25 @@ func takesOperand(fl *ast.FieldList) bool {
 // isOperandType reports whether a parameter can carry a statement: an
 // `any` (or a slice/variadic of one) and a drops.Expression can, a
 // string or a *Table cannot.
-func isOperandType(e ast.Expr) bool {
-	switch v := e.(type) {
-	case *ast.Ellipsis:
-		return isOperandType(v.Elt)
-	case *ast.ArrayType:
-		return isOperandType(v.Elt)
-	case *ast.Ident:
-		return v.Name == "any"
-	case *ast.InterfaceType:
-		return v.Methods == nil || len(v.Methods.List) == 0
+//
+// The question is what the declaration ADMITS, which is why it goes
+// through [pgSyntax.interfaceOf] rather than matching `any` and the
+// empty interface literally. Those two were the whole answer once, and
+// one line defeated it:
+//
+//	type operand interface{ drops.Expression }
+//
+// A parameter of that type takes a statement exactly as an `any` does
+// — it is an *ast.Ident whose name is not "any", so the census walked
+// past every helper that declared one.
+func (p *pgSyntax) isOperandType(e ast.Expr) bool {
+	if isExpressionType(elementType(e)) {
+		return true
 	}
-	return isExpressionType(e)
+	if it := p.interfaceOf(e); it != nil {
+		return p.interfaceAdmits(it, p.rendering)
+	}
+	return false
 }
 
 // TestOperandConstructorsCarryTheTenantAxis runs the whole table with a
@@ -1119,6 +1121,21 @@ type pgSyntax struct {
 	methods map[string]map[string]*ast.FuncDecl // receiver type name -> method name -> decl
 	funcs   []*ast.FuncDecl                     // package-level functions
 	bearing map[string]bool                     // types that can hold a caller's expression
+
+	// statementBuilding is the set of package types that implement one
+	// of resolveExpr's arms and render — a statement builder, derived
+	// from the resolver's own decision instead of from the name
+	// *SelectBuilder. See statementBuildingTypes.
+	statementBuilding map[string]bool
+
+	// rendering is the set of package types that render a caller's
+	// expression, and it is the set an interface's method demand is
+	// answered against. bearing is the wrong set for that question:
+	// bearing follows field types to any depth, so a *Column is bearing
+	// because it holds a *Table which holds DefaultFilters — and a
+	// column reference is not a statement, which is the distinction
+	// typesRenderingCallerExpressions exists to draw.
+	rendering map[string]bool
 }
 
 // loadPgSyntax parses the non-test sources of package pg and computes
@@ -1242,10 +1259,87 @@ func loadPgSyntaxWith(t *testing.T, extra ...string) *pgSyntax {
 			}
 		}
 		if !changed {
+			p.rendering = p.typesRenderingCallerExpressions()
+			p.statementBuilding = p.statementBuildingTypes()
 			return p
 		}
 	}
 }
+
+// statementBuildingTypes returns the package types the resolver can
+// enter AND that render: the derived spelling of "*SelectBuilder".
+//
+// It reads resolveExpr's own type switch, which is the one place that
+// decides what a statement is, and asks which types satisfy an arm of
+// it. Written as a name, the answer went stale the day the second
+// builder was written — which is the whole history of this file. The
+// staleness fatals live in resolverArms; this returns an empty set
+// rather than reporting, so a synthetic package can be walked with it.
+func (p *pgSyntax) statementBuildingTypes() map[string]bool {
+	fn := p.allFuncs()["resolveExpr"]
+	if fn == nil {
+		return map[string]bool{}
+	}
+	var arms [][]string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		cc, ok := n.(*ast.CaseClause)
+		if !ok {
+			return true
+		}
+		for _, e := range cc.List {
+			if tn := typeName(e); tn != "" && p.ifaces[tn] != nil {
+				arms = append(arms, p.interfaceMethods(tn))
+			}
+		}
+		return true
+	})
+	out := map[string]bool{}
+	for name := range p.structs {
+		renders := false
+		for _, m := range p.methods[name] {
+			if takesBuilder(m.Type) {
+				renders = true
+				break
+			}
+		}
+		if !renders {
+			continue
+		}
+		for _, arm := range arms {
+			if len(arm) > 0 && hasAllMethods(p.methods[name], arm) {
+				out[name] = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+// interfaceOf returns the interface a declaration's type IS, whichever
+// of the three ways it is spelled: a local interface name, an inline
+// anonymous interface, or `any`.
+//
+// The three are one promise, and every check that matched only the last
+// two was walked past by writing the first. Slice, pointer, variadic
+// and map wrappers are stripped on the way, because a []operand takes
+// operands.
+func (p *pgSyntax) interfaceOf(e ast.Expr) *ast.InterfaceType {
+	switch v := elementType(e).(type) {
+	case *ast.InterfaceType:
+		return v
+	case *ast.Ident:
+		if v.Name == "any" {
+			return emptyInterface
+		}
+		return p.ifaces[v.Name]
+	}
+	return nil
+}
+
+// emptyInterface stands for `any`, which is an identifier rather than
+// an *ast.InterfaceType in the syntax tree and the same promise in the
+// language.
+var emptyInterface = &ast.InterfaceType{Methods: &ast.FieldList{}}
 
 func hasAllMethods(have map[string]*ast.FuncDecl, want []string) bool {
 	for _, w := range want {
@@ -1287,37 +1381,258 @@ func hasAllMethods(have map[string]*ast.FuncDecl, want []string) bool {
 // where none was needed, and being wrong the other way costs a
 // statement nobody walked.
 func (p *pgSyntax) interfaceHolds(name string, bearing map[string]bool) bool {
-	it := p.ifaces[name]
+	return p.interfaceAdmits(p.ifaces[name], bearing)
+}
+
+// interfaceAdmits is interfaceHolds asked of the interface itself
+// rather than of its name, which is what lets the same three answers
+// serve a field declared with an INLINE anonymous interface.
+//
+// A name is a spelling. `holder` and `interface{ drops.Expression }`
+// are the same promise, and a check that could only answer for the
+// first was defeated by deleting one line of the declaration — the same
+// shape as the bypass interfaceHolds was written to close, one syntax
+// further out.
+func (p *pgSyntax) interfaceAdmits(it *ast.InterfaceType, bearing map[string]bool) bool {
 	if it == nil {
 		return false
 	}
-	if it.Methods == nil || len(it.Methods.List) == 0 {
-		return true
-	}
-	var own []string
-	for _, m := range it.Methods.List {
-		if len(m.Names) == 0 {
-			if isExpressionType(m.Type) {
-				return true
-			}
-			if e := typeName(m.Type); e != "" && p.ifaces[e] != nil && p.interfaceHolds(e, bearing) {
-				return true
-			}
-			continue
-		}
-		for _, n := range m.Names {
-			own = append(own, n.Name)
-		}
-	}
+	own := p.interfaceMethodsOf(it)
 	if len(own) == 0 {
+		// Demands nothing at all — `any`, or an interface embedding
+		// only interfaces from other packages. It holds anything,
+		// including a statement.
 		return true
 	}
+	if !sealedToCallers(own) && p.embedsExpression(it) {
+		// Embeds drops.Expression and can be implemented from outside:
+		// it promises exactly the thing the resolver walks. This is the
+		// bypass that was open — the check asked only "which bearing
+		// struct implements it?", and `interface{ drops.Expression }`
+		// declares no methods of its own, so the answer was "none".
+		return true
+	}
+	// Otherwise it holds one when some type that already does satisfies
+	// its methods, which is how ColumnValue qualifies: exprBinding holds
+	// a drops.Expression and implements it.
+	//
+	// A SEALED interface reaches this answer and no other, and that is
+	// the difference between ColumnValue and ColRef. Both demand an
+	// unexported method, so no caller can implement either; what a
+	// caller CAN do is get one from an exported constructor of this
+	// package, and whether that hands them somewhere to put a statement
+	// is a question about this package's own implementors rather than
+	// about the embedded drops.Expression. exprBinding holds a caller's
+	// expression, so ColumnValue admits one. *Column is the only ColRef
+	// and renders a qualified name, so ColRef admits none — which it
+	// must not, or every helper taking a column reference is read as
+	// taking a statement.
 	for impl := range bearing {
 		if bearing[impl] && p.methods[impl] != nil && hasAllMethods(p.methods[impl], own) {
 			return true
 		}
 	}
 	return false
+}
+
+// interfaceMethodsOf returns every method name an interface demands of
+// its own, following the local interfaces it embeds. An embedded
+// interface from another package is skipped: drops.Expression is
+// answered by embedsExpression, on different terms.
+func (p *pgSyntax) interfaceMethodsOf(it *ast.InterfaceType) []string {
+	if it == nil || it.Methods == nil {
+		return nil
+	}
+	var out []string
+	for _, m := range it.Methods.List {
+		if len(m.Names) == 0 {
+			if inner, ok := m.Type.(*ast.InterfaceType); ok {
+				out = append(out, p.interfaceMethodsOf(inner)...)
+				continue
+			}
+			if e := typeName(m.Type); e != "" && p.ifaces[e] != nil {
+				out = append(out, p.interfaceMethodsOf(p.ifaces[e])...)
+			}
+			continue
+		}
+		for _, n := range m.Names {
+			out = append(out, n.Name)
+		}
+	}
+	return out
+}
+
+// embedsExpression reports whether the interface embeds
+// drops.Expression, directly or through a local interface.
+func (p *pgSyntax) embedsExpression(it *ast.InterfaceType) bool {
+	if it == nil || it.Methods == nil {
+		return false
+	}
+	for _, m := range it.Methods.List {
+		if len(m.Names) != 0 {
+			continue
+		}
+		if isExpressionType(m.Type) {
+			return true
+		}
+		if inner, ok := m.Type.(*ast.InterfaceType); ok && p.embedsExpression(inner) {
+			return true
+		}
+		if e := typeName(m.Type); e != "" && p.embedsExpression(p.ifaces[e]) {
+			return true
+		}
+	}
+	return false
+}
+
+// sealedToCallers reports whether an interface demands a method no
+// caller can write: an unexported one. Nothing outside this package can
+// implement it, so "a caller could satisfy this with a statement" is
+// not one of the reasons it holds one.
+func sealedToCallers(methods []string) bool {
+	for _, m := range methods {
+		if !ast.IsExported(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// bearsRelation reports whether a value declared with this type
+// expression can carry a *Table, given the set of package types that
+// already count as carrying one.
+//
+// It is [pgSyntax.bearsExpression] for relations, and it exists because
+// every check that had a relation in it decided by the NAME "Table":
+// isOperandType, isWideOperandType, takesRelation, and the holdsTable
+// and holdsDB walks the two censuses run. All five were walked past
+// with one line —
+//
+//	type rel interface{ drops.Expression }
+//
+// — because a field or a parameter declared with a local interface is
+// an *ast.Ident naming something that is not called Table, and every
+// one of those checks stopped there. A *Table IS a drops.Expression,
+// which is exactly how FromExpr took a relation on the expression path
+// and nothing scoped it; a local interface that embeds one takes a
+// relation on the same terms and under a different spelling.
+//
+// The three answers are interfaceAdmits's, and they are the right three
+// here for the same reasons: an interface that embeds drops.Expression
+// admits a *Table by definition, an interface that demands nothing
+// admits everything, and otherwise it admits one when some type that
+// carries a relation satisfies its methods. Being wrong in the
+// admitting direction costs a check that asks for scoping where none
+// was needed; being wrong the other way costs a relation nobody
+// scoped.
+func (p *pgSyntax) bearsRelation(e ast.Expr, holders map[string]bool) bool {
+	if isExpressionType(elementType(e)) {
+		// A *Table IS a drops.Expression, and this is the answer
+		// FromExpr took a relation through while nothing scoped it. It
+		// is the fail-closed half, so it belongs to the questions asked
+		// of what a caller can HAND IN — a parameter, a field a
+		// renderer reads — and not to namesRelation.
+		return true
+	}
+	return p.namesRelation(e, holders)
+}
+
+// namesRelation is bearsRelation without the drops.Expression answer:
+// what the package DECLARES this to be, rather than what could arrive
+// through it.
+//
+// The two are asymmetric on purpose. A parameter typed drops.Expression
+// can be handed a *Table by a caller, so it is a door. A function
+// declared to answer with a drops.Expression is answering with whatever
+// it built — Subquery, And, Count — and reading every one of those as
+// "hands a relation back" would make the census the whole package. What
+// makes a returned value a second handle on a relation is that the
+// package says so, in the type: a *Table, or a local interface only a
+// relation satisfies, which is the one spelling of Table.As's shape
+// that the name "Table" could not see.
+func (p *pgSyntax) namesRelation(e ast.Expr, holders map[string]bool) bool {
+	if name := typeName(e); name != "" && holders[name] {
+		return true
+	}
+	// interfaceOf rather than a lookup in p.ifaces: `any` is an
+	// identifier and an inline interface is not an identifier at all,
+	// and all three spellings are the same promise.
+	if it := p.interfaceOf(e); it != nil {
+		return p.interfaceAdmits(it, holders)
+	}
+	return false
+}
+
+// declaresRelation is namesRelation minus the answer "demands nothing".
+//
+// `any` is a promise about nothing at all, and which way that cuts
+// depends on the direction the value travels. As a PARAMETER it is a
+// door: a caller can put a *Table through it, which is why
+// bearsRelation admits it. As a RETURN type, or as the handle a
+// function is HANDED, it says only that the package did not commit to
+// anything — and reading it as a relation made (*SelectBuilder).ToSQL,
+// which answers (string, []any), a door that hands relations out.
+//
+// An interface that demands something, or that embeds drops.Expression,
+// is a commitment and is read as one.
+func (p *pgSyntax) declaresRelation(e ast.Expr, holders map[string]bool) bool {
+	if name := typeName(e); name != "" && holders[name] {
+		return true
+	}
+	it := p.interfaceOf(e)
+	if it == nil {
+		return false
+	}
+	if len(p.interfaceMethodsOf(it)) == 0 && !p.embedsExpression(it) {
+		return false
+	}
+	return p.interfaceAdmits(it, holders)
+}
+
+// relationHolders is the fixpoint the three relation predicates are
+// asked against: the package types a *Table can be reached through,
+// computed rather than listed.
+//
+// seed names the type at the root — "Table" for the relation census,
+// "DB" for the executor one, since the two walks are the same question
+// about two different handles.
+//
+// The fields are walked with declaresRelation rather than
+// bearsRelation: a struct with an `any` field has committed to nothing,
+// and reading one as holding a relation makes an event payload and a
+// saga's state bag into relation handles. What a field DOES commit to —
+// the type itself, or an interface that demands something a relation
+// satisfies — is followed to convergence, so a *Table three hops away
+// still counts.
+func (p *pgSyntax) relationHolders(seed string) map[string]bool {
+	holders := map[string]bool{seed: true}
+	for {
+		changed := false
+		for name, st := range p.structs {
+			if holders[name] {
+				continue
+			}
+			for _, f := range st.Fields.List {
+				if p.declaresRelation(f.Type, holders) {
+					holders[name], changed = true, true
+					break
+				}
+			}
+		}
+		for name, u := range p.aliases {
+			if !holders[name] && p.declaresRelation(u, holders) {
+				holders[name], changed = true, true
+			}
+		}
+		for name, it := range p.ifaces {
+			if !holders[name] && p.interfaceAdmits(it, holders) {
+				holders[name], changed = true, true
+			}
+		}
+		if !changed {
+			return holders
+		}
+	}
 }
 
 // bearsExpression reports whether a value of type e can carry an
@@ -2219,7 +2534,7 @@ func censusBuilderOperandMethods(t *testing.T) []string {
 				continue
 			}
 			for _, param := range fn.Type.Params.List {
-				if !isWideOperandType(param.Type) {
+				if !p.isWideOperandType(param.Type) {
 					continue
 				}
 				if !seen[name] {
@@ -2255,20 +2570,17 @@ func isContextType(e ast.Expr) bool {
 // arbitrary expression in one, which is how a subquery reaches an
 // INSERT row or an UPDATE SET list, the two places an unresolved read
 // decides what gets written rather than what gets returned.
-func isWideOperandType(e ast.Expr) bool {
-	switch v := e.(type) {
-	case *ast.Ellipsis:
-		return isWideOperandType(v.Elt)
-	case *ast.ArrayType:
-		return isWideOperandType(v.Elt)
-	case *ast.StarExpr:
-		return typeName(v.X) == "SelectBuilder"
-	case *ast.Ident:
-		return v.Name == "any" || v.Name == "ColumnValue"
-	case *ast.InterfaceType:
-		return v.Methods == nil || len(v.Methods.List) == 0
+func (p *pgSyntax) isWideOperandType(e ast.Expr) bool {
+	if p.isOperandType(e) {
+		return true
 	}
-	return isExpressionType(e)
+	// A pointer to a statement builder: Union(other *SelectBuilder)
+	// takes a whole statement, and a statement is the thing that has to
+	// be resolved. Derived from the arms resolveExpr dispatches on
+	// rather than named, so the fifth builder is a wide operand on the
+	// day it is written — *SelectBuilder was the name here, and a
+	// second builder growing the same method was invisible.
+	return p.statementBuilding[typeName(e)]
 }
 
 // TestBuilderOperandMethodsCarryTheTenantAxis runs the whole method
@@ -2423,7 +2735,7 @@ func censusWidenedOperandConstructors(t *testing.T) []string {
 		if !fn.Name.IsExported() || fn.Type.Results == nil {
 			continue
 		}
-		if !takesWideOperand(fn.Type.Params) || !returnsRendered(rendered, fn.Type.Results) {
+		if !p.takesWideOperand(fn.Type.Params) || !returnsRendered(rendered, fn.Type.Results) {
 			continue
 		}
 		out = append(out, fn.Name.Name)
@@ -2432,12 +2744,12 @@ func censusWidenedOperandConstructors(t *testing.T) []string {
 	return out
 }
 
-func takesWideOperand(fl *ast.FieldList) bool {
+func (p *pgSyntax) takesWideOperand(fl *ast.FieldList) bool {
 	if fl == nil {
 		return false
 	}
 	for _, f := range fl.List {
-		if isWideOperandType(f.Type) {
+		if p.isWideOperandType(f.Type) {
 			return true
 		}
 	}

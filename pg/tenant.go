@@ -43,7 +43,13 @@ import (
 // rejects if r already carries a different tenant) so a stray
 // background job can't silently insert into the wrong tenant.
 //
-// Two things a reader of this file has to take away with it.
+// Three things a reader of this file has to take away with it.
+//
+// These predicates are not the isolation boundary. PostgreSQL
+// row-level security is, and this layer is what makes the common path
+// fast, legible and correct on top of it — see "The predicates are not
+// the boundary" in the package doc for why no amount of further work
+// here changes that, and for what to declare instead.
 //
 // The predicate reaches every statement drops composed, to any depth —
 // a CTE body, a subquery operand, a set-operation operand, an

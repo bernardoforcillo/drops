@@ -297,6 +297,16 @@ reach further than the entity they are spelled on:
   `db.Select()`, an eager-loaded edge, a CTE body, a subquery — and
   refuses when the ctx carries none. Widen one statement with
   `Unscoped()`, one relation edge with `RelConfig.Unscoped()`.
+
+  It is not the isolation boundary, and the `pg` package doc says so
+  under "The predicates are not the boundary". PostgreSQL row-level
+  security is the boundary; these predicates are the layer that makes
+  the common path fast, legible and correct on top of it. `drops.Raw`
+  is an escape hatch by design, `Unscoped()` exists and has to, and the
+  source checks that keep the axis honest are a lint over one package —
+  so declare RLS with `EnableRLS` / `AddPolicy` on every table that
+  holds more than one tenant's rows, and read this bullet as defence in
+  depth.
 - `AuthorizeWith` AND-s the guard's predicate into every Get / Query /
   Update / Delete. A `MembershipGuard`'s junction subquery is a
   statement drops composed rather than SQL text, so the junction table's

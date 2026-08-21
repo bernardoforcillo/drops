@@ -491,7 +491,15 @@ func carriesTenantAxis(sql, qualifier string) bool {
 	if strings.Contains(normalisePlaceholders(sql), `"`+qualifier+`"."tenantId" = $?`) {
 		return true
 	}
-	return strings.HasPrefix(sql, "INSERT ") && strings.Contains(sql, `"tenantId"`)
+	// A COPY is an INSERT with the row bodies moved off the statement,
+	// and it carries the axis the same way an INSERT does: the tenant
+	// column is in the destination list and the value is in the stream.
+	// The stream is where the caller's fixture puts it — see
+	// execDriver.Copy — so the column list is what is asserted here and
+	// the tenant among the copied values is asserted by the same
+	// containsArg every other case uses.
+	return (strings.HasPrefix(sql, "INSERT ") || strings.HasPrefix(sql, "COPY ")) &&
+		strings.Contains(sql, `"tenantId"`)
 }
 
 // renderedStmt is one statement a case produced: what was rendered, and
@@ -755,24 +763,11 @@ func caseKey(name string) string {
 // resolver walks expressions, so a relation reaching a statement by a
 // door nobody enumerated is a relation nobody scopes.
 func (p *pgSyntax) relationReceivers() map[string]bool {
-	holdsTable := map[string]bool{}
-	for {
-		changed := false
-		for name, st := range p.structs {
-			if holdsTable[name] {
-				continue
-			}
-			for _, f := range st.Fields.List {
-				if tn := typeName(f.Type); tn == "Table" || holdsTable[tn] {
-					holdsTable[name], changed = true, true
-					break
-				}
-			}
-		}
-		if !changed {
-			break
-		}
-	}
+	// Which declarations can carry a *Table is computed, not spelled:
+	// see bearsRelation for the one-line local interface that walked
+	// past every version of this walk that compared against the name
+	// "Table".
+	holdsTable := p.relationHolders("Table")
 
 	out := map[string]bool{}
 	for name, st := range p.structs {
@@ -793,7 +788,7 @@ func (p *pgSyntax) relationReceivers() map[string]bool {
 			}
 		}
 		for f := range p.fieldsReadAt(name, fields, sites) {
-			if tn := typeName(fieldType[f]); tn == "Table" || holdsTable[tn] {
+			if p.bearsRelation(fieldType[f], holdsTable) {
 				out[name] = true
 				break
 			}
@@ -801,7 +796,7 @@ func (p *pgSyntax) relationReceivers() map[string]bool {
 	}
 	for recv, ms := range p.methods {
 		for _, fn := range ms {
-			if returnsTable(fn.Type) {
+			if p.returnsTable(fn.Type, relationItself) {
 				out[recv] = true
 				break
 			}
@@ -819,7 +814,7 @@ func (p *pgSyntax) relationReceivers() map[string]bool {
 				if !out[recv] && fn.Type.Params != nil {
 					takes := false
 					for _, param := range fn.Type.Params.List {
-						if typeName(param.Type) == "Table" {
+						if p.bearsRelation(param.Type, relationItself) {
 							takes = true
 						}
 					}
@@ -841,7 +836,7 @@ func (p *pgSyntax) relationReceivers() map[string]bool {
 				}
 				for _, r := range fn.Type.Results.List {
 					sub := typeName(r.Type)
-					if sub == "" || out[sub] || p.structs[sub] == nil || !holdsTable[sub] {
+					if sub == "" || out[sub] || p.structs[sub] == nil || !p.declaresRelation(r.Type, holdsTable) {
 						continue
 					}
 					out[sub], changed = true, true
@@ -908,7 +903,12 @@ func TestEveryRelationEntryPointIsCensused(t *testing.T) {
 // function that does both.
 func censusRelationEntryPoints(t *testing.T) []string {
 	t.Helper()
-	p := loadPgSyntax(t)
+	return censusRelationEntryPointsIn(loadPgSyntax(t))
+}
+
+// censusRelationEntryPointsIn is the census body, taking the parsed
+// package so it can be pointed at one built to slip past it.
+func censusRelationEntryPointsIn(p *pgSyntax) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(name string) {
@@ -927,7 +927,7 @@ func censusRelationEntryPoints(t *testing.T) []string {
 			if !ast.IsExported(name) {
 				continue
 			}
-			if returnsTable(fn.Type) {
+			if p.returnsTable(fn.Type, relationItself) {
 				add(recv + "." + name)
 				continue
 			}
@@ -947,7 +947,7 @@ func censusRelationEntryPoints(t *testing.T) []string {
 				continue
 			}
 			for _, param := range fn.Type.Params.List {
-				if takesRelation(param.Type) {
+				if p.takesRelation(param.Type, relationItself) {
 					add(recv + "." + name)
 					break
 				}
@@ -955,11 +955,11 @@ func censusRelationEntryPoints(t *testing.T) []string {
 		}
 	}
 	for _, fn := range p.funcs {
-		if !ast.IsExported(fn.Name.Name) || !returnsTable(fn.Type) || fn.Type.Params == nil {
+		if !ast.IsExported(fn.Name.Name) || !p.returnsTable(fn.Type, relationItself) || fn.Type.Params == nil {
 			continue
 		}
 		for _, param := range fn.Type.Params.List {
-			if typeName(param.Type) == "Table" {
+			if p.takesRelation(param.Type, relationItself) {
 				add(fn.Name.Name)
 				break
 			}
@@ -983,38 +983,40 @@ func takesContext(ft *ast.FuncType) bool {
 	return false
 }
 
+// relationItself is the holder set for the question "can this
+// declaration be a relation?", as opposed to "can it hold one". A
+// *SelectBuilder holds a *Table and is not one, so a method answering
+// with a builder has not handed a relation out — which is the
+// difference between Table.As, the shape this census exists for, and
+// every chainable setter in the package.
+var relationItself = map[string]bool{"Table": true}
+
 // takesRelation reports whether a parameter of this type can be handed
 // a *Table.
 //
-// drops.Expression is in the list, and it is the entry that matters: a
-// *Table IS one, which is how FromExpr took a relation on the
-// expression path and nothing scoped it. `any` and the empty interface
-// are here for the same reason one level wider.
-func takesRelation(e ast.Expr) bool {
-	switch v := e.(type) {
-	case *ast.Ellipsis:
-		return takesRelation(v.Elt)
-	case *ast.ArrayType:
-		return takesRelation(v.Elt)
-	case *ast.StarExpr:
-		return typeName(v.X) == "Table"
-	case *ast.Ident:
-		return v.Name == "any"
-	case *ast.InterfaceType:
-		return v.Methods == nil || len(v.Methods.List) == 0
-	}
-	return isExpressionType(e)
+// drops.Expression is the answer that matters: a *Table IS one, which
+// is how FromExpr took a relation on the expression path and nothing
+// scoped it. It is reached through [pgSyntax.bearsRelation] rather than
+// matched here, so the same is true of every other way to spell that
+// promise — `any`, an inline anonymous interface, and the local
+// interface that used to walk straight past this check:
+//
+//	type rel interface{ drops.Expression }
+func (p *pgSyntax) takesRelation(e ast.Expr, holders map[string]bool) bool {
+	return p.bearsRelation(e, holders)
 }
 
-// returnsTable reports whether a signature hands back a *Table — a
+// returnsTable reports whether a signature hands back a relation — a
 // second handle on a table the caller can use later, which is the shape
-// Table.As got wrong.
-func returnsTable(ft *ast.FuncType) bool {
+// Table.As got wrong. Computed the same way and for the same reason as
+// takesRelation: a method answering with an interface a *Table
+// satisfies has handed one out.
+func (p *pgSyntax) returnsTable(ft *ast.FuncType, holders map[string]bool) bool {
 	if ft.Results == nil {
 		return false
 	}
 	for _, r := range ft.Results.List {
-		if typeName(r.Type) == "Table" {
+		if p.declaresRelation(r.Type, holders) {
 			return true
 		}
 	}

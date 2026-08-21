@@ -57,6 +57,49 @@
 // thundering herd resolves to one DB query. Query results are keyed
 // by sha256(SQL+args) and rely on the cache's TTL for freshness.
 //
+// # The predicates are not the boundary
+//
+// PostgreSQL row-level security is. drops' tenant predicates are the
+// application-level layer that makes the common path fast, legible and
+// correct; RLS is what makes it a boundary. A schema holding more than
+// one tenant's rows wants both, and this section is here because the
+// rest of the documentation used to imply that the first alone was
+// enough.
+//
+// That is a finding, and it was reached by trying the other thing.
+// Successive audits took twenty-nine scoping defects out of this
+// package and left behind a family of checks that read its own source
+// so the answers cannot go stale — see the pg/scope*_test.go files, and
+// pg/scopecheckself_test.go, which points each check at a package built
+// to slip past it. What that work established is that no amount more of
+// it produces a boundary, for three reasons none of which is a bug:
+//
+//   - [github.com/bernardoforcillo/drops.Builder] is an exported escape
+//     hatch, by design. What is assembled on one is text whose
+//     structure drops never sees, so there is nothing in it to scope.
+//     The list below is where that falls;
+//   - the checks are an AST walk over one package. That makes them a
+//     lint, and a lint is advice to exactly the person it constrains: a
+//     change that edits the check passes the check;
+//   - [SelectBuilder.Unscoped] exists and has to. Reading across
+//     tenants is a real requirement, and a layer the guarded code can
+//     switch off is not a layer that code sits behind.
+//
+// So declare RLS on every table that carries tenant rows —
+// [Table.EnableRLS] and [Table.AddPolicy] emit it into the migration —
+// write the policy against a setting the connection carries
+// (current_setting), and set that setting for the request. Then a
+// statement that lost its predicate returns no rows rather than
+// somebody else's, and everything in the section below is a question of
+// defence in depth rather than a disclosure.
+//
+// What the predicates still buy, with RLS underneath them, is worth
+// stating: the axis is declared once per table instead of written into
+// every call site; a request with no tenant on its ctx is refused
+// before it reaches the server rather than answered with an empty
+// result that reads like "no such row"; and the predicate is in the
+// statement, where a query plan and a reviewer can both see it.
+//
 // # Where the automatic scoping stops
 //
 // This section describes package pg and nothing else. mysql, sqlite and

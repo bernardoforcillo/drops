@@ -3,6 +3,7 @@ package pg_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/bernardoforcillo/drops/dropstest"
 	"github.com/bernardoforcillo/drops/pg"
+	"github.com/bernardoforcillo/drops/vector"
 )
 
 // ----------------------------------------------------------------------
@@ -79,12 +81,46 @@ func newExecFixture() *execFixture {
 		[]string{"id", "tenantId", "name"},
 		[]any{int64(1), execTenant, "row"},
 	)
-	f := &execFixture{drv: drv, db: pg.New(drv), tbl: pg.NewTable("ex_rows")}
+	f := &execFixture{drv: drv, tbl: pg.NewTable("ex_rows")}
+	f.db = pg.New(&execDriver{Driver: drv, f: f})
 	f.id = pg.Add(f.tbl, pg.BigSerial("id").PrimaryKey())
 	tenant := pg.Add(f.tbl, pg.BigInt("tenantId").NotNull())
 	f.name = pg.Add(f.tbl, pg.Text("name").NotNull())
 	f.ent = pg.NewEntity[execRow](f.tbl).ScopeByTenant(tenant)
 	return f
+}
+
+// execDriver is the fixture's driver with COPY support bolted on, so
+// [pg.CopyFrom] can be run by the same table as every other executor.
+//
+// A COPY carries no SQL for the axis to appear in — that is the point
+// of it — so what reaches the server is recorded in the shape the
+// assertion can read: the destination relation, the column list, and
+// every value that was streamed. The tenant column has to be among the
+// columns and the ctx tenant among the values, which is exactly what
+// [pg.Entity.CreateMany] promises and what CopyFrom's own stamping
+// exists to keep.
+type execDriver struct {
+	*dropstest.Driver
+	f *execFixture
+}
+
+func (d *execDriver) Copy(_ context.Context, table string, cols []string, rows [][]any) (int64, error) {
+	var b strings.Builder
+	b.WriteString(`COPY "` + table + `" (`)
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(`"` + c + `"`)
+	}
+	b.WriteString(") FROM STDIN")
+	var args []any
+	for _, r := range rows {
+		args = append(args, r...)
+	}
+	d.f.record(b.String(), args)
+	return int64(len(rows)), nil
 }
 
 // record is how a ToSQLCtx case reports what it rendered.
@@ -97,6 +133,14 @@ func (f *execFixture) record(sql string, args []any) {
 func (f *execFixture) statements() []renderedStmt {
 	out := append([]renderedStmt(nil), f.rendered...)
 	for _, st := range f.drv.Statements() {
+		// A transaction boundary is a driver call and not a statement:
+		// [dropstest.Driver] records begin, commit and rollback with no
+		// SQL at all rather than inventing the text, so there is
+		// nothing in one for an axis to be carried by and nothing sent
+		// to a server by it. Seeder.Apply wraps its inserts in one.
+		if st.Op != dropstest.OpExec && st.Op != dropstest.OpQuery {
+			continue
+		}
 		out = append(out, renderedStmt{sql: st.SQL, args: st.Args})
 	}
 	return out
@@ -302,7 +346,65 @@ func executorEntryPoints() []executorCase {
 			_, err := f.db.ExecExpr(ctx, f.db.Delete(f.tbl))
 			return err
 		}},
+
+		// copy.go — the bulk path, which sends no SQL at all. See
+		// execDriver for the shape its rows are asserted in.
+		{name: "CopyFrom", run: func(f *execFixture, ctx context.Context) error {
+			_, err := pg.CopyFrom(f.db, ctx, f.ent, []execRow{{Name: "x"}, {Name: "y"}})
+			return err
+		}},
+
+		// factory.go — a test fixture builder, and every row it writes
+		// is a row in somebody's table.
+		{name: "Factory.Create", run: func(f *execFixture, ctx context.Context) error {
+			_, err := execFactory(f).Create(ctx, f.db)
+			return err
+		}},
+		{name: "Factory.CreateN", run: func(f *execFixture, ctx context.Context) error {
+			_, err := execFactory(f).CreateN(ctx, f.db, 2)
+			return err
+		}},
+
+		// seed.go — the same rows through the seeder, inside its
+		// transaction.
+		{name: "Seeder.Apply", run: func(f *execFixture, ctx context.Context) error {
+			s := pg.NewSeeder(f.db)
+			pg.SeedAdd(s, f.ent, execRow{Name: "x"})
+			return s.Apply(ctx)
+		}},
+
+		// vectorstore.go — a nearest-neighbour read is a read.
+		{
+			name: "VectorStore.Search",
+			// The store scans (id, distance) and nothing else, so the
+			// canned three-column row of the fixture would not align.
+			rows: func(d *dropstest.Driver) {
+				d.AlwaysRows([]string{"id", "_drops_distance"}, []any{int64(1), 0.5})
+			},
+			run: func(f *execFixture, ctx context.Context) error {
+				// The text column stands in for the embedding: the
+				// distance expression is built from the query vector
+				// and the column reference, and what this case asserts
+				// is the predicate around them.
+				store := pg.NewVectorStore(f.db, f.tbl, f.id, f.name)
+				_, err := store.Search(ctx, vector.Query{
+					Vector: []float32{1, 2, 3},
+					TopK:   1,
+					Metric: vector.Cosine,
+				})
+				return err
+			},
+		},
 	}
+}
+
+// execFactory is the factory the two Factory cases share: one row per
+// call, with nothing set but the name, so the tenant in the statement
+// can only have come from the entity's axis.
+func execFactory(f *execFixture) *pg.Factory[execRow] {
+	return pg.NewFactory(f.ent, func(seq int) execRow {
+		return execRow{Name: fmt.Sprintf("row-%d", seq)}
+	})
 }
 
 // execRender runs a ToSQLCtx case: it renders rather than sends, and
@@ -326,6 +428,8 @@ var exemptExecutors = map[string]string{
 	"DB.Begin":            "starts a transaction and sends no statement of its own; the statements inside it are the executors below, each scoped on its own terms",
 	"DB.StartPoolMetrics": "samples the driver's connection pool on a timer and sends no statement at all; the ctx is the sampler's lifetime",
 	"DB.InTx":             "runs the caller's function against a transactional *DB, and every statement inside it goes out through one of the executors this table covers",
+	"Push":                "reconciles the SCHEMA: every statement it sends is DDL — CREATE, ALTER, DROP — against relations rather than rows, and DDL has no WHERE clause and no row for a tenant predicate to select. What it must not do is destroy a relation nobody declared, which is ownedBy's promise and TestPushWithholdsUnmanagedObjects's assertion",
+	"Subscribe":           "sends LISTEN and no statement against the entity's table: the change feed is a whole-table stream by construction, and the one place it reads a row is Entity.Get, which is in this table and carries the axis. What crosses tenants is the primary key of a changed row, which is what a change feed publishes — a consumer that must not see other tenants' keys filters the stream, or reads the feed behind row-level security",
 }
 
 // TestEveryExecutorCarriesTheTenantAxis is the first half: with a
@@ -392,7 +496,7 @@ func TestEveryExecutorIsCensused(t *testing.T) {
 		covered[strings.Fields(tc.name)[0]] = true
 	}
 
-	census := censusExecutors(t)
+	census := censusExecutors(t, loadPgSyntax(t))
 	for _, want := range []string{"SelectBuilder.All", "Entity.CreateMany", "EntityQuery.Stream", "PageBuilder.All"} {
 		if !hasEntry(census, want) {
 			t.Fatalf("%s is no longer an executor — this census has gone stale", want)
@@ -427,45 +531,65 @@ func TestEveryExecutorIsCensused(t *testing.T) {
 }
 
 // censusExecutors returns every door a statement for a caller's table
-// can go out through: an exported method handed a context.Context, on a
-// type that builds statements out of the caller's relations, or on the
-// DB itself.
+// can go out through: an exported function or method that is handed a
+// context.Context and can reach a driver.
 //
-// The receiver set is the relation census's, derived there from what a
-// type renders and hands out, so the two censuses cannot disagree about
-// what a statement-building type is. The DB is added because it is the
-// one executor that holds no relation of its own: ExecExpr renders
-// whatever it is handed.
-func censusExecutors(t *testing.T) []string {
+// "Can reach a driver" is the whole test, and it replaced a narrower
+// one. The census used to also require the receiver to be a type that
+// builds statements out of relations, which is true of the builders and
+// of Entity and false of everything else that sends SQL — so CopyFrom,
+// Subscribe, the Factory, VectorStore.Search and Seeder.Apply were
+// outside it, and a package-level function that took a *DB and a ctx
+// was outside it twice over. None of them is exempt from the axis: a
+// statement is a statement whoever assembled it, and the tenant a
+// scoped table demands is owed by the door that sends it, not by the
+// door that looks like a builder.
+//
+// Which declarations can carry a *DB is computed by the same predicate
+// the relation census uses for a *Table — see bearsRelation — so a
+// receiver that holds its handle behind a local interface is censused
+// like one that names the type.
+func censusExecutors(t *testing.T, p *pgSyntax) []string {
 	t.Helper()
-	p := loadPgSyntax(t)
-	receivers := p.relationReceivers()
-	receivers["DB"] = true
+	holdsDB := p.relationHolders("DB")
 
-	holdsDB := map[string]bool{"DB": true}
-	for {
-		changed := false
-		for name, st := range p.structs {
-			if holdsDB[name] {
-				continue
-			}
-			for _, f := range st.Fields.List {
-				if tn := typeName(f.Type); tn == "DB" || holdsDB[tn] {
-					holdsDB[name], changed = true, true
-					break
-				}
+	carriesRelation := p.relationHolders("Table")
+	renders := p.relationReceivers()
+
+	// hasRelation: the door has a caller's relation in its hands,
+	// either because the receiver carries one or because the signature
+	// is handed one. The DB is the third case and the only named one:
+	// it carries no relation of its own and renders whatever it is
+	// given, which is what ExecExpr is.
+	hasRelation := func(recv string, ft *ast.FuncType) bool {
+		if recv == "DB" || carriesRelation[recv] || renders[recv] {
+			return true
+		}
+		if ft.Params == nil {
+			return false
+		}
+		for _, param := range ft.Params.List {
+			// A parameter that IS an expression can be handed a *Table
+			// — DB.ExecExpr is the door that is — and one that CARRIES
+			// a relation is one too, which is how CopyFrom and
+			// Subscribe are handed a caller's table through an
+			// *Entity[T].
+			//
+			// `any` is neither, and this is the one place it is read
+			// that way. A payload parameter — Notify's, the outbox
+			// row's, the event store's — commits to nothing and names
+			// no relation; reading it as one put every function with a
+			// payload in this census, where there is no statement for
+			// an axis to be carried by.
+			if isExpressionType(elementType(param.Type)) || p.declaresRelation(param.Type, carriesRelation) {
+				return true
 			}
 		}
-		if !changed {
-			break
-		}
+		return false
 	}
 
 	var out []string
 	for recv, ms := range p.methods {
-		if !receivers[recv] {
-			continue
-		}
 		for name, fn := range ms {
 			if !ast.IsExported(name) || !takesContext(fn.Type) {
 				continue
@@ -473,18 +597,47 @@ func censusExecutors(t *testing.T) []string {
 			// It has to be able to REACH a driver: the receiver holds a
 			// *DB, or is handed one. Entity's methods take the *DB,
 			// which is why this is not "holds" alone.
-			takesDB := false
-			for _, param := range fn.Type.Params.List {
-				if typeName(param.Type) == "DB" {
-					takesDB = true
-				}
+			if !holdsDB[recv] && !p.handedDB(fn.Type, holdsDB) {
+				continue
 			}
-			if !holdsDB[recv] && !takesDB {
+			if !hasRelation(recv, fn.Type) {
 				continue
 			}
 			out = append(out, recv+"."+name)
 		}
 	}
+	// A package-level function handed a ctx and a *DB sends statements
+	// with nobody's receiver in the way, and the census could not see
+	// one at all.
+	for _, fn := range p.funcs {
+		if !fn.Name.IsExported() || !takesContext(fn.Type) {
+			continue
+		}
+		if !p.handedDB(fn.Type, holdsDB) || !hasRelation("", fn.Type) {
+			continue
+		}
+		out = append(out, fn.Name.Name)
+	}
 	sort.Strings(out)
 	return out
+}
+
+// handedDB reports whether a signature is given something that can
+// reach a driver.
+//
+// It asks declaresRelation rather than bearsRelation: a parameter typed
+// drops.Expression, or `any`, can be handed a *Table, which is why the
+// relation census treats it as a door — but nobody hands a *DB through
+// one, and reading every expression parameter as a database handle
+// would make this census the package.
+func (p *pgSyntax) handedDB(ft *ast.FuncType, holdsDB map[string]bool) bool {
+	if ft.Params == nil {
+		return false
+	}
+	for _, param := range ft.Params.List {
+		if p.declaresRelation(param.Type, holdsDB) {
+			return true
+		}
+	}
+	return false
 }

@@ -903,17 +903,21 @@ func TestReseedWhereNarrowsBothStatements(t *testing.T) {
 	// strings.Contains of the predicate cannot see is how the
 	// predicates are joined to the key bound, and a fake that applies
 	// a predicate by recognising its text cannot see it either. The
-	// expected strings are the ones PostgreSQL 16 was handed and
-	// accepted for this walk, table name aside.
+	// expected strings are pg's own rendering of the clause, which is
+	// what these reads are assembled from since the walk stopped
+	// building SQL by hand — see Reseeder.read for why.
 	//
 	// An ORed predicate is not a narrowing at all: the server answers
 	// `"id" > 3 OR (("views" <> 20))` with keys 1 and 3 — behind the
 	// cursor that asked for keys past 3 — so fetchKeys returns a
 	// non-empty chunk whose highest key never passes lastKey, and
-	// pg.Backfill.Run loops on it forever.
+	// pg.Backfill.Run loops on it forever. So the assertion is on the
+	// whole clause and on the placeholder each predicate got: every
+	// term ANDed at the top level, in the order the two statements
+	// number their arguments.
 	const (
-		wantKeyScan = `"docs"."id" > $1 AND (("docs"."views" <> $2)) AND (("docs"."title" <> $3))`
-		wantRowRead = `"docs"."id" >= $1 AND "docs"."id" <= $2 AND (("docs"."views" <> $3)) AND (("docs"."title" <> $4))`
+		wantKeyScan = `("docs"."id" > $1) AND ("docs"."views" <> $2) AND ("docs"."title" <> $3)`
+		wantRowRead = `("docs"."id" >= $1) AND ("docs"."id" <= $2) AND ("docs"."views" <> $3) AND ("docs"."title" <> $4)`
 	)
 	if got := reseedWhereClause(scans[0].sql); got != wantKeyScan {
 		t.Errorf("key scan WHERE = %s\nwant                %s", got, wantKeyScan)

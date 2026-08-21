@@ -485,6 +485,84 @@ func pgScalar(t *testing.T, db *pg.DB, sqlText string) string {
 	return v.String
 }
 
+// A setting name drops does not check, because it is bound and the
+// server is the authority on it. PostgreSQL accepts a custom setting
+// only when its name is prefixed; an unprefixed name it does not
+// recognise is an error, and the error aborts the transaction rather
+// than leaving the body to run with an identity it does not have.
+//
+// This is the case the byte-level check on Session.Settings
+// deliberately does NOT cover, so it is worth knowing what happens
+// instead of assuming.
+func TestPGInTxAsAbortsOnASettingTheServerRefuses(t *testing.T) {
+	f := newRLSFixture(t)
+	ctx := context.Background()
+
+	ran := false
+	err := f.db.InTxAs(ctx, pg.Session{
+		Role: f.role,
+		Settings: map[string]string{
+			"app.tenantId":                  "1",
+			"there_is_no_such_setting_here": "x",
+		},
+	}, func(tx *pg.DB) error {
+		ran = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("InTxAs ran the body with a setting the server rejected")
+	}
+	if ran {
+		t.Error("the body ran after a setting could not be established")
+	}
+	if !strings.Contains(err.Error(), "there_is_no_such_setting_here") {
+		t.Errorf("err = %v, want it to name the setting that failed", err)
+	}
+	// The connection is clean and usable afterwards.
+	if got := pgScalar(t, f.db, "SELECT current_setting('app.tenantId', true)"); got != "" {
+		t.Errorf("app.tenantId = %q after the aborted transaction, want it gone", got)
+	}
+}
+
+// The documented limit, against the server that decides it. Nothing
+// stops the body of the transaction resetting its own role, and drops
+// does not pretend otherwise — what it promises is about the
+// transaction BOUNDARY, and the server is what keeps that promise.
+//
+// So: the body resets the role and sets a session-lifetime value for
+// the very setting the policy reads. Both are real, both take effect,
+// and both are gone once the transaction ends — because SET LOCAL's
+// revert restores what the setting was when the transaction started,
+// which is what a is_local=false SET inside that transaction is
+// measured against.
+func TestPGInTxAsBoundaryHoldsEvenWhenTheBodyChangesItsOwnIdentity(t *testing.T) {
+	f := newRLSFixture(t)
+	ctx := context.Background()
+	poolUser := pgScalar(t, f.db, "SELECT current_user")
+
+	if err := f.db.InTxAs(ctx, f.session("1"), func(tx *pg.DB) error {
+		if got := pgScalar(t, tx, "SELECT current_user"); got != f.role {
+			t.Fatalf("current_user = %q, want %q", got, f.role)
+		}
+		if _, err := tx.Exec(ctx, "RESET ROLE"); err != nil {
+			return err
+		}
+		if got := pgScalar(t, tx, "SELECT current_user"); got != poolUser {
+			t.Errorf("after the body's own RESET ROLE current_user = %q, want %q — drops does not police this, and should not appear to", got, poolUser)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("InTxAs: %v", err)
+	}
+
+	if got := pgScalar(t, f.db, "SELECT current_user"); got != poolUser {
+		t.Errorf("after the transaction current_user = %q, want %q", got, poolUser)
+	}
+	if got := pgScalar(t, f.db, "SELECT current_setting('app.tenantId', true)"); got != "" {
+		t.Errorf("app.tenantId = %q after the transaction, want it gone whatever the body did", got)
+	}
+}
+
 // pgQuoteIdent quotes an identifier for the raw DDL this file issues.
 // It is spelled out here rather than reached for in pg because pg does
 // not export it, and a test that needed it exported would be asking

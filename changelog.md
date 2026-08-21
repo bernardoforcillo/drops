@@ -9,6 +9,28 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **`pg.DB.InTxAs` and `pg.Session`** — drops could WRITE a row-level
+  security policy (`Table.EnableRLS`, `NewPolicy`, `Table.AddPolicy`)
+  and could not SATISFY one: nothing in the package made a pooled
+  connection carry the identity a policy reads, so the package doc's
+  conclusion that RLS is the isolation boundary was an instruction to
+  write the other half by hand. `InTxAs` runs a transaction under a
+  `Session` — a role established with `SET LOCAL ROLE`, session
+  settings established with `set_config(k, v, true)`. `LOCAL` is the
+  word that carries it: the server reverts both when the transaction
+  ends, so a connection cannot hand one request's identity to the next
+  request that draws it, which is how the hand-rolled version breaks
+  and it breaks towards more access. A failure to establish the
+  identity aborts the transaction and the body never runs — falling
+  back to the pool's own user is a fail-open beneath every tenant
+  predicate in the package. The role is validated and quoted because
+  `SET ROLE` has no placeholder slot; `set_config`'s key and value are
+  bound, because it is an ordinary function. New sentinels
+  `ErrInvalidRole`, `ErrInvalidSetting` and `ErrEmptySession`. The
+  integration suite asks a real server the two questions a rendering
+  test cannot: whether the policy filters, and whether `LOCAL` means
+  what it says — over a pool of one connection, with a control probe
+  that proves the pool does not reset sessions on its own.
 - **Version bands in `drops/mirror`** — `Change.Version` decides which
   of two writes to a row the mirror keeps, and a `ReplacingMergeTree`
   never revisits that decision. Two incomparable spaces were in play

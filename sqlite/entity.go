@@ -647,37 +647,23 @@ func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 type EntityQuery[T any] struct {
 	e  *Entity[T]
 	sb *SelectBuilder
-	// unscoped records [EntityQuery.Unscoped], which means something
-	// narrower here than it does on the raw builder — see there, and
-	// see stmt for how the narrower meaning is composed.
-	unscoped bool
 }
 
 // stmt returns the SELECT to run for ctx.
 //
-// With no Unscoped it is the builder itself, and the executor does
-// everything. With Unscoped it is a per-execution COPY that opts the
-// statement out of the table's automatic predicates and then AND-s the
-// context filters back in, resolved for this ctx.
+// It is the builder itself, and the executor does everything: the
+// narrower meaning of [EntityQuery.Unscoped] is composed by the builder
+// too, which drops the default filters and goes on resolving the
+// context ones — see SelectBuilder.unscopeDefaults. It used to be
+// composed here, by copying the builder and AND-ing the resolved
+// context filters back into its WHERE list, which produced the same
+// SQL by a second route that only this dialect had.
 //
-// The copy is not an optimisation. Appending the resolved predicates to
-// q.sb would leave them there: the second execution of a reused query
-// would carry the tenant twice, and a query value held across requests
-// would answer the second request with the first request's tenant.
-// That is the same accretion the old applyScopes flag existed to paper
-// over, and copying is what removes the need for a flag.
-func (q *EntityQuery[T]) stmt(ctx context.Context) (*SelectBuilder, error) {
-	if !q.unscoped {
-		return q.sb, nil
-	}
-	scope, err := q.e.table.resolveContextFilters(ctx)
-	if err != nil {
-		return nil, err
-	}
-	cp := *q.sb
-	cp.unscoped = true
-	cp.wheres = append(append([]drops.Expression(nil), q.sb.wheres...), scope...)
-	return &cp, nil
+// It stays a function rather than becoming q.sb at four call sites
+// because it is also where the error return lives, and one chokepoint
+// is what stopped an executor being added that skipped the scoping.
+func (q *EntityQuery[T]) stmt(_ context.Context) (*SelectBuilder, error) {
+	return q.sb, nil
 }
 
 // Where AND-s predicates onto the query.
@@ -698,9 +684,10 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 // makes an audit or a restore flow impossible to write.
 //
 // It does NOT drop the table's context filters: the tenant axis and the
-// authorization guard survive it. That is a deliberate difference from
-// [SelectBuilder.Unscoped], which is statement-wide, and from
-// drops/pg's entity query, which is statement-wide too. The two lists
+// authorization guard survive it, and a ctx with no tenant is still
+// refused. That is a deliberate difference from
+// [SelectBuilder.Unscoped], which is statement-wide, and it is the
+// difference the four dialects state in the same words. The two lists
 // are not the same kind of thing — a default filter is a default scope,
 // a context filter is a row-visibility boundary — and the failures of
 // conflating them are not symmetric. Widening a default scope when the
@@ -709,18 +696,10 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 // on the one method a caller reaches for while thinking about
 // soft-deleted rows rather than about tenancy.
 //
-// pg makes the other trade, and its reason is real: a caller who says
-// Unscoped and gets ErrTenantMissing has learned nothing about the row
-// they were after. The reason it lands differently here is that this
-// dialect ALREADY behaved this way — the entity injected its guard
-// whether or not the query said Unscoped — and a port that silently
-// widened every existing Unscoped() call to span tenants would be a
-// scoping regression shipped under the banner of scoping work.
-//
 // A query that genuinely has to span tenants is written on the raw
 // builder, db.Select().From(t).Unscoped(), where a reviewer reading the
 // call sees the whole of what was given up.
-func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.unscoped = true; return q }
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.unscopeDefaults(); return q }
 
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }

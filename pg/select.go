@@ -28,7 +28,13 @@ type SelectBuilder struct {
 	recursiveCTE bool
 	setOps       []setOp // UNION / INTERSECT / EXCEPT continuations
 	unscoped     bool
-	err          error // deferred error (e.g. cursor decode failure) surfaced at Rows()
+
+	// unscopedDefaults drops the DEFAULT filters of every table this
+	// statement names and keeps the context filters — the narrower
+	// half of [SelectBuilder.Unscoped], which the entity query uses
+	// and no caller can reach directly. See unscopeDefaults.
+	unscopedDefaults bool
+	err              error // deferred error (e.g. cursor decode failure) surfaced at Rows()
 
 	// ctxFrom and ctxJoins carry the resolved context filters of the
 	// FROM table and of the joined tables that place theirs in the
@@ -306,7 +312,39 @@ func (s *SelectBuilder) ForUpdate() *SelectBuilder { s.forUpdate = true; return 
 // predicate they did not ask for silently reads a subset. Scope such a
 // query explicitly — Unscoped().Where(pg.Eq(TenantID, id)) — where the
 // intent is on the page.
+//
+// That is the meaning at THIS level. The entity query makes the
+// narrower trade — it drops the default filters and keeps the context
+// ones — because a caller reaching for it is usually thinking about
+// soft-deleted rows rather than about tenancy; see
+// [EntityQuery.Unscoped].
 func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
+
+// unscopeDefaults drops the DEFAULT filters of every table the
+// statement names and keeps the context filters.
+//
+// It is unexported because it is not a level a caller writes at: the
+// two levels a caller sees are the raw builder, where Unscoped is
+// statement-wide, and the entity query, where Unscoped is
+// defaults-only. This is how the second one is composed. See
+// EntityQuery.Unscoped for why the entity query makes the narrower
+// trade, in the same words in all four dialects.
+func (s *SelectBuilder) unscopeDefaults() *SelectBuilder { s.unscopedDefaults = true; return s }
+
+// autoDefaults returns the default filters to render for t: the list
+// this execution resolved, or none when the statement opted out of the
+// defaults alone.
+//
+// Asking here rather than at each render site is what keeps the two
+// opt-outs from drifting: a clause that read s.defaults directly would
+// go on rendering a soft-delete guard the caller asked to be rid of,
+// and the guard would be present in one clause and absent in the next.
+func (s *SelectBuilder) autoDefaults(t *Table) []drops.Expression {
+	if s.unscopedDefaults {
+		return nil
+	}
+	return s.defaults.of(t)
+}
 
 // Join appends an INNER JOIN.
 //
@@ -644,7 +682,7 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 	if !s.unscoped {
 		fromCtx = s.ctxFrom
 		for _, rel := range s.fromRelations() {
-			switch dfs := s.defaults.of(rel); {
+			switch dfs := s.autoDefaults(rel); {
 			case len(dfs) == 0:
 			case fromDefaults == nil:
 				// The single-relation statement keeps the list it
@@ -670,7 +708,7 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		j.table.writeFrom(b)
 		on := j.on
 		if !s.unscoped {
-			switch dfs := s.defaults.of(j.table); j.kind.filterPlacement() {
+			switch dfs := s.autoDefaults(j.table); j.kind.filterPlacement() {
 			case placeInOn:
 				on = andWith(on, append(append([]drops.Expression(nil), dfs...), j.ctxOn...))
 			case placeInWhere:
@@ -851,7 +889,13 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 		}
 	}
 
-	if !s.unscoped {
+	// The default filters are skipped when the statement opted out of
+	// them alone, and not merely dropped at render time: resolving one
+	// walks the statements written inside it, and a default filter
+	// holding a subquery over a scoped table would REFUSE on a ctx with
+	// no tenant — refusing the very statement whose defaults the caller
+	// just said to ignore.
+	if !s.unscoped && !s.unscopedDefaults {
 		// The DefaultFilters of every table the statement names, walked
 		// for the statements written inside them. Same list writeCore
 		// reads, same reason resolveJoins exists: a predicate the

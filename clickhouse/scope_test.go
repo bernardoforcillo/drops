@@ -845,3 +845,98 @@ func TestFiltersMayBeRegisteredWhileQueriesRun(t *testing.T) {
 	}
 	checkArgs(t, args, "acme")
 }
+
+// EntityQuery.Unscoped is narrower than [SelectBuilder.Unscoped], on
+// purpose and in all four dialects: it drops the DEFAULT filters and
+// keeps the context filters.
+//
+// The two lists are not the same kind of thing. A default filter is a
+// default scope; a context filter is a row-visibility boundary.
+// Widening a default scope when the caller asked to widen it costs
+// nothing. Dropping the boundary hands this request every tenant's
+// rows, or every subject's, and it does so on the one method a caller
+// reaches for while thinking about soft-deleted rows rather than about
+// tenancy.
+//
+// So Unscoped has ONE meaning per level: statement-wide on the raw
+// builder, where the caller is describing the whole statement's
+// authority and a reviewer reads the whole of what was given up, and
+// defaults-only on the entity query.
+//
+// This dialect used to make the other trade — the entity query
+// delegated straight to the builder.
+func TestEntityQueryUnscopedKeepsTheTenantAndDropsTheDefaultFilter(t *testing.T) {
+	tbl := clickhouse.NewTable("equ_hits")
+	clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	tenant := clickhouse.Add(tbl, clickhouse.String("tenantId"))
+	clickhouse.Add(tbl, clickhouse.String("path"))
+	deleted := clickhouse.SoftDelete(tbl).DeletedAt
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(tenant).
+		DefaultFilter(deleted.IsNull()).
+		ContextFilter(clickhouse.TenantFilter(tenant))
+	ent := clickhouse.NewEntity[equHit](tbl, clickhouse.AllowUnmappedColumns("deletedAt"))
+
+	drv := dropstest.New().AlwaysRows([]string{"id", "tenantId", "path"})
+	db := clickhouse.New(drv)
+
+	if _, err := ent.Query(db).All(tenantCtx("acme")); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if got := drv.LastSQL(); !strings.Contains(got, `"deletedAt" IS NULL`) {
+		t.Fatalf("the scoped query lost its default filter:\n%s", got)
+	}
+
+	drv.Reset()
+	if _, err := ent.Query(db).Unscoped().All(tenantCtx("acme")); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := drv.LastSQL()
+	if strings.Contains(got, `"deletedAt" IS NULL`) {
+		t.Errorf("Unscoped did not drop the default filter:\n%s", got)
+	}
+	if !strings.Contains(got, `("equ_hits"."tenantId" = ?)`) {
+		t.Errorf("Unscoped dropped the tenant axis:\n%s", got)
+	}
+
+	// And it still refuses on a ctx with no tenant, rather than widening
+	// to every tenant because the caller asked for hidden rows.
+	drv.Reset()
+	if _, err := ent.Query(db).Unscoped().All(context.Background()); !errors.Is(err, clickhouse.ErrTenantMissing) {
+		t.Fatalf("err = %v, want %v", err, clickhouse.ErrTenantMissing)
+	}
+	if len(drv.SQL()) != 0 {
+		t.Errorf("statements = %v, want none", drv.SQL())
+	}
+}
+
+// equHit is the row type the case above scans.
+type equHit struct {
+	ID       uint64 `drop:"id"`
+	TenantID string `drop:"tenantId"`
+	Path     string `drop:"path"`
+}
+
+// The raw builder keeps the wide meaning: a caller who says Unscoped
+// there is describing this statement's authority, and gets a statement
+// with no automatic predicate of either kind and no refusal.
+func TestSelectBuilderUnscopedStaysStatementWide(t *testing.T) {
+	tbl := clickhouse.NewTable("sbu_hits")
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	tenant := clickhouse.Add(tbl, clickhouse.String("tenantId"))
+	deleted := clickhouse.SoftDelete(tbl).DeletedAt
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(tenant).
+		DefaultFilter(deleted.IsNull()).
+		ContextFilter(clickhouse.TenantFilter(tenant))
+
+	db := clickhouse.New(dropstest.New())
+	sql, args, err := db.Select(id).From(tbl).Unscoped().ToSQLCtx(context.Background())
+	if err != nil {
+		t.Fatalf("ToSQLCtx: %v", err)
+	}
+	if sql != `SELECT "sbu_hits"."id" FROM "sbu_hits"` {
+		t.Errorf("sql = %s", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v, want none", args)
+	}
+}

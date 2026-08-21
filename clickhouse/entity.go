@@ -272,10 +272,28 @@ func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T] { q.sb.Limit(n); return 
 // Offset sets the OFFSET.
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 
-// Unscoped opts out of the table's automatic predicates — its
-// DefaultFilter list and its ContextFilter list alike. See
-// [SelectBuilder.Unscoped].
-func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+// Unscoped opts out of the table's DEFAULT filters for this query —
+// the declaration-time ones, a soft-delete guard above all. Without it
+// a soft-deleted row is unreachable through the entity at all, which
+// makes an audit or a restore flow impossible to write.
+//
+// It does NOT drop the table's context filters: the tenant axis and the
+// authorization guard survive it, and a ctx with no tenant is still
+// refused. That is a deliberate difference from
+// [SelectBuilder.Unscoped], which is statement-wide, and it is the
+// difference the four dialects state in the same words. The two lists
+// are not the same kind of thing — a default filter is a default scope,
+// a context filter is a row-visibility boundary — and the failures of
+// conflating them are not symmetric. Widening a default scope when the
+// caller asked to widen it costs nothing. Dropping the boundary hands
+// this request every tenant's rows, or every subject's, and it does so
+// on the one method a caller reaches for while thinking about
+// soft-deleted rows rather than about tenancy.
+//
+// A query that genuinely has to span tenants is written on the raw
+// builder, db.Select().From(t).Unscoped(), where a reviewer reading the
+// call sees the whole of what was given up.
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.unscopeDefaults(); return q }
 
 // GroupBy / Having / Limit-free chaining is available on the
 // underlying builder.

@@ -893,3 +893,96 @@ func TestContextFilterOnUnionOperands(t *testing.T) {
 var _ pg.ContextFilterFunc = func(ctx context.Context) (drops.Expression, error) {
 	return nil, nil
 }
+
+// EntityQuery.Unscoped is narrower than [SelectBuilder.Unscoped], on
+// purpose and in all four dialects: it drops the DEFAULT filters and
+// keeps the context filters.
+//
+// The two lists are not the same kind of thing. A default filter is a
+// default scope; a context filter is a row-visibility boundary.
+// Widening a default scope when the caller asked to widen it costs
+// nothing. Dropping the boundary hands this request every tenant's
+// rows, or every subject's, and it does so on the one method a caller
+// reaches for while thinking about soft-deleted rows rather than about
+// tenancy.
+//
+// So Unscoped has ONE meaning per level: statement-wide on the raw
+// builder, where the caller is describing the whole statement's
+// authority and a reviewer reads the whole of what was given up, and
+// defaults-only on the entity query.
+//
+// This dialect used to make the other trade — the entity query
+// delegated straight to the builder — and its doc sentence promised the
+// narrow one regardless.
+func TestEntityQueryUnscopedKeepsTheTenantAndDropsTheDefaultFilter(t *testing.T) {
+	tbl := pg.NewTable("equ_posts")
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	tenant := pg.Add(tbl, pg.BigInt("tenantId").NotNull())
+	pg.Add(tbl, pg.Text("title").NotNull())
+	deleted := pg.SoftDelete(tbl).DeletedAt
+	tbl.DefaultFilter(deleted.IsNull())
+	ent := pg.NewEntity[equPost](tbl, pg.AllowUnmappedColumns("deletedAt")).
+		ScopeByTenant(tenant)
+
+	drv := dropstest.New().AlwaysRows([]string{"id", "tenantId", "title"})
+	db := pg.New(drv)
+
+	if _, err := ent.Query(db).All(scopeCtx()); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if got := drv.LastSQL(); !strings.Contains(got, softDeletePred) {
+		t.Fatalf("the scoped query lost its default filter:\n%s", got)
+	}
+
+	drv.Reset()
+	if _, err := ent.Query(db).Unscoped().All(scopeCtx()); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	got := drv.LastSQL()
+	if strings.Contains(got, softDeletePred) {
+		t.Errorf("Unscoped did not drop the default filter:\n%s", got)
+	}
+	if !strings.Contains(got, `"equ_posts"."tenantId" = $`) {
+		t.Errorf("Unscoped dropped the tenant axis:\n%s", got)
+	}
+
+	// And it still refuses on a ctx with no tenant, rather than widening
+	// to every tenant because the caller asked for hidden rows.
+	drv.Reset()
+	if _, err := ent.Query(db).Unscoped().All(context.Background()); !errors.Is(err, pg.ErrTenantMissing) {
+		t.Fatalf("err = %v, want %v", err, pg.ErrTenantMissing)
+	}
+	if len(drv.SQL()) != 0 {
+		t.Errorf("statements = %v, want none", drv.SQL())
+	}
+}
+
+// equPost is the row type the case above scans.
+type equPost struct {
+	ID       int64  `drop:"id"`
+	TenantID int64  `drop:"tenantId"`
+	Title    string `drop:"title"`
+}
+
+// The raw builder keeps the wide meaning: a caller who says Unscoped
+// there is describing this statement's authority, and gets a statement
+// with no automatic predicate of either kind and no refusal.
+func TestSelectBuilderUnscopedStaysStatementWide(t *testing.T) {
+	tbl := pg.NewTable("sbu_posts")
+	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	tenant := pg.Add(tbl, pg.BigInt("tenantId").NotNull())
+	tbl.DefaultFilter(pg.SoftDelete(tbl).DeletedAt.IsNull())
+	tbl.ContextFilter(pg.TenantFilter(tenant))
+
+	db := pg.New(dropstest.New())
+	sql, args, err := db.Select(id).From(tbl).Unscoped().ToSQLCtx(context.Background())
+	if err != nil {
+		t.Fatalf("ToSQLCtx: %v", err)
+	}
+	if sql != `SELECT "sbu_posts"."id" FROM "sbu_posts"` {
+		t.Errorf("sql = %s", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v, want none", args)
+	}
+}

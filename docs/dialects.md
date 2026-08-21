@@ -14,7 +14,8 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Keyset pagination | ✅ | ✅ | — | ✅ (via mirror) | ✅ (via vector) |
 | Migrations, diff, snapshot | ✅ | ✅ | — | ✅ | — |
 | Outbox, saga, event store | ✅ | ✅ | — | event store | — |
-| Audit, tenancy, authz, cache | ✅ | ✅ | — | — | — |
+| Tenant scoping | ✅ | ✅ | ✅ | ✅ (narrower) | — |
+| Audit, authz, cache | ✅ | ✅ | — | — | — |
 | Vector search | ✅ pgvector | — | — | ✅ built-in | ✅ native |
 
 Where a cell is empty the feature is not there yet, not disabled. The
@@ -169,6 +170,66 @@ collections, points, search, recommend and scroll, plus a filter DSL.
 
 Through [`drops/vector`](vector-search.md) it also satisfies the same
 portable search interface as pgvector and ClickHouse.
+
+## Tenant scoping
+
+The one feature that is the same mechanism in four dialects, on
+purpose. A table declares the axis; the *executors* resolve it; the
+predicate reaches every statement drops composed, to any depth — a
+joined table, a CTE body, a subquery operand, an eager-loaded edge, the
+predicate another table's filter answers with — and a ctx with no
+tenant is refused before anything is sent.
+
+```go
+Posts.ContextFilter(pg.TenantFilter(PostTenantID)).
+    ScopeWritesByTenant(PostTenantID)
+
+ctx = pg.WithTenant(ctx, currentTenant)
+```
+
+Read the same line with `sqlite.`, `mysql.` or `clickhouse.` in front
+of it and it means the same thing. Each package holds a `resolve.go`
+carrying the walk; normalise the dialect name and diff any two of them
+and the same file comes back, which is how the next divergence is meant
+to be caught rather than re-derived.
+
+What differs is surface, and it differs where the SQL does:
+
+- **PostgreSQL** is the reference, and the only one where the
+  predicates are *not* the isolation boundary: row-level security is,
+  and `EnableRLS` / `AddPolicy` / `DB.InTxAs` are how you declare it.
+  Read the predicates as defence in depth there.
+- **SQLite** has the whole mechanism minus what the dialect lacks: no
+  `RIGHT` or `FULL JOIN`, so the join-placement shapes cannot arise.
+  There is no row-level security to sit underneath — no roles, no
+  policies, and a process that can open the file reads every byte.
+- **MySQL** has the whole mechanism, including the aliased `UPDATE` and
+  `DELETE` that must name their alias twice and the upsert whose
+  `ON DUPLICATE KEY UPDATE` has no conflict target and no `WHERE`
+  clause for a predicate to reach. Its nearest thing to RLS is a
+  definer-rights view, which drops does not manage.
+- **ClickHouse** is narrower because the dialect is. There is no
+  `UPDATE` or `DELETE` to carry a predicate, so the write side is
+  stamping and refusal only; no upsert to gate, because a merging
+  engine folds rows sharing a sorting key in the background — which is
+  where the check went instead, as `ErrTenantNotInSortingKey`; no
+  relations and so no eager-loaded edge; no cache to key by tenant; and
+  no set operations. A materialised view evaluates its stored body on
+  INSERT with no ctx anywhere near it.
+
+`Unscoped` has one meaning per level in all four: **statement-wide** on
+a raw builder, where the caller is describing the whole statement's
+authority, and **defaults-only** on an entity query, which drops the
+declaration-time filters (a soft-delete guard) and keeps the tenant
+axis and the authorization guard. A query that genuinely has to span
+tenants is written on the raw builder, where a reviewer reads the whole
+of what was given up.
+
+What the mechanism does *not* reach is listed per dialect in each
+package's `tenant.go`, under "Where the automatic scoping stops". It is
+not a footnote — in three of the four dialects the predicates are the
+whole of what there is — and the entries are the same entries in the
+same order, so a reviewer who has read one has read them all.
 
 ## Porting between them
 

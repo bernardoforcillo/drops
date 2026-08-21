@@ -64,7 +64,20 @@ import (
 //     column — see [Table.ScopeWritesByTenant] for why drops will not
 //     guess the column;
 //   - the outbox, the event store and the idempotency store, which
-//     issue their own hand-written SQL against their own tables.
+//     issue their own hand-written SQL against their own tables;
+//   - a scoped table INNER- or LEFT-joined BEFORE a RIGHT JOIN keeps its
+//     guard in the WHERE clause, and the RIGHT JOIN NULL-extends the left
+//     side — so the guard is false for exactly the rows the RIGHT JOIN
+//     exists to preserve. fromFilterJoin moves the FROM table's guard
+//     into the first RIGHT JOIN's ON clause; a table joined at position i
+//     takes its placement from its own join kind alone, and nothing looks
+//     at the kinds after it. This LOSES rows rather than leaking them —
+//     fail-closed, which is why nine rounds of adversarial review did not
+//     surface it — and the fix is to make filterPlacement consult the
+//     join kinds after position i. It is written down rather than fixed
+//     because moving where a guard lands is a change to the mechanism
+//     this section describes, and it belongs in a round that can verify
+//     it in its own right.
 //
 // A reviewer who has not read that list will read a raw fragment or a
 // view body as scoped when it is not.

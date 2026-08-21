@@ -126,10 +126,31 @@ func bracketConjuncts(preds []drops.Expression) []drops.Expression {
 //
 // A fragment whose parentheses do not balance is the one shape reported
 // as safe without being read, on purpose. It is not an expression, so
-// bracketing cannot repair it — and for the shape that matters,
-// "a = 1) OR (1 = 1", bracketing would close the injected parenthesis
-// and turn a statement SQLite refuses into a working, unscoped OR. Left
-// alone it stays a syntax error, which is the fail-closed answer.
+// bracketing cannot repair it. There are two ways such a fragment can
+// be written, and only one of them is answered by design; both are
+// stated here because the second reads as safe and is not, quite.
+//
+// The first escapes SIDEWAYS: "a = 1) OR (1 = 1" closes the conjunct's
+// own parenthesis, ORs past it, and opens another so the whole clause
+// balances again. Bracketing that would close the injected parenthesis
+// and turn a statement SQLite refuses into a working, unscoped OR.
+// Left alone it stays a syntax error, which is the fail-closed answer,
+// and it is the reason this shape is not bracketed.
+//
+// The second escapes UPWARDS: "1) --" written into a conjunct of a
+// subquery closes the subquery and comments out everything after it,
+// the tenant guard included. Bracketing would not repair that one
+// either — the parenthesis it opens is closed again before the comment
+// begins — so the fragment is rendered as written. What stops it is not
+// this check: the arguments bound for the commented-out tail have no
+// placeholders left to fill, and the driver rejects the statement on
+// the argument count. That is fail-closed BY ACCIDENT rather than by
+// design, and an injection with no arguments after it would not be
+// caught by it at all.
+//
+// Both live entirely inside [drops.Raw], which every dialect documents
+// as the caller's to scope: drops re-emits its text and does not parse
+// it. Do not build one from request data.
 func escapesConjunct(p drops.Expression) bool {
 	if p == nil {
 		return false

@@ -131,6 +131,16 @@
 // [Entity.ScopeByTenant] carry the reasoning, and tenant.go lists what
 // the predicates do not reach.
 //
+// It is the same mechanism drops/pg, drops/sqlite and
+// drops/clickhouse carry — normalise the dialect name and diff
+// mysql/resolve.go against any of theirs and the same file comes back.
+// What does NOT come across from drops/pg is the boundary underneath:
+// PostgreSQL row-level security is what those predicates sit on top of,
+// and MySQL's nearest equivalent is a definer-rights view, a schema
+// object drops does not manage. Here the predicates are the whole of
+// what there is, which makes tenant.go's list of where they stop
+// load-bearing rather than a footnote.
+//
 // Two of the answers are this dialect's own. A join places the
 // predicate by kind — INNER in the WHERE clause, LEFT in the ON clause,
 // and a RIGHT JOIN inverts both sides — see

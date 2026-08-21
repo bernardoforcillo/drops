@@ -318,10 +318,26 @@ reach further than the entity they are spelled on:
   stops authorising, and in `pg`, where a table can carry a tenant
   filter, so does a membership row belonging to another tenant.
 
-`WithBudget` is PostgreSQL only. The other four exist in `sqlite` too —
-its `WithAudit` is a package function rather than a method — but its
-tenant scoping is the shape `pg` had before the axis moved onto
-the table — the predicate is injected by the entity methods, so a query
-built from `db.Select()` and a relation loader bypass it. `mysql` and
-`clickhouse` have neither. Treat tenant isolation outside `pg` as
-unimplemented rather than as implemented differently.
+`WithBudget` is PostgreSQL only. `WithCache`, `WithAudit` and
+`AuthorizeWith` exist in `sqlite` too — its `WithAudit` is a package
+function rather than a method — and not in `mysql` or `clickhouse`.
+
+`ScopeByTenant` is in all four. It is the same mechanism in each: the
+axis is declared on the *table*, resolved by the *executors*, and
+reaches every statement drops composed to any depth, refusing rather
+than running when the ctx carries no tenant. `sqlite`'s old
+entity-injected predicate — the shape `pg` had before the axis moved
+onto the table, which a bare `db.Select()` and a relation loader went
+around — is gone. What differs between the four is surface rather than
+mechanism: `clickhouse` in particular has no UPDATE, no DELETE, no
+upsert and no relations for an axis to reach into. See
+[dialects.md](dialects.md#tenant-scoping) for the per-dialect table,
+and each package's `tenant.go` for what the scoping does not reach.
+
+One rule worth carrying to the call site, because it is the same in all
+four: `Unscoped` on an **entity query** drops the declaration-time
+default filters — a soft-delete guard — and *keeps* the tenant axis and
+the authorization guard. `Unscoped` on a **raw builder** is
+statement-wide and drops both. A query that genuinely has to span
+tenants is written on the raw builder, where a reviewer reads the whole
+of what was given up.

@@ -59,13 +59,20 @@ import (
 // the caller's to scope, and a reviewer who has not read them will read
 // a raw fragment or a view body as scoped when it is not.
 //
-// And all of it is pg. mysql and clickhouse have no ctx-resolved filter
-// at all, and sqlite's ScopeByTenant is the shape described above as
-// the one that was learned the hard way — a
-// predicate the Entity methods inject, which a relation loader or a
-// bare db.Select goes around. A schema ported across dialects is
-// unscoped on arrival, so treat tenant isolation outside pg as
-// unimplemented rather than as implemented differently.
+// And it is no longer only pg. drops/sqlite, drops/mysql and
+// drops/clickhouse now declare the axis on the table and resolve it in
+// the executors, on the same terms and in the same words — sqlite's
+// Entity-injected predicate, the shape described above as the one
+// learned the hard way, is gone. What differs between the four is
+// surface rather than mechanism, and the package doc's "Where the
+// automatic scoping stops" says where, per dialect. Read the list in
+// the dialect you are using: clickhouse in particular has no UPDATE,
+// no DELETE, no upsert and no relations for an axis to reach into.
+//
+// What does NOT port is the boundary. PostgreSQL row-level security is
+// the isolation boundary these predicates sit on top of, and the other
+// three dialects have no equivalent to sit on. There the predicates are
+// the whole of what there is.
 
 type tenantCtxKey int
 

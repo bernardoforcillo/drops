@@ -71,7 +71,12 @@ import (
 //   - a statement said Unscoped(), which is the point of the method;
 //   - an INSERT into a table that declared a read filter and no write
 //     column — see [Table.ScopeWritesByTenant] for why drops will not
-//     guess the column.
+//     guess the column;
+//   - the RIGHT JOIN placement gap the other three dialects carry cannot
+//     be written here: this package exposes INNER and LEFT JOIN and
+//     nothing else (see joinKind). The entry is kept so the four lists
+//     say the same things in the same order, and so that adding a join
+//     kind is known to bring the gap with it.
 //
 // A reviewer who has not read that list will read a raw fragment or a
 // view body as scoped when it is not.

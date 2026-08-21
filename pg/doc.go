@@ -115,17 +115,44 @@
 //
 // # Where the automatic scoping stops
 //
-// This section describes package pg and nothing else. mysql, sqlite and
-// clickhouse have no resolver walk at all: their builders render, and a
-// table's DefaultFilters are the whole of what renders automatically.
-// sqlite additionally has an Entity-level tenant predicate, which is the
-// shape pg had before the axis moved onto the Table — a relation loader
-// or a bare db.Select bypasses it. So treat tenant scoping in the other
-// three dialects as UNIMPLEMENTED rather than as implemented
-// differently: a schema ported across without changing anything is
-// unscoped on arrival. (A port of the walk is queued as separate work.
-// This paragraph is true the day it is written and has to go when that
-// stops being so.)
+// This section describes package pg, and the three ports now carry the
+// same mechanism rather than none of it. drops/sqlite, drops/mysql and
+// drops/clickhouse each declare the axis on the TABLE, resolve it in
+// the EXECUTORS, and walk every statement drops composed to any depth.
+// Normalise the dialect name and diff pg/resolve.go against
+// sqlite/resolve.go, mysql/resolve.go or clickhouse/resolve.go: the
+// same file comes back, which is how a future divergence is meant to be
+// caught.
+//
+// What differs between them is surface, and it differs where the SQL
+// does:
+//
+//   - drops/sqlite has the whole of it bar what SQLite lacks: no RIGHT
+//     or FULL JOIN, so the join-placement shapes below cannot arise;
+//     and no relations declared beyond the loader's own, so read its
+//     tenant.go list rather than assuming this one.
+//   - drops/mysql has the whole of it, including the aliased UPDATE and
+//     DELETE that have to name their alias twice, and the upsert whose
+//     ON DUPLICATE KEY UPDATE has no conflict target and no WHERE
+//     clause for a predicate to reach.
+//   - drops/clickhouse has a narrower surface because the dialect does.
+//     There is no UPDATE or DELETE to carry a predicate, so the write
+//     side is stamping and refusal only; no upsert to gate, because a
+//     merging engine folds rows sharing a sorting key in the background
+//     — which is where the check went instead, as
+//     ErrTenantNotInSortingKey; no relations and so no eager-loaded
+//     edge; no cache to key by tenant; and no set operations. A
+//     materialised view evaluates its stored body on INSERT with no ctx
+//     anywhere near it.
+//
+// What none of the three has is the boundary this section opened by
+// naming. PostgreSQL row-level security has no equivalent in SQLite
+// (no roles, no policies, and a process that can open the file reads
+// every byte), in MySQL (whose nearest equivalent is a definer-rights
+// view, a schema object drops does not manage), or in ClickHouse. In
+// those three dialects the predicates are the whole of what there is,
+// which makes each package's own "Where the automatic scoping stops"
+// list load-bearing rather than a footnote.
 //
 // Everything drops builds, drops walks. A statement written anywhere
 // inside a statement drops composed — a CTE body, a subquery operand in
@@ -193,6 +220,20 @@
 //     the WHERE clause deletes the FROM side's. Join a pre-filtered
 //     subquery, or say Unscoped and write the predicates where a reviewer
 //     can see them.
+//
+//   - a scoped table INNER- or LEFT-joined BEFORE a RIGHT JOIN keeps its
+//     guard in the WHERE clause, and the RIGHT JOIN NULL-extends the left
+//     side — so the guard is false for exactly the rows the RIGHT JOIN
+//     exists to preserve. fromFilterJoin moves the FROM table's guard
+//     into the first RIGHT JOIN's ON clause; a table joined at position i
+//     takes its placement from its own join kind alone, and nothing looks
+//     at the kinds after it. This LOSES rows rather than leaking them —
+//     fail-closed, which is why nine rounds of adversarial review did not
+//     surface it — and the fix is to make filterPlacement consult the
+//     join kinds after position i. It is written down rather than fixed
+//     because moving where a guard lands is a change to the mechanism
+//     this section describes, and it belongs in a round that can verify
+//     it in its own right.
 //
 //   - Eager-load refusal is not atomic. A Find issues the parent query
 //     and then one query per edge, so a refusal on a later edge surfaces

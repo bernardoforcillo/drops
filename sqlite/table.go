@@ -156,10 +156,19 @@ func (t *Table) As(alias string) *Table {
 
 // PrimaryKey declares a composite (multi-column) primary key. For a
 // single-column key use (*Col[T]).PrimaryKey() instead.
+//
+// Like the column-level spelling it states NOT NULL on each member,
+// last-writer-wins over an earlier Nullable. That is not decoration:
+// SQLite's own PRIMARY KEY does not enforce it — a legacy bug it
+// keeps for compatibility — so a key column that does not say NOT NULL
+// really will accept a NULL, and the two spellings of the same key
+// would otherwise describe two different tables.
 func (t *Table) PrimaryKey(cols ...ColRef) *Table {
 	t.compositePK = make([]*Column, len(cols))
 	for i, c := range cols {
-		t.compositePK[i] = c.col()
+		col := c.col()
+		col.notNull, col.nullStated = true, true
+		t.compositePK[i] = col
 	}
 	return t
 }

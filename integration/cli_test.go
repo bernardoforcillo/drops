@@ -1296,3 +1296,117 @@ func applyGeneratedSQL(t *testing.T, db *pg.DB, path string) {
 		}
 	}
 }
+
+// A table renamed and a column inside it renamed in the same commit.
+const schemaTableAndColumnRenamed = `package schema
+
+import "github.com/bernardoforcillo/drops/pg"
+
+var (
+	People      = pg.NewTable("people")
+	PersonID    = pg.Add(People, pg.BigSerial("id").PrimaryKey())
+	PersonEmail = pg.Add(People, pg.Text("emailAddress").NotNull().Unique())
+)
+
+func Schema() *pg.Schema { return pg.NewSchema(People) }
+`
+
+// Renaming a table and a column inside it, through the CLI, with a row
+// in the table.
+//
+// The two are asked in turn — the column inside a renamed table is not
+// a question anyone can put until the table has an answer — so this is
+// also the test that the prompt keeps going, and that a non-interactive
+// run holding only half the answers still refuses rather than emitting
+// the DROP TABLE.
+func TestCLIGenerateRenamesATableAndAColumnInsideIt(t *testing.T) {
+	dsn := freshDatabase(t)
+	db := openDB(t, dsn)
+	p := newProject(t, dsn)
+	p.schema(schemaV1)
+	p.mustRun("generate", "--schema", "./schema", "--name", "init")
+	applyGeneratedSQL(t, db, filepath.Join(p.dir, "drizzle", "0000_init.sql"))
+
+	if _, err := db.Exec(context.Background(),
+		`INSERT INTO users (email) VALUES ($1)`, "ada@example.com"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	p.schema(schemaTableAndColumnRenamed)
+
+	// No answers at all: exit 3, nothing written.
+	if _, _, code := p.run("generate", "--schema", "./schema", "--name", "rename"); code != 3 {
+		t.Fatalf("generate exited %d, want 3 (refused)", code)
+	}
+	// The table answered and not the column: still exit 3, because
+	// answering the table is what made the column a question.
+	stdout, stderr, code := p.run("generate", "--schema", "./schema", "--name", "rename",
+		"--rename-table", "users=people")
+	if code != 3 {
+		t.Fatalf("a half-answered rename exited %d, want 3\n%s%s", code, stdout, stderr)
+	}
+	if out := stdout + stderr; !strings.Contains(out, "--rename-column people.email=emailAddress") {
+		t.Errorf("the refusal does not name the column question:\n%s", out)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(p.dir, "drizzle", "0001_*.sql")); len(matches) > 0 {
+		t.Fatalf("a refused generate wrote %v", matches)
+	}
+
+	// Interactive, with a yes for each: the prompt has to come back for
+	// the second question after the first is answered.
+	stdout, stderr, code = p.runWithStdin("y\ny\n",
+		"generate", "--schema", "./schema", "--name", "rename", "--interactive")
+	if code != 0 {
+		t.Fatalf("generate exited %d\n%s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "is table people a rename of users?") {
+		t.Errorf("the table question was not asked:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "is people.emailAddress a rename of people.email?") {
+		t.Errorf("the column question was never asked:\n%s", stdout)
+	}
+
+	body, err := os.ReadFile(filepath.Join(p.dir, "drizzle", "0001_rename.sql"))
+	if err != nil {
+		t.Fatalf("generate did not write the migration: %v", err)
+	}
+	// The UNIQUE constraint is dropped and re-added, because its
+	// generated name is built from the table's and the column's and
+	// PostgreSQL does not rename it along with them. Nothing holding a
+	// row may go.
+	for _, forbidden := range []string{"DROP TABLE", "DROP COLUMN"} {
+		if strings.Contains(string(body), forbidden) {
+			t.Fatalf("a migration made entirely of renames has a %s in it:\n%s", forbidden, body)
+		}
+	}
+	applyGeneratedSQL(t, db, filepath.Join(p.dir, "drizzle", "0001_rename.sql"))
+	if got := scalar(t, db, `SELECT "emailAddress" FROM people`); got != "ada@example.com" {
+		t.Fatalf("the row did not survive: emailAddress = %q", got)
+	}
+
+	// Both answers are on disk now, so the same run finds nothing left
+	// to ask and nothing left to do.
+	if out := p.mustRun("generate", "--schema", "./schema", "--name", "again"); !strings.Contains(out, "no changes") {
+		t.Errorf("a settled schema still generated something:\n%s", out)
+	}
+}
+
+// --interactive with nothing on stdin is the accident the flag exists to
+// make impossible: EOF is not an answer, so the run fails rather than
+// reading one into the silence.
+func TestCLIInteractiveWithNoStdinDoesNotGuess(t *testing.T) {
+	dsn := freshDatabase(t)
+	p := newProject(t, dsn)
+	p.schema(schemaV1)
+	p.mustRun("generate", "--schema", "./schema", "--name", "init")
+
+	p.schema(schemaRenamed)
+	stdout, stderr, code := p.runWithStdin("",
+		"generate", "--schema", "./schema", "--name", "rename", "--interactive")
+	if code == 0 {
+		t.Fatalf("generate exited 0 with nothing to read\n%s%s", stdout, stderr)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(p.dir, "drizzle", "0001_*.sql")); len(matches) > 0 {
+		t.Fatalf("a run with no answers wrote %v", matches)
+	}
+}

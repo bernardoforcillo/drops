@@ -361,7 +361,10 @@ func TestPageCursorRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(drv2.queries[0], `("users"."id") > (?)`) {
+	// The guard is keysetWhere, the same one SelectBuilder.AfterCursor
+	// builds, so a single ordering column renders as a plain strict
+	// comparison rather than a one-element row comparison.
+	if !strings.Contains(drv2.queries[0], `("users"."id" > ?)`) {
 		t.Errorf("keyset guard absent:\n%s", drv2.queries[0])
 	}
 }

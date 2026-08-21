@@ -166,7 +166,24 @@ func (t *Table) SampleBy(e drops.Expression) *Table { t.sampleBy = e; return t }
 func (t *Table) TTL(expr string) *Table { t.ttl = expr; return t }
 
 // Setting appends a "key = value" pair to the SETTINGS clause.
+//
+// The value is raw SQL — a number, a quoted literal, a function call —
+// and it is checked to be one value rather than several. SETTINGS is a
+// comma-separated list and so is ALTER TABLE … MODIFY SETTING, so a
+// value carrying a comma outside a literal would not set this setting;
+// it would set this one and whatever the rest of the string named. A
+// value read from configuration or built from a template is exactly
+// the case that catches, which is why it is checked here rather than
+// left to the author: a bad one panics at declaration, where the
+// schema is written, instead of altering a table nobody asked about.
+//
+// "One value" is read narrowly: a comma inside a string literal or
+// inside a function call's arguments is part of the value and goes
+// through, so 'tier_a,tier_b' and disk(name = 'd', type = cache) are
+// both fine.
 func (t *Table) Setting(key, value string) *Table {
+	mustSettingKey(key)
+	mustSettingValue(key, value)
 	t.settings = append(t.settings, key+" = "+value)
 	return t
 }

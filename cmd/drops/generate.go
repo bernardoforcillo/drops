@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -64,22 +65,33 @@ func runGenerate(ctx context.Context, args []string) error {
 	// A change that could be a rename generated nothing. Ask, if the
 	// command line asked to be asked; otherwise stop, because the
 	// alternative is the DROP COLUMN that loses the column.
-	if len(res.RenameCandidates) > 0 {
+	//
+	// Answering can raise questions of its own: agreeing that "users"
+	// became "people" is what makes a column renamed inside it visible
+	// as a question at all, so the prompt runs until the generator has
+	// nothing left to ask. The loop stops if a round comes back with
+	// exactly the questions it went in with, which would otherwise mean
+	// asking the same thing forever.
+	asked := ""
+	stdin := bufio.NewReader(os.Stdin)
+	for len(res.RenameCandidates) > 0 {
 		if !*interactive {
 			// Exit 3, the code for a run that worked and refused: the
 			// schema was read, the diff was computed, and the answer to
 			// what it means is the one thing that was missing.
 			return findingError{errors.New(res.RenameMessage + interactiveHint)}
 		}
-		answered, err := promptRenames(os.Stdin, os.Stdout, res.RenameCandidates)
+		if res.RenameMessage == asked {
+			return findingError{errors.New(res.RenameMessage)}
+		}
+		asked = res.RenameMessage
+		answered, err := promptRenames(stdin, os.Stdout, res.RenameCandidates)
 		if err != nil {
 			return err
 		}
-		if res, err = generate(append(decisions, answered...)); err != nil {
+		decisions = append(decisions, answered...)
+		if res, err = generate(decisions); err != nil {
 			return err
-		}
-		if len(res.RenameCandidates) > 0 {
-			return findingError{errors.New(res.RenameMessage)}
 		}
 	}
 	if res.NoOp {

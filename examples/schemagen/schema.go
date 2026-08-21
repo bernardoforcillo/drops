@@ -16,4 +16,4 @@ import "github.com/bernardoforcillo/drops/pg"
 // a table another tool owns stays out of drops's way.
 //
 //go:generate go run github.com/bernardoforcillo/drops/cmd/dropsgen -rows .
-func Schema() *pg.Schema { return pg.NewSchema(Users) }
+func Schema() *pg.Schema { return pg.NewSchema(Users, Posts) }

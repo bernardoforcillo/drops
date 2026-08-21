@@ -253,3 +253,136 @@ func TestGenerateReplaysARecordedAnswer(t *testing.T) {
 		t.Errorf("migration SQL:\n%s", res.SQL)
 	}
 }
+
+// --- A rename inside a rename -----------------------------------------
+
+// The same table under two names, with one column also renamed: the
+// shape a migration has when a table is renamed and a column inside it
+// tidied in one commit. SQLite is where this costs the most — the change
+// forces a rebuild, and a rebuild copies only the columns both snapshots
+// name.
+func renamePeopleAfter() *sqlite.Schema {
+	people := sqlite.NewTable("people")
+	sqlite.Add(people, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(people, sqlite.Text("emailAddress").NotNull())
+	return sqlite.NewSchema(people)
+}
+
+func TestDetectRenamesFindsATablePairThatAlsoChangedAColumn(t *testing.T) {
+	got := sqlite.DetectRenames(
+		sqlite.BuildSnapshot(renameUsersBefore()),
+		sqlite.BuildSnapshot(renamePeopleAfter()))
+	var found bool
+	for _, c := range got {
+		if c.Kind == sqlite.RenameTable && c.From == "users" && c.To == "people" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no table candidate for users/people: %+v", got)
+	}
+}
+
+// Once the table rename is answered, the column inside it is a question
+// in its own right rather than a DROP the rebuild performs silently.
+func TestResolveRenamesAsksAboutAColumnInsideARenamedTable(t *testing.T) {
+	prev := sqlite.BuildSnapshot(renameUsersBefore())
+	cur := sqlite.BuildSnapshot(renamePeopleAfter())
+
+	applied, unresolved := sqlite.ResolveRenames(prev, cur, []sqlite.RenameDecision{{
+		Rename:   sqlite.Rename{Kind: sqlite.RenameTable, From: "users", To: "people"},
+		IsRename: true,
+	}})
+	if len(applied) != 1 || applied[0].Kind != sqlite.RenameTable {
+		t.Fatalf("applied: %+v", applied)
+	}
+	if len(unresolved) != 1 {
+		t.Fatalf("the column inside the renamed table was not asked about: %+v", unresolved)
+	}
+	c := unresolved[0]
+	if c.Kind != sqlite.RenameColumn || c.Table != "people" || c.From != "email" || c.To != "emailAddress" {
+		t.Errorf("candidate: %+v", c)
+	}
+}
+
+func TestGenerateRefusesARenameInsideARenamedTable(t *testing.T) {
+	files := map[string][]byte{}
+	res, err := sqlite.GenerateMigration(sqlite.GenerateOptions{
+		Schema: renamePeopleAfter(),
+		Dir:    "drizzle",
+		Name:   "rename",
+		FS:     renameFixtureFS(t, renameUsersBefore()),
+		Write:  func(rel string, data []byte) error { files[rel] = data; return nil },
+		Now:    func() int64 { return 2 },
+		Renames: []sqlite.RenameDecision{{
+			Rename:   sqlite.Rename{Kind: sqlite.RenameTable, From: "users", To: "people"},
+			IsRename: true,
+		}},
+	})
+	var amb *sqlite.RenameAmbiguityError
+	if !errors.As(err, &amb) {
+		t.Fatalf("generated a migration that loses the renamed column: %v\n%s", err, res.SQL)
+	}
+	if len(files) != 0 {
+		t.Errorf("a refused run wrote files: %v", files)
+	}
+}
+
+// --- Renaming onto a name that is already taken ------------------------
+
+func TestGenerateRejectsARenameOntoAnOccupiedColumnName(t *testing.T) {
+	before := sqlite.NewTable("users")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("email").NotNull())
+	sqlite.Add(before, sqlite.Text("alias"))
+	after := sqlite.NewTable("users")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(after, sqlite.Text("alias"))
+
+	res, err := sqlite.GenerateMigration(sqlite.GenerateOptions{
+		Schema: sqlite.NewSchema(after),
+		Dir:    "drizzle",
+		Name:   "rename",
+		FS:     renameFixtureFS(t, sqlite.NewSchema(before)),
+		Write:  func(string, []byte) error { return nil },
+		Now:    func() int64 { return 2 },
+		Renames: []sqlite.RenameDecision{{
+			Rename:   sqlite.Rename{Kind: sqlite.RenameColumn, Table: "users", From: "email", To: "alias"},
+			IsRename: true,
+		}},
+	})
+	if err == nil {
+		t.Fatalf("generated a migration SQLite will reject:\n%s", res.SQL)
+	}
+	if !strings.Contains(err.Error(), `already has a column "alias"`) {
+		t.Errorf("error does not say what is wrong: %v", err)
+	}
+}
+
+func TestGenerateRejectsATableRenameOntoAnOccupiedName(t *testing.T) {
+	users := sqlite.NewTable("users")
+	sqlite.Add(users, sqlite.BigInt("id").PrimaryKey())
+	people := sqlite.NewTable("people")
+	sqlite.Add(people, sqlite.BigInt("id").PrimaryKey())
+	after := sqlite.NewTable("people")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+
+	res, err := sqlite.GenerateMigration(sqlite.GenerateOptions{
+		Schema: sqlite.NewSchema(after),
+		Dir:    "drizzle",
+		Name:   "rename",
+		FS:     renameFixtureFS(t, sqlite.NewSchema(users, people)),
+		Write:  func(string, []byte) error { return nil },
+		Now:    func() int64 { return 2 },
+		Renames: []sqlite.RenameDecision{{
+			Rename:   sqlite.Rename{Kind: sqlite.RenameTable, From: "users", To: "people"},
+			IsRename: true,
+		}},
+	})
+	if err == nil {
+		t.Fatalf("generated a migration SQLite will reject:\n%s", res.SQL)
+	}
+	if !strings.Contains(err.Error(), `already holds a table "people"`) {
+		t.Errorf("error does not say what is wrong: %v", err)
+	}
+}

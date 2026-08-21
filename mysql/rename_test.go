@@ -227,3 +227,134 @@ func TestGenerateReplaysARecordedAnswer(t *testing.T) {
 		t.Errorf("migration SQL:\n%s", res.SQL)
 	}
 }
+
+// --- A rename inside a rename -----------------------------------------
+
+// The same table under two names, with one column also renamed: the
+// shape a migration has when a table is renamed and a column inside it
+// tidied in one commit.
+func renamePeopleAfter() *mysql.Schema {
+	people := mysql.NewTable("people")
+	mysql.Add(people, mysql.BigInt("id").PrimaryKey().AutoIncrement())
+	mysql.Add(people, mysql.Varchar("emailAddress", 190).NotNull())
+	return mysql.NewSchema(people)
+}
+
+func TestDetectRenamesFindsATablePairThatAlsoChangedAColumn(t *testing.T) {
+	got := mysql.DetectRenames(
+		mysql.BuildSnapshot(renameUsersBefore()),
+		mysql.BuildSnapshot(renamePeopleAfter()))
+	var found bool
+	for _, c := range got {
+		if c.Kind == mysql.RenameTable && c.From == "users" && c.To == "people" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no table candidate for users/people: %+v", got)
+	}
+}
+
+// Once the table rename is answered, the column inside it is a question
+// in its own right rather than a DROP COLUMN nobody was asked about.
+func TestResolveRenamesAsksAboutAColumnInsideARenamedTable(t *testing.T) {
+	prev := mysql.BuildSnapshot(renameUsersBefore())
+	cur := mysql.BuildSnapshot(renamePeopleAfter())
+
+	applied, unresolved := mysql.ResolveRenames(prev, cur, []mysql.RenameDecision{{
+		Rename:   mysql.Rename{Kind: mysql.RenameTable, From: "users", To: "people"},
+		IsRename: true,
+	}})
+	if len(applied) != 1 || applied[0].Kind != mysql.RenameTable {
+		t.Fatalf("applied: %+v", applied)
+	}
+	if len(unresolved) != 1 {
+		t.Fatalf("the column inside the renamed table was not asked about: %+v", unresolved)
+	}
+	c := unresolved[0]
+	if c.Kind != mysql.RenameColumn || c.Table != "people" || c.From != "email" || c.To != "emailAddress" {
+		t.Errorf("candidate: %+v", c)
+	}
+}
+
+func TestGenerateRefusesARenameInsideARenamedTable(t *testing.T) {
+	files := map[string][]byte{}
+	res, err := mysql.GenerateMigration(mysql.GenerateOptions{
+		Schema: renamePeopleAfter(),
+		Dir:    "migrations",
+		Name:   "rename",
+		FS:     renameFixtureFS(t, renameUsersBefore()),
+		Write:  func(rel string, data []byte) error { files[rel] = data; return nil },
+		Now:    func() int64 { return 2 },
+		Renames: []mysql.RenameDecision{{
+			Rename:   mysql.Rename{Kind: mysql.RenameTable, From: "users", To: "people"},
+			IsRename: true,
+		}},
+	})
+	var amb *mysql.RenameAmbiguityError
+	if !errors.As(err, &amb) {
+		t.Fatalf("generated a migration that drops the renamed column: %v\n%s", err, res.SQL)
+	}
+	if len(files) != 0 {
+		t.Errorf("a refused run wrote files: %v", files)
+	}
+}
+
+// --- Renaming onto a name that is already taken ------------------------
+
+func TestGenerateRejectsARenameOntoAnOccupiedColumnName(t *testing.T) {
+	before := mysql.NewTable("users")
+	mysql.Add(before, mysql.BigInt("id").PrimaryKey().AutoIncrement())
+	mysql.Add(before, mysql.Varchar("email", 190).NotNull())
+	mysql.Add(before, mysql.Varchar("alias", 190))
+	after := mysql.NewTable("users")
+	mysql.Add(after, mysql.BigInt("id").PrimaryKey().AutoIncrement())
+	mysql.Add(after, mysql.Varchar("alias", 190))
+
+	res, err := mysql.GenerateMigration(mysql.GenerateOptions{
+		Schema: mysql.NewSchema(after),
+		Dir:    "migrations",
+		Name:   "rename",
+		FS:     renameFixtureFS(t, mysql.NewSchema(before)),
+		Write:  func(string, []byte) error { return nil },
+		Now:    func() int64 { return 2 },
+		Renames: []mysql.RenameDecision{{
+			Rename:   mysql.Rename{Kind: mysql.RenameColumn, Table: "users", From: "email", To: "alias"},
+			IsRename: true,
+		}},
+	})
+	if err == nil {
+		t.Fatalf("generated a migration the server will reject:\n%s", res.SQL)
+	}
+	if !strings.Contains(err.Error(), `already has a column "alias"`) {
+		t.Errorf("error does not say what is wrong: %v", err)
+	}
+}
+
+func TestGenerateRejectsATableRenameOntoAnOccupiedName(t *testing.T) {
+	users := mysql.NewTable("users")
+	mysql.Add(users, mysql.BigInt("id").PrimaryKey().AutoIncrement())
+	people := mysql.NewTable("people")
+	mysql.Add(people, mysql.BigInt("id").PrimaryKey().AutoIncrement())
+	after := mysql.NewTable("people")
+	mysql.Add(after, mysql.BigInt("id").PrimaryKey().AutoIncrement())
+
+	res, err := mysql.GenerateMigration(mysql.GenerateOptions{
+		Schema: mysql.NewSchema(after),
+		Dir:    "migrations",
+		Name:   "rename",
+		FS:     renameFixtureFS(t, mysql.NewSchema(users, people)),
+		Write:  func(string, []byte) error { return nil },
+		Now:    func() int64 { return 2 },
+		Renames: []mysql.RenameDecision{{
+			Rename:   mysql.Rename{Kind: mysql.RenameTable, From: "users", To: "people"},
+			IsRename: true,
+		}},
+	})
+	if err == nil {
+		t.Fatalf("generated a migration the server will reject:\n%s", res.SQL)
+	}
+	if !strings.Contains(err.Error(), `already holds a table "people"`) {
+		t.Errorf("error does not say what is wrong: %v", err)
+	}
+}

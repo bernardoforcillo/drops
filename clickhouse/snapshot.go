@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -317,18 +318,51 @@ func buildTableSnapshot(t *Table) *TableSnapshot {
 //
 // system.columns reports which columns a partition or sampling
 // expression names, not the expression, so the declared side has to be
-// reduced the same way for the two to be comparable. Rendering the
-// expression and looking for each column's name in it is crude, and it
-// is the same crudeness the server's own flag has: toYYYYMM(ts) and
-// toYear(ts) both flag ts and nothing distinguishes them here either.
+// reduced the same way for the two to be comparable. The reduction is
+// still crude in the way the server's own flag is — toYYYYMM(ts) and
+// toYear(ts) both flag ts, and nothing distinguishes them here either.
 // The expression itself is compared separately and exactly, as
 // [TableSnapshot.PartitionKey].
+//
+// What it is not is a substring search. A column named "s" is not
+// named by toYYYYMM(ts), and flagging it would put a claim nobody made
+// into the snapshot file — where [Diff] does not read it, because it
+// answers from the live side, but the next reader of the file does.
+// So the rendering is split into identifier-shaped words and the
+// column name has to equal one of them.
 func columnsNamedBy(t *Table, e drops.Expression) []string {
-	rendered := renderBare(e)
+	words := identWords(renderBare(e))
 	var out []string
 	for _, c := range t.columns {
-		if strings.Contains(rendered, c.name) {
+		if words[c.name] {
 			out = append(out, c.name)
+		}
+	}
+	return out
+}
+
+// identWords splits rendered SQL into the maximal runs of characters
+// an identifier can be made of. Quoting falls away with the delimiters
+// — "ts" and ts both yield ts — so the set is the same whether the
+// expression came through the builder or through [drops.Raw]. Function
+// names land in it too, which costs nothing: a column named toYYYYMM
+// would be a column the expression does name.
+func identWords(rendered string) map[string]bool {
+	out := map[string]bool{}
+	start := -1
+	for i := 0; i <= len(rendered); i++ {
+		isWord := false
+		if i < len(rendered) {
+			c := rendered[i]
+			isWord = c == '_' || c >= '0' && c <= '9' ||
+				c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= utf8.RuneSelf
+		}
+		switch {
+		case isWord && start < 0:
+			start = i
+		case !isWord && start >= 0:
+			out[rendered[start:i]] = true
+			start = -1
 		}
 	}
 	return out

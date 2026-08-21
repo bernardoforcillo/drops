@@ -9,6 +9,56 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **`dropsgen -rels`: the struct an eager load fills, generated.**
+  Rows mode emits what a `SELECT` of one table hands back. What was
+  still hand-written was the other shape — a parent with its children
+  attached — and it is the one most likely to be wrong, because four
+  things in it have to agree with declarations that live somewhere
+  else: the field name, the slice-versus-pointer choice, the `dropRel`
+  tag and the nested type. Three of the four fail silently. A relation
+  that does not load reads exactly like a parent with no children.
+
+  `dropsgen -rels ./db/schema -shape users:posts.comments` writes one
+  struct per shape, embedding the `<Table>Row` rows mode already emits
+  and adding one field per relation. The cardinalities follow the
+  loader rather than the declaration, because where the two could be
+  read differently `pg/find.go` is the one that decides: `HasMany`,
+  `ManyToMany` and `MorphMany` become a slice, and a parent with no
+  children is assigned an empty non-nil one, so `len()` is the answer
+  and a nil means nobody loaded it; `HasOne` and `BelongsTo` become a
+  pointer, because the loader leaves the field untouched when nothing
+  matches and a zeroed struct is indistinguishable from a real row of
+  zeros; `MorphTo` becomes an `any`, and a path through one is refused
+  here exactly as the loader refuses to descend past one.
+
+  The `-shape` paths are the same strings `With()` takes, so the shape
+  and the query that fills it are written from one spelling — and they
+  are the whole of how deep it goes. There is no "every relation": a
+  schema with a back-reference makes that an infinite type, and a
+  struct that declares a relation the query does not load is refused
+  outright under `StrictLoading`, so generating more than was asked
+  for would break the query it was generated for. A shape is named for
+  its table and its paths (`UsersWithPostsComments`), which keeps a
+  self-referential chain apart, and `-shape 'AuthorWithBooks=...'`
+  names one outright. A name the package already declares is skipped
+  with a note in the header, as in rows mode; the output is
+  byte-stable, including across a different arrangement of the same
+  arguments.
+
+  Each relation field also carries `drop:"-"`. It is not decoration: a
+  relation field sits at depth 0 and would out-rank a real column of
+  the same name promoted from the embedded row struct, so the column
+  would scan into the slice. And `-rows` now moves any
+  `*_drops_rels.go` aside while it compiles the package, because a
+  shape only compiles while the row structs it names exist — without
+  that, generating the first shape made regenerating the row structs
+  impossible.
+
+- **`(*pg.Table).RelationNames`** lists the relations a table declares,
+  sorted — the counterpart of `FilterNames`, and what a tool that
+  walks a schema needs, since nothing outside the package can range
+  over the map.
+
 - **A rename is a rename, and drops stops rather than guess.** A
   structural diff can see that `email` is gone and `emailAddress` has
   arrived. It cannot see whether that was one rename or a drop and an
@@ -634,6 +684,13 @@ once a 1.0 is cut.
 - Smaller additions: `pg.SmallSerial`, `sqlite.Column.Asc/Desc/As`,
   `clickhouse.Bind`, `clickhouse.Table.OrderByColumns`,
   `(*Col[T]).Managed` on pg/sqlite/clickhouse.
+- **`clickhouse.ValidateSetting`** returns what
+  `clickhouse.Table.Setting` panics on, for code that has to answer
+  for a `SETTINGS` pair it did not write. `mirror.WithSetting` is the
+  first such caller: its arguments arrive from outside the program and
+  `DeriveClickHouse` reports everything else about its options as an
+  error, so a bad pair now comes back as one instead of unwinding the
+  caller.
 
 ### Changed
 - **`NewEntity` now refuses a nullable column bound to a field that
@@ -999,6 +1056,55 @@ once a 1.0 is cut.
 - **`drops.TagStatement(ctx, "")` returned `" /*…*/"`.** The separator
   keeps the comment off the end of the statement; with no statement
   there is nothing to separate it from.
+- **`sqlite.NewEntity` could not see a key declared on the table.** A
+  SQLite primary key arrives two ways — `(*Col[T]).PrimaryKey()` or
+  `Table.PrimaryKey(a, b)` — and `NewEntity` read only the first, so a
+  table declared the other way panicked "table has no PRIMARY KEY"
+  beside a `CreateTable` that had been reading both spellings all
+  along. It now reads both. `Table.PrimaryKey` also states NOT NULL on
+  each member, as the column spelling already did: SQLite's
+  table-level PRIMARY KEY does not enforce it — the legacy bug it
+  keeps for compatibility — so on a live engine the key column really
+  did take a NULL, and took a second identical NULL row after it. The
+  two spellings now describe the same table, and drops/pg's `inKey`
+  exemption in the nullability check is deliberately *not* copied
+  here, because in SQLite it is not true.
+- **`mysql.CreateTable` silently dropped every `CHECK` constraint.**
+  The migration path emits `ALTER TABLE … ADD CONSTRAINT … CHECK`
+  for a new table too, so one declaration built two different tables
+  depending on which layer built it: against live MariaDB 10.11 the
+  `CreateTable` one accepted rows the `Push` one rejects. `CHECK`
+  clauses are now rendered inside the table body, in name order, after
+  the keys.
+- **`clickhouse.Push` sent a `CREATE TABLE` whose `ENGINE` was a Go
+  comment.** A table nobody called `.Engine(…)` on renders a marker
+  where the engine belongs, which `CreateTableErr` exists to catch and
+  `Push` was not calling. `Push` now returns `ErrEngineRequired`,
+  naming the table, before it reads the server — so `DryRun` is
+  refused on the same terms, and `AllowRefused` does not waive it,
+  that flag being about changes ClickHouse will not make rather than
+  statements it cannot parse.
+- **A ClickHouse `SETTINGS` value was concatenated unchecked.**
+  `SETTINGS` is a comma-separated list and `MODIFY SETTING` is the
+  same list of one, so a value carrying a comma outside a literal set
+  this setting and whatever the rest of the string named; a comment
+  opener did worse, ending the list while leaving the statement valid,
+  so every setting after it was silently never applied.
+  `Table.Setting` and `SelectBuilder.Setting` now panic on a pair that
+  is not one setting — declaration-time loudness, like `mustIdent` —
+  and the check is narrow enough that `'tier_a,tier_b'` and
+  `disk(name = 'd', type = cache)` still go through. The reachable
+  caller was `vector.Query.Params`, a map the caller fills: a key that
+  is not a setting name is now dropped rather than rendered, and a
+  string parameter ending in a backslash no longer escapes its own
+  closing quote.
+- **`clickhouse` snapshots flagged columns the partition key merely
+  contains the name of.** `columnsNamedBy` was a substring search, so
+  a column named `s` came back `inPartitionKey: true` under
+  `toYYYYMM(ts)` — written into the snapshot file the next reader
+  believes. The rendering is now split into identifier-shaped words
+  and the name has to equal one; quoting falls away with the
+  delimiters, so it works for `drops.Raw` expressions too.
 
 
 ## [0.6.0] - 2026-08-16

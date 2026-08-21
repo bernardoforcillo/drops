@@ -77,7 +77,16 @@ func WithPartitionBy(e drops.Expression) DeriveOption {
 	return func(c *deriveConfig) { c.partition = e }
 }
 
-// WithSetting appends a table-level SETTINGS pair.
+// WithSetting appends a table-level SETTINGS pair. The two halves are
+// raw SQL and are checked, on the terms [clickhouse.Table.Setting]
+// states, to be one setting rather than this one and whatever the rest
+// of the string says — the case a value built from configuration
+// falls into.
+//
+// A pair that fails comes back as an error from [DeriveClickHouse],
+// not as a panic here: this option's arguments are the kind that
+// arrive from outside the program, and DeriveClickHouse already
+// answers for everything else about them that way.
 func WithSetting(key, value string) DeriveOption {
 	return func(c *deriveConfig) { c.settings = append(c.settings, [2]string{key, value}) }
 }
@@ -168,6 +177,13 @@ func DeriveClickHouse(src *pg.Table, opts ...DeriveOption) (*clickhouse.Table, e
 		out.PartitionBy(cfg.partition)
 	}
 	for _, s := range cfg.settings {
+		// Table.Setting panics on a bad pair, which is right where a
+		// schema is being written and wrong here: these come in as
+		// options and this function reports everything else about its
+		// options as an error.
+		if err := clickhouse.ValidateSetting(s[0], s[1]); err != nil {
+			return nil, fmt.Errorf("drops/mirror: WithSetting(%q, %q): %w", s[0], s[1], err)
+		}
 		out.Setting(s[0], s[1])
 	}
 	_ = version

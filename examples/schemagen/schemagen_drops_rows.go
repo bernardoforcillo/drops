@@ -10,6 +10,31 @@ package schemagen
 
 import "time"
 
+// PostsRow is one row of the "posts" table, derived from its
+// declaration. Every column is bound, so pg.NewEntity needs no
+// exemption; a column that admits NULL is a pointer, because that
+// is the field type pg.NewEntity will let it bind to.
+type PostsRow struct {
+	ID     int64  `drop:"id"`
+	UserID int64  `drop:"user_id"`
+	Title  string `drop:"title"`
+}
+
+// PostsInsert is PostsRow without the columns a caller must not
+// supply.
+//
+// Omitted:
+//   - id — bigserial
+//
+// A pointer field is a column that admits NULL. Bind it with
+// (*pg.Col[T]).ValPtr: a nil writes NULL rather than a zero, and
+// the column is still in the INSERT — a column the database is
+// the one to fill is not in this struct at all.
+type PostsInsert struct {
+	UserID int64  `drop:"user_id"`
+	Title  string `drop:"title"`
+}
+
 // UsersRow is one row of the "users" table, derived from its
 // declaration. Every column is bound, so pg.NewEntity needs no
 // exemption; a column that admits NULL is a pointer, because that

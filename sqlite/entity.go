@@ -15,8 +15,8 @@ import (
 // Entity[T]. It precomputes the column↔struct-field mapping for T and
 // offers Get / Create / Update / Delete plus a fluent Query. T must be
 // a struct with a field bound to each column (by `drop:"col"` tag, or
-// by field name / camelCase), and the table must have a single-column
-// primary key.
+// by field name / camelCase), and the table must have a primary key —
+// declared either on its columns or on the table itself.
 type Entity[T any] struct {
 	table *Table
 	// pk / pkField describe the primary key when it is a single
@@ -62,14 +62,11 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	}
 	fields := drops.StructFields(rt)
 
-	var pks []*Column
-	for _, c := range t.columns {
-		if c.primary {
-			pks = append(pks, c)
-		}
-	}
+	pks := primaryKeyColumns(t)
 	if len(pks) == 0 {
-		panic(fmt.Sprintf("drops/sqlite: NewEntity[%s]: table %q has no PRIMARY KEY", rt.Name(), t.name))
+		panic(fmt.Sprintf("drops/sqlite: NewEntity[%s]: table %q has no PRIMARY KEY; "+
+			"mark a column .PrimaryKey() or declare the key on the table with PrimaryKey(cols...)",
+			rt.Name(), t.name))
 	}
 	pkFields := make([][]int, len(pks))
 	for i, c := range pks {
@@ -97,6 +94,28 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 		panic(err.Error())
 	}
 	return &Entity[T]{table: t, pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields}
+}
+
+// primaryKeyColumns returns t's PRIMARY KEY columns in key order,
+// whichever of the two declarations the schema used.
+//
+// A key arrives either as Table.PrimaryKey(cols...) or by marking
+// columns with (*Col[T]).PrimaryKey(), and drops/pg's own
+// primaryKeyColumns says why every reader has to accept both: a table
+// declared one way silently loses its key in a reader that knows only
+// the other. CreateTable here already reads both spellings, so a
+// reader that did not disagreed with the DDL it was rendered beside.
+func primaryKeyColumns(t *Table) []*Column {
+	if pk := t.compositePK; len(pk) > 0 {
+		return pk
+	}
+	var out []*Column
+	for _, c := range t.columns {
+		if c.primary {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // EntityOption configures [NewEntity].

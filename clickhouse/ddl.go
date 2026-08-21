@@ -7,16 +7,23 @@ import (
 	"github.com/bernardoforcillo/drops"
 )
 
-// ErrEngineRequired is returned by CreateTable when the target table
-// doesn't yet have an Engine set. ClickHouse refuses CREATE TABLE
-// without an ENGINE clause, so we fail fast and clearly.
-var ErrEngineRequired = errors.New("drops/clickhouse: table has no Engine set; call .Engine(clickhouse.MergeTree()) before CreateTable")
+// ErrEngineRequired reports a table with no Engine set. ClickHouse
+// refuses CREATE TABLE without an ENGINE clause, so the declaration is
+// incomplete and no statement built from it can run.
+//
+// [CreateTableErr] returns it instead of DDL, and [Push] returns it
+// before it reads the server. [CreateTable] cannot: it returns an
+// expression, and renders the marker below in place of the engine.
+var ErrEngineRequired = errors.New("drops/clickhouse: table has no Engine set; call .Engine(clickhouse.MergeTree()) before creating it")
 
-// CreateTable returns a CREATE TABLE statement for t. It panics-via-
-// expression: rendering builds a SQL fragment that ends up emitting a
-// clearly-marked error string if the engine is missing, so a caller
-// who forgets gets a loud failure at exec time rather than silent bad
-// DDL. Use CreateTableErr if you want the engine check at build time.
+// CreateTable returns a CREATE TABLE statement for t.
+//
+// It does not fail on a table with no engine, because it returns an
+// expression and an expression has nowhere to put an error: it renders
+// a clearly-marked comment where the ENGINE clause belongs, so a caller
+// who forgot gets a readable rejection at exec time rather than a bare
+// syntax error. Use [CreateTableErr] to have the check at build time,
+// and note that [Push] makes it for you.
 func CreateTable(t *Table) drops.Expression {
 	return drops.ExprFunc(func(b *drops.Builder) { writeCreate(b, t, false) })
 }

@@ -97,6 +97,8 @@ type PushResult struct {
 // statement behind them.
 //
 // Behaviour:
+//   - refuses a schema with a table that names no engine, with
+//     [ErrEngineRequired] and before it reads anything;
 //   - reads the current state with [Introspect], scoped to one
 //     database;
 //   - builds the target snapshot with [BuildSnapshot];
@@ -163,6 +165,9 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	if err != nil {
 		return nil, err
 	}
+	if err := checkEngines(schema); err != nil {
+		return nil, err
+	}
 
 	desired := BuildSnapshot(schema)
 	live, err := Introspect(ctx, db, IntrospectOptions{
@@ -196,6 +201,31 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}
 	res.Applied = true
 	return res, plan.Refused()
+}
+
+// checkEngines refuses a schema whose tables do not all name an
+// engine, before Push has read anything.
+//
+// A table with no engine renders its ENGINE clause as the marker
+// [CreateTable] emits — a Go comment, which the server answers with a
+// syntax error. [CreateTableErr] exists for "migration tooling that
+// wants a definite error rather than SQL that references a sentinel
+// string", and Push is that tooling: it would otherwise introspect,
+// diff, and send a statement that could never have run.
+//
+// The check is over the whole schema rather than only the tables the
+// server is missing, because a declaration with no engine is
+// incomplete however the live database happens to look: [BuildSnapshot]
+// records an empty engine, and [Diff] reads an empty engine as "the
+// declaration does not say", so such a table is also one whose engine
+// drift nothing will ever report.
+func checkEngines(schema *Schema) error {
+	for _, t := range schema.Tables() {
+		if t.engine == nil {
+			return fmt.Errorf("%w: table %s", ErrEngineRequired, QualifiedName(t.database, t.name))
+		}
+	}
+	return nil
 }
 
 // pushDatabase works out which database this push is about.

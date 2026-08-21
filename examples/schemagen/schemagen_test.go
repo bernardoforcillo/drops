@@ -208,3 +208,159 @@ func TestGeneratedRowsFileIsCurrent(t *testing.T) {
 		t.Errorf("schemagen_drops_rows.go is stale — rerun go generate\n--- fresh ---\n%s\n--- checked in ---\n%s", fresh, checkedIn)
 	}
 }
+
+// The generated eager-load shape is the one the loader fills. Each
+// of these four is something a hand-written struct gets wrong
+// silently: a slice where the loader fills a slice, a pointer where
+// at most one row arrives, the tag the loader looks the relation up
+// by, and the row struct of the table on the far side.
+func TestGeneratedShapeMatchesWhatTheLoaderFills(t *testing.T) {
+	many, ok := reflect.TypeOf(schemagen.UsersWithPosts{}).FieldByName("Posts")
+	if !ok {
+		t.Fatal("UsersWithPosts has no Posts field")
+	}
+	if want := reflect.TypeOf([]schemagen.PostsRow(nil)); many.Type != want {
+		t.Errorf("Posts is %s, want %s — HasMany fills a slice and the loader refuses anything else", many.Type, want)
+	}
+	if got := many.Tag.Get("dropRel"); got != "posts" {
+		t.Errorf(`Posts is tagged dropRel:%q, want "posts"`, got)
+	}
+	// Not decoration: the relation field sits at depth 0 and would
+	// outrank a real column of the same name promoted from the
+	// embedded row struct, so it is opted out of column binding.
+	if got := many.Tag.Get("drop"); got != "-" {
+		t.Errorf(`Posts is tagged drop:%q, want "-"`, got)
+	}
+
+	// A nested path nests a generated struct, and it is the same
+	// struct the other shape generates rather than a second copy of
+	// it: a shape is named for its table and the paths beneath it, so
+	// two shapes that reach one node share one declaration.
+	nested, ok := reflect.TypeOf(schemagen.PostsWithAuthorPosts{}).FieldByName("Author")
+	if !ok {
+		t.Fatal("PostsWithAuthorPosts has no Author field")
+	}
+	if want := reflect.TypeOf((*schemagen.UsersWithPosts)(nil)); nested.Type != want {
+		t.Errorf("the nested author is %s, want %s", nested.Type, want)
+	}
+
+	one, ok := reflect.TypeOf(schemagen.PostsWithAuthor{}).FieldByName("Author")
+	if !ok {
+		t.Fatal("PostsWithAuthor has no Author field")
+	}
+	if want := reflect.TypeOf((*schemagen.UsersRow)(nil)); one.Type != want {
+		t.Errorf("Author is %s, want %s — BelongsTo leaves the field untouched when nothing matches, and only a pointer can say so", one.Type, want)
+	}
+}
+
+// The shape carries the parent's columns by embedding, which is also
+// what gives the loader the key column it joins on: it looks the
+// join key up with the same field mapping the scanner uses, and that
+// walks embedded structs.
+func TestGeneratedShapeCarriesTheJoinKey(t *testing.T) {
+	shape := reflect.TypeOf(schemagen.UsersWithPosts{})
+	if _, ok := shape.FieldByName("UsersRow"); !ok {
+		t.Fatal("UsersWithPosts does not embed UsersRow")
+	}
+	f, ok := shape.FieldByName("ID")
+	if !ok || f.Tag.Get("drop") != "id" {
+		t.Fatalf("the users primary key is not reachable through the shape: %+v", f)
+	}
+}
+
+// The checked-in generated file must match what the generator
+// produces today, or the example documents a stale workflow. The
+// copy-into-testdata dance is the rows test's, and for the same
+// reason: the generator evaluates the declarations by compiling a
+// program that imports the package.
+func TestGeneratedRelsFileIsCurrent(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable")
+	}
+	dir := copyPackageToTestdata(t, "schemagenrels")
+
+	cmd := exec.CommandContext(context.Background(),
+		"go", "run", "github.com/bernardoforcillo/drops/cmd/dropsgen",
+		"-rels", dir, "-shape", "users:posts", "-shape", "posts:author",
+		"-shape", "posts:author.posts")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dropsgen -rels failed: %v\n%s", err, out)
+	}
+
+	fresh, err := os.ReadFile(filepath.Join(dir, "schemagen_drops_rels.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkedIn, err := os.ReadFile("schemagen_drops_rels.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(fresh) != string(checkedIn) {
+		t.Errorf("schemagen_drops_rels.go is stale — rerun go generate\n--- fresh ---\n%s\n--- checked in ---\n%s", fresh, checkedIn)
+	}
+}
+
+// And a second run over the same input produces the same bytes. A
+// generator whose output churns turns every regeneration into a diff
+// nobody can read, and the file is checked in, so the churn is
+// permanent.
+func TestGeneratedRelsFileIsByteStable(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable")
+	}
+	dir := copyPackageToTestdata(t, "schemagenrelstwice")
+	run := func() string {
+		t.Helper()
+		cmd := exec.CommandContext(context.Background(),
+			"go", "run", "github.com/bernardoforcillo/drops/cmd/dropsgen",
+			"-rels", dir, "-shape", "users:posts", "-shape", "posts:author",
+			"-shape", "posts:author.posts")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("dropsgen -rels failed: %v\n%s", err, out)
+		}
+		src, err := os.ReadFile(filepath.Join(dir, "schemagen_drops_rels.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(src)
+	}
+	if first, second := run(), run(); first != second {
+		t.Errorf("two runs disagree\n--- first ---\n%s\n--- second ---\n%s", first, second)
+	}
+}
+
+// copyPackageToTestdata copies this package's non-test sources into a
+// fresh directory inside the module, and returns it. See
+// TestGeneratedRowsFileIsCurrent for why testdata is the only place
+// this works.
+func copyPackageToTestdata(t *testing.T, prefix string) string {
+	t.Helper()
+	if err := os.MkdirAll("testdata", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("testdata", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if dir, err = filepath.Abs(dir); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range sources {
+		if strings.HasSuffix(src, "_test.go") {
+			continue
+		}
+		body, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, src), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}

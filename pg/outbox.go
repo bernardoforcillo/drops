@@ -448,13 +448,22 @@ func markPublishedOn(ctx context.Context, exec interface {
 // becomes available for retry at nextRetryAt with attempts bumped
 // and the error message stored in lastError.
 func (o *Outbox) MarkFailed(ctx context.Context, id int64, attempts int, nextRetryAt time.Time, lastErr string) error {
+	return markFailedOn(ctx, o.db, o.table, id, attempts, nextRetryAt, lastErr)
+}
+
+// markFailedOn is the shared body used by Outbox.MarkFailed and the
+// in-transaction path in the per-aggregate worker, as
+// [markPublishedOn] is for the other half of the bookkeeping.
+func markFailedOn(ctx context.Context, exec interface {
+	Exec(context.Context, string, ...any) (drops.Result, error)
+}, table string, id int64, attempts int, nextRetryAt time.Time, lastErr string) error {
 	if nextRetryAt.IsZero() {
-		sql := fmt.Sprintf(`UPDATE %s SET "attempts" = $2, "lastError" = $3, "failedAt" = now() WHERE "id" = $1`, quoteIdent(o.table))
-		_, err := o.db.Exec(ctx, sql, id, attempts, lastErr)
+		sql := fmt.Sprintf(`UPDATE %s SET "attempts" = $2, "lastError" = $3, "failedAt" = now() WHERE "id" = $1`, quoteIdent(table))
+		_, err := exec.Exec(ctx, sql, id, attempts, lastErr)
 		return err
 	}
-	sql := fmt.Sprintf(`UPDATE %s SET "attempts" = $2, "lastError" = $3, "availableAt" = $4 WHERE "id" = $1`, quoteIdent(o.table))
-	_, err := o.db.Exec(ctx, sql, id, attempts, lastErr, nextRetryAt)
+	sql := fmt.Sprintf(`UPDATE %s SET "attempts" = $2, "lastError" = $3, "availableAt" = $4 WHERE "id" = $1`, quoteIdent(table))
+	_, err := exec.Exec(ctx, sql, id, attempts, lastErr, nextRetryAt)
 	return err
 }
 
@@ -797,7 +806,7 @@ func (w *OutboxWorker) runBatchInTx(ctx context.Context, tx *DB, events []Outbox
 		return markPublishedOn(ctx, tx, w.ob.table, ids...)
 	}
 	for _, e := range events {
-		w.failOne(ctx, e, herr)
+		w.failOneOn(ctx, tx, e, herr)
 	}
 	return nil
 }
@@ -811,7 +820,7 @@ func (w *OutboxWorker) runBatchInTx(ctx context.Context, tx *DB, events []Outbox
 func (w *OutboxWorker) runSequentialInTx(ctx context.Context, tx *DB, events []OutboxEvent) error {
 	for _, e := range events {
 		if herr := w.handler(ctx, e); herr != nil {
-			w.failOne(ctx, e, herr)
+			w.failOneOn(ctx, tx, e, herr)
 			return nil
 		}
 		if err := markPublishedOn(ctx, tx, w.ob.table, e.ID); err != nil {
@@ -821,15 +830,38 @@ func (w *OutboxWorker) runSequentialInTx(ctx context.Context, tx *DB, events []O
 	return nil
 }
 
-// failOne handles a per-event failure: bump attempts, compute next
-// retry time, mark terminal if MaxAttempts is reached.
+// failOne handles a per-event failure on the unordered paths, which
+// hold no transaction: bump attempts, compute next retry time, mark
+// terminal if MaxAttempts is reached.
 func (w *OutboxWorker) failOne(ctx context.Context, e OutboxEvent, herr error) {
+	w.failOneOn(ctx, w.ob.db, e, herr)
+}
+
+// failOneOn is failOne against a specific handle.
+//
+// The per-aggregate paths pass their own transaction. Writing the
+// failure through the pool instead would want a second connection while
+// DrainAggregate's transaction still holds the first — a worker on a
+// pool of one stops dead at the first handler error, waiting for a
+// connection its own transaction is holding.
+//
+// The argument for the pool is that a rollback must not be able to undo
+// an attempts bump, or a poison event whose transaction rolls back
+// every time never reaches MaxAttempts and retries forever. That is
+// worth stating and it does not apply here: both in-transaction callers
+// record the failure and immediately return nil, so the transaction
+// carrying the bump is the one that commits. Anything that later gives
+// those callers a way to fail after this point has to move the bump
+// back out.
+func (w *OutboxWorker) failOneOn(ctx context.Context, exec interface {
+	Exec(context.Context, string, ...any) (drops.Result, error)
+}, e OutboxEvent, herr error) {
 	attempts := e.Attempts + 1
 	var nextRetry time.Time
 	if w.maxAttempts == 0 || attempts < w.maxAttempts {
 		nextRetry = w.now().Add(w.computeBackoff(attempts))
 	}
-	if err := w.ob.MarkFailed(ctx, e.ID, attempts, nextRetry, herr.Error()); err != nil && w.onError != nil {
+	if err := markFailedOn(ctx, exec, w.ob.table, e.ID, attempts, nextRetry, herr.Error()); err != nil && w.onError != nil {
 		w.onError(err)
 	}
 }

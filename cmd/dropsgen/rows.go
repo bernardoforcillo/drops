@@ -136,6 +136,17 @@ func runRows(pattern, outName string) error {
 	if err != nil {
 		return err
 	}
+	// The eager-load shapes nest these row structs, so a shape file
+	// cannot survive their absence either — and it is in the same
+	// package, which the bridge is about to compile. It is put back
+	// either way: regenerating it is -rels mode's job, not this
+	// one's.
+	restoreShapes, err := stashShapes(pkg)
+	if err != nil {
+		restore()
+		return err
+	}
+	defer restoreShapes()
 	tables, err := runRowsBridge(ctx, pkg)
 	if err != nil {
 		restore()
@@ -169,6 +180,39 @@ func stash(path string) (restore func(), err error) {
 		return nil, err
 	}
 	return func() { _ = os.WriteFile(path, body, 0o644) }, nil
+}
+
+// stashShapes takes every generated shape file in the package out of
+// the way and returns the one function that puts them all back.
+func stashShapes(pkg *rowsPackage) (func(), error) {
+	paths, err := filepath.Glob(filepath.Join(pkg.Dir, "*"+relsFileSuffix))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	restores := make([]func(), 0, len(paths))
+	// Idempotent, because rels mode puts these back as soon as the
+	// bridge is done rather than at the end, and the deferred call is
+	// still there to cover the paths that return early.
+	done := false
+	undo := func() {
+		if done {
+			return
+		}
+		done = true
+		for _, r := range restores {
+			r()
+		}
+	}
+	for _, path := range paths {
+		restore, err := stash(path)
+		if err != nil {
+			undo()
+			return nil, err
+		}
+		restores = append(restores, restore)
+	}
+	return undo, nil
 }
 
 // locateRowsPackage resolves a package pattern to the package on disk

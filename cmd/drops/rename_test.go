@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"flag"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -60,7 +62,7 @@ func TestRenameAnswersRejectMalformedSpecs(t *testing.T) {
 
 func TestPromptRenamesRecordsAYes(t *testing.T) {
 	out := new(bytes.Buffer)
-	got, err := promptRenames(strings.NewReader("y\n"), out, []bridgeCandidate{
+	got, err := promptRenames(bufio.NewReader(strings.NewReader("y\n")), out, []bridgeCandidate{
 		{Kind: "column", Table: "users", From: "email", To: "emailAddress"},
 	})
 	if err != nil {
@@ -78,7 +80,7 @@ func TestPromptRenamesRecordsAYes(t *testing.T) {
 // Anything that is not a yes is a no, and the no is recorded against
 // the old name alone so it covers every pair the diff offered for it.
 func TestPromptRenamesTreatsAnythingElseAsNo(t *testing.T) {
-	got, err := promptRenames(strings.NewReader("\n"), new(bytes.Buffer), []bridgeCandidate{
+	got, err := promptRenames(bufio.NewReader(strings.NewReader("\n")), new(bytes.Buffer), []bridgeCandidate{
 		{Kind: "column", Table: "users", From: "email", To: "emailAddress"},
 	})
 	if err != nil {
@@ -94,7 +96,7 @@ func TestPromptRenamesTreatsAnythingElseAsNo(t *testing.T) {
 // the same column is never put to anybody.
 func TestPromptRenamesStopsAskingAboutAnAnsweredColumn(t *testing.T) {
 	out := new(bytes.Buffer)
-	got, err := promptRenames(strings.NewReader("y\n"), out, []bridgeCandidate{
+	got, err := promptRenames(bufio.NewReader(strings.NewReader("y\n")), out, []bridgeCandidate{
 		{Kind: "column", Table: "users", From: "email", To: "emailAddress"},
 		{Kind: "column", Table: "users", From: "email", To: "contact"},
 	})
@@ -106,5 +108,30 @@ func TestPromptRenamesStopsAskingAboutAnAnsweredColumn(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "contact") {
 		t.Errorf("asked about a column already answered:\n%s", out.String())
+	}
+}
+
+// Two rounds of questions read from one stdin. A reader built per round
+// buffers the whole of stdin on the first read and drops what it did not
+// use, so the second round found EOF where the second answer was.
+func TestPromptRenamesReadsASecondRoundFromTheSameStdin(t *testing.T) {
+	in := bufio.NewReader(strings.NewReader("y\ny\n"))
+	first, err := promptRenames(in, io.Discard, []bridgeCandidate{
+		{Kind: "table", From: "users", To: "people"},
+	})
+	if err != nil {
+		t.Fatalf("first round: %v", err)
+	}
+	if len(first) != 1 || !first[0].IsRename {
+		t.Fatalf("first round: %+v", first)
+	}
+	second, err := promptRenames(in, io.Discard, []bridgeCandidate{
+		{Kind: "column", Table: "people", From: "email", To: "emailAddress"},
+	})
+	if err != nil {
+		t.Fatalf("the second answer was read away by the first round: %v", err)
+	}
+	if len(second) != 1 || !second[0].IsRename {
+		t.Fatalf("second round: %+v", second)
 	}
 }

@@ -113,7 +113,7 @@ func (e *RenameAmbiguityError) Error() string {
 			fmt.Fprintf(&b, "    or drop it:     --drop-column %s.%s\n", c.Table, c.From)
 			continue
 		}
-		fmt.Fprintf(&b, "  table %q is gone and %q has appeared with the same columns\n", c.From, c.To)
+		fmt.Fprintf(&b, "  table %q is gone and %q has appeared with much the same columns\n", c.From, c.To)
 		fmt.Fprintf(&b, "    rename it:      --rename-table %s=%s\n", c.From, c.To)
 		fmt.Fprintf(&b, "    or drop it:     --drop-table %s\n", c.From)
 	}
@@ -127,11 +127,17 @@ func (e *RenameAmbiguityError) Error() string {
 // A column pair qualifies when the two types belong to the same family:
 // identical would miss a rename that widened the column in the same
 // step, and no test at all would ask about a dropped datetime and an
-// added tinyint. A table pair qualifies when both carry the same column
-// names with compatible types.
+// added tinyint. A table pair qualifies when the two agree on at least
+// half their columns — see tablesLookAlike.
+//
+// A column inside a table that is itself a rename candidate is not
+// reported here, because until the table question is answered there is
+// no table to ask it about: the two snapshots file that table under
+// different names. ResolveRenames asks the second question once the
+// first has an answer.
 //
 // The result is sorted, so two runs over the same pair of snapshots ask
-// the same questions in the same order.
+// the same questions in the same order..
 func DetectRenames(prev, cur *Snapshot) []RenameCandidate {
 	if prev == nil {
 		prev = EmptySnapshot()
@@ -139,8 +145,16 @@ func DetectRenames(prev, cur *Snapshot) []RenameCandidate {
 	if cur == nil {
 		cur = EmptySnapshot()
 	}
-	var out []RenameCandidate
+	out := detectTableRenames(prev, cur)
+	out = append(out, detectColumnRenames(prev, cur)...)
+	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	return out
+}
 
+// detectTableRenames pairs each table prev has and cur does not with
+// each table cur has and prev does not, when the two look alike.
+func detectTableRenames(prev, cur *Snapshot) []RenameCandidate {
+	var out []RenameCandidate
 	var goneTables, newTables []string
 	for _, k := range sortedKeys(prev.Tables) {
 		if _, ok := cur.Tables[k]; !ok {
@@ -154,7 +168,7 @@ func DetectRenames(prev, cur *Snapshot) []RenameCandidate {
 	}
 	for _, gk := range goneTables {
 		for _, nk := range newTables {
-			if !sameTableShape(prev.Tables[gk], cur.Tables[nk]) {
+			if !tablesLookAlike(prev.Tables[gk], cur.Tables[nk]) {
 				continue
 			}
 			out = append(out, RenameCandidate{Rename: Rename{
@@ -164,7 +178,14 @@ func DetectRenames(prev, cur *Snapshot) []RenameCandidate {
 			}})
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	return out
+}
 
+// detectColumnRenames pairs a gone column with an arrived one, within
+// each table both snapshots name.
+func detectColumnRenames(prev, cur *Snapshot) []RenameCandidate {
+	var out []RenameCandidate
 	for _, k := range sortedKeys(cur.Tables) {
 		prevT, ok := prev.Tables[k]
 		if !ok {
@@ -195,19 +216,36 @@ func DetectRenames(prev, cur *Snapshot) []RenameCandidate {
 	return out
 }
 
-// sameTableShape reports whether two tables carry the same column names
-// with compatible types — the test a table-rename candidate has to pass.
-func sameTableShape(a, b *TableSnapshot) bool {
-	if len(a.Columns) == 0 || len(a.Columns) != len(b.Columns) {
+// tablesLookAlike reports whether two tables resemble each other enough
+// for one to be the other under a new name: at least half the columns of
+// the wider of the two appear in both, under the same name and with a
+// compatible type.
+//
+// A majority rather than an equality, because the alternative to asking
+// is dropping the table. Demanding the two carry exactly the same
+// columns meant a table renamed in the same commit that added a column
+// to it — or renamed a column inside it — resembled nothing, so nothing
+// was asked, and the diff dropped the table and built a new one with the
+// rows left behind. A question nobody needed costs one --drop-table; a
+// DROP TABLE nobody was asked about costs the table.
+//
+// A table whose every column was also renamed still resembles nothing,
+// and drops still cannot tell that from an unrelated drop and add.
+func tablesLookAlike(a, b *TableSnapshot) bool {
+	wider := len(a.Columns)
+	if len(b.Columns) > wider {
+		wider = len(b.Columns)
+	}
+	if wider == 0 {
 		return false
 	}
+	shared := 0
 	for name, ac := range a.Columns {
-		bc, ok := b.Columns[name]
-		if !ok || !renameTypeCompatible(ac.Type, bc.Type) {
-			return false
+		if bc, ok := b.Columns[name]; ok && renameTypeCompatible(ac.Type, bc.Type) {
+			shared++
 		}
 	}
-	return true
+	return shared > 0 && shared*2 >= wider
 }
 
 // renameTypeCompatible reports whether a column of type a could
@@ -270,48 +308,66 @@ func typeFamily(t string) string {
 // pair of snapshots produces and returns the renames to apply, plus the
 // candidates still unanswered.
 //
+// The two kinds are settled in turn, tables first, because a column
+// rename inside a renamed table is not a visible question until the
+// table has an answer: while the two snapshots file the table under
+// different names, nothing in it pairs with anything, and the diff that
+// followed dropped the column and added the new one with no question
+// asked. So the column pass runs against a previous snapshot in which
+// the accepted table renames have already happened. A migration that
+// renames both therefore asks twice — once about the table, and once,
+// after that answer is recorded, about the column inside it.
+//
 // A decision that names a pair no longer in question is ignored rather
 // than rejected: the file accumulates answers, and an answer about a
 // migration that has already been generated describes a schema change
 // that has already happened.
 func ResolveRenames(prev, cur *Snapshot, decisions []RenameDecision) (applied []Rename, unresolved []RenameCandidate) {
-	candidates := DetectRenames(prev, cur)
+	if prev == nil {
+		prev = EmptySnapshot()
+	}
+	if cur == nil {
+		cur = EmptySnapshot()
+	}
+	tables, tablesOpen := resolveOneKind(prev, cur, decisions, RenameTable, detectTableRenames(prev, cur))
+	after := applyRenames(prev, tables)
+	columns, columnsOpen := resolveOneKind(after, cur, decisions, RenameColumn, detectColumnRenames(after, cur))
+
+	applied = tables
+	applied = append(applied, columns...)
+	unresolved = tablesOpen
+	unresolved = append(unresolved, columnsOpen...)
+	return applied, unresolved
+}
+
+// resolveOneKind settles the decisions of a single kind against the
+// candidates of that kind.
+func resolveOneKind(prev, cur *Snapshot, decisions []RenameDecision, kind RenameKind, candidates []RenameCandidate) (applied []Rename, unresolved []RenameCandidate) {
 	offered := map[string]bool{}
 	for _, c := range candidates {
 		offered[c.key()] = true
 	}
 	answered := map[string]bool{}
 	declined := map[string]bool{}
-	var stated []Rename
 	for _, d := range decisions {
+		if d.Kind != kind {
+			continue
+		}
 		if !d.IsRename && d.To == "" {
 			declined[d.Kind.side(d.Table, d.From)] = true
 			continue
 		}
 		answered[d.key()] = d.IsRename
-		if d.IsRename && !offered[d.key()] {
-			stated = append(stated, d.Rename)
-		}
-	}
-	// A rename nobody was asked about is still a rename. The detector's
-	// type test decides what to ask, not what is true, and somebody
-	// renaming a column and changing its type past what that test
-	// accepts is telling drops something it could not have worked out.
-	// Only a rename that still describes a pending change is applied,
-	// which is what keeps a recorded answer from an earlier migration
-	// from being replayed against a schema that has already moved past
-	// it.
-	var statedTables []Rename
-	for _, r := range stated {
-		if r.Kind == RenameTable && renameStillPending(prev, cur, r) {
-			statedTables = append(statedTables, r)
-			applied = append(applied, r)
-		}
-	}
-	after := applyRenames(prev, statedTables)
-	for _, r := range stated {
-		if r.Kind == RenameColumn && renameStillPending(after, cur, r) {
-			applied = append(applied, r)
+		// A rename nobody was asked about is still a rename. The
+		// detector decides what to ask, not what is true, and somebody
+		// renaming a column and changing its type past what the type
+		// test accepts is telling drops something it could not have
+		// worked out. Only a rename that still describes a pending
+		// change is applied, which is what keeps a recorded answer from
+		// an earlier migration from being replayed against a schema
+		// that has already moved past it.
+		if d.IsRename && !offered[d.key()] && renameStillPending(prev, cur, d.Rename) {
+			applied = append(applied, d.Rename)
 		}
 	}
 	// A candidate whose From or To has been claimed by an accepted
@@ -378,12 +434,15 @@ func (k RenameKind) side(table, name string) string {
 }
 
 // validateRenames checks that every rename names objects that exist on
-// the side they should, and that no name is renamed twice.
+// the side they should, that no name is renamed twice, and that the name
+// each rename is moving to is free.
 func validateRenames(prev, cur *Snapshot, renames []Rename) error {
 	seenFrom := map[string]bool{}
 	seenTo := map[string]bool{}
-	after := applyRenames(prev, tablesOnly(renames))
 	for _, r := range renames {
+		if r.Kind != RenameTable && r.Kind != RenameColumn {
+			return fmt.Errorf("drops/mysql: unknown rename kind %q", r.Kind)
+		}
 		if seenFrom[r.Kind.side(r.Table, r.From)] {
 			return fmt.Errorf("drops/mysql: %s is renamed twice", r)
 		}
@@ -392,32 +451,53 @@ func validateRenames(prev, cur *Snapshot, renames []Rename) error {
 		}
 		seenFrom[r.Kind.side(r.Table, r.From)] = true
 		seenTo[r.Kind.side(r.Table, r.To)] = true
+	}
 
-		switch r.Kind {
-		case RenameTable:
-			if prev.Tables[r.From] == nil {
-				return fmt.Errorf("drops/mysql: rename %s: no table %q in the previous snapshot", r, r.From)
-			}
-			if cur.Tables[r.To] == nil {
-				return fmt.Errorf("drops/mysql: rename %s: no table %q in the new schema", r, r.To)
-			}
-		case RenameColumn:
-			pt := after.Tables[r.Table]
-			if pt == nil {
-				return fmt.Errorf("drops/mysql: rename %s: no table %q in the previous snapshot", r, r.Table)
-			}
-			if _, ok := pt.Columns[r.From]; !ok {
-				return fmt.Errorf("drops/mysql: rename %s: table %q has no column %q in the previous snapshot", r, r.Table, r.From)
-			}
-			ct := cur.Tables[r.Table]
-			if ct == nil {
-				return fmt.Errorf("drops/mysql: rename %s: no table %q in the new schema", r, r.Table)
-			}
-			if _, ok := ct.Columns[r.To]; !ok {
-				return fmt.Errorf("drops/mysql: rename %s: table %q has no column %q in the new schema", r, r.Table, r.To)
-			}
-		default:
-			return fmt.Errorf("drops/mysql: unknown rename kind %q", r.Kind)
+	// Tables first, and against prev rather than against the rewritten
+	// copy below, because the rewrite is what an occupied name corrupts:
+	// moving a table onto a name already in use overwrites the entry
+	// standing there, and the diff then says nothing at all about the
+	// table it displaced.
+	for _, r := range renames {
+		if r.Kind != RenameTable {
+			continue
+		}
+		if prev.Tables[r.From] == nil {
+			return fmt.Errorf("drops/mysql: rename %s: no table %q in the previous snapshot", r, r.From)
+		}
+		if cur.Tables[r.To] == nil {
+			return fmt.Errorf("drops/mysql: rename %s: no table %q in the new schema", r, r.To)
+		}
+		if prev.Tables[r.To] != nil {
+			return fmt.Errorf("drops/mysql: rename %s: the previous snapshot already holds a table %q, "+
+				"and no server will rename one onto the other; drop or rename that table in a migration of its own first", r, r.To)
+		}
+	}
+
+	// Table renames land first, so a column rename is checked against
+	// the table names cur uses.
+	after := applyRenames(prev, tablesOnly(renames))
+	for _, r := range renames {
+		if r.Kind != RenameColumn {
+			continue
+		}
+		pt := after.Tables[r.Table]
+		if pt == nil {
+			return fmt.Errorf("drops/mysql: rename %s: no table %q in the previous snapshot", r, r.Table)
+		}
+		if _, ok := pt.Columns[r.From]; !ok {
+			return fmt.Errorf("drops/mysql: rename %s: table %q has no column %q in the previous snapshot", r, r.Table, r.From)
+		}
+		if _, ok := pt.Columns[r.To]; ok {
+			return fmt.Errorf("drops/mysql: rename %s: table %q already has a column %q, "+
+				"and no server will rename one onto the other; drop that column in a migration of its own first", r, r.Table, r.To)
+		}
+		ct := cur.Tables[r.Table]
+		if ct == nil {
+			return fmt.Errorf("drops/mysql: rename %s: no table %q in the new schema", r, r.Table)
+		}
+		if _, ok := ct.Columns[r.To]; !ok {
+			return fmt.Errorf("drops/mysql: rename %s: table %q has no column %q in the new schema", r, r.Table, r.To)
 		}
 	}
 	return nil

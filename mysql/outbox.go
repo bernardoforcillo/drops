@@ -481,6 +481,33 @@ func (o *Outbox) Drain(ctx context.Context, limit int) ([]OutboxEvent, error) {
 	return scanOutboxRows(rows)
 }
 
+// DrainUnaggregated is Drain restricted to events that carry no
+// aggregate ID. Those are the events no ordering promise covers, so
+// they are the only ones the per-aggregate worker may drain outside an
+// aggregate's lock — see [OrderingPerAggregate].
+func (o *Outbox) DrainUnaggregated(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	sql := fmt.Sprintf("SELECT `id`, `kind`, `aggregateType`, `aggregateID`, `payload`, `headers`, `attempts`, `lastError`, `createdAt`\n"+
+		"FROM %s\n"+
+		"WHERE `publishedAt` IS NULL\n"+
+		"  AND `failedAt` IS NULL\n"+
+		"  AND `availableAt` <= ?\n"+
+		"  AND `aggregateID` IS NULL\n"+
+		"ORDER BY `id`\n"+
+		"LIMIT ?%s", Dialect.QuoteIdent(o.table), lockingClause(o.locking))
+	rows, err := o.db.Query(ctx, sql, o.now().UTC(), limit)
+	if err != nil {
+		if o.locking == LockSkipLocked && isSkipLockedRejection(err) {
+			return nil, fmt.Errorf("%w: call Outbox.ProbeLocking at startup, or pick a mode with Outbox.WithLocking: %w", ErrSkipLockedUnsupported, err)
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOutboxRows(rows)
+}
+
 // lockingClause renders the trailing locking clause for a drain.
 func lockingClause(m DrainLocking) string {
 	switch m {
@@ -528,17 +555,37 @@ func (o *Outbox) DrainAggregate(ctx context.Context, aggregateType, aggregateID 
 		}
 		defer releaseNamedLock(tx, ctx, name)
 
+		// The events available now, up to but not past the first one
+		// that is not.
+		//
+		// "availableAt <= now" alone is not enough for an ordered
+		// stream: an event whose handler failed is pushed into the
+		// future by its backoff, and a drain that merely skipped it
+		// would deliver the events emitted after it first — the
+		// ordering this whole path exists to preserve, broken by the
+		// one case it was built for. The subquery reads the same table
+		// the outer SELECT does, which MySQL allows because neither is
+		// writing to it.
+		now := o.now().UTC()
 		sql := fmt.Sprintf("SELECT `id`, `kind`, `aggregateType`, `aggregateID`, `payload`, `headers`, `attempts`, `lastError`, `createdAt`\n"+
-			"FROM %s\n"+
+			"FROM %[1]s\n"+
 			"WHERE `publishedAt` IS NULL\n"+
 			"  AND `failedAt` IS NULL\n"+
 			"  AND `availableAt` <= ?\n"+
 			"  AND `aggregateType` <=> ?\n"+
 			"  AND `aggregateID` = ?\n"+
+			"  AND `id` < COALESCE((\n"+
+			"        SELECT MIN(`id`) FROM %[1]s\n"+
+			"        WHERE `publishedAt` IS NULL\n"+
+			"          AND `failedAt` IS NULL\n"+
+			"          AND `availableAt` > ?\n"+
+			"          AND `aggregateType` <=> ?\n"+
+			"          AND `aggregateID` = ?), 9223372036854775807)\n"+
 			"ORDER BY `id`\n"+
 			"LIMIT ?", Dialect.QuoteIdent(o.table))
-		eventRows, err := tx.Query(ctx, sql, o.now().UTC(),
-			outboxNullableString(aggregateType), aggregateID, limit)
+		eventRows, err := tx.Query(ctx, sql,
+			now, outboxNullableString(aggregateType), aggregateID,
+			now, outboxNullableString(aggregateType), aggregateID, limit)
 		if err != nil {
 			return err
 		}
@@ -1044,10 +1091,41 @@ func (w *OutboxWorker) tickNone(ctx context.Context) error {
 	return nil
 }
 
+// tickUnaggregated drains only the events that carry no aggregate,
+// which is what the per-aggregate mode may deliver outside a lock.
+func (w *OutboxWorker) tickUnaggregated(ctx context.Context) error {
+	events, err := w.ob.DrainUnaggregated(ctx, w.batch)
+	if err != nil || len(events) == 0 {
+		return err
+	}
+	if w.batchHandler != nil {
+		return w.runBatch(ctx, events)
+	}
+	for _, e := range events {
+		if herr := w.handler(ctx, e); herr == nil {
+			if err := w.ob.MarkPublished(ctx, e.ID); err != nil && w.onError != nil {
+				w.onError(err)
+			}
+		} else {
+			w.failOne(ctx, e, herr)
+		}
+	}
+	return nil
+}
+
 // tickPerAggregate processes one aggregate at a time inside its named
 // lock so per-aggregate order is preserved even when many workers are
-// running in parallel. Events without an AggregateID fall through to
-// the unordered path so the worker still drains everything.
+// running in parallel.
+//
+// The pass that follows drains only the events with no aggregate. It
+// used to be the plain unordered drain, which selects every pending row
+// — so the two cases where the ordered pass delivers nothing, an
+// aggregate whose lock another worker holds and an aggregate parked
+// behind a failed event, were exactly the cases where the same tick
+// went on to deliver that aggregate's events anyway: concurrently with
+// the lock holder in the first, and ahead of the event they were
+// emitted after in the second. Both break the only promise this mode
+// makes.
 func (w *OutboxWorker) tickPerAggregate(ctx context.Context) error {
 	aggs, err := w.ob.PendingAggregates(ctx, w.batch)
 	if err != nil {
@@ -1064,9 +1142,9 @@ func (w *OutboxWorker) tickPerAggregate(ctx context.Context) error {
 			w.onError(err)
 		}
 	}
-	// Fall back to the unordered drain so events without an
-	// aggregate id still flow.
-	return w.tickNone(ctx)
+	// Events with no aggregate have no order to keep, so they flow on
+	// this tick regardless of what the ordered pass could reach.
+	return w.tickUnaggregated(ctx)
 }
 
 // runBatch publishes a whole batch via the OnBatch handler. On success

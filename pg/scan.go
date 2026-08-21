@@ -17,13 +17,14 @@ var ErrNoRows = errors.New("drops/pg: no rows in result set")
 // reflection scanner without going through a builder.
 func ScanOne(rows drops.Rows, dest any) error { return scanOne(rows, dest) }
 
-// ScanAll consumes every row from rows into dest (pointer to
-// slice of struct or *struct). Exported for the same reason as
-// ScanOne.
+// ScanAll consumes every row from rows into dest (pointer to a slice
+// of struct, *struct or — for a single-column result — scalar).
+// Exported for the same reason as ScanOne.
 func ScanAll(rows drops.Rows, dest any) error { return scanAll(rows, dest) }
 
 // scanAll consumes rows into dest, which must be a pointer to a slice
-// of structs or pointer-to-structs. The struct-to-column mapping is
+// of structs, pointer-to-structs or — for a single-column result —
+// scalars, as [drops.ScanAll] accepts. The struct-to-column mapping is
 // the one [drops.ScanOne] documents — a `drop:"col"` tag names the
 // column, an untagged field matches its own name and its camelCase
 // form, embedded structs are walked whether or not the embedded type
@@ -39,7 +40,32 @@ func scanAll(rows drops.Rows, dest any) error {
 	if slice.Kind() != reflect.Slice {
 		return fmt.Errorf("drops/pg: All requires a pointer to slice, got *%s", slice.Kind())
 	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
 	elemType := slice.Type().Elem()
+	// A single-column result into a slice of scalars, the shape SELECT
+	// id produces. It has to be decided before the struct unwrap below,
+	// because some scalars are structs: a []time.Time taken apart
+	// field-by-field matches no column at all and comes back as a slice
+	// of zero timestamps with a nil error, which is the same query
+	// through the same rows answering differently depending on whether
+	// the caller reached [drops.ScanAll] or this one.
+	if drops.IsScalarDest(elemType) {
+		if len(cols) > 1 {
+			return fmt.Errorf("drops/pg: All into *[]%s needs a single-column result, got %d columns %v",
+				elemType, len(cols), cols)
+		}
+		for rows.Next() {
+			ptr := reflect.New(elemType)
+			if err := rows.Scan(ptr.Interface()); err != nil {
+				return err
+			}
+			slice.Set(reflect.Append(slice, ptr.Elem()))
+		}
+		return rows.Err()
+	}
 	isPtr := elemType.Kind() == reflect.Ptr
 	structType := elemType
 	if isPtr {
@@ -47,11 +73,6 @@ func scanAll(rows drops.Rows, dest any) error {
 	}
 	if structType.Kind() != reflect.Struct {
 		return fmt.Errorf("drops/pg: slice element must be struct or *struct, got %s", structType.Kind())
-	}
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return err
 	}
 	fields := fieldMap(structType)
 

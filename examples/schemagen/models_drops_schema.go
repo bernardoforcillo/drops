@@ -9,6 +9,14 @@ package schemagen
 
 import "github.com/bernardoforcillo/drops/pg"
 
+// Posts is the "posts" table, derived from Post.
+var (
+	Posts      = pg.NewTable("posts")
+	PostID     = pg.Add(Posts, pg.BigSerial("id").PrimaryKey())
+	PostUserID = pg.Add(Posts, pg.BigInt("user_id").NotNull())
+	PostTitle  = pg.Add(Posts, pg.Text("title").NotNull())
+)
+
 // Users is the "users" table, derived from User.
 var (
 	Users         = pg.NewTable("users")

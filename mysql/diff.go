@@ -177,7 +177,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 			out = append(out, diffColumns(prevT, curT, opt)...)
 			out = append(out, diffPrimaryKey(prevT, curT)...)
 		}
-		out = append(out, diffIndexes(prevT, curT, opt)...)
+		out = append(out, diffIndexes(prevT, curT)...)
 		out = append(out, diffChecks(prevT, curT, opt)...)
 	}
 	for _, key := range sortedKeys(cur.Tables) {
@@ -422,7 +422,7 @@ func addPrimaryKeySQL(table string, pk *PrimaryKeySnapshot) string {
 
 // diffIndexes emits CREATE INDEX / DROP INDEX. An index is never
 // altered in place: any structural change drops and recreates it.
-func diffIndexes(prev, cur *TableSnapshot, opt DiffOptions) []string {
+func diffIndexes(prev, cur *TableSnapshot) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.Indexes) {
 		curIdx, present := cur.Indexes[k]

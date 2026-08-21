@@ -109,8 +109,12 @@ const interactiveHint = "\nor re-run with --interactive to be asked about each o
 // stray keystroke is "leave the column alone and drop it", which the
 // migration then says out loud in its DROP COLUMN, rather than a rename
 // nobody asked for.
-func promptRenames(in io.Reader, out io.Writer, candidates []bridgeCandidate) ([]bridgeRename, error) {
-	reader := bufio.NewReader(in)
+//
+// The reader is the caller's, not one made here, because answering can
+// raise a second round of questions: a bufio.Reader built per round
+// would read ahead into its own buffer and throw away the answers meant
+// for the round after it.
+func promptRenames(reader *bufio.Reader, out io.Writer, candidates []bridgeCandidate) ([]bridgeRename, error) {
 	answers := make([]bridgeRename, 0, len(candidates))
 	claimed := map[string]bool{}
 	for _, c := range candidates {

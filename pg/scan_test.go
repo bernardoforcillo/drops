@@ -1,6 +1,7 @@
 package pg_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -106,5 +107,59 @@ func TestScanPrefersTheShallowerFieldOnACollision(t *testing.T) {
 	if unexported.Title != "outer" || unexported.scanInnerName.Title != "" {
 		t.Errorf("unexported embed: column landed in the embedded field: outer=%q inner=%q",
 			unexported.Title, unexported.scanInnerName.Title)
+	}
+}
+
+// A single-column result into a slice of scalars is the shape SELECT id
+// produces, and drops.All[int64] over a pg builder already reads it —
+// so pg's own All has to read it too. It used to reject an []int64
+// outright, and, worse, take a []time.Time apart field-by-field: a
+// time.Time is a struct, so the walk matched no column, and the caller
+// got a slice of zero timestamps and a nil error.
+func TestScanAllReadsASliceOfScalars(t *testing.T) {
+	at := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	stamps := func() *fakeRows {
+		return &fakeRows{cols: []string{"t"}, data: [][]any{{at}, {at.Add(time.Hour)}}}
+	}
+
+	var got []time.Time
+	if err := pg.ScanAll(stamps(), &got); err != nil {
+		t.Fatalf("pg.ScanAll into []time.Time: %v", err)
+	}
+	var want []time.Time
+	if err := drops.ScanAll(stamps(), &want); err != nil {
+		t.Fatalf("drops.ScanAll into []time.Time: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("pg read %d rows, root read %d", len(got), len(want))
+	}
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Errorf("[%d] pg %v, root %v", i, got[i], want[i])
+		}
+	}
+	if got[0].IsZero() {
+		t.Error("a []time.Time was taken apart field-by-field instead of scanned")
+	}
+
+	var ids []int64
+	if err := pg.ScanAll(&fakeRows{cols: []string{"id"}, data: [][]any{{int64(1)}, {int64(2)}}}, &ids); err != nil {
+		t.Fatalf("pg.ScanAll into []int64: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Errorf("got %v, want [1 2]", ids)
+	}
+}
+
+// The width check the root scanner makes has to be made here too, or a
+// two-column result silently binds its first column and drops the rest.
+func TestScanAllRejectsAWideResultIntoScalars(t *testing.T) {
+	var ids []int64
+	err := pg.ScanAll(&fakeRows{cols: []string{"id", "name"}, data: [][]any{{int64(1), "a"}}}, &ids)
+	if err == nil {
+		t.Fatal("a two-column result into []int64 should be an error")
+	}
+	if !strings.Contains(err.Error(), "single-column") {
+		t.Errorf("the error should say what is wrong: %v", err)
 	}
 }

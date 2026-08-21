@@ -129,6 +129,20 @@ func (t *Table) Rel(name string) *Relation {
 	return r
 }
 
+// RelationNames returns the names of every relation declared on t,
+// sorted. It is the counterpart of [Table.FilterNames]: a table can
+// already be asked whether it has one relation, and this asks it
+// which ones it has — the question a tool that walks a schema has to
+// ask, because nothing outside the package can range over the map.
+func (t *Table) RelationNames() []string {
+	out := make([]string, 0, len(t.relations))
+	for name := range t.relations {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Name returns the table's unqualified name.
 func (t *Table) Name() string { return t.name }
 

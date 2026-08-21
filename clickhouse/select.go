@@ -136,7 +136,16 @@ func (s *SelectBuilder) Limit(n int64) *SelectBuilder  { s.limit = &n; return s 
 func (s *SelectBuilder) Offset(n int64) *SelectBuilder { s.offset = &n; return s }
 
 // Setting appends a "key = value" pair to the SETTINGS clause.
+//
+// Both halves are raw SQL and are checked to be one setting, on the
+// terms [Table.Setting] states: a comma outside a literal would make
+// the value this setting and whatever follows it. A pair that fails
+// the check panics, so a caller passing something that did not come
+// from them — a key out of a request, a value out of configuration —
+// should not hand it here unfiltered.
 func (s *SelectBuilder) Setting(key, value string) *SelectBuilder {
+	mustSettingKey(key)
+	mustSettingValue(key, value)
 	s.settings = append(s.settings, key+" = "+value)
 	return s
 }

@@ -178,7 +178,7 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	out = append(head, out...)
 	out = append(out, diffSequencesDrop(prev, cur, opt.Safe)...)
 	out = append(out, diffEnumsDrop(prev, cur, opt.Safe)...)
-	out = append(out, diffViewsCreate(prev, cur, opt.Safe)...)
+	out = append(out, diffViewsCreate(prev, cur, opt.Safe, len(opt.Renames) > 0)...)
 
 	// RLS + policies, table-scoped.
 	for _, key := range sortedKeys(cur.Tables) {
@@ -274,7 +274,10 @@ func diffViewsDrop(prev, cur *Snapshot, safe bool) []string {
 
 // diffViewsCreate builds the views cur declares and brings the ones
 // that changed into line.
-func diffViewsCreate(prev, cur *Snapshot, safe bool) []string {
+//
+// renamed says a rename is part of this migration, which decides how a
+// changed view is replaced: see the comment on the branch that uses it.
+func diffViewsCreate(prev, cur *Snapshot, safe, renamed bool) []string {
 	var out []string
 	for _, key := range sortedKeys(cur.Views) {
 		curV := cur.Views[key]
@@ -297,7 +300,20 @@ func diffViewsCreate(prev, cur *Snapshot, safe bool) []string {
 			// CREATE OR REPLACE if the shape didn't change
 			// (non-materialised views support REPLACE);
 			// materialised views require drop + recreate.
-			if curV.Materialized {
+			//
+			// A rename changes the shape by definition. CREATE OR
+			// REPLACE VIEW may add columns at the end and nothing
+			// else — it will not rename one — so a view selecting a
+			// column that has just been renamed is rejected with
+			// "cannot change name of view column", and the migration
+			// stops there with the rename already applied. Whether
+			// this particular view named the renamed column is not
+			// something drops can tell without parsing the SQL it was
+			// handed, so any view whose body moved in a migration that
+			// renames anything is rebuilt rather than replaced. A view
+			// holds no rows, so the cost of being wrong is a DROP and
+			// a CREATE where a REPLACE would have done.
+			if curV.Materialized || renamed {
 				out = append(out, dropViewSQL(prevV, safe))
 				out = append(out, createViewSQL(curV, false))
 			} else {

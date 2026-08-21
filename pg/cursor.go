@@ -1,6 +1,7 @@
 package pg
 
 import (
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -241,6 +242,16 @@ func encodeCursorValue(v any) (cursorVal, error) {
 				return cursorVal{T: cTypeNull, V: json.RawMessage("null")}, nil
 			}
 			return encodeCursorValue(rv.Elem().Interface())
+		}
+		// The other shape a nullable column takes on a row struct is an
+		// sql.NullString and its siblings, which say what they are worth
+		// through driver.Valuer — including that they are worth NULL.
+		if val, ok := v.(driver.Valuer); ok {
+			inner, err := val.Value()
+			if err != nil {
+				return cursorVal{}, fmt.Errorf("drops/pg: cursor value %T: %w", v, err)
+			}
+			return encodeCursorValue(inner)
 		}
 		return cursorVal{}, fmt.Errorf("drops/pg: cursor value type %T not supported", v)
 	}

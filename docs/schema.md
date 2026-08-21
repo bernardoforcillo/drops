@@ -288,9 +288,128 @@ is the package's own name and not the last element of its path, since
 every module past v1 ends its path in a version element —
 `github.com/gofrs/uuid/v5` is package `uuid`.
 
-`examples/schemagen` runs both directions over one table, and its
+`examples/schemagen` runs every direction over its two tables, and its
 tests close the loop: the struct that generated the table and the
 struct generated from it agree field for field.
+
+### Generating the shape an eager load fills
+
+A row struct is what a `SELECT` of one table hands back. An eager load
+hands back something else, and it is the struct most likely to be
+wrong, because four separate things in it have to agree with
+declarations that live somewhere else:
+
+```go
+type UsersWithPosts struct {
+    UsersRow
+    Posts []PostsRow `drop:"-" dropRel:"posts"`
+}
+```
+
+The field name, the slice-versus-pointer choice, the `dropRel` tag and
+the nested type — and three of the four fail silently. A misspelled
+tag is a relation that does not load, which reads exactly like a
+parent with no children. `StrictLoading` turns that into a refused
+query rather than a wrong answer, but it is still a shape nobody
+should be retyping.
+
+`-rels` generates it from the relation declarations. Ask for one
+struct per set of relations you load:
+
+```go
+//go:generate go run github.com/bernardoforcillo/drops/cmd/dropsgen -rels . -shape users:posts -shape posts:author -shape posts:author.posts
+var (
+    _ = pg.NewRelations(Users).HasMany("posts", Posts, UserID, PostUserID)
+    _ = pg.NewRelations(Posts).BelongsTo("author", Users, PostUserID, UserID)
+)
+```
+
+A `-shape` is `[Name=]table:path[,path...]`, and the paths are the
+same strings `With()` takes — the shape and the query that fills it
+are written from one spelling:
+
+```go
+var rows []schemagen.UsersWithPosts
+db.Find(schemagen.Users).With("posts").All(ctx, &rows)
+```
+
+**The shape follows the loader, not the declaration.** Where the two
+could be read differently, `pg/find.go` is the authority:
+
+- `HasMany`, `ManyToMany` and `MorphMany` fill a **slice**, and the
+  loader refuses anything else. A parent with no children is assigned
+  an empty non-nil slice, so `len()` is the answer — and a nil slice
+  means nobody loaded it.
+- `HasOne` and `BelongsTo` fill a **pointer**. The loader leaves the
+  field untouched when no row matches, so a value struct would come
+  back zeroed, and a zeroed struct is indistinguishable from a real
+  row of zeros. Absence is a state only the nil can express.
+- `MorphTo` fills an **interface**, because the concrete type varies
+  row by row. The loader refuses to descend past one for the same
+  reason, so a path through a `MorphTo` is refused here rather than
+  generating a struct no query can fill.
+
+The `drop:"-"` beside the `dropRel` is not decoration. A relation
+field sits at depth 0 and would out-rank a real column of the same
+name promoted from the embedded row struct, so it is opted out of
+column binding; the column is still scanned, through the embedding.
+
+**How deep is exactly as deep as the paths go.** There is no "every
+relation": any schema with a back-reference makes that an infinite
+type, and even truncated at one level it is wrong in a way that costs
+something — a struct declaring a relation the query does not load is
+refused outright under `StrictLoading`, so generating more than was
+asked for breaks the query it was generated for.
+
+A nested path grows a struct per level, and a leaf is the `<Table>Row`
+that `-rows` already emits rather than a third copy of it:
+
+```
+-shape users:posts.comments
+
+type UsersWithPostsComments struct {
+    UsersRow
+    Posts []PostsWithComments `drop:"-" dropRel:"posts"`
+}
+
+type PostsWithComments struct {
+    PostsRow
+    Comments []CommentsRow `drop:"-" dropRel:"comments"`
+}
+```
+
+A shape is named for its table and the paths beneath it, so the name
+is derivable by a reader and stable across runs — and a
+self-referential chain names apart, `users:manager.manager` giving
+`UsersWithManagerManager` nesting `UsersWithManager`. It also means
+two shapes that reach the same node share one declaration rather than
+generating two copies of it: `posts:author.posts` above nests the
+`UsersWithPosts` the first shape generates. Where the derived name is
+not the one a codebase wants, name it outright:
+`-shape 'AuthorWithBooks=authors:books'`.
+
+The same two rules as rows mode apply. A name the package already
+declares is **skipped**, with the header saying which name and which
+file — and here the hand-written struct is what the other generated
+structs nest, so it has to carry the same fields. And the output is
+byte-stable, including across a different arrangement of the same
+`-shape` arguments.
+
+Run `-rows` first: a shape nests the row struct of every table it
+reaches, and a missing one is an error naming it rather than a compile
+failure in the generated file. The two files know about each other in
+the other direction too — `-rows` moves any `*_drops_rels.go` aside
+while it compiles the package, because a shape only compiles while the
+row structs it names exist. That is also why `-o` has to end in
+`_drops_rels.go`: a shape file under any other name is one `-rows`
+cannot know to move, and the package would never be able to regenerate
+its row structs again.
+
+Two shapes can derive the same name — `users:posts.tags` and
+`users:posts,tags` both arrive at `UsersWithPostsTags`, carrying
+different fields. That is refused, naming the struct and offering the
+`-shape 'SomeName=…'` that resolves it; two shapes that arrive at the
+same name *and* the same fields are one declaration, not a refusal.
 
 ### AutoTable
 

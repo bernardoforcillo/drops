@@ -1,10 +1,7 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"reflect"
@@ -23,9 +20,12 @@ type Page[T any] struct {
 
 // PageBuilder composes a cursor-paginated query, keeping the cursor
 // encoding/decoding internal — callers never construct or inspect
-// cursors directly. Cursors are opaque, URL-safe base64 strings whose
-// payload is a gob-encoded slice of the ordering columns' values,
-// stable as long as the OrderBy spec doesn't change between calls.
+// cursors directly. Cursors are opaque, URL-safe base64 strings — the
+// same encoding [EncodeCursor] produces, and the same keyset guard
+// [SelectBuilder.AfterCursor] builds from them, because a page walked
+// through this builder and a page walked through the SELECT builder are
+// the same walk. Stable as long as the OrderBy spec doesn't change
+// between calls.
 type PageBuilder[T any] struct {
 	e        *Entity[T]
 	db       *DB
@@ -147,85 +147,52 @@ func orderingExpr(o OrderingColumn) drops.Expression {
 	})
 }
 
+// cursorSpec restates the ordering columns as the cursor shape the
+// keyset guard is written against.
+//
+// The ORDER BY these columns render carries no NULLS clause, so SQLite
+// applies its per-direction default, and NullsDefault is what
+// [nullsFirst] resolves against the same default. The two therefore
+// cannot drift.
+func cursorSpec(orderBys []OrderingColumn) CursorSpec {
+	keys := make([]OrderKey, len(orderBys))
+	for i, o := range orderBys {
+		keys[i] = OrderKey{Col: o.col, Desc: !o.asc}
+	}
+	return CursorSpec{Keys: keys}
+}
+
 // cursorGuard builds the WHERE predicate that moves past the cursor.
-// Homogeneous directions use the row-comparison form (SQLite supports
-// row values since 3.15); mixed directions fall back to the tie-break
-// disjunction.
+//
+// It is [keysetWhere], the guard the SELECT builder's AfterCursor uses,
+// rather than a second row comparison written here. The row comparison
+// this used to render — (c1, c2) > (?, ?) — is not NULL-aware, and a
+// nullable ordering column is the ordinary case rather than an exotic
+// one: a page whose last row held a NULL rendered a comparison against
+// NULL, which matches nothing, so the walk reported no further rows and
+// stopped short of every row behind that NULL with nothing anywhere
+// saying why. See [keysetStrict] for what replaces it.
 func cursorGuard(orderBys []OrderingColumn, cursor string) (drops.Expression, error) {
-	vals, err := decodeCursor(cursor)
+	vals, err := Cursor(cursor).Decode()
 	if err != nil {
 		return nil, fmt.Errorf("drops/sqlite: invalid cursor: %w", err)
 	}
 	if len(vals) != len(orderBys) {
 		return nil, fmt.Errorf("drops/sqlite: cursor has %d value(s), OrderBy has %d column(s)", len(vals), len(orderBys))
 	}
-	allAsc, allDesc := true, true
-	for _, o := range orderBys {
-		if o.asc {
-			allDesc = false
-		} else {
-			allAsc = false
-		}
-	}
-	if allAsc || allDesc {
-		op := ">"
-		if allDesc {
-			op = "<"
-		}
-		return drops.ExprFunc(func(b *drops.Builder) {
-			b.WriteByte('(')
-			for i, o := range orderBys {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				o.col.WriteSQL(b)
-			}
-			b.WriteString(") ")
-			b.WriteString(op)
-			b.WriteString(" (")
-			for i, v := range vals {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				b.AddArg(v)
-			}
-			b.WriteByte(')')
-		}), nil
-	}
-	// Mixed-direction fallback: cumulative-equality-prefix disjunction.
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		for i := range orderBys {
-			if i > 0 {
-				b.WriteString(" OR ")
-			}
-			b.WriteByte('(')
-			for j := 0; j < i; j++ {
-				if j > 0 {
-					b.WriteString(" AND ")
-				}
-				orderBys[j].col.WriteSQL(b)
-				b.WriteString(" = ")
-				b.AddArg(vals[j])
-			}
-			if i > 0 {
-				b.WriteString(" AND ")
-			}
-			orderBys[i].col.WriteSQL(b)
-			if orderBys[i].asc {
-				b.WriteString(" > ")
-			} else {
-				b.WriteString(" < ")
-			}
-			b.AddArg(vals[i])
-			b.WriteByte(')')
-		}
-		b.WriteByte(')')
-	}), nil
+	return keysetWhere(cursorSpec(orderBys), vals, true), nil
 }
 
-// encodeCursor extracts the ordering-column values from row and
-// gob-encodes them inside a URL-safe base64 string.
+// encodeCursor extracts the ordering-column values from row and hands
+// them to [EncodeCursor], which is the encoding [Cursor.Decode] and the
+// keyset guard both read.
+//
+// It used to gob-encode the values, which could not carry two of the
+// shapes an ordering column most often has: a nil pointer, which is how
+// a NULL arrives on the row struct, gob refuses outright, and a
+// time.Time inside an interface needs a gob.Register nothing performed
+// — so paging by a timestamp, the column keyset pagination exists for,
+// failed on the first page boundary.
 func encodeCursor[T any](e *Entity[T], orderBys []OrderingColumn, row T) (string, error) {
 	v := reflect.ValueOf(&row).Elem()
 	vals := make([]any, len(orderBys))
@@ -242,22 +209,9 @@ func encodeCursor[T any](e *Entity[T], orderBys []OrderingColumn, row T) (string
 		}
 		vals[i] = v.FieldByIndex(idx).Interface()
 	}
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(vals); err != nil {
+	cur, err := EncodeCursor(cursorSpec(orderBys), vals...)
+	if err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
-}
-
-// decodeCursor is the inverse of encodeCursor.
-func decodeCursor(s string) ([]any, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		return nil, err
-	}
-	var vals []any
-	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&vals); err != nil {
-		return nil, err
-	}
-	return vals, nil
+	return string(cur), nil
 }

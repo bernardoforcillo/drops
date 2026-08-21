@@ -131,6 +131,16 @@ unrelated dropped timestamp and added boolean are not. A rename that
 also changes the type produces the `RENAME` and the type change, in that
 order.
 
+Two tables are paired when they agree on at least half their columns, so
+a table renamed in the same commit that added a column to it — or
+renamed a column inside it — is still offered rather than dropped and
+rebuilt. A rename inside a renamed table is asked *after* the table
+question is answered, because until then the two snapshots file the
+table under different names and nothing in it pairs with anything. So a
+commit that renames both asks twice; `--interactive` keeps asking until
+there is nothing left, and a scripted run states `--rename-table` first,
+gets the column question, and states `--rename-column` on the run after.
+
 ### `drops migrate`
 
 Applies every migration in the journal that the database has not

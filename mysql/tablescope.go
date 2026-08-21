@@ -10,34 +10,66 @@ import (
 	"github.com/bernardoforcillo/drops"
 )
 
-// The request-scoped half of a table's automatic predicates: the
-// filters that cannot be built until a request is in hand, and the
-// column an INSERT stamps from it.
-//
-// [Table.DefaultFilter] lives on the *Table itself and is copied by
-// [Table.As], because it is part of the declaration and this dialect's
-// alias is a snapshot of the declaration. What is here is shared by a
-// table and every alias of it, for the reason Table.As states: a filter
-// that says who may see a row must not go missing because somebody took
-// the alias one statement too early.
+// A table's automatic predicates, and the state a table shares with
+// every alias taken off it.
 
-// tableScope is the automatic-predicate state a table shares with its
-// aliases: the context-filter list and the write-side tenant column.
+// tableScope is the automatic-predicate state of a table: the two
+// filter lists and the write-side tenant column. It lives behind a
+// pointer so that a table and every alias taken off it share ONE of
+// them.
 //
-// It lives behind a pointer so that a table and every alias taken off
-// it share ONE of them. Sharing is the whole point — see Table.As for
-// the unscoped DELETE the other answer produced.
+// Sharing is the whole point, and it is the rule the four dialects
+// state in the same words: an alias shares the whole scope — both
+// filter lists — and rebinds its columns. While As copied a list, an
+// alias was a snapshot of the table's scoping at the instant As was
+// called, and the spelling this package invites is exactly the one that
+// loses:
+//
+//	var Users = mysql.NewTable("users")   // package scope
+//	var U     = Users.As("u")             // package scope, before init
+//
+//	func init() { Users.ContextFilter(mysql.TenantFilter(UserTenantID)) }
+//
+// Go initialises package-level variables before it runs init, so U was
+// taken while the table had no tenant axis and never gained one. A
+// statement written against the alias then rendered, on a ctx carrying
+// no tenant at all and without refusing, DELETE `u` FROM `users` AS `u`
+// — no predicate, every tenant's rows, and nothing walks a DELETE back.
+// The same snapshot dropped a soft-delete guard registered after the
+// alias was taken, so the alias read rows the application had deleted.
+//
+// The two lists are shared on the same terms because the argument does
+// not distinguish them: a default filter registered after As was taken
+// went missing exactly as a context filter did, and the difference
+// between the two failures is only how bad it is. Splitting them was
+// this dialect's local answer to a question nobody had written down.
+//
+// One consequence to state plainly, because it follows from sharing and
+// is not a bug: registering a filter ON an alias registers it on the
+// table, and so on every other alias of it. That is what "the same
+// table" means. Where two genuinely different scopings are wanted, they
+// are two tables.
 //
 // The mutex guards every field, and it is the same mutex the base table
-// and all its aliases lock. Registration is a supported thing to do
-// while queries are in flight (see ctxFilter), so the list is REPLACED
-// rather than edited in place: a reader takes the slice header under the
-// read lock and walks it with the lock released, which is only sound
-// while no writer touches an element a reader may already be holding.
+// and all its aliases lock — which is the other half of what sharing
+// has to mean. An alias with a lock of its own would serialise against
+// nothing while another goroutine replaced the list it was reading.
+// Registration is a supported thing to do while queries are in flight
+// (see ctxFilter), so the lists are REPLACED rather than edited in
+// place: a reader takes the slice header under the read lock and walks
+// it with the lock released, which is only sound while no writer
+// touches an element a reader may already be holding.
 type tableScope struct {
 	mu sync.RWMutex
 
-	// ctxFilters are the request-scoped twins of Table.defaultFilters:
+	// defaultFilters are predicates applied automatically by
+	// SelectBuilder / UpdateBuilder / DeleteBuilder unless the caller
+	// opts out with Unscoped(). Used to implement default scopes (e.g.
+	// a soft-delete "deletedAt IS NULL" guard). Declaration-time only —
+	// see Table.DefaultFilter.
+	defaultFilters []drops.Expression
+
+	// ctxFilters are the request-scoped twins of defaultFilters:
 	// predicates that cannot be built until a ctx is in hand. They are
 	// resolved by the executors rather than by WriteSQL — see
 	// Table.ContextFilter.
@@ -232,13 +264,17 @@ func (t *Table) ctxFilterList() []ctxFilter {
 // resolve. Nil-safe so a SELECT with no FROM table can ask.
 func (t *Table) hasContextFilters() bool { return len(t.ctxFilterList()) > 0 }
 
-// defaultFilterList returns the table's render-time filters. Nil-safe
-// so a statement with no table can ask.
+// defaultFilterList returns the table's render-time filters through the
+// shared scope, so an alias renders the guards its table carries now
+// rather than the ones it carried when As was called. Nil-safe so a
+// statement with no table can ask.
 func (t *Table) defaultFilterList() []drops.Expression {
-	if t == nil {
+	if t == nil || t.scope == nil {
 		return nil
 	}
-	return t.defaultFilters
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.defaultFilters
 }
 
 // hasDefaultFilters reports whether the table carries any render-time

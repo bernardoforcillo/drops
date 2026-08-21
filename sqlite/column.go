@@ -25,6 +25,30 @@ type Column struct {
 	ref        *FK
 	pii        bool
 	managed    bool // drops writes this column, not the application
+
+	// origin is the column this one was copied from by (*Table).As,
+	// and nil on a column as declared. An alias rebinds its columns so
+	// they render under the alias; origin is what lets the copy still
+	// BE the declared column everywhere a column is identified rather
+	// than rendered — see key.
+	origin *Column
+}
+
+// key returns the identity a column is recognised by, collapsing every
+// alias copy onto the column it was declared as.
+//
+// Aliasing changes how a reference RENDERS and nothing else, so
+// everywhere drops compares columns rather than writing them — an
+// entity's key columns, the tenant axis, a hook's Has, a page's
+// ordering column — it compares keys. Without it an alias's handle
+// looks like a second column that happens to have the same name, and
+// the caller who declared the tenant axis over an alias handle gets a
+// statement that stamps two of them.
+func (c *Column) key() *Column {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
 }
 
 // FK describes a single-column foreign-key reference.

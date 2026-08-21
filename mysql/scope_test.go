@@ -540,6 +540,45 @@ func TestAnAliasTakenBeforeTheAxisStillCarriesIt(t *testing.T) {
 	wantArgs(t, args, scopeTenant)
 }
 
+// The DEFAULT filter list is shared on the same terms as the context
+// filters, and for the same reason at one remove: the loss is a
+// soft-delete guard rather than a tenant axis, so the alias reads rows
+// the application has already deleted instead of rows another tenant
+// owns. Both are the alias disagreeing with its table about what the
+// table is.
+//
+// This is the divergence the cross-dialect verifier found. drops/pg,
+// drops/sqlite and drops/clickhouse shared both lists; this dialect
+// shared one and snapshotted the other, and nobody had written down
+// which answer was the rule.
+func TestAnAliasTakenBeforeTheDefaultFilterStillCarriesIt(t *testing.T) {
+	tbl := mysql.NewTable("dfa_users")
+	mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	deleted := mysql.Add(tbl, mysql.Timestamp("deletedAt", false))
+	early := tbl.As("u") // taken first, as a package-level var would be
+
+	tbl.DefaultFilter(deleted.IsNull())
+
+	db := mysql.New(dropstest.New())
+	sql, _ := db.Select().From(early).ToSQL()
+	wantText(t, sql, "SELECT * FROM `dfa_users` AS `u` WHERE (`u`.`deletedAt` IS NULL)")
+}
+
+// Sharing runs in the other direction too, and saying so is half the
+// rule: a filter registered ON an alias is registered on the table, and
+// so on every other alias of it. That is what "the same table" means.
+func TestADefaultFilterRegisteredOnAnAliasReachesTheTable(t *testing.T) {
+	tbl := mysql.NewTable("dfb_users")
+	mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	deleted := mysql.Add(tbl, mysql.Timestamp("deletedAt", false))
+
+	tbl.As("u").DefaultFilter(deleted.IsNull())
+
+	db := mysql.New(dropstest.New())
+	sql, _ := db.Select().From(tbl).ToSQL()
+	wantText(t, sql, "SELECT * FROM `dfb_users` WHERE (`dfb_users`.`deletedAt` IS NULL)")
+}
+
 // A DefaultFilter is rendered under the same rename, which is a repair
 // rather than a side effect: before it, an aliased query against a
 // soft-deleting table rendered `users`.`deletedAt` against

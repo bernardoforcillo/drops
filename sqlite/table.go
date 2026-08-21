@@ -297,9 +297,18 @@ func (t *Table) ScopeWritesByTenant(col ColRef) *Table {
 // setTenantAxis records the table's tenant column. Called by
 // ScopeWritesByTenant and by Entity.ScopeByTenant, which registers the
 // read-side filter in the same breath.
+//
+// The column is stored as the DECLARED handle — Column.key — so that a
+// table and its aliases, whose columns are separate copies, name one
+// axis between them. An INSERT built from the table after the axis was
+// declared over an alias's handle would otherwise stamp a second column
+// that happens to have the same name.
 func (t *Table) setTenantAxis(c *Column) {
 	t.scope.mu.Lock()
 	defer t.scope.mu.Unlock()
+	if c != nil {
+		c = c.key()
+	}
 	t.scope.tenantCol = c
 }
 
@@ -716,15 +725,153 @@ func (t *Table) Alias() string           { return t.alias }
 func (t *Table) Columns() []*Column      { return t.columns }
 func (t *Table) Col(name string) *Column { return t.byName[name] }
 
-// As returns an aliased view of the table for use in joins.
+// As returns a copy of the table under an alias, for self-joins.
 //
-// The alias IS the table: it shares the one [tableScope], so it carries
-// every default filter, context filter and lifecycle hook the table has
-// — including the ones registered after As was called. See tableScope
-// for the unscoped DELETE the other answer produced.
+// An alias is a second handle on ONE table, and the rule the four
+// dialects state in the same words has two halves: the alias SHARES the
+// table's whole scope — both filter lists, the write-side tenant column
+// and the lifecycle hooks — and it REBINDS its columns. Sharing is what
+// stops the alias disagreeing with its table about which rows may be
+// seen; rebinding is what stops it disagreeing with the statement about
+// which relation a reference names. Neither half is optional, and each
+// was got wrong on its own in some dialect before this was written
+// down.
+//
+// The copy carries its own columns, bound to the aliased table, so a
+// reference reached through it — p := Posts.As("p"); p.Col("id") —
+// qualifies with the alias while the original package-level handles go
+// on qualifying with the table name. That is what makes both sides of
+// a self-join addressable at once. It used to be a shallow copy, so
+// p.Col("id") rendered "posts"."id": the alias's own handles named a
+// relation the statement did not mention where it named one at all, and
+// on a self-join both sides of the ON condition collapsed onto one.
+//
+// An aliased handle still *means* the column it was copied from. An
+// Entity's key columns, the tenant axis, a hook's Has and a page's
+// ordering column all identify a column through Column.key, which
+// collapses the copy back onto the declared column. Aliasing changes
+// how a reference renders and nothing else.
+//
+// The automatic predicates a table carries are SHARED with the alias
+// rather than copied, and shared rather than snapshotted because the
+// alias is the same table: a filter or a lifecycle hook registered on
+// either handle at any time applies to both, in whichever order the two
+// happen. That ordering is not hypothetical. Go initialises
+// package-level variables before it runs init, so an alias declared
+// beside its table is taken before any init or constructor that
+// declares the scoping — and while the lists were copied, that alias
+// was unscoped for ever. It rendered DELETE FROM "users" AS "u" with no predicate at all,
+// on a ctx carrying no tenant, without refusing; and it lost a
+// soft-delete guard registered after it was taken, so it read rows the
+// application had deleted.
+//
+// BOTH filter lists are shared, on the same terms, because the argument
+// does not distinguish them: a [Table.DefaultFilter] registered after
+// As was taken went missing exactly as a [Table.ContextFilter] did, and
+// the difference between the two failures is only how bad it is.
+//
+// The predicates cannot be rewritten, being closures over the handles
+// they were given, so they are rendered inside a relation rename
+// instead: see resolveFilterExprs. Without it an aliased query against
+// a scoped table could not run at all — "notes"."tenantId" against FROM "notes" AS "n" is "no such column", not a widened result — which made the one
+// table shape that must never lose its tenant axis the one shape that
+// could not be queried under an alias.
+//
+// The consequence in the other direction is that registering on an
+// alias registers on the table, and so on every other alias of it,
+// which is what "the same table" has to mean. Where two genuinely
+// different scopings are wanted, they are two tables — so register over
+// the DECLARED column handles even when the call goes through an alias,
+// since the base table renders the same predicate and an alias handle
+// would qualify with a relation its statement never names.
+//
+// What is still not rewritten is anything else the caller built and
+// drops only re-emits: a Patch operation, and any predicate handed to
+// Where. Both are closed over the handles they were given, so build a
+// Patch for an aliased entity, and the predicates of an aliased query,
+// from the alias's own handles.
+//
+// The SHAPE of the table is still a snapshot, and only the shape: a
+// column, relation or constraint added to the base table after As returned does
+// not reach the alias, for the same package-level-var reason described
+// above. Take the alias at the query site, or after the schema is
+// complete. Scoping is exempt from that caveat because scoping is the
+// half where being a snapshot destroys data.
 func (t *Table) As(alias string) *Table {
+	mustIdent("alias", alias)
+	// The whole-struct copy carries the scope POINTER across, so the
+	// alias reads and writes the same filter lists, the same tenant
+	// column, the same hooks and the same lock as the table it names.
+	// Nothing here needs that lock: the copy reads no field the lock
+	// guards.
 	cp := *t
 	cp.alias = alias
+	cp.columns = make([]*Column, len(t.columns))
+	cp.byName = make(map[string]*Column, len(t.byName))
+	for i, c := range t.columns {
+		aliased := *c
+		aliased.table = &cp
+		// The origin chains to the declared column rather than to c,
+		// so aliasing an alias does not make a stranger of the root.
+		aliased.origin = c.key()
+		cp.columns[i] = &aliased
+		cp.byName[aliased.name] = &aliased
+	}
+	// rebind maps a column declared on t to the aliased copy's handle
+	// for it, and leaves any column belonging to another table alone.
+	rebind := func(c *Column) *Column {
+		if c != nil && c.table == t {
+			if aliased := cp.byName[c.name]; aliased != nil {
+				return aliased
+			}
+		}
+		return c
+	}
+	rebindAll := func(cols []*Column) []*Column {
+		if cols == nil {
+			return nil
+		}
+		out := make([]*Column, len(cols))
+		for i, c := range cols {
+			out[i] = rebind(c)
+		}
+		return out
+	}
+	// Every map on the copy has to be its own, or a relation, check or
+	// unique declared against the alias writes through into the table it
+	// was aliased from.
+	if t.relations != nil {
+		cp.relations = make(map[string]*Relation, len(t.relations))
+		for name, rel := range t.relations {
+			r := *rel
+			// Only the near side — the end of the edge that belongs to
+			// this table — moves to the alias. On a self-referential
+			// relation both ends name this table and rebinding both
+			// would erase the distinction the alias exists to draw.
+			r.Local = rebind(r.Local)
+			r.LocalKey = rebind(r.LocalKey)
+			cp.relations[name] = &r
+		}
+	}
+	cp.compositePK = rebindAll(t.compositePK)
+	if t.compositeUniques != nil {
+		cp.compositeUniques = make(map[string][]*Column, len(t.compositeUniques))
+		for name, cols := range t.compositeUniques {
+			cp.compositeUniques[name] = rebindAll(cols)
+		}
+	}
+	if t.checks != nil {
+		cp.checks = make(map[string]string, len(t.checks))
+		for name, expr := range t.checks {
+			cp.checks[name] = expr
+		}
+	}
+	cp.compositeFKs = make([]*CompositeFK, len(t.compositeFKs))
+	for i, fk := range t.compositeFKs {
+		f := *fk
+		f.Columns = rebindAll(fk.Columns)
+		cp.compositeFKs[i] = &f
+	}
 	return &cp
 }
 

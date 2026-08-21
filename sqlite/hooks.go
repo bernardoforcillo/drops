@@ -64,24 +64,24 @@ type InsertHookCtx struct {
 }
 
 // Has reports whether col is already bound on the INSERT.
-func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[col] }
+func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[col.key()] }
 
 // SetExpr binds expr to col across every row, unless col is already
 // bound. Use for DB-evaluated defaults (drops.Raw("CURRENT_TIMESTAMP")).
 func (c *InsertHookCtx) SetExpr(col *Column, expr drops.Expression) {
-	if c.bound[col] {
+	if c.bound[col.key()] {
 		return
 	}
-	c.bound[col] = true
+	c.bound[col.key()] = true
 	c.adds = append(c.adds, &exprBinding{col: col, expr: expr})
 }
 
 // Set binds a typed ColumnValue (e.g. (*Col[T]).Val(v)).
 func (c *InsertHookCtx) Set(v ColumnValue) {
-	if c.bound[v.column()] {
+	if c.bound[v.column().key()] {
 		return
 	}
-	c.bound[v.column()] = true
+	c.bound[v.column().key()] = true
 	c.adds = append(c.adds, v)
 }
 
@@ -108,24 +108,24 @@ type UpdateHookCtx struct {
 }
 
 // Has reports whether col is already bound on the UPDATE.
-func (c *UpdateHookCtx) Has(col *Column) bool { return c.bound[col] }
+func (c *UpdateHookCtx) Has(col *Column) bool { return c.bound[col.key()] }
 
 // Set appends v to the UPDATE's SET list, unless its column is already
 // bound.
 func (c *UpdateHookCtx) Set(v ColumnValue) {
-	if c.bound[v.column()] {
+	if c.bound[v.column().key()] {
 		return
 	}
-	c.bound[v.column()] = true
+	c.bound[v.column().key()] = true
 	c.add = append(c.add, v)
 }
 
 // SetExpr is the raw-expression variant of Set.
 func (c *UpdateHookCtx) SetExpr(col *Column, expr drops.Expression) {
-	if c.bound[col] {
+	if c.bound[col.key()] {
 		return
 	}
-	c.bound[col] = true
+	c.bound[col.key()] = true
 	c.add = append(c.add, &exprBinding{col: col, expr: expr})
 }
 

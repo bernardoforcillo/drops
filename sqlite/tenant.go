@@ -183,7 +183,7 @@ func tenantAxisName(c *Column) string {
 func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 	c := col.col()
 	for _, cf := range e.colFields {
-		if cf.col == c {
+		if cf.col.key() == c.key() {
 			e.tenantCol = c
 			e.tenantField = cf.field
 			// The filter closes over the entity, not over the column,
@@ -246,7 +246,7 @@ func (e *Entity[T]) tenantWriteAxis() (*Column, []int, bool) {
 		return nil, nil, false
 	}
 	for _, cf := range e.colFields {
-		if cf.col == c {
+		if cf.col.key() == c.key() {
 			return c, cf.field, true
 		}
 	}

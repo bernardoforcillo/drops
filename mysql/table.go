@@ -18,10 +18,6 @@ type Table struct {
 	columns   []*Column
 	byName    map[string]*Column
 
-	// defaultFilters are AND-ed onto every SELECT from this table
-	// unless the builder opts out with Unscoped.
-	defaultFilters []drops.Expression
-
 	// indexes and checks are what the migration layer needs and the
 	// query layer never looks at: the secondary indexes and CHECK
 	// constraints declared against this table. Registered through
@@ -33,10 +29,11 @@ type Table struct {
 	// a table as declared — see key.
 	origin *Table
 
-	// scope carries the request-scoped half of the table's automatic
-	// predicates. It is a pointer, and an alias taken off this table
-	// SHARES it rather than copying it — see tableScope, and see
-	// Table.As.
+	// scope carries every automatic predicate the table declares —
+	// both filter lists and the write-side tenant column. It is a
+	// pointer, and an alias taken off this table SHARES it rather than
+	// copying it — see tableScope, and see Table.As for the write that
+	// went out unscoped while it was a snapshot.
 	scope *tableScope
 }
 
@@ -65,6 +62,16 @@ func (t *Table) Alias() string    { return t.alias }
 
 // As returns a copy of the table under an alias, for self-joins.
 //
+// An alias is a second handle on ONE table, and the rule the four
+// dialects state in the same words has two halves: the alias SHARES the
+// table's whole scope — both filter lists, the write-side tenant column
+// and the lifecycle hooks — and it REBINDS its columns. Sharing is what
+// stops the alias disagreeing with its table about which rows may be
+// seen; rebinding is what stops it disagreeing with the statement about
+// which relation a reference names. Neither half is optional, and each
+// was got wrong on its own in some dialect before this was written
+// down.
+//
 // The copy carries its own columns, bound to the aliased table, so a
 // reference reached through it — u := users.As("u"); u.Col("id") —
 // qualifies with the alias while the original package-level handles go
@@ -82,42 +89,50 @@ func (t *Table) Alias() string    { return t.alias }
 // INSERT, whose INTO clause has no AS to carry. Aliasing changes how a
 // reference renders and nothing else.
 //
-// What is not rewritten is anything the caller built and drops only
-// re-emits: a predicate, and the expression inside a [SetExpr]. Both
-// are closed over the handles they were given, so they go on naming the
-// relation those handles belong to.
+// The automatic predicates a table carries are SHARED with the alias
+// rather than copied, and shared rather than snapshotted because the
+// alias is the same table: a filter or a lifecycle hook registered on
+// either handle at any time applies to both, in whichever order the two
+// happen. That ordering is not hypothetical. Go initialises
+// package-level variables before it runs init, so an alias declared
+// beside its table is taken before any init or constructor that
+// declares the scoping — and while the lists were copied, that alias
+// was unscoped for ever. It rendered DELETE `u` FROM `users` AS `u` with no predicate at all,
+// on a ctx carrying no tenant, without refusing; and it lost a
+// soft-delete guard registered after it was taken, so it read rows the
+// application had deleted.
 //
-// The table's own automatic predicates are the exception, and the
-// exception is a repair rather than an inconsistency. A
-// [Table.DefaultFilter] or a [Table.ContextFilter] is built from the
-// declared column handles and then rendered into a statement whose FROM
-// entry may be an alias, where `users`.`deletedAt` names a relation the
-// statement never mentions and MySQL answers 1054 — a query that cannot
-// run, not a widened result. So they are rendered under a relation
-// rename that resolves the declared table to this instance's alias, and
-// a scoped table is queryable under an alias like any other. See
-// Table.resolveFilterExprs. A predicate the caller wrote AT the query
-// is still theirs: build it from the handles of the relation the
-// statement names.
+// BOTH filter lists are shared, on the same terms, because the argument
+// does not distinguish them: a [Table.DefaultFilter] registered after
+// As was taken went missing exactly as a [Table.ContextFilter] did, and
+// the difference between the two failures is only how bad it is.
 //
-// The copy is a snapshot of everything the DECLARATION owns. A column,
-// index, default filter or check added to the base table after As
-// returned does not reach the alias, and none added to the alias
-// reaches the table. That matters because Go initialises package-level
-// variables before it runs init: an alias declared as a var beside its
-// table is taken before any init that adds to the schema. Take the
-// alias at the query site, or after the schema is complete.
+// The predicates cannot be rewritten, being closures over the handles
+// they were given, so they are rendered inside a relation rename
+// instead: see resolveFilterExprs. Without it an aliased query against
+// a scoped table could not run at all — `users`.`deletedAt` against FROM `users` AS `u` is MySQL 1054, not a widened result — which made the one
+// table shape that must never lose its tenant axis the one shape that
+// could not be queried under an alias.
 //
-// The request-scoped half is shared rather than copied, and the
-// asymmetry is deliberate. A context filter — a tenant axis, an authz
-// guard — states who may see a row, and an alias that silently lacked
-// one would render, on a ctx carrying no tenant at all and without
-// refusing, DELETE `u` FROM `users` AS `u`: no predicate, every
-// tenant's rows, and nothing walks a DELETE back. So a filter follows
-// the relation, which is what tableScope holds; the consequence, worth
-// stating plainly, is that registering one on an alias registers it on
-// the table and so on every other alias of it. Where two genuinely
-// different scopings are wanted, they are two tables.
+// The consequence in the other direction is that registering on an
+// alias registers on the table, and so on every other alias of it,
+// which is what "the same table" has to mean. Where two genuinely
+// different scopings are wanted, they are two tables — so register over
+// the DECLARED column handles even when the call goes through an alias,
+// since the base table renders the same predicate and an alias handle
+// would qualify with a relation its statement never names.
+//
+// What is still not rewritten is anything the caller built and drops
+// only re-emits: a predicate, and the expression inside a [SetExpr].
+// Both are closed over the handles they were given, so build them from
+// the handles of the relation the statement names.
+//
+// The SHAPE of the table is still a snapshot, and only the shape: a
+// column, index or check added to the base table after As returned does
+// not reach the alias, for the same package-level-var reason described
+// above. Take the alias at the query site, or after the schema is
+// complete. Scoping is exempt from that caveat because scoping is the
+// half where being a snapshot destroys data.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
@@ -141,12 +156,13 @@ func (t *Table) As(alias string) *Table {
 			cp.checks[name] = expr
 		}
 	}
-	// The remaining slices are shared by value but not by array: a
-	// copy taken at full capacity would let an append through the
-	// alias land in the base table's spare capacity, and the next
-	// append through another handle overwrite it.
+	// The index list is shared by value but not by array: a copy taken
+	// at full capacity would let an append through the alias land in
+	// the base table's spare capacity, and the next append through
+	// another handle overwrite it. It is the last slice here that is
+	// copied at all — both filter lists live in the shared tableScope,
+	// which cp already points at.
 	cp.indexes = append([]*Index(nil), t.indexes...)
-	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
 	return &cp
 }
 
@@ -186,8 +202,14 @@ func (t *Table) Comment(text string) *Table { t.comment = text; return t }
 // DefaultFilter registers a predicate AND-ed onto every SELECT from
 // this table — a soft-delete or tenant guard. Bypass it with
 // (*SelectBuilder).Unscoped.
+//
+// It is registered on the shared scope, so it reaches every alias of
+// the table however early the alias was taken, and registering it
+// through an alias registers it on the table. See [Table.As].
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.defaultFilters = appendShared(t.scope.defaultFilters, e)
 	return t
 }
 

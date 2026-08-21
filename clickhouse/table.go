@@ -50,6 +50,16 @@ func (t *Table) Alias() string    { return t.alias }
 
 // As returns a copy of the table under an alias, for self-joins.
 //
+// An alias is a second handle on ONE table, and the rule the four
+// dialects state in the same words has two halves: the alias SHARES the
+// table's whole scope — both filter lists, the write-side tenant column
+// and the lifecycle hooks — and it REBINDS its columns. Sharing is what
+// stops the alias disagreeing with its table about which rows may be
+// seen; rebinding is what stops it disagreeing with the statement about
+// which relation a reference names. Neither half is optional, and each
+// was got wrong on its own in some dialect before this was written
+// down.
+//
 // The copy carries its own columns, bound to the aliased table, so a
 // reference reached through it — e := events.As("e"); e.Col("id") —
 // qualifies with the alias while the original package-level handles go
@@ -59,13 +69,48 @@ func (t *Table) Alias() string    { return t.alias }
 // pointing at the un-aliased table, which ClickHouse cannot resolve
 // once the alias has shadowed the name.
 //
-// The automatic predicates and the lifecycle hooks are SHARED with the
-// table rather than copied, and they are restated under the alias when
-// they render — see tableScope and Table.resolveFilterExprs. Both
-// halves of that used to be wrong, and each was wrong in its own
-// direction: the alias snapshotted a list that a later init would add
-// to, and the predicates it did carry named the un-aliased relation,
-// which ClickHouse answers with UNKNOWN_IDENTIFIER.
+// An aliased handle still *means* the column it was copied from. The
+// INSERT column list and the hook bookkeeping identify a column through
+// Column.key, which collapses the copy back onto the declared column.
+// Aliasing changes how a reference renders and nothing else.
+//
+// The automatic predicates a table carries are SHARED with the alias
+// rather than copied, and shared rather than snapshotted because the
+// alias is the same table: a filter or a lifecycle hook registered on
+// either handle at any time applies to both, in whichever order the two
+// happen. That ordering is not hypothetical. Go initialises
+// package-level variables before it runs init, so an alias declared
+// beside its table is taken before any init or constructor that
+// declares the scoping — and while the lists were copied, that alias
+// was unscoped for ever. It rendered DELETE-shaped mutation against `events` AS `e` with no predicate at all,
+// on a ctx carrying no tenant, without refusing; and it lost a
+// soft-delete guard registered after it was taken, so it read rows the
+// application had deleted.
+//
+// BOTH filter lists are shared, on the same terms, because the argument
+// does not distinguish them: a [Table.DefaultFilter] registered after
+// As was taken went missing exactly as a [Table.ContextFilter] did, and
+// the difference between the two failures is only how bad it is.
+//
+// The predicates cannot be rewritten, being closures over the handles
+// they were given, so they are rendered inside a relation rename
+// instead: see resolveFilterExprs. Without it an aliased query against
+// a scoped table could not run at all — `events`.`tenantId` against FROM `events` AS `e` is UNKNOWN_IDENTIFIER, not a widened result — which made the one
+// table shape that must never lose its tenant axis the one shape that
+// could not be queried under an alias.
+//
+// The consequence in the other direction is that registering on an
+// alias registers on the table, and so on every other alias of it,
+// which is what "the same table" has to mean. Where two genuinely
+// different scopings are wanted, they are two tables — so register over
+// the DECLARED column handles even when the call goes through an alias,
+// since the base table renders the same predicate and an alias handle
+// would qualify with a relation its statement never names.
+//
+// What is still not rewritten is anything the caller built and drops
+// only re-emits: any predicate handed to Where, closed over the handles
+// it was given. Build the predicates of an aliased query from the
+// alias's own handles.
 //
 // The engine clauses — ORDER BY, PARTITION BY, PRIMARY KEY, SAMPLE BY —
 // keep pointing at the original's columns. Every one of them renders
@@ -76,14 +121,12 @@ func (t *Table) Alias() string    { return t.alias }
 // including the empty string, which used to pass through and hand back
 // an un-aliased copy — panics with ErrInvalidIdentifier.
 //
-// The column list is a snapshot: a column added to the table after this
-// call is absent from the alias. Alias at query time, which is where a
-// self-join is written anyway, not at declaration time.
-//
-// Each copy remembers the column it came from, so the two handles stay
-// interchangeable everywhere a column is identified rather than
-// rendered — INSERT column lists and hook bookkeeping (see
-// (*Column).key). Only the qualifier they render differs.
+// The SHAPE of the table is still a snapshot, and only the shape: a
+// column, or engine clause added to the base table after As returned does
+// not reach the alias, for the same package-level-var reason described
+// above. Take the alias at the query site, or after the schema is
+// complete. Scoping is exempt from that caveat because scoping is the
+// half where being a snapshot destroys data.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t

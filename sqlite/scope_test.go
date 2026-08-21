@@ -630,13 +630,11 @@ type sfPost struct {
 // under the table name — which is what resolveFilterExprs is for, and
 // what makes a scoped table joinable to itself at all.
 //
-// The join condition is written raw rather than with p.Col("id"),
-// because a column handle taken off an alias still renders under the
-// base table's name in this dialect: Table.As copies the table and the
-// columns keep pointing at the original. That is a separate gap from
-// this one — drops/pg closed it with a column identity key — and
-// papering over it here would hide it. What this test is about is the
-// automatic predicates, which do follow the alias.
+// The join condition is written raw rather than with p.Col("id"), and
+// stays that way now only because the assertion below is about the
+// automatic predicates. A column handle taken off an alias renders
+// under the alias since [Table.As] began rebinding its columns — see
+// TestAnAliasColumnQualifiesWithTheAlias for that half.
 func TestASelfJoinRestrictsBothSides(t *testing.T) {
 	posts, id, _ := scopedTable("sj_posts")
 	p := posts.As("p")
@@ -650,6 +648,53 @@ func TestASelfJoinRestrictsBothSides(t *testing.T) {
 			`ON "sj_posts"."id" = "p"."id" `+
 			`WHERE ("sj_posts"."tenantId" = ?) AND ("p"."tenantId" = ?)`,
 		args, []any{scopeTenant, scopeTenant})
+}
+
+// An alias is a second handle on ONE table, and the two halves of that
+// are the scope it shares and the columns it rebinds. This is the
+// second half: a handle reached through the alias qualifies with the
+// alias, so both sides of a self-join are addressable at once without
+// the caller dropping to drops.Raw.
+//
+// This dialect used to copy the table shallowly, so p.Col("id")
+// rendered under the base table's name — the alias's own columns named
+// a relation the statement did not mention where it named one at all,
+// and on a self-join both sides of the ON condition collapsed onto one.
+func TestAnAliasColumnQualifiesWithTheAlias(t *testing.T) {
+	posts, id, _ := scopedTable("acq_posts")
+	p := posts.As("p")
+	db := sqlite.New(nil)
+
+	sel := db.Select(id).From(posts).Join(p, sqlite.Eq(id, p.Col("id")))
+	sql, args := renderCtx(t, sel, scopeCtx())
+	checkSQL(t, sql,
+		`SELECT "acq_posts"."id" FROM "acq_posts" JOIN "acq_posts" AS "p" `+
+			`ON ("acq_posts"."id" = "p"."id") `+
+			`WHERE ("acq_posts"."tenantId" = ?) AND ("p"."tenantId" = ?)`,
+		args, []any{scopeTenant, scopeTenant})
+}
+
+// Rebinding changes how a handle RENDERS and nothing else. Everywhere a
+// column is identified rather than rendered — an entity's key columns,
+// the tenant axis, a hook's Has — the aliased copy has to collapse back
+// onto the column it was copied from, or the alias would look to those
+// callers like a second column that happens to share a name.
+func TestAnAliasColumnIsStillTheColumnItWasCopiedFrom(t *testing.T) {
+	posts := sqlite.NewTable("acr_posts")
+	id := sqlite.Add(posts, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(posts, sqlite.BigInt("tenantId").NotNull())
+	p := posts.As("p")
+
+	// The axis is declared over the ALIAS's handle; the INSERT is built
+	// from the table. One axis between them, or the INSERT stamps a
+	// second column that happens to share a name.
+	posts.ScopeWritesByTenant(p.Col("tenantId"))
+
+	db := sqlite.New(nil)
+	ins := db.Insert(posts).Values(id.Val(int64(1)))
+	sql, args := renderCtx(t, ins, scopeCtx())
+	checkSQL(t, sql, `INSERT INTO "acr_posts" ("id", "tenantId") VALUES (?, ?)`,
+		args, []any{int64(1), scopeTenant})
 }
 
 // Registering a filter while queries against the table are in flight is

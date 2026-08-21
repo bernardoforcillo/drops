@@ -427,6 +427,17 @@ func TestAliasChecksAreNotSharedWithTheBaseTable(t *testing.T) {
 	}
 }
 
+// The index list belongs to the DECLARATION and is copied by As, so
+// two aliases must not append into one backing array: a copy taken at
+// full capacity would let a1's append land in the base table's spare
+// capacity and a2's overwrite it.
+//
+// The filter lists are not copied at all any more — they live in the
+// shared tableScope, so a filter registered on either alias is
+// registered on the table and reaches both. That is the D2 rule, and it
+// makes the same spare-capacity hazard the scope's own appendShared
+// answer: both aliases' filters have to survive, on every handle, in
+// registration order.
 func TestAliasSlicesDoNotShareSpareCapacity(t *testing.T) {
 	tbl, id, _, _ := aliasTable()
 	// Three appends leave len 3, cap 4 — one slot of spare capacity
@@ -442,9 +453,22 @@ func TestAliasSlicesDoNotShareSpareCapacity(t *testing.T) {
 	a2.AddIndex(mysql.NewIndex("idx_a2", tbl, id))
 
 	db := mysql.New(&fakeDriver{})
-	_, args := db.Select(id).From(a1).ToSQL()
-	if len(args) != 4 || args[3] != int64(111) {
-		t.Errorf("a1's own filter was overwritten through the shared array: %v", args)
+	want := []any{int64(0), int64(1), int64(2), int64(111), int64(222)}
+	for _, h := range []struct {
+		name string
+		tbl  *mysql.Table
+	}{{"a1", a1}, {"a2", a2}, {"the table", tbl}} {
+		_, args := db.Select(id).From(h.tbl).ToSQL()
+		if len(args) != len(want) {
+			t.Errorf("%s renders %v, want %v", h.name, args, want)
+			continue
+		}
+		for i := range want {
+			if args[i] != want[i] {
+				t.Errorf("%s renders %v, want %v", h.name, args, want)
+				break
+			}
+		}
 	}
 	if got := a1.Indexes(); len(got) != 4 {
 		t.Errorf("a1 has %d indexes, want 4", len(got))
@@ -453,9 +477,6 @@ func TestAliasSlicesDoNotShareSpareCapacity(t *testing.T) {
 	}
 	if len(tbl.Indexes()) != 3 {
 		t.Errorf("an alias appended an index into its table: %d", len(tbl.Indexes()))
-	}
-	if _, baseArgs := db.Select(id).From(tbl).ToSQL(); len(baseArgs) != 3 {
-		t.Errorf("an alias appended a filter into its table: %v", baseArgs)
 	}
 }
 

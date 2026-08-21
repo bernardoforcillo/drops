@@ -256,7 +256,7 @@ func (e *Entity[T]) pkValuesOf(r *T) []any {
 // isKeyColumn reports whether c is part of the primary key.
 func (e *Entity[T]) isKeyColumn(c *Column) bool {
 	for _, k := range e.pks {
-		if k == c {
+		if k.key() == c.key() {
 			return true
 		}
 	}
@@ -467,12 +467,12 @@ func (e *Entity[T]) alignBindings(rows [][]ColumnValue) [][]ColumnValue {
 	bound := map[*Column]bool{}
 	for _, r := range rows {
 		for _, cv := range r {
-			bound[cv.column()] = true
+			bound[cv.column().key()] = true
 		}
 	}
 	var cols []*Column
 	for _, cf := range e.colFields {
-		if bound[cf.col] {
+		if bound[cf.col.key()] {
 			cols = append(cols, cf.col)
 		}
 	}
@@ -483,11 +483,11 @@ func (e *Entity[T]) alignBindings(rows [][]ColumnValue) [][]ColumnValue {
 	for i, r := range rows {
 		byCol := make(map[*Column]ColumnValue, len(r))
 		for _, cv := range r {
-			byCol[cv.column()] = cv
+			byCol[cv.column().key()] = cv
 		}
 		wide := make([]ColumnValue, 0, len(cols))
 		for _, c := range cols {
-			if cv, ok := byCol[c]; ok {
+			if cv, ok := byCol[c.key()]; ok {
 				wide = append(wide, cv)
 				continue
 			}

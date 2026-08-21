@@ -230,7 +230,7 @@ func encodeCursor[T any](e *Entity[T], orderBys []OrderingColumn, row T) (string
 	for i, o := range orderBys {
 		var idx []int
 		for _, cf := range e.colFields {
-			if cf.col == o.col {
+			if cf.col.key() == o.col.key() {
 				idx = cf.field
 				break
 			}

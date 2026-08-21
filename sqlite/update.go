@@ -129,7 +129,7 @@ func (u *UpdateBuilder) autoWheres() []drops.Expression {
 func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
 	hctx := &UpdateHookCtx{bound: make(map[*Column]bool, len(u.sets))}
 	for _, s := range u.sets {
-		hctx.bound[s.column()] = true
+		hctx.bound[s.column().key()] = true
 	}
 	for _, h := range u.table.updateHookList() {
 		h.BeforeUpdate(hctx)

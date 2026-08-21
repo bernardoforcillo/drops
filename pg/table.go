@@ -268,6 +268,16 @@ func (t *Table) Alias() string { return t.alias }
 
 // As returns a copy of the table under an alias, for self-joins.
 //
+// An alias is a second handle on ONE table, and the rule the four
+// dialects state in the same words has two halves: the alias SHARES the
+// table's whole scope — both filter lists, the write-side tenant column
+// and the lifecycle hooks — and it REBINDS its columns. Sharing is what
+// stops the alias disagreeing with its table about which rows may be
+// seen; rebinding is what stops it disagreeing with the statement about
+// which relation a reference names. Neither half is optional, and each
+// was got wrong on its own in some dialect before this was written
+// down.
+//
 // The copy carries its own columns, bound to the aliased table, so a
 // reference reached through it — u := Users.As("u"); u.Col("id") —
 // qualifies with the alias while the original package-level handles go
@@ -284,36 +294,38 @@ func (t *Table) Alias() string { return t.alias }
 // relation the statement names. Aliasing changes how a reference
 // renders and nothing else.
 //
-// The automatic predicates a table carries — a default filter
-// registered by SoftDeleteMixin, a context filter registered by
-// ContextFilter or ScopeByTenant, an authz guard built from the
-// package-level columns — are SHARED with it rather than copied, and
-// the alias renders them qualified with the alias. They cannot be
-// rewritten, being closures over the handles they were given, so they
-// are rendered inside a relation rename instead: see
-// resolveFilterExprs. Without it an aliased query against a scoped
-// table could not run at all — "notes"."tenantId" against
-// FROM "notes" AS "n" is 42P01, not a widened result — which made the
-// one table shape that must never lose its tenant axis the one shape
-// that could not be queried under an alias.
+// The automatic predicates a table carries are SHARED with the alias
+// rather than copied, and shared rather than snapshotted because the
+// alias is the same table: a filter or a lifecycle hook registered on
+// either handle at any time applies to both, in whichever order the two
+// happen. That ordering is not hypothetical. Go initialises
+// package-level variables before it runs init, so an alias declared
+// beside its table is taken before any init or constructor that
+// declares the scoping — and while the lists were copied, that alias
+// was unscoped for ever. It rendered DELETE FROM "users" AS "u" with no predicate at all,
+// on a ctx carrying no tenant, without refusing; and it lost a
+// soft-delete guard registered after it was taken, so it read rows the
+// application had deleted.
 //
-// Shared, and not a snapshot, because the alias is the same table: a
-// filter or a lifecycle hook registered on either handle at any time
-// applies to both, in whichever order the two happen. That ordering is
-// not hypothetical. Go initialises package-level variables before it
-// runs init, so an alias declared beside its table is taken before any
-// init or constructor that calls ScopeByTenant, AuthorizeWith or
-// ApplyMixins — and while the lists were copied, that alias was
-// unscoped for ever. It rendered DELETE FROM "users" AS "u" with no
-// predicate, on a ctx carrying no tenant, without refusing; and it lost
-// a soft-delete hook applied after it was taken, so the DELETE was
-// hard. See tableScope. The consequence in the other direction is that
-// registering on an alias registers on the table, which is what "the
-// same table" has to mean — so register over the DECLARED column
-// handles even when the call goes through an alias, since the base
-// table renders the same predicate and an alias handle would qualify
-// with a relation its statement never names. That is the rule
-// [TenantFilter] already states, now reaching one more caller.
+// BOTH filter lists are shared, on the same terms, because the argument
+// does not distinguish them: a [Table.DefaultFilter] registered after
+// As was taken went missing exactly as a [Table.ContextFilter] did, and
+// the difference between the two failures is only how bad it is.
+//
+// The predicates cannot be rewritten, being closures over the handles
+// they were given, so they are rendered inside a relation rename
+// instead: see resolveFilterExprs. Without it an aliased query against
+// a scoped table could not run at all — "notes"."tenantId" against FROM "notes" AS "n" is 42P01, not a widened result — which made the one
+// table shape that must never lose its tenant axis the one shape that
+// could not be queried under an alias.
+//
+// The consequence in the other direction is that registering on an
+// alias registers on the table, and so on every other alias of it,
+// which is what "the same table" has to mean. Where two genuinely
+// different scopings are wanted, they are two tables — so register over
+// the DECLARED column handles even when the call goes through an alias,
+// since the base table renders the same predicate and an alias handle
+// would qualify with a relation its statement never names.
 //
 // What is still not rewritten is anything else the caller built and
 // drops only re-emits: a Patch operation, and any predicate handed to
@@ -328,11 +340,11 @@ func (t *Table) Alias() string { return t.alias }
 // clause.
 //
 // The SHAPE of the table is still a snapshot, and only the shape: a
-// column, relation or constraint added to the base table after As
-// returned does not reach the alias, for the same package-level-var
-// reason described above. Take the alias at the query site, or after
-// the schema is complete. Scoping is exempt from that caveat because
-// scoping is the half where being a snapshot destroys data.
+// column, relation or constraint added to the base table after As returned does
+// not reach the alias, for the same package-level-var reason described
+// above. Take the alias at the query site, or after the schema is
+// complete. Scoping is exempt from that caveat because scoping is the
+// half where being a snapshot destroys data.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	// The whole-struct copy carries the scope POINTER across, so the

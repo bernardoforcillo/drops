@@ -78,7 +78,7 @@ func migrateUp(ctx context.Context, db *pg.DB, dir string, allow bool) error {
 	for _, s := range pending {
 		fmt.Println("  " + s.Tag)
 	}
-	printWarnings(os.Stdout, statements)
+	printWarnings(os.Stdout, statements, nil)
 	if err := guard(os.Stdout, statements, allow); err != nil {
 		return err
 	}

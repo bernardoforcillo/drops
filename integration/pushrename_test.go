@@ -157,6 +157,13 @@ func TestSQLitePushRefusesARenameAndKeepsTheData(t *testing.T) {
 // The other answer: no, the column really is going. That is not a fact
 // about the schema — once pushed, the old column is gone and the
 // question never comes back — so it is stated for the one run.
+//
+// It takes both answers to get through, and deliberately so: declining
+// the rename settles what the change means, AllowDestructive settles
+// whether it may run, and neither stands in for the other. The
+// declined rename alone leaves Push refusing a drop-column nobody
+// permitted; AllowDestructive alone leaves it refusing to guess at a
+// rename nobody answered.
 func TestSQLitePushTakesADeclinedRename(t *testing.T) {
 	ctx := context.Background()
 	db := openSQLite(t)
@@ -165,14 +172,30 @@ func TestSQLitePushTakesADeclinedRename(t *testing.T) {
 	after := sqlite.NewTable("users")
 	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
 	sqlite.Add(after, sqlite.Text("emailAddress"))
+	declined := []sqlite.RenameDecision{{
+		// No To: a refusal names only the object that is going.
+		Rename: sqlite.Rename{Kind: sqlite.RenameColumn, Table: "users", From: "email"},
+	}}
 
 	if _, err := sqlite.Push(ctx, db, sqlite.NewSchema(after), sqlite.PushOptions{
-		// No To: a refusal names only the object that is going.
-		Renames: []sqlite.RenameDecision{{
-			Rename: sqlite.Rename{Kind: sqlite.RenameColumn, Table: "users", From: "email"},
-		}},
+		Renames: declined,
+	}); err == nil {
+		t.Fatal("a declined rename applied the drop it declined into; that answers the wrong question")
+	} else {
+		var destructive *sqlite.DestructiveChangeError
+		if !errors.As(err, &destructive) {
+			t.Fatalf("error is %T, want *sqlite.DestructiveChangeError: %v", err, err)
+		}
+	}
+	if got, ok := sqliteColumn(t, db, "users", "email"); !ok || got != "ada@example.com" {
+		t.Fatalf("the refused push touched the table: email = %q, present = %v", got, ok)
+	}
+
+	if _, err := sqlite.Push(ctx, db, sqlite.NewSchema(after), sqlite.PushOptions{
+		Renames:          declined,
+		AllowDestructive: true,
 	}); err != nil {
-		t.Fatalf("push with the drop stated: %v", err)
+		t.Fatalf("push with the drop stated and permitted: %v", err)
 	}
 	if _, ok := sqliteColumn(t, db, "users", "email"); ok {
 		t.Error("the column the push was told to drop is still there")
@@ -430,11 +453,11 @@ func TestMySQLPushRenamesATableAndKeepsTheRows(t *testing.T) {
 
 // --- the answer given for this run, against the one in the schema ----
 
-// The two states of one project, with no UNIQUE on either column: a
-// dropped column that carries one produces a DROP CONSTRAINT after the
-// DROP COLUMN that removed it, which PostgreSQL rejects. That is a
-// fault in the ordering of the plain diff and not in anything here, and
-// a test about which answer wins should not fail for it.
+// The two states of one project. The old column carries a UNIQUE, so
+// the answer under test is given about a column whose drop takes a
+// constraint with it — the shape that used to make the plain diff emit
+// a DROP CONSTRAINT after the DROP COLUMN that had already removed it,
+// which PostgreSQL rejects. See pg.Diff on the order the drops run in.
 const schemaPlainEmail = `package schema
 
 import "github.com/bernardoforcillo/drops/pg"
@@ -442,7 +465,7 @@ import "github.com/bernardoforcillo/drops/pg"
 var (
 	Users     = pg.NewTable("users")
 	UserID    = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
-	UserEmail = pg.Add(Users, pg.Text("email").NotNull())
+	UserEmail = pg.Add(Users, pg.Text("email").NotNull().Unique())
 )
 
 func Schema() *pg.Schema { return pg.NewSchema(Users) }
@@ -497,6 +520,12 @@ func TestCLIPushDropColumnOutranksTheSchemasDeclaration(t *testing.T) {
 	}
 	if !strings.Contains(out, `DROP COLUMN "email"`) {
 		t.Fatalf("the column the operator said was going is not being dropped:\n%s", out)
+	}
+	// The safety analyser reads statements and cannot see that the
+	// question was answered on the command line. Still asking it, right
+	// under the answer, is how a tool teaches people to stop reading it.
+	if strings.Contains(out, "unstated-column-rename") {
+		t.Fatalf("push asked about a rename --drop-column had already answered:\n%s", out)
 	}
 
 	p.mustRun("push", "--schema", "./schema", "--drop-column", "users.email", "--allow-destructive")

@@ -199,6 +199,15 @@ jobs:
         with:
           version: latest
           working-directory: cmd/drops
+      # The integration module is the third one, and for a while it was
+      # the only one nothing here named: five noctx findings had
+      # accumulated in its harness because no job was looking. staticcheck
+      # and govulncheck below already scan all three; this is the linter
+      # catching up with them.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: integration
 
   # ── security ─────────────────────────────────────────────────────────
   govulncheck:

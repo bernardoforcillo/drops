@@ -73,7 +73,12 @@ func cliBinary(t *testing.T) string {
 		// cmd/drops is a module of its own — the root ./... does not
 		// reach it, and it has to be built from inside its own
 		// directory or its go.mod (and its pgx) are not in scope.
-		cmd := osexec.Command("go", "build", "-o", builtCLI, ".")
+		//
+		// The build takes context.Background() rather than the
+		// context of whichever test asked first: one build serves
+		// every test in the suite, so no single test's lifetime is
+		// the right one to tie it to.
+		cmd := osexec.CommandContext(context.Background(), "go", "build", "-o", builtCLI, ".")
 		cmd.Dir = filepath.Join(repoRoot(t), "cmd", "drops")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("go build ./cmd/drops: %v\n%s", err, out)
@@ -197,7 +202,10 @@ func (p *project) schema(body string) {
 // and exit code.
 func (p *project) run(args ...string) (stdout, stderr string, code int) {
 	p.t.Helper()
-	cmd := osexec.Command(cliBinary(p.t), args...)
+	// The test's own context, so a run that is still going when the
+	// test ends is killed with it rather than left holding a
+	// connection to the database the cleanup is about to drop.
+	cmd := osexec.CommandContext(p.t.Context(), cliBinary(p.t), args...)
 	cmd.Dir = p.dir
 	cmd.Env = append(os.Environ(), "DROPS_PG_DSN="+p.dsn)
 	var out, errb strings.Builder
@@ -439,7 +447,7 @@ func TestCLIInterruptRollsBackTheMigrationInFlight(t *testing.T) {
 --> statement-breakpoint
 SELECT pg_sleep(60);
 `)
-	cmd := osexec.Command(cliBinary(t), "migrate")
+	cmd := osexec.CommandContext(t.Context(), cliBinary(t), "migrate")
 	cmd.Dir = p.dir
 	cmd.Env = append(os.Environ(), "DROPS_PG_DSN="+p.dsn)
 	var out strings.Builder
@@ -1219,7 +1227,7 @@ func TestCLIFailureModes(t *testing.T) {
 			if c.name == "no database named" {
 				env = ""
 			}
-			cmd := osexec.Command(cliBinary(t), c.args...)
+			cmd := osexec.CommandContext(t.Context(), cliBinary(t), c.args...)
 			cmd.Dir = p.dir
 			cmd.Env = append(os.Environ(), "DROPS_PG_DSN="+env, "DATABASE_URL=")
 			out, err := cmd.CombinedOutput()
@@ -1400,7 +1408,7 @@ func TestCLIGenerateAsksWhenToldTo(t *testing.T) {
 // what the prompt needs and nothing else in this file does.
 func (p *project) runWithStdin(input string, args ...string) (stdout, stderr string, code int) {
 	p.t.Helper()
-	cmd := osexec.Command(cliBinary(p.t), args...)
+	cmd := osexec.CommandContext(p.t.Context(), cliBinary(p.t), args...)
 	cmd.Dir = p.dir
 	cmd.Env = append(os.Environ(), "DROPS_PG_DSN="+p.dsn)
 	cmd.Stdin = strings.NewReader(input)

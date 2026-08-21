@@ -104,7 +104,7 @@ func runPush(ctx context.Context, args []string) error {
 	for _, s := range plan.Statements {
 		fmt.Println("  " + oneLine(s))
 	}
-	printWarnings(os.Stdout, plan.Statements)
+	printWarnings(os.Stdout, plan.Statements, req.Renames)
 	if err := guard(os.Stdout, plan.Statements, *allow); err != nil {
 		return err
 	}

@@ -816,6 +816,59 @@ once a 1.0 is cut.
   every column change on that dialect produces.
 
 ### Changed
+- **CI lints the integration module.** `golangci-lint` named the root
+  module and `cmd/drops` and nothing else, so the third module was the
+  one nobody was looking at — and five `noctx` findings had piled up in
+  its CLI harness while `staticcheck` and `govulncheck`, which do scan
+  all three, stayed green. The harness now builds every subprocess with
+  `exec.CommandContext`, on the test's own context where there is one,
+  so a run still going when its test ends is killed with it instead of
+  outliving the database the cleanup is about to drop.
+
+- **`sqlite.Push` now refuses a change that a table rebuild cannot
+  carry the data through, and applies nothing until somebody says
+  otherwise.** This is a breaking change for anyone relying on the old
+  silence: pushing a schema with a column removed used to apply
+  cleanly, the rebuild copied the columns both sides named, the data
+  was gone and `err` was `nil`.
+
+  It went unnoticed because no guard downstream of the SQL could have
+  caught it. On PostgreSQL a destructive change is a destructive
+  statement, so `drops push` reads its own plan and refuses the `DROP
+  COLUMN` in it. SQLite has no `ALTER COLUMN` and drops emits no `DROP
+  COLUMN`; the plan is a `CREATE`, an `INSERT … SELECT`, a `DROP
+  TABLE` and a `RENAME`, and those four are identical whether the
+  rebuild widens the table or empties half of it — the column that is
+  going is simply absent from the `INSERT`'s column list. The fact
+  lives in the diff, so that is where it is now computed:
+  `sqlite.DestructiveChanges(prev, cur, opts)` reads a snapshot pair
+  for what evolving one into the other destroys, and `Push` carries
+  the answer out rather than trying to recover it from the statements.
+
+  Six rules, named after `drops/pg`'s wherever the meaning is the same
+  so `drop-column` means here what it means there: `drop-column`,
+  `drop-table`, `alter-column-type` for text moving into a numeric
+  affinity (the copy converts as it goes, and `'007'` arrives as `7`),
+  `alter-column-set-not-null` for a column tightened over rows that
+  hold NULL, and `rebuild-drops-index` / `rebuild-stale-trigger` for
+  the index a rebuild will not put back and the trigger it puts back
+  broken. The last two are what `GenerateMigration` has always warned
+  about through `AnalyzeMigration` and `Push`, which prints no
+  migration for anyone to read, did not.
+
+  `PushOptions.AllowDestructive` applies them anyway — the same
+  permission `--allow-destructive` carries on PostgreSQL and the same
+  meaning, that somebody has read what the change destroys. It does
+  not answer a rename question and a rename answer does not permit a
+  drop; declining a rename says what the change means, the option says
+  whether it may run, and neither stands in for the other. Two things
+  deliberately do not trigger it, because an option needed on every
+  push is an option nobody reads: a rebuild that only widens a table
+  loses nothing, and `alter-column-set-not-null` is confirmed against
+  the rows first, so tightening a column that holds no NULL goes
+  through untouched. `DryRun` reports rather than refusing, in
+  `PushResult.Destructive`.
+
 - **`NewEntity` now refuses a nullable column bound to a field that
   cannot hold NULL, and it refuses at package-var init time — so an
   upgraded program does not start until the schema says what it
@@ -875,6 +928,72 @@ once a 1.0 is cut.
   transaction carrying the bump is the one that commits.
 
 ### Fixed
+- **A PostgreSQL migration that dropped a column and something naming
+  it could not be applied.** `pg.Diff` emitted the column drop first
+  and the constraint, index or policy drop after it, and PostgreSQL had
+  already taken the second along with the first — so the statement
+  named an object that no longer existed (SQLSTATE 42704) and, because
+  `Push` runs its plan in one transaction, the whole migration rolled
+  back with nothing done. Dropping a column carrying a UNIQUE was the
+  reported shape; the same order broke a CHECK, an index, and a
+  composite PRIMARY KEY losing one of its columns, and it does not
+  need a rename anywhere near it.
+
+  The mirror image was a refusal rather than a stale name. A column
+  another table's foreign key points at, or a policy reads, cannot be
+  dropped at all while that object stands (SQLSTATE 2BP01) — and
+  neither of those lives on the same table, so no per-table pass could
+  have got the order right. `DROP TABLE`, which drops emits `CASCADE`,
+  had the same effect on the foreign keys pointing at it from tables
+  that survive: the `DROP CONSTRAINT` that followed named a constraint
+  the cascade had already taken.
+
+  `Diff` now emits the drops grouped by kind across every table and in
+  dependency order — foreign keys, then the table drops, then policies,
+  UNIQUE, the primary key, CHECK and indexes, and only then the
+  columns — with the adds unchanged behind them. Ordering rather than
+  suppression, because the two are not equivalent: a constraint can be
+  dropped while every column it spans stays, and deciding whether an
+  index names a column would mean modelling PostgreSQL's dependency
+  graph, expressions included, which the snapshot deliberately does not
+  record. Ten cases are pinned down against a live PostgreSQL in
+  `integration/pgdropdeps_test.go` and
+  `integration/pgdropdeps_all_test.go`, the last of them putting every
+  shape into one migration, since a fix that grouped the drops by shape
+  rather than by kind would still pass the nine taken one at a time.
+
+  One dependent kind is left out, and named as such on `Diff`: a view
+  the schema still declares stands through the whole migration, so a
+  column any surviving view selects still cannot be dropped (2BP01),
+  whether that view's body changed or not. Closing it means dropping
+  surviving views up front and rebuilding them in dependency order,
+  which needs a record of the columns a view names that the snapshot
+  does not keep. And `Push` only reaches the policy case with
+  `DropUnmanagedObjects`: under the default it withholds the `DROP
+  POLICY` — deliberately, since dropping a policy nobody declared opens
+  the table up — and the `DROP COLUMN` behind it is then refused.
+
+  MySQL/MariaDB's diff was written from the same shape and has the same
+  fault — `DROP COLUMN` ahead of the `DROP INDEX`, the `DROP
+  CONSTRAINT` and the `DROP FOREIGN KEY` — which MariaDB 10.11 rejects
+  with 1091 for the two stale names, 1553 for a column an FK's index
+  needs, and 1072 for a column of the primary key. It is not fixed
+  here.
+
+- **`drops push` asked about an unstated rename after `--drop-column`
+  had answered it.** The safety analyser reads statements and nothing
+  else — deliberately, since it is also handed migration files drops
+  did not write — so it went on reporting a `DROP COLUMN` beside an
+  `ADD COLUMN` as the shape a rename makes, printed directly beneath
+  the answer the operator had just given. It is right about the SQL and
+  wrong about the run, and advice like that teaches people to stop
+  reading the output. The analyser keeps its contract; the CLI, which
+  is the one layer holding both the plan and the answers, now drops the
+  `unstated-column-rename` and `unstated-table-rename` notices whose
+  every object has a decision on record. A half-answered question
+  stays: a migration that drops two columns from one table and has an
+  answer for one of them still has something to ask.
+
 - **The `dropRel` tag's fallback is documented as the hazard it is.**
   `relationTargetField` looks a relation's field up by its `dropRel`
   tag and then, failing that, by a case-insensitive field-name match.

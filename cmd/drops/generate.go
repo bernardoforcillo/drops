@@ -111,7 +111,7 @@ func runGenerate(ctx context.Context, args []string) error {
 	for _, s := range statements {
 		fmt.Println("  " + oneLine(s))
 	}
-	printWarnings(os.Stdout, statements)
+	printWarnings(os.Stdout, statements, decisions)
 	// Generating is not applying, so a destructive statement is
 	// reported rather than refused — this is the review step.
 	if found := destructive(statements); len(found) > 0 {

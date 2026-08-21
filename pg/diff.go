@@ -61,21 +61,62 @@ func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
 //     ahead of the table drops that would CASCADE them away first
 //  2. CREATE TYPE, CREATE SEQUENCE for enums and sequences the schema
 //     newly declares, ahead of the CREATE TABLE naming them
-//  3. DROP TABLE   for tables removed entirely
-//  4. CREATE TABLE for new tables (column defs only — every
+//  3. DROP CONSTRAINT for foreign keys that are going, ahead of the
+//     DROP TABLEs that would CASCADE them away first
+//  4. DROP TABLE   for tables removed entirely
+//  5. CREATE TABLE for new tables (column defs only — every
 //     composite key, UNIQUE, FOREIGN KEY and CHECK constraint is
 //     emitted as a separate ALTER TABLE below, never inline)
-//  5. ALTER TABLE  for column-level changes on surviving tables
-//     (drop, add, type, NOT NULL, DEFAULT)
-//  6. UNIQUE       constraint adds/drops on every table
-//  7. FOREIGN KEY  adds/drops on every table — emitted after CREATE
-//     TABLEs so cross-table references resolve
-//  8. CREATE INDEX / DROP INDEX
-//  9. DROP SEQUENCE, DROP TYPE, once the last table naming them is
+//  6. DROP POLICY, DROP CONSTRAINT and DROP INDEX for everything else
+//     that names a column and is going: policies, UNIQUE, the
+//     PRIMARY KEY, CHECK, indexes
+//  7. DROP COLUMN, once nothing names the column any more
+//  8. ADD COLUMN and the ALTER COLUMNs — type, NOT NULL, DEFAULT
+//  9. ADD CONSTRAINT for UNIQUE, the PRIMARY KEY and CHECK, once the
+//     columns they span are there
+//  10. ADD CONSTRAINT ... FOREIGN KEY, after the CREATE TABLEs and the
+//     keys they reference, so cross-table references resolve
+//  11. CREATE INDEX
+//  12. DROP SEQUENCE, DROP TYPE, once the last table naming them is
 //     gone
-//  10. CREATE / CREATE OR REPLACE VIEW, once the tables a view selects
+//  13. CREATE / CREATE OR REPLACE VIEW, once the tables a view selects
 //     from are in their final shape
-//  11. ROW LEVEL SECURITY and its policies, table by table
+//  14. ROW LEVEL SECURITY and CREATE POLICY, table by table
+//
+// Steps 3, 6 and 7 are one rule seen from three sides: PostgreSQL
+// removes a dependent object along with the thing it depends on, and
+// refuses to remove the thing while a dependent it cannot remove
+// stands. Dropping a column takes every constraint and index that
+// names it — whether it spans that column alone or several, and
+// whether an index names it in its key, its INCLUDE list, an
+// expression or a partial predicate — so a DROP CONSTRAINT emitted
+// after the DROP COLUMN names something that is already gone
+// (SQLSTATE 42704). A DROP TABLE, emitted CASCADE, does the same to
+// the foreign keys pointing at it from tables that survive. In the
+// other direction a column another table's foreign key points at, or
+// a policy reads, cannot be dropped at all while that object stands
+// (SQLSTATE 2BP01) — and neither of those is on the same table, which
+// is why the drops are grouped by kind across every table rather than
+// run table by table.
+//
+// Emitting the drop rather than suppressing it is the deliberate half.
+// The two are not equivalent: a constraint can be dropped while every
+// column it spans stays, which no suppression rule would emit, and
+// working out whether an index names a column would mean modelling
+// PostgreSQL's dependency graph — including the expressions the
+// snapshot deliberately does not record. Ordering needs none of that.
+//
+// A view that survives the migration is the dependent kind this order
+// does not reach. Step 1 drops the views the schema stopped declaring;
+// one it still declares is left standing while the columns move, so a
+// migration dropping a column any surviving view selects is refused
+// with the same SQLSTATE 2BP01 — whether the view's body changed or
+// not, since a body that did not change emits no statement at all.
+// Ordering alone cannot close it: the view would have to be dropped
+// up front and rebuilt afterwards, in view-on-view dependency order,
+// and drops does not record which columns a view names. Until then,
+// change such a view in its own migration, ahead of the one that drops
+// the column.
 //
 // ALTER TABLE ... RENAME comes in front of all of it, when
 // DiffOptions.Renames says a rename is what happened; everything below
@@ -96,71 +137,6 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	prev = applyRenames(prev, opt.Renames)
 	var out []string
 
-	for _, key := range sortedKeys(prev.Tables) {
-		if _, ok := cur.Tables[key]; !ok {
-			out = append(out, dropTableSQL(prev.Tables[key], opt.Safe))
-		}
-	}
-	for _, key := range sortedKeys(cur.Tables) {
-		if _, ok := prev.Tables[key]; !ok {
-			out = append(out, createTableSQL(cur.Tables[key], opt.Safe))
-		}
-	}
-	for _, key := range sortedKeys(cur.Tables) {
-		curT := cur.Tables[key]
-		prevT, exists := prev.Tables[key]
-		if !exists {
-			// New table: createTableSQL above emitted the bare
-			// column definitions only. Every table-level
-			// constraint — composite PK, UNIQUE and CHECK — is
-			// emitted here as a separate ALTER TABLE statement so
-			// the CREATE TABLE stays constraint-free. (Foreign
-			// keys are handled in the dedicated pass below.)
-			empty := &TableSnapshot{
-				CompositePrimaryKeys: map[string]*CompositePKSnapshot{},
-				UniqueConstraints:    map[string]*UniqueSnapshot{},
-				CheckConstraints:     map[string]*CheckSnapshot{},
-			}
-			out = append(out, diffCompositePKs(empty, curT, opt.Safe)...)
-			out = append(out, diffUniques(empty, curT, opt.Safe)...)
-			out = append(out, diffChecks(empty, curT, opt.Safe)...)
-			continue
-		}
-		out = append(out, diffColumns(prevT, curT, opt.Safe)...)
-		out = append(out, diffUniques(prevT, curT, opt.Safe)...)
-		out = append(out, diffCompositePKs(prevT, curT, opt.Safe)...)
-		out = append(out, diffChecks(prevT, curT, opt.Safe)...)
-	}
-	// Foreign keys: emitted after CREATE TABLE / column changes
-	// so target columns exist; emitted before indexes so the
-	// supporting unique constraint is in place if a FK depends on
-	// it.
-	for _, key := range sortedKeys(cur.Tables) {
-		curT := cur.Tables[key]
-		prevT, exists := prev.Tables[key]
-		if !exists {
-			prevT = &TableSnapshot{ForeignKeys: map[string]*ForeignKeySnapshot{}}
-		}
-		out = append(out, diffForeignKeys(prevT, curT, opt.Safe)...)
-	}
-	// Indexes after FKs so dependency order is consistent.
-	for _, key := range sortedKeys(cur.Tables) {
-		curT := cur.Tables[key]
-		prevT, exists := prev.Tables[key]
-		if !exists {
-			prevT = &TableSnapshot{Indexes: map[string]*IndexSnapshot{}}
-		}
-		out = append(out, diffIndexes(prevT, curT, opt.Safe)...)
-	}
-
-	// Top-level objects. A type or a sequence a column references has
-	// to exist before the CREATE TABLE that names it, and cannot be
-	// dropped until the last table naming it is gone — so the creates
-	// go in front of the table DDL and the drops behind it. Emitting
-	// the creates last, as this once did, meant a schema declaring a
-	// single enum column produced a migration whose CREATE TABLE
-	// named a type three statements before it existed.
-	//
 	// A view that is going away goes in front of everything: DROP
 	// TABLE is emitted CASCADE, which takes every view selecting from
 	// the table with it, and the DROP VIEW that followed then named an
@@ -168,30 +144,124 @@ func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
 	// the migration halfway. Dropping the view first is always legal —
 	// nothing depends on a view being there — and leaves the CASCADE
 	// with nothing left to take.
-	//
+	out = append(out, diffViewsDrop(prev, cur, opt.Safe)...)
+
+	// A type or a sequence a column references has to exist before the
+	// CREATE TABLE that names it, and cannot be dropped until the last
+	// table naming it is gone — so the creates go in front of the table
+	// DDL and the drops (further down) behind it. Emitting the creates
+	// last, as this once did, meant a schema declaring a single enum
+	// column produced a migration whose CREATE TABLE named a type
+	// three statements before it existed.
+	out = append(out, diffEnumsCreate(prev, cur, opt.Safe)...)
+	out = append(out, diffSequencesCreate(prev, cur, opt.Safe)...)
+
+	// Foreign keys that are going, ahead of the DROP TABLEs: a key
+	// pointing at a table that is going is removed by that table's
+	// CASCADE, and the DROP CONSTRAINT would then name a constraint
+	// PostgreSQL had already taken.
+	for _, key := range sortedKeys(cur.Tables) {
+		out = append(out, dropForeignKeys(prevTable(prev, key), cur.Tables[key], opt.Safe)...)
+	}
+
+	for _, key := range sortedKeys(prev.Tables) {
+		if _, ok := cur.Tables[key]; !ok {
+			out = append(out, dropTableSQL(prev.Tables[key], opt.Safe))
+		}
+	}
+	// New tables carry their column definitions and nothing else.
+	// Every table-level constraint — composite PK, UNIQUE and CHECK —
+	// is emitted below as a separate ALTER TABLE, so the CREATE TABLE
+	// stays constraint-free.
+	for _, key := range sortedKeys(cur.Tables) {
+		if _, ok := prev.Tables[key]; !ok {
+			out = append(out, createTableSQL(cur.Tables[key], opt.Safe))
+		}
+	}
+
+	// The rest of what names a column, before the columns go. The
+	// foreign keys are already out of the way, which is what lets a
+	// UNIQUE or a PRIMARY KEY that another table's key referenced be
+	// dropped at all.
+	for _, key := range sortedKeys(cur.Tables) {
+		prevT, curT := prevTable(prev, key), cur.Tables[key]
+		out = append(out, dropPolicies(prevT, curT, opt.Safe)...)
+		out = append(out, dropUniques(prevT, curT, opt.Safe)...)
+		out = append(out, dropCompositePK(prevT, curT, opt.Safe)...)
+		out = append(out, dropChecks(prevT, curT, opt.Safe)...)
+		out = append(out, dropIndexes(prevT, curT, opt.Safe)...)
+	}
+
+	// Columns, on the tables both sides have. A table cur creates is
+	// already complete from its CREATE TABLE, and one only prev has is
+	// gone by now.
+	surviving := survivingTables(prev, cur)
+	for _, key := range surviving {
+		out = append(out, dropColumns(prev.Tables[key], cur.Tables[key], opt.Safe)...)
+	}
+	for _, key := range surviving {
+		out = append(out, addColumns(prev.Tables[key], cur.Tables[key], opt.Safe)...)
+		out = append(out, alterColumns(prev.Tables[key], cur.Tables[key])...)
+	}
+
+	// Everything the columns now support.
+	for _, key := range sortedKeys(cur.Tables) {
+		prevT, curT := prevTable(prev, key), cur.Tables[key]
+		out = append(out, addUniques(prevT, curT)...)
+		out = append(out, addCompositePK(prevT, curT)...)
+		out = append(out, addChecks(prevT, curT)...)
+	}
+	// Foreign keys after the CREATE TABLEs so cross-table references
+	// resolve, and after the UNIQUE and PRIMARY KEY adds because a key
+	// can only point at one of those.
+	for _, key := range sortedKeys(cur.Tables) {
+		out = append(out, addForeignKeys(prevTable(prev, key), cur.Tables[key])...)
+	}
+	for _, key := range sortedKeys(cur.Tables) {
+		out = append(out, addIndexes(prevTable(prev, key), cur.Tables[key], opt.Safe)...)
+	}
+
+	out = append(out, diffSequencesDrop(prev, cur, opt.Safe)...)
+	out = append(out, diffEnumsDrop(prev, cur, opt.Safe)...)
+
 	// Views that survive are built last of all: a view selects from
 	// the tables, so it can only be built once they are in their final
 	// shape.
-	head := diffViewsDrop(prev, cur, opt.Safe)
-	head = append(head, diffEnumsCreate(prev, cur, opt.Safe)...)
-	head = append(head, diffSequencesCreate(prev, cur, opt.Safe)...)
-	out = append(head, out...)
-	out = append(out, diffSequencesDrop(prev, cur, opt.Safe)...)
-	out = append(out, diffEnumsDrop(prev, cur, opt.Safe)...)
 	out = append(out, diffViewsCreate(prev, cur, opt.Safe, len(opt.Renames) > 0)...)
 
-	// RLS + policies, table-scoped.
+	// RLS and the policies it governs, table-scoped. The drops ran
+	// with the other dependent objects; only the creates are left, and
+	// they wait here because a policy reads columns.
 	for _, key := range sortedKeys(cur.Tables) {
-		curT := cur.Tables[key]
-		prevT, exists := prev.Tables[key]
-		if !exists {
-			prevT = &TableSnapshot{Policies: map[string]*PolicySnapshot{}}
-		}
+		prevT, curT := prevTable(prev, key), cur.Tables[key]
 		out = append(out, diffRLS(prevT, curT)...)
-		out = append(out, diffPolicies(prevT, curT, opt.Safe)...)
+		out = append(out, addPolicies(prevT, curT)...)
 	}
 
 	return append(renames, out...)
+}
+
+// prevTable returns the table's previous shape, or an empty one when
+// this migration creates it. Every pass below is written against two
+// sides; a table that is new simply has nothing on its old side, and
+// handing it one keeps each pass from needing its own special case.
+func prevTable(prev *Snapshot, name string) *TableSnapshot {
+	if t, ok := prev.Tables[name]; ok {
+		return t
+	}
+	return &TableSnapshot{}
+}
+
+// survivingTables lists, in sorted order, the tables both snapshots
+// have — the ones a column diff is about.
+func survivingTables(prev, cur *Snapshot) []string {
+	var out []string
+	for _, key := range sortedKeys(cur.Tables) {
+		if _, ok := prev.Tables[key]; ok {
+			out = append(out, key)
+		}
+	}
+	return out
 }
 
 // diffEnumsDrop emits DROP TYPE for every enum cur no longer declares.
@@ -353,22 +423,34 @@ func rlsVerb(on bool, yes, no string) string {
 	return no
 }
 
-func diffPolicies(prev, cur *TableSnapshot, safe bool) []string {
+// dropPolicies emits DROP POLICY for the policies that are going, and
+// for those whose definition changed — PostgreSQL's ALTER POLICY
+// cannot restate one, so a changed policy is dropped and recreated.
+//
+// It runs with the constraint and index drops rather than beside
+// addPolicies, because a policy's USING and WITH CHECK expressions
+// read columns: PostgreSQL refuses to drop a column a policy names
+// (SQLSTATE 2BP01), and a policy that is going was blocking the very
+// column drop the same migration asked for.
+func dropPolicies(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, key := range sortedKeys(prev.Policies) {
-		if _, ok := cur.Policies[key]; !ok {
+		curP, ok := cur.Policies[key]
+		if !ok || !policyEqual(prev.Policies[key], curP) {
 			out = append(out, dropPolicySQL(cur.Name, key, safe))
 		}
 	}
+	return out
+}
+
+// addPolicies is dropPolicies's other half, emitted last of all
+// because a policy reads the columns it is written against.
+func addPolicies(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, key := range sortedKeys(cur.Policies) {
 		curP := cur.Policies[key]
 		prevP, ok := prev.Policies[key]
-		if !ok {
-			out = append(out, createPolicySQL(cur.Name, curP))
-			continue
-		}
-		if !policyEqual(prevP, curP) {
-			out = append(out, dropPolicySQL(cur.Name, key, safe))
+		if !ok || !policyEqual(prevP, curP) {
 			out = append(out, createPolicySQL(cur.Name, curP))
 		}
 	}
@@ -646,7 +728,10 @@ func columnDefSQL(c *ColumnSnapshot) string {
 	return b.String()
 }
 
-func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
+// dropColumns emits DROP COLUMN for every column cur no longer has.
+// It runs after the constraints, indexes and policies that name those
+// columns are already gone; see Diff.
+func dropColumns(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.Columns) {
 		if _, ok := cur.Columns[k]; !ok {
@@ -657,6 +742,12 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 			}
 		}
 	}
+	return out
+}
+
+// addColumns emits ADD COLUMN for every column cur newly declares.
+func addColumns(prev, cur *TableSnapshot, safe bool) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.Columns) {
 		if _, ok := prev.Columns[k]; ok {
 			continue
@@ -667,6 +758,13 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 			out = append(out, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s;`, quoteIdent(cur.Name), columnDefSQL(cur.Columns[k])))
 		}
 	}
+	return out
+}
+
+// alterColumns brings a column both sides have into line: its type,
+// its nullability and its default.
+func alterColumns(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.Columns) {
 		prevC, ok := prev.Columns[k]
 		if !ok {
@@ -696,13 +794,22 @@ func diffColumns(prev, cur *TableSnapshot, safe bool) []string {
 	return out
 }
 
-func diffUniques(prev, cur *TableSnapshot, safe bool) []string {
+// dropUniques emits DROP CONSTRAINT for every UNIQUE cur no longer
+// declares.
+func dropUniques(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.UniqueConstraints) {
 		if _, ok := cur.UniqueConstraints[k]; !ok {
 			out = append(out, dropConstraintSQL(cur.Name, k, safe))
 		}
 	}
+	return out
+}
+
+// addUniques emits ADD CONSTRAINT ... UNIQUE for every one cur newly
+// declares.
+func addUniques(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.UniqueConstraints) {
 		if _, ok := prev.UniqueConstraints[k]; ok {
 			continue
@@ -714,13 +821,22 @@ func diffUniques(prev, cur *TableSnapshot, safe bool) []string {
 	return out
 }
 
-func diffForeignKeys(prev, cur *TableSnapshot, safe bool) []string {
+// dropForeignKeys emits DROP CONSTRAINT for every foreign key cur no
+// longer declares. It runs ahead of the DROP TABLEs; see Diff.
+func dropForeignKeys(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.ForeignKeys) {
 		if _, ok := cur.ForeignKeys[k]; !ok {
 			out = append(out, dropConstraintSQL(cur.Name, k, safe))
 		}
 	}
+	return out
+}
+
+// addForeignKeys emits ADD CONSTRAINT ... FOREIGN KEY for every one
+// cur newly declares.
+func addForeignKeys(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.ForeignKeys) {
 		if _, ok := prev.ForeignKeys[k]; ok {
 			continue
@@ -753,24 +869,24 @@ func quoteIdents(names []string) []string {
 	return out
 }
 
-// diffIndexes emits CREATE INDEX / DROP INDEX for indexes that
-// were added or removed between prev and cur. Index changes are
-// not "modified in place" — they are dropped and recreated when
-// any structural field differs.
-func diffIndexes(prev, cur *TableSnapshot, safe bool) []string {
+// dropIndexes emits DROP INDEX for every index cur no longer declares,
+// and for every one whose shape changed — an index is never modified
+// in place, it is dropped and recreated by addIndexes.
+func dropIndexes(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.Indexes) {
 		curIdx, present := cur.Indexes[k]
-		prevIdx := prev.Indexes[k]
-		if !present {
-			out = append(out, dropIndexSQL(k, safe))
-			continue
-		}
-		// Drop-and-recreate when shape changed.
-		if !indexEqual(prevIdx, curIdx) {
+		if !present || !indexEqual(prev.Indexes[k], curIdx) {
 			out = append(out, dropIndexSQL(k, safe))
 		}
 	}
+	return out
+}
+
+// addIndexes emits CREATE INDEX for every index cur newly declares and
+// for every one dropIndexes took down because its shape changed.
+func addIndexes(prev, cur *TableSnapshot, safe bool) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.Indexes) {
 		curIdx := cur.Indexes[k]
 		if len(curIdx.Columns) == 0 {
@@ -795,9 +911,10 @@ func diffIndexes(prev, cur *TableSnapshot, safe bool) []string {
 	return out
 }
 
-// diffCompositePKs emits ALTER TABLE ADD/DROP PRIMARY KEY.
-// Single-column PKs continue to live on the column definition
-// and are handled by the column diff.
+// dropCompositePK emits ALTER TABLE DROP CONSTRAINT for a composite
+// PRIMARY KEY that is going or whose columns changed. Single-column
+// PKs continue to live on the column definition and are handled by the
+// column diff.
 //
 // The two sides are matched by their column list, not by their name: a
 // table has at most one PRIMARY KEY, and the name it wears is whatever
@@ -805,23 +922,28 @@ func diffIndexes(prev, cur *TableSnapshot, safe bool) []string {
 // compositePKName's camelCase when drops did. Matching by name would
 // have a push against a server-named key drop and recreate it, every
 // time, for no change at all.
-func diffCompositePKs(prev, cur *TableSnapshot, safe bool) []string {
+func dropCompositePK(prev, cur *TableSnapshot, safe bool) []string {
 	prevPK := tableCompositePK(prev)
+	if prevPK == nil {
+		return nil
+	}
+	if curPK := tableCompositePK(cur); curPK != nil && sameStrings(prevPK.Columns, curPK.Columns) {
+		return nil
+	}
+	return []string{dropConstraintSQL(cur.Name, prevPK.Name, safe)}
+}
+
+// addCompositePK is dropCompositePK's other half: the ADD CONSTRAINT
+// for the key cur declares, matched the same way.
+func addCompositePK(prev, cur *TableSnapshot) []string {
 	curPK := tableCompositePK(cur)
-	switch {
-	case prevPK == nil && curPK == nil:
-		return nil
-	case curPK == nil:
-		return []string{dropConstraintSQL(cur.Name, prevPK.Name, safe)}
-	case prevPK == nil:
-		return []string{addPrimaryKeySQL(cur.Name, curPK)}
-	case sameStrings(prevPK.Columns, curPK.Columns):
+	if curPK == nil {
 		return nil
 	}
-	return []string{
-		dropConstraintSQL(cur.Name, prevPK.Name, safe),
-		addPrimaryKeySQL(cur.Name, curPK),
+	if prevPK := tableCompositePK(prev); prevPK != nil && sameStrings(prevPK.Columns, curPK.Columns) {
+		return nil
 	}
+	return []string{addPrimaryKeySQL(cur.Name, curPK)}
 }
 
 // tableCompositePK returns the table's multi-column PRIMARY KEY, or
@@ -854,8 +976,8 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
-// diffChecks emits ALTER TABLE ADD/DROP CONSTRAINT for CHECK
-// constraints.
+// dropChecks emits ALTER TABLE DROP CONSTRAINT for the CHECK
+// constraints that are going, and for those whose expression changed.
 //
 // A constraint whose expression changed under an unchanged name is
 // dropped and re-added: PostgreSQL has no ALTER CONSTRAINT for a
@@ -864,7 +986,7 @@ func sameStrings(a, b []string) bool {
 // all. The same caveat as indexEqual applies to the comparison: the
 // two Values have to be spelled alike, which against a live server is
 // Push's job, not Diff's.
-func diffChecks(prev, cur *TableSnapshot, safe bool) []string {
+func dropChecks(prev, cur *TableSnapshot, safe bool) []string {
 	var out []string
 	for _, k := range sortedKeys(prev.CheckConstraints) {
 		curC, ok := cur.CheckConstraints[k]
@@ -872,6 +994,12 @@ func diffChecks(prev, cur *TableSnapshot, safe bool) []string {
 			out = append(out, dropConstraintSQL(cur.Name, k, safe))
 		}
 	}
+	return out
+}
+
+// addChecks is dropChecks's other half.
+func addChecks(prev, cur *TableSnapshot) []string {
+	var out []string
 	for _, k := range sortedKeys(cur.CheckConstraints) {
 		if prevC, ok := prev.CheckConstraints[k]; ok && prevC.Value == cur.CheckConstraints[k].Value {
 			continue

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -500,4 +501,257 @@ func humanList(xs []string) string {
 		return xs[0] + " and " + xs[1]
 	}
 	return strings.Join(xs[:len(xs)-1], ", ") + " and " + xs[len(xs)-1]
+}
+
+// ----------------------------------------------------------------------
+// What the statements cannot say
+// ----------------------------------------------------------------------
+
+// Everything above reads SQL, and on this dialect reading SQL is not
+// enough.
+//
+// A destructive change in PostgreSQL is a destructive statement — DROP
+// COLUMN, DROP TABLE, TRUNCATE — so an analyser that classifies DDL
+// text finds every one of them, and drops/pg's does. SQLite has no
+// ALTER COLUMN and drops emits no ALTER TABLE ... DROP COLUMN, so the
+// same change arrives as a table rebuild: CREATE "t_new", INSERT ...
+// SELECT, DROP TABLE, ALTER TABLE ... RENAME TO. All four statements
+// appear unchanged in a rebuild that loses nothing whatsoever, and the
+// column that went missing is missing from the INSERT's column list —
+// which is to say no statement names it at all.
+//
+// Diff does write a `-- rebuild "t": drop column "c"` comment above the
+// sequence, and that is not a way round this. The comment is there
+// because Diff read the diff; the fact travels out of the diff and into
+// the text, never the other way. So this is where it is read: this
+// column is in the previous snapshot and not in the next one.
+// DestructiveChanges reports it from there, and Push carries the answer
+// out rather than trying to reconstruct it from what it emitted.
+
+// DestructiveChange is one thing evolving a schema would destroy, named
+// from the diff rather than from the statements.
+//
+// A rebuild is the whole of SQLite's schema-change vocabulary, so the
+// same four statements carry both the safe changes and these; nothing
+// downstream can tell them apart. That is why this is a value the diff
+// produces rather than a verdict on SQL somebody else can re-derive.
+type DestructiveChange struct {
+	// Rule is a stable identifier for the kind of change. The names are
+	// shared with the statement analyser above and with drops/pg
+	// wherever the meaning is the same, so drop-column means here what
+	// it means there: "drop-table", "drop-column",
+	// "alter-column-type", "alter-column-set-not-null",
+	// "rebuild-drops-index", "rebuild-stale-trigger".
+	Rule string
+
+	// Table is the table the change is on, under the name it has after
+	// any stated rename.
+	Table string
+
+	// Object is the column, index or trigger the change is about, empty
+	// when the whole table is going.
+	Object string
+
+	// Message says what would be destroyed and how.
+	Message string
+
+	// Suggestion is how to keep it, or how to say the loss is intended.
+	Suggestion string
+}
+
+// String renders the change as "rule: message".
+func (c DestructiveChange) String() string { return c.Rule + ": " + c.Message }
+
+// DestructiveChanges reports what evolving prev into cur would destroy.
+//
+// It is the diff read for loss rather than for statements, and it takes
+// the same DiffOptions for the same reason Diff does: a stated rename
+// is not a drop, so the renames are applied to prev before anything is
+// compared. Pass exactly what you pass Diff and the two agree on what
+// the migration means.
+//
+// The alter-column-set-not-null rule is the one whose answer this
+// function cannot finish. Whether a column that gains NOT NULL has any
+// NULL to carry is a fact about the rows, not about either schema, so
+// the rule reports every such column and leaves confirming it to the
+// caller that holds a database — see Push, which asks and discards the
+// ones the data acquits.
+func DestructiveChanges(prev, cur *Snapshot, opts ...DiffOptions) []DestructiveChange {
+	var opt DiffOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if prev == nil {
+		prev = EmptySnapshot()
+	}
+	if cur == nil {
+		cur = EmptySnapshot()
+	}
+	prev = applyRenames(prev, opt.Renames)
+
+	var out []DestructiveChange
+	for _, key := range sortedMapKeys(prev.Tables) {
+		prevT := prev.Tables[key]
+		curT, ok := cur.Tables[key]
+		if !ok {
+			out = append(out, DestructiveChange{
+				Rule:       "drop-table",
+				Table:      prevT.Name,
+				Message:    "table " + quoteIdent(prevT.Name) + " is in the database and not in the schema; the table and every row in it go.",
+				Suggestion: "If the table is really going, say so with PushOptions.AllowDestructive. Otherwise rename it aside and drop it in a later migration, once a retention window has passed.",
+			})
+			continue
+		}
+		out = append(out, tableLosses(prevT, curT)...)
+	}
+	return out
+}
+
+// tableLosses reports what rebuilding prev into cur costs the table.
+//
+// The index and trigger rules mirror replayObjectsSQL exactly, because
+// they are describing what it does: an index keyed on a column that is
+// going is not replayed, and a trigger whose body names one is replayed
+// and will fail when it fires. Both only arise where a column is going,
+// which is why they are computed under that condition — a rebuild that
+// only widens a table gets all of them back untouched and has lost
+// nothing.
+func tableLosses(prev, cur *TableSnapshot) []DestructiveChange {
+	var out []DestructiveChange
+	var dropped []string
+	gone := map[string]bool{}
+	for _, k := range sortedMapKeys(prev.Columns) {
+		if _, ok := cur.Columns[k]; ok {
+			continue
+		}
+		dropped = append(dropped, k)
+		gone[k] = true
+		out = append(out, DestructiveChange{
+			Rule:    "drop-column",
+			Table:   cur.Name,
+			Object:  k,
+			Message: "column " + quoteIdent(k) + " of " + quoteIdent(cur.Name) + " is in the database and not in the schema; the rebuild copies the columns both sides name, so the column's data goes with no DROP COLUMN anywhere in the statement list to say so.",
+			Suggestion: "If the column was renamed rather than dropped, state the rename — sqlite.Text(\"newName\").RenamedFrom(" + strconv.Quote(k) +
+				") — and the data comes with it. If it really is going, back it up and set PushOptions.AllowDestructive.",
+		})
+	}
+	for _, k := range sortedMapKeys(cur.Columns) {
+		prevC, ok := prev.Columns[k]
+		if !ok {
+			continue
+		}
+		curC := cur.Columns[k]
+		if narrowsAffinity(prevC.Type, curC.Type) {
+			out = append(out, DestructiveChange{
+				Rule:   "alter-column-type",
+				Table:  cur.Name,
+				Object: k,
+				Message: "column " + quoteIdent(k) + " of " + quoteIdent(cur.Name) + " changes declared type " + prevC.Type + " -> " + curC.Type +
+					", from TEXT affinity to " + typeAffinity(curC.Type) + "; the rebuild's INSERT ... SELECT applies the new affinity as it copies, so stored text that reads as a number is converted to one — '007' comes back as 7.",
+				Suggestion: "Add a second column of the new type, copy into it and check what the conversion did, then drop the old one. If the conversion is what you want, set PushOptions.AllowDestructive.",
+			})
+		}
+		if !prevC.NotNull && curC.NotNull {
+			out = append(out, DestructiveChange{
+				Rule:       "alter-column-set-not-null",
+				Table:      cur.Name,
+				Object:     k,
+				Message:    "column " + quoteIdent(k) + " of " + quoteIdent(cur.Name) + " gains NOT NULL; the rebuild's INSERT ... SELECT carries every existing NULL into a column that rejects it, so the push fails partway rather than converging.",
+				Suggestion: "Backfill the NULLs first — UPDATE " + quoteIdent(cur.Name) + " SET " + quoteIdent(k) + " = ... WHERE " + quoteIdent(k) + " IS NULL — and push after.",
+			})
+		}
+	}
+	if len(dropped) == 0 {
+		return out
+	}
+	for _, name := range sortedMapKeys(prev.Indexes) {
+		idx := prev.Indexes[name]
+		if idx.SQL == "" {
+			continue
+		}
+		var lost []string
+		for _, c := range idx.Columns {
+			if gone[c] {
+				lost = append(lost, quoteIdent(c))
+			}
+		}
+		if len(lost) == 0 {
+			continue
+		}
+		out = append(out, DestructiveChange{
+			Rule:       "rebuild-drops-index",
+			Table:      cur.Name,
+			Object:     name,
+			Message:    "index " + quoteIdent(name) + " keys column " + strings.Join(lost, ", ") + ", which this change removes; the rebuild drops the table and does not put the index back.",
+			Suggestion: "If the index is still wanted over the columns that remain, declare it by hand and create it after the push. To lose it, set PushOptions.AllowDestructive.",
+		})
+	}
+	for _, name := range sortedMapKeys(prev.Triggers) {
+		trg := prev.Triggers[name]
+		if trg.SQL == "" {
+			continue
+		}
+		named := identsMentioned(trg.SQL, dropped)
+		if len(named) == 0 {
+			continue
+		}
+		out = append(out, DestructiveChange{
+			Rule:       "rebuild-stale-trigger",
+			Table:      cur.Name,
+			Object:     name,
+			Message:    "trigger " + quoteIdent(name) + " names column " + strings.Join(quoteIdentList(named), ", ") + ", which this change removes; the rebuild re-creates the trigger as it was stored, SQLite accepts it without resolving the body, and it fails the first time it fires.",
+			Suggestion: "Rewrite the trigger against the new shape, or drop it, before pushing. To leave it broken, set PushOptions.AllowDestructive.",
+		})
+	}
+	return out
+}
+
+// narrowsAffinity reports whether re-declaring a column from to to
+// changes what the engine will store.
+//
+// The test is deliberately narrower than "the type changed", because
+// most type changes on SQLite cost nothing: the engine is dynamically
+// typed, a column's declared type only sets an affinity, and an
+// affinity only converts a value when the conversion is one it considers
+// faithful. A REAL 1.5 copied into an INTEGER column stays 1.5, and a
+// BLOB copied anywhere stays a BLOB — the engine says so, and the
+// integration suite asks it.
+//
+// One direction does convert: text into a numeric affinity. A column
+// declared TEXT holding '007' becomes the integer 7 the moment the
+// rebuild copies it into a column with INTEGER, REAL or NUMERIC
+// affinity, and nothing about the migration says it happened. That is
+// the case worth stopping for, and the only one this reports.
+//
+// Note that NUMERIC is where SQLite's rules put every declared type it
+// does not otherwise recognise, DATE, DATETIME and BOOLEAN included, so
+// re-declaring a Text column as a Timestamp lands here too. It should:
+// that conversion is the same conversion.
+func narrowsAffinity(from, to string) bool {
+	if typeAffinity(from) != "TEXT" {
+		return false
+	}
+	switch typeAffinity(to) {
+	case "INTEGER", "REAL", "NUMERIC":
+		return true
+	}
+	return false
+}
+
+// typeAffinity applies SQLite's declared-type rules, in their order,
+// to work out which of the five affinities a declared type carries.
+// See https://sqlite.org/datatype3.html#determination_of_column_affinity.
+func typeAffinity(declared string) string {
+	t := strings.ToUpper(strings.TrimSpace(declared))
+	switch {
+	case strings.Contains(t, "INT"):
+		return "INTEGER"
+	case strings.Contains(t, "CHAR"), strings.Contains(t, "CLOB"), strings.Contains(t, "TEXT"):
+		return "TEXT"
+	case t == "", strings.Contains(t, "BLOB"):
+		return "BLOB"
+	case strings.Contains(t, "REAL"), strings.Contains(t, "FLOA"), strings.Contains(t, "DOUB"):
+		return "REAL"
+	}
+	return "NUMERIC"
 }

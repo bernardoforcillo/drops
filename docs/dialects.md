@@ -96,6 +96,74 @@ with its own indexes. So the generated SQL carries a comment above
 every rebuild saying exactly that, `AnalyzeMigration` reports it as
 `rebuild-loses-indexes`, and re-creating them is the reviewer's job.
 
+### `sqlite.Push` refuses a destructive change (breaking change)
+
+A rebuild is also where SQLite's destructive changes hide, and until
+now `Push` had no guard against them at all. Pushing a schema with a
+column removed applied cleanly, the rebuild copied the columns both
+sides named, the data was gone and `err` was `nil`.
+
+The reason it went unnoticed is worth stating, because it shapes the
+fix. On PostgreSQL, `drops push` reads the plan it is about to run and
+refuses the destructive statements in it — `DROP COLUMN`, `DROP TABLE`,
+`TRUNCATE`. On SQLite there is no such statement to find. The plan is a
+`CREATE`, an `INSERT … SELECT`, a `DROP TABLE` and a `RENAME`, and
+those four are identical whether the rebuild widens the table or empties
+half of it; the column that is going is simply absent from the
+`INSERT`'s column list. **No guard that reads the SQL can see this.**
+The fact lives in the diff — this column is in the previous snapshot
+and not in the next one — so that is where it is computed, and it is
+carried out to the caller rather than recovered afterwards.
+
+`sqlite.Push` now returns `*sqlite.DestructiveChangeError` and applies
+nothing when the change would destroy any of:
+
+| Rule | What it is |
+|---|---|
+| `drop-column` | the column is in the database and not in the schema |
+| `alter-column-type` | the column moves from `TEXT` affinity to a numeric one, and the copy converts as it goes: `'007'` arrives as `7` |
+| `alter-column-set-not-null` | the column gains `NOT NULL` and rows still hold `NULL`, which the copy will not accept |
+| `rebuild-drops-index` | the rebuild drops an index keyed on a departing column and does not put it back |
+| `rebuild-stale-trigger` | the rebuild puts a trigger back naming a departing column; SQLite accepts it and it fails when it fires |
+
+The names are `drops/pg`'s names wherever the meaning is the same, so
+`drop-column` means here what it means there. The last two are what
+`GenerateMigration` has always warned about through `AnalyzeMigration`
+and `Push`, which prints no migration for anyone to read, did not.
+
+There is a sixth rule, `drop-table`, and `Push` never reaches it. It
+diffs only over the tables the schema declares — a table drops was
+never told about belongs to somebody else — so deleting a `NewTable`
+from the schema does not drop the table and does not raise a finding
+either; it is left alone, silently, exactly as before. The rule is for
+callers of `sqlite.DestructiveChanges` (below), which diffs whatever
+two snapshots it is handed. Dropping a table still means writing the
+`DROP` into a migration.
+
+`PushOptions.AllowDestructive` applies them anyway — the same
+permission `drops push --allow-destructive` carries on PostgreSQL, and
+the same meaning: not that the change is safe, but that somebody has
+read what it destroys. It does **not** answer a rename question, and a
+rename answer does not permit a drop; a column being renamed rather
+than dropped is a question about what the change means, and the two
+must not collapse into one option. `sqlite.DestructiveChanges(prev,
+cur, opts)` computes the same list from any pair of snapshots.
+
+Two things deliberately do not trigger it. A rebuild that only widens a
+table loses nothing and is not refused — otherwise the option would be
+needed on almost every push and would stop meaning anything. And
+`alter-column-set-not-null` is confirmed against the rows before it is
+reported: tightening a column that holds no `NULL` goes through
+untouched.
+
+`PushOptions.DryRun` does not refuse. It returns the plan with
+`PushResult.Destructive` filled in, because a preview that will not show
+you what you would have to permit is no preview.
+
+**This is a breaking change** for anyone who relied on the old silence:
+a push that used to drop a column now stops. The migration path is one
+option, or one flag.
+
 One rebuild is impossible rather than lossy. `ALTER TABLE t_new RENAME
 TO t` resolves every view and every trigger body that names `t`, and
 between the `DROP` and the `RENAME` there is no `t` — so a table

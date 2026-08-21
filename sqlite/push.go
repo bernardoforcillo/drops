@@ -4,13 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // PushOptions tunes how Push applies schema changes.
 type PushOptions struct {
 	// DryRun returns the statements that would be applied without
 	// executing them — useful for previewing changes in CI.
+	//
+	// A dry run does not refuse. It reports what it found in
+	// PushResult.Destructive and leaves the decision to the caller,
+	// because a preview that will not show you the plan you would have
+	// to permit is no preview at all. The refusal happens on the run
+	// that would have written.
 	DryRun bool
+
+	// AllowDestructive applies the changes Push otherwise refuses —
+	// the ones that lose a column, convert a value, drop an index or
+	// leave a trigger broken. It is off by default; see "A change a
+	// rebuild cannot carry the data through" in Push's doc comment.
+	//
+	// It is the same permission `drops push --allow-destructive`
+	// carries on PostgreSQL, and it means the same thing: not that the
+	// change is safe, but that somebody has looked at what it destroys
+	// and said yes. It does not answer a rename question — see
+	// PushOptions.Renames — because whether a column is being renamed
+	// and whether it may be destroyed are two different questions, and
+	// one answer must not stand in for the other.
+	AllowDestructive bool
 
 	// Renames answers the rename questions this push raises, for one
 	// run. They are merged over what the schema itself declares — see
@@ -35,10 +56,44 @@ type PushResult struct {
 	// Applied is true when the statements were executed (false for
 	// DryRun or an empty diff).
 	Applied bool
+
+	// Destructive is what this push destroys — read out of the diff,
+	// because none of it can be read out of Statements. Non-empty only
+	// on a DryRun or under AllowDestructive: otherwise Push refuses
+	// and these come back inside a *DestructiveChangeError instead.
+	Destructive []DestructiveChange
 }
 
 // ErrSchemaRequired is returned by Push when schema is nil.
 var ErrSchemaRequired = errors.New("drops/sqlite: Push requires a non-nil schema")
+
+// DestructiveChangeError is Push declining to destroy something
+// nobody said it could. Nothing was applied.
+//
+// It carries the findings rather than a summary because a refusal that
+// says only "this push is destructive" has told the operator nothing
+// they can act on, and the next thing they do is set AllowDestructive
+// blind — which is how the option stops meaning anything.
+type DestructiveChangeError struct {
+	// Changes is everything the push would have destroyed, in the
+	// order the diff found it.
+	Changes []DestructiveChange
+}
+
+func (e *DestructiveChangeError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "drops/sqlite: refusing a push that destroys %d thing(s), and applying nothing:", len(e.Changes))
+	for _, c := range e.Changes {
+		b.WriteString("\n  [" + c.Rule + "] " + c.Message)
+		if c.Suggestion != "" {
+			b.WriteString("\n      " + c.Suggestion)
+		}
+	}
+	b.WriteString("\nNone of this is visible in the statements the push would run: on SQLite a schema change is a\n" +
+		"table rebuild, and a rebuild that loses a column is spelled exactly like one that does not.\n" +
+		"Set PushOptions.AllowDestructive once you have read the list.")
+	return b.String()
+}
 
 // Push introspects the live database, diffs it against the supplied Go
 // schema, and applies the changes — the drops equivalent of drizzle-kit
@@ -50,7 +105,10 @@ var ErrSchemaRequired = errors.New("drops/sqlite: Push requires a non-nil schema
 //     "A change that could be a rename" below.
 //   - Diffs the two, over the tables schema declares — a table drops was
 //     never told about belongs to somebody else and is left alone.
-//   - If DryRun, returns the statements unexecuted.
+//   - Reads the same diff for what it destroys, and refuses unless
+//     AllowDestructive says otherwise. See "A change a rebuild cannot
+//     carry the data through" below.
+//   - If DryRun, returns the statements unexecuted, with what it found.
 //   - Otherwise applies them in a single transaction; any failure rolls
 //     the whole push back.
 //
@@ -81,6 +139,46 @@ var ErrSchemaRequired = errors.New("drops/sqlite: Push requires a non-nil schema
 // (*Table).RenamedFrom, which is durable and travels to every database
 // the schema is pushed to, or for one run with PushOptions.Renames.
 //
+// # A change a rebuild cannot carry the data through
+//
+// Answering the rename question settles what a change means. It does
+// not settle whether the change may run, and on this dialect that
+// second question has nowhere else to be asked.
+//
+// On PostgreSQL a destructive change is a destructive statement, so
+// `drops push` can read the plan it is about to run, classify the DDL
+// and stop on a DROP COLUMN. Here the plan is a CREATE, an INSERT ...
+// SELECT, a DROP TABLE and a RENAME — the same four statements whether
+// the rebuild widens the table or loses half of it. The column that is
+// going is simply absent from the INSERT's column list. There is no
+// statement to classify, so a guard downstream of the SQL cannot exist.
+//
+// What can is a guard on the diff, which is where the fact lives: this
+// column is in the previous snapshot and not in the next one. Push asks
+// DestructiveChanges for it and refuses unless AllowDestructive. The
+// rules cover what a rebuild costs, which is more than a dropped
+// column:
+//
+//   - drop-column — the column is in the database and not in the
+//     schema, so the copy leaves it out and its data goes.
+//   - alter-column-type — the column goes from TEXT affinity to a
+//     numeric one, and the copy converts as it goes: '007' arrives as
+//     the integer 7.
+//   - alter-column-set-not-null — the column gains NOT NULL and the
+//     rows still hold NULLs, which the copy will not accept. Push
+//     confirms this one against the data before reporting it, so a
+//     table with no NULLs in the column is not stopped for nothing;
+//     see confirmNotNullLosses.
+//   - rebuild-drops-index and rebuild-stale-trigger — the index that
+//     keys a departing column, which the rebuild does not put back,
+//     and the trigger that names one, which it puts back broken. Diff
+//     writes both into the migration as comments and GenerateMigration
+//     surfaces them through AnalyzeMigration; until now Push, which
+//     prints no migration for anyone to read, did not.
+//
+// The refusal returns *DestructiveChangeError naming every finding,
+// before any statement runs.
+//
 // Push is convenient for development but skips migration history; prefer
 // the Migrator for production, so changes are reviewable and reproducible.
 func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*PushResult, error) {
@@ -109,8 +207,17 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	if len(stmts) == 0 {
 		return &PushResult{Statements: nil, Applied: false}, nil
 	}
+
+	destructive, err := confirmNotNullLosses(ctx, db,
+		DestructiveChanges(owned, desired, DiffOptions{Renames: renames}), renames)
+	if err != nil {
+		return nil, err
+	}
 	if opt.DryRun {
-		return &PushResult{Statements: stmts, Applied: false}, nil
+		return &PushResult{Statements: stmts, Applied: false, Destructive: destructive}, nil
+	}
+	if len(destructive) > 0 && !opt.AllowDestructive {
+		return nil, &DestructiveChangeError{Changes: destructive}
 	}
 
 	if err := db.InTx(ctx, func(tx *DB) error {
@@ -123,7 +230,94 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}); err != nil {
 		return nil, err
 	}
-	return &PushResult{Statements: stmts, Applied: true}, nil
+	return &PushResult{Statements: stmts, Applied: true, Destructive: destructive}, nil
+}
+
+// confirmNotNullLosses puts the alter-column-set-not-null findings to
+// the database and keeps only the ones the rows bear out.
+//
+// Every other rule is settled by the two schemas alone: a column either
+// is in both or is not, a declared type either changes affinity or does
+// not. This one is not. "Gains NOT NULL" is a fact about the schemas;
+// "and there are NULLs to carry" is a fact about the rows, and only the
+// second one costs anything — a table with no NULL in that column
+// rebuilds cleanly and has nothing to be stopped for.
+//
+// Refusing without asking would be the more conservative choice and the
+// worse one. Tightening a column that was never actually null is an
+// ordinary, frequent change, and a guard that demands AllowDestructive
+// for it teaches the reflex of setting AllowDestructive — after which
+// the option is no longer protecting the drop-column case it exists
+// for.
+//
+// The lookup is by the names the database has now. The findings are
+// computed against a previous schema in which the renames have already
+// been applied, but nothing has run yet, so the live table still
+// answers to the name it had before this push.
+func confirmNotNullLosses(ctx context.Context, db *DB, changes []DestructiveChange, renames []Rename) ([]DestructiveChange, error) {
+	out := make([]DestructiveChange, 0, len(changes))
+	for _, c := range changes {
+		if c.Rule != "alter-column-set-not-null" {
+			out = append(out, c)
+			continue
+		}
+		table, column := liveNames(renames, c.Table, c.Object)
+		n, err := countNulls(ctx, db, table, column)
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			continue
+		}
+		c.Message = fmt.Sprintf("column %s of %s gains NOT NULL and %d row(s) hold NULL there; "+
+			"the rebuild's INSERT ... SELECT carries those NULLs into a column that rejects them, so the push fails partway rather than converging.",
+			quoteIdent(c.Object), quoteIdent(c.Table), n)
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// countNulls asks how many rows hold NULL in one column.
+func countNulls(ctx context.Context, db *DB, table, column string) (int64, error) {
+	rows, err := db.Query(ctx, "SELECT count(*) FROM "+quoteIdent(table)+" WHERE "+quoteIdent(column)+" IS NULL")
+	if err != nil {
+		return 0, fmt.Errorf("drops/sqlite: counting NULLs in %s.%s: %w", table, column, err)
+	}
+	defer rows.Close()
+	var n int64
+	if rows.Next() {
+		if err := rows.Scan(&n); err != nil {
+			return 0, fmt.Errorf("drops/sqlite: counting NULLs in %s.%s: %w", table, column, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("drops/sqlite: counting NULLs in %s.%s: %w", table, column, err)
+	}
+	return n, nil
+}
+
+// liveNames maps a table and column named as the diff names them —
+// after the renames — back to the names the database still has.
+//
+// Table renames run before column renames, so a column rename states
+// its table by the table's new name; unwinding therefore goes the other
+// way, column first and then table.
+func liveNames(renames []Rename, table, column string) (string, string) {
+	liveTable, liveColumn := table, column
+	for _, r := range renames {
+		if r.Kind == RenameColumn && r.Table == table && r.To == column {
+			liveColumn = r.From
+		}
+	}
+	for _, r := range renames {
+		if r.Kind == RenameTable && r.To == table {
+			liveTable = r.From
+		}
+	}
+	return liveTable, liveColumn
 }
 
 // resolvePushRenames settles the rename questions this push raises, or

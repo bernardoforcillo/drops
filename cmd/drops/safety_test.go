@@ -5,6 +5,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/bernardoforcillo/drops/pg"
 )
 
 func TestDestructiveNamesWhatItRefuses(t *testing.T) {
@@ -65,9 +67,89 @@ func TestExpensiveStatementsAreWarningsNotRefusals(t *testing.T) {
 	if found := destructive(statements); len(found) != 0 {
 		t.Fatalf("refused %d non-destructive statement(s): %+v", len(found), found)
 	}
-	if got := warnings(statements); len(got) == 0 {
+	if got := warnings(statements, nil); len(got) == 0 {
 		t.Fatal("no warnings for a migration that rewrites a table and locks it twice")
 	}
+}
+
+// The safety analyser sees a DROP COLUMN beside an ADD COLUMN and says
+// that is what an unstated rename looks like. It is right about the SQL
+// and wrong about this run: --drop-column stated the answer, and
+// repeating the question under it is how a tool teaches people to stop
+// reading its output.
+func TestAnsweredRenameNoticesAreNotPrintedAgain(t *testing.T) {
+	statements := []string{
+		`ALTER TABLE "users" DROP COLUMN "email"`,
+		`ALTER TABLE "users" ADD COLUMN "emailAddress" text`,
+		`DROP TABLE "sessions"`,
+		`CREATE TABLE "tokens" ("id" bigserial PRIMARY KEY NOT NULL)`,
+	}
+	if !hasWarning(warnings(statements, nil), "unstated-column-rename") {
+		t.Fatal("the notice this test is about is not raised with no answers at all")
+	}
+	if !hasWarning(warnings(statements, nil), "unstated-table-rename") {
+		t.Fatal("the table notice is not raised with no answers at all")
+	}
+
+	answered := []bridgeRename{
+		{Kind: "column", Table: "users", From: "email"},
+		{Kind: "table", From: "sessions"},
+	}
+	got := warnings(statements, answered)
+	if hasWarning(got, "unstated-column-rename") {
+		t.Errorf("the column question was asked again after --drop-column answered it: %+v", got)
+	}
+	if hasWarning(got, "unstated-table-rename") {
+		t.Errorf("the table question was asked again after --drop-table answered it: %+v", got)
+	}
+}
+
+// An answer covers the column it names and no other. A migration that
+// drops two columns from one table and has an answer for one of them
+// still has a question outstanding, and the notice is how it gets
+// asked.
+func TestAHalfAnsweredRenameNoticeStays(t *testing.T) {
+	statements := []string{
+		`ALTER TABLE "users" DROP COLUMN "email"`,
+		`ALTER TABLE "users" DROP COLUMN "nickname"`,
+		`ALTER TABLE "users" ADD COLUMN "emailAddress" text`,
+	}
+	answered := []bridgeRename{{Kind: "column", Table: "users", From: "email"}}
+	if !hasWarning(warnings(statements, answered), "unstated-column-rename") {
+		t.Error("nickname was never asked about and the notice went quiet anyway")
+	}
+	answered = append(answered, bridgeRename{Kind: "column", Table: "users", From: "nickname"})
+	if hasWarning(warnings(statements, answered), "unstated-column-rename") {
+		t.Error("both columns are answered and the notice is still asking")
+	}
+}
+
+// An answer about one table says nothing about another.
+func TestAnAnswerDoesNotTravelBetweenTables(t *testing.T) {
+	statements := []string{
+		`ALTER TABLE "users" DROP COLUMN "email"`,
+		`ALTER TABLE "users" ADD COLUMN "emailAddress" text`,
+		`ALTER TABLE "orders" DROP COLUMN "note"`,
+		`ALTER TABLE "orders" ADD COLUMN "comment" text`,
+	}
+	answered := []bridgeRename{{Kind: "column", Table: "users", From: "email"}}
+	got := warnings(statements, answered)
+	if len(got) != 1 || got[0].Rule != "unstated-column-rename" {
+		t.Fatalf("warnings = %+v, want the one notice orders still has coming", got)
+	}
+	if !strings.Contains(got[0].Statement, "orders") {
+		t.Errorf("the surviving notice is about the answered table: %s", got[0].Statement)
+	}
+}
+
+// hasWarning reports whether the rule appears among the findings.
+func hasWarning(found []pg.SafetyWarning, rule string) bool {
+	for _, w := range found {
+		if w.Rule == rule {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGuardRefusesAndExplains(t *testing.T) {

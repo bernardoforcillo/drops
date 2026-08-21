@@ -72,19 +72,124 @@ func destructive(statements []string) []refusal {
 
 // warnings returns the safety findings that are not refusals, so a
 // migration that is merely expensive still says so.
-func warnings(statements []string) []pg.SafetyWarning {
+//
+// decisions are the rename answers this run carries — the flags, plus
+// whatever --interactive collected. The two rename notices they have
+// already settled are left out; see answeredRenames.
+func warnings(statements []string, decisions []bridgeRename) []pg.SafetyWarning {
 	flat := make([]string, 0, len(statements))
 	for _, stmt := range statements {
 		flat = append(flat, collapse(stmt))
 	}
+	answered := newAnsweredRenames(flat, decisions)
 	var out []pg.SafetyWarning
 	for _, w := range pg.AnalyzeStatements(flat) {
 		if _, isRefusal := destructiveRules[w.Rule]; isRefusal {
 			continue
 		}
+		if answered.settles(w) {
+			continue
+		}
 		out = append(out, w)
 	}
 	return out
+}
+
+// answeredRenames matches a rename notice against the answers this run
+// was given.
+//
+// pg.AnalyzeStatements reads statements and only statements. That is
+// deliberate and worth keeping: it is a library, and most of what it is
+// handed — a drizzle-kit migration, a file somebody edited by hand — has
+// no decision behind it to be told about. So it goes on reporting that a
+// migration drops one column and adds another, which is all the SQL
+// says, and cannot know that --drop-column named that very column.
+//
+// Printing "state the rename" directly underneath the answer is how a
+// tool teaches people to stop reading its output, so the notice is
+// dropped here, at the one layer that holds both the plan and the
+// answers, rather than by giving the analyser a second kind of input.
+type answeredRenames struct {
+	// tables and columns are the objects a decision spoke for, by the
+	// name that is going. A rename and a refusal both count: either
+	// way the question has an answer on record.
+	tables  map[string]bool
+	columns map[string]map[string]bool
+	// dropped is every column the plan drops, by table. A notice
+	// covers all of them, not only the one its Statement happens to
+	// name, so a half-answered question has to stay on the screen.
+	dropped map[string][]string
+}
+
+func newAnsweredRenames(statements []string, decisions []bridgeRename) answeredRenames {
+	a := answeredRenames{
+		tables:  map[string]bool{},
+		columns: map[string]map[string]bool{},
+		dropped: map[string][]string{},
+	}
+	for _, d := range decisions {
+		switch d.Kind {
+		case "table":
+			a.tables[d.From] = true
+		case "column":
+			if a.columns[d.Table] == nil {
+				a.columns[d.Table] = map[string]bool{}
+			}
+			a.columns[d.Table][d.From] = true
+		}
+	}
+	for _, stmt := range statements {
+		if m := reDropColumnStmt.FindStringSubmatch(stmt); len(m) > 2 {
+			table := unquoteIdent(m[1])
+			a.dropped[table] = append(a.dropped[table], unquoteIdent(m[2]))
+		}
+	}
+	return a
+}
+
+// settles reports whether w is one of the two rename notices and every
+// object it is about has a decision on record.
+func (a answeredRenames) settles(w pg.SafetyWarning) bool {
+	switch w.Rule {
+	case "unstated-table-rename":
+		m := reDropTableStmt.FindStringSubmatch(w.Statement)
+		if len(m) < 2 {
+			return false
+		}
+		return a.tables[unquoteIdent(m[1])]
+	case "unstated-column-rename":
+		m := reDropColumnStmt.FindStringSubmatch(w.Statement)
+		if len(m) < 3 {
+			return false
+		}
+		table := unquoteIdent(m[1])
+		for _, col := range a.dropped[table] {
+			if !a.columns[table][col] {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// identPat matches one SQL identifier, quoted or bare, optionally
+// schema-qualified — the same shape pg's analyser reads names with. The
+// CLI needs its own readers because a notice arrives as text: matching
+// one against the answers on the command line means recovering the
+// names out of the statement it names.
+const identPat = `(?:"[^"]*"|[A-Za-z_][\w$]*)(?:\.(?:"[^"]*"|[A-Za-z_][\w$]*))?`
+
+var (
+	reDropTableStmt  = regexp.MustCompile(`(?i)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(` + identPat + `)`)
+	reDropColumnStmt = regexp.MustCompile(
+		`(?i)\bALTER\s+TABLE\s+(?:ONLY\s+)?(` + identPat + `)\s+DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?(` + identPat + `)`)
+)
+
+// unquoteIdent strips the quoting from an identifier so the two
+// spellings of one name compare equal.
+func unquoteIdent(s string) string {
+	return strings.ReplaceAll(s, `"`, "")
 }
 
 // guard reports the destructive statements in a plan and, unless
@@ -114,9 +219,10 @@ func guard(w io.Writer, statements []string, allowed bool) error {
 	return findingError{errors.New("stopped before applying anything; re-run with --allow-destructive if that is what you meant")}
 }
 
-// printWarnings writes the non-destructive safety findings.
-func printWarnings(w io.Writer, statements []string) {
-	found := warnings(statements)
+// printWarnings writes the non-destructive safety findings, less the
+// rename notices the run's own answers have already settled.
+func printWarnings(w io.Writer, statements []string, decisions []bridgeRename) {
+	found := warnings(statements, decisions)
 	if len(found) == 0 {
 		return
 	}

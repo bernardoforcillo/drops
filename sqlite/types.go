@@ -42,8 +42,13 @@ func Numeric(name string, _, _ int) *Col[string] { return newCol[string](name, s
 // Boolean is stored as INTEGER 0/1; declared as BOOLEAN for readability.
 func Boolean(name string) *Col[bool] { return newCol[bool](name, simpleType("BOOLEAN")) }
 
-// Date / Time / Timestamp map to SQLite's date-time storage (TEXT
-// affinity via the DATE/TIME/DATETIME declared types).
+// Date / Time / Timestamp map to SQLite's date-time storage, declared
+// DATE / TIME / DATETIME. None of those spellings matches any of
+// SQLite's affinity keywords, so all three carry NUMERIC affinity, not
+// TEXT — an ISO-8601 string is stored as text because it is not a
+// numeric literal, but a value that does read as a number is converted
+// to one on the way in. See typeAffinity in safety.go, which is where
+// that matters.
 func Date(name string) *Col[time.Time] { return newCol[time.Time](name, simpleType("DATE")) }
 func Time(name string) *Col[time.Time] { return newCol[time.Time](name, simpleType("TIME")) }
 

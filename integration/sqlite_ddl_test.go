@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
+	_ "modernc.org/sqlite"
+
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/sqlite"
 	"github.com/bernardoforcillo/drops/stdlib"
-	_ "modernc.org/sqlite"
 )
 
 func openSQLite(t *testing.T) *sqlite.DB {

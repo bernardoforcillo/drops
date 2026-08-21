@@ -71,8 +71,8 @@ type bridgeRequest struct {
 	DryRun               bool       `json:"dryRun,omitempty"`
 	DropUnmanagedIndexes bool       `json:"dropUnmanagedIndexes,omitempty"`
 
-	// Renames answers the rename questions generate would otherwise
-	// stop on. See rename.go.
+	// Renames answers the rename questions generate or push would
+	// otherwise stop on. See rename.go.
 	Renames []bridgeRename `json:"renames,omitempty"`
 }
 
@@ -132,6 +132,16 @@ type bridgePushResult struct {
 	Statements []string       `json:"statements"`
 	Applied    bool           `json:"applied"`
 	Notices    []bridgeNotice `json:"notices"`
+
+	// RenameCandidates is non-empty when the push refused because the
+	// change could be a rename and no answer was on hand, and then
+	// nothing was introspected further and nothing was applied.
+	// RenameMessage is what drops/pg said about it, passed through
+	// whole. Push carries the same two fields generate does because it
+	// stops for the same reason, and the CLI puts the question the same
+	// way.
+	RenameCandidates []bridgeCandidate `json:"renameCandidates,omitempty"`
+	RenameMessage    string            `json:"renameMessage,omitempty"`
 }
 
 type bridgeNotice struct {
@@ -390,25 +400,13 @@ func run() error {
 		reply["snapshot"] = json.RawMessage(body)
 
 	case "generate":
-		decisions := make([]pg.RenameDecision, 0, len(req.Renames))
-		for _, r := range req.Renames {
-			decisions = append(decisions, pg.RenameDecision{
-				Rename: pg.Rename{
-					Kind:  pg.RenameKind(r.Kind),
-					Table: r.Table,
-					From:  r.From,
-					To:    r.To,
-				},
-				IsRename: r.IsRename,
-			})
-		}
 		res, err := pg.GenerateMigration(pg.GenerateOptions{
 			Schema:   schema,
 			Dir:      req.Dir,
 			Name:     req.Name,
 			Safe:     req.Safe,
 			WithDown: req.WithDown,
-			Renames:  decisions,
+			Renames:  decisions(req),
 		})
 		if err != nil {
 			// An ambiguous rename is a question, not a failure: it
@@ -418,16 +416,8 @@ func run() error {
 			if !errors.As(err, &amb) {
 				return err
 			}
-			cands := make([]map[string]any, 0, len(amb.Candidates))
-			for _, c := range amb.Candidates {
-				cands = append(cands, map[string]any{
-					"kind": string(c.Kind), "table": c.Table,
-					"from": c.From, "to": c.To,
-					"fromType": c.FromType, "toType": c.ToType,
-				})
-			}
 			reply["generate"] = map[string]any{
-				"renameCandidates": cands, "renameMessage": amb.Error(),
+				"renameCandidates": candidates(amb.Candidates), "renameMessage": amb.Error(),
 			}
 			break
 		}
@@ -455,9 +445,22 @@ func run() error {
 			Safe:                 req.Safe,
 			DryRun:               req.DryRun,
 			DropUnmanagedIndexes: req.DropUnmanagedIndexes,
+			Renames:              decisions(req),
 		})
 		if err != nil {
-			return err
+			// Same as generate: a rename drops cannot settle is a
+			// question, not a failure, and it travels back as data. It
+			// arrives before anything was applied, so there is no
+			// half-done push behind it.
+			var amb *pg.RenameAmbiguityError
+			if !errors.As(err, &amb) {
+				return err
+			}
+			reply["push"] = map[string]any{
+				"statements": []string{}, "applied": false, "notices": []any{},
+				"renameCandidates": candidates(amb.Candidates), "renameMessage": amb.Error(),
+			}
+			break
 		}
 		notices := make([]map[string]any, 0, len(res.Notices))
 		for _, n := range res.Notices {
@@ -474,6 +477,38 @@ func run() error {
 		return fmt.Errorf("unknown mode %q", req.Mode)
 	}
 	return json.NewEncoder(os.Stdout).Encode(reply)
+}
+
+// decisions turns the answers the CLI passed in into the shape both
+// pg.GenerateOptions and pg.PushOptions take. The two commands stop on
+// the same question, so they take the same answer.
+func decisions(req request) []pg.RenameDecision {
+	out := make([]pg.RenameDecision, 0, len(req.Renames))
+	for _, r := range req.Renames {
+		out = append(out, pg.RenameDecision{
+			Rename: pg.Rename{
+				Kind:  pg.RenameKind(r.Kind),
+				Table: r.Table,
+				From:  r.From,
+				To:    r.To,
+			},
+			IsRename: r.IsRename,
+		})
+	}
+	return out
+}
+
+// candidates renders the unanswered pairs for the reply.
+func candidates(in []pg.RenameCandidate) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, c := range in {
+		out = append(out, map[string]any{
+			"kind": string(c.Kind), "table": c.Table,
+			"from": c.From, "to": c.To,
+			"fromType": c.FromType, "toType": c.ToType,
+		})
+	}
+	return out
 }
 
 $CONNECT$`

@@ -35,7 +35,6 @@ func TestMySQLCreateTableEnforcesChecks(t *testing.T) {
 	if _, err := db.Exec(ctx, "INSERT INTO `"+tbl.Name()+"` (`age`) VALUES (7)"); err != nil {
 		t.Fatalf("a conforming row was rejected: %v", err)
 	}
-	err = nil
 	if _, err = db.Exec(ctx, "INSERT INTO `"+tbl.Name()+"` (`age`) VALUES (-1)"); err == nil {
 		t.Fatal("the server accepted a row the CHECK forbids, so CreateTable did not create it")
 	}

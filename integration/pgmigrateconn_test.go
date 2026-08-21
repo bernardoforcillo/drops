@@ -26,7 +26,12 @@ import (
 // binary timeout.
 func openPGCapped(t *testing.T, max int) *pg.DB {
 	t.Helper()
-	dsn := integration.DSN(t, integration.EnvPostgres)
+	return openCappedDSN(t, integration.DSN(t, integration.EnvPostgres), max)
+}
+
+// openCappedDSN is the same, against a database the caller names.
+func openCappedDSN(t *testing.T, dsn string, max int) *pg.DB {
+	t.Helper()
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -147,7 +152,14 @@ func TestPGDrizzleMigrationFitsInTwoConnections(t *testing.T) {
 // after the last. Pinning that keeps a future lock around Push from
 // being added without the cap that pays for it.
 func TestPGPushFitsInOneConnection(t *testing.T) {
-	db := openPGCapped(t, 1)
+	// A database of its own. Push's previous side is everything it
+	// introspects, so against the suite's shared database this push
+	// would propose to drop every table another test left behind —
+	// and, since Push learned to ask about renames, stop to ask
+	// whether one of those is this test's table arriving under a new
+	// name. The connection budget is what is being pinned here, so the
+	// question is kept out of the way rather than answered.
+	db := openCappedDSN(t, freshDatabase(t), 1)
 	ctx := cappedCtx(t)
 
 	tbl := pg.NewTable(integration.UniqueName(t, "pushconn"))

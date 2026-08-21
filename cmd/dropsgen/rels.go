@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
 	"go/format"
+	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"os/exec"
@@ -72,11 +75,31 @@ import (
 // is not the one a codebase wants, the shape can be named outright:
 // -shape 'AuthorWithBooks=authors:books'.
 //
-// What happens when the struct already exists. The same as in rows
-// mode, for the same reason: it is skipped and the header says which
-// name and which file, because two declarations of one name in one
-// package do not compile and overwriting somebody's struct is not a
-// generator's call to make.
+// What happens when the struct already exists. It is skipped and the
+// header says which name and which file, because two declarations of
+// one name in one package do not compile and overwriting somebody's
+// struct is not a generator's call to make — but only when the struct
+// already there is the one this run would have written.
+//
+// That last clause is the whole of the naming scheme's soundness. A
+// derived name erases where a path was split: users plus
+// "comments.posts" and users plus "comments,posts" are two different
+// trees and one string. Asked for both in one run the generator sees
+// the clash and refuses. Asked for them in two runs writing two files
+// it would see only the second, find the name declared, and stand
+// aside — leaving the caller with no error and a name that resolves
+// to a struct carrying different relations, which is a query that
+// loads the wrong thing or is refused outright under StrictLoading.
+//
+// The fix is not a longer name. The names are already at the limit of
+// what anybody will read — UsersWithManagerPostsPostsCommentsPostsTagsProfile
+// is a real output — and encoding the tree unambiguously into one Go
+// identifier can only add to that. The package's own declarations are
+// the manifest instead: the fields of every struct it already
+// declares are read back and compared with the fields this run would
+// have written, and a disagreement is the same refusal the in-run
+// collision gets, with the same way out. Nothing new to check in, no
+// file to keep in sync, and no name a character longer.
 
 // relsFileSuffix names the generated shape file. Rows mode knows it
 // too: a shape nests the row structs, so the two files are written
@@ -192,7 +215,15 @@ func runRels(pattern string, shapes []string, outName string) error {
 		restore()
 		return err
 	}
-	src, err := emitRels(pkg, tables, specs, taken)
+	// And what those declarations *are*, not just that they exist. A
+	// name already taken is only one to stand aside for when the
+	// struct behind it is the struct this run would have written.
+	declared, err := declaredShapeFields(pkg.Dir, pkg.Name)
+	if err != nil {
+		restore()
+		return err
+	}
+	src, err := emitRels(pkg, tables, specs, taken, declared)
 	if err != nil {
 		restore()
 		return err
@@ -500,10 +531,15 @@ type relsDef struct {
 	// dropped, so what the collision message suggests is a -shape the
 	// generator would accept.
 	Rename string
+	// Root says whether this struct is the shape's own, or a nested
+	// one named for its table and the paths beneath it. Only the root
+	// can be renamed on the command line, so only the root gets told
+	// to.
+	Root bool
 }
 
 // emitRels renders the generated file.
-func emitRels(pkg *rowsPackage, tables []relsTable, specs []relsSpec, taken map[string]string) ([]byte, error) {
+func emitRels(pkg *rowsPackage, tables []relsTable, specs []relsSpec, taken map[string]string, declared map[string][]string) ([]byte, error) {
 	byName := make(map[string]*relsTable, len(tables))
 	for i := range tables {
 		byName[qualifiedName(tables[i])] = &tables[i]
@@ -546,7 +582,7 @@ func emitRels(pkg *rowsPackage, tables []relsTable, specs []relsSpec, taken map[
 			name = shapeTypeName(root)
 		}
 		collectRowNames(root, needRow)
-		if err := defineRelsNodes(root, name, spec, taken, define); err != nil {
+		if err := defineRelsNodes(root, name, true, spec, taken, define); err != nil {
 			return nil, err
 		}
 	}
@@ -570,11 +606,20 @@ func emitRels(pkg *rowsPackage, tables []relsTable, specs []relsSpec, taken map[
 	sort.Strings(order)
 	var kept []string
 	for _, name := range order {
-		if prev, ok := taken[name]; ok {
-			skipped = append(skipped, skipNote(name, prev))
+		prev, ok := taken[name]
+		if !ok {
+			kept = append(kept, name)
 			continue
 		}
-		kept = append(kept, name)
+		fields, isStruct := declared[name]
+		same, err := sameShape(fields, defs[name])
+		if err != nil {
+			return nil, err
+		}
+		if !same {
+			return nil, collisionWithDeclaration(defs[name], prev, isStruct)
+		}
+		skipped = append(skipped, skipNote(name, prev))
 	}
 
 	var b bytes.Buffer
@@ -592,10 +637,10 @@ func emitRels(pkg *rowsPackage, tables []relsTable, specs []relsSpec, taken map[
 			fmt.Fprintf(&b, "//   %s\n", s)
 		}
 		b.WriteString("// Two declarations of one name in one package do not compile, so a\n")
-		b.WriteString("// generator that meets a hand-written struct can only stand aside.\n")
-		b.WriteString("// The hand-written one is what the other structs here nest, so it\n")
-		b.WriteString("// has to carry the same fields — rename yours, or delete it and let\n")
-		b.WriteString("// this file own the name.\n")
+		b.WriteString("// generator that meets one already there can only stand aside — and\n")
+		b.WriteString("// it only stands aside for a struct carrying the fields it would\n")
+		b.WriteString("// have written itself, because that struct is what the shapes below\n")
+		b.WriteString("// nest. Edit it and the next run refuses rather than skips.\n")
 	}
 	fmt.Fprintf(&b, "\npackage %s\n", pkg.Name)
 
@@ -636,7 +681,7 @@ func collectRowNames(n *relsNode, into map[string]bool) {
 // needs to define. name overrides the derived name for the root only:
 // a nested node is named by its table and its paths, because that is
 // what makes two shapes that reach the same node share one struct.
-func defineRelsNodes(n *relsNode, name string, spec relsSpec, taken map[string]string, define func(*relsDef) error) error {
+func defineRelsNodes(n *relsNode, name string, root bool, spec relsSpec, taken map[string]string, define func(*relsDef) error) error {
 	if len(n.children) == 0 {
 		return nil // a leaf is the row struct; rows mode declares it
 	}
@@ -664,7 +709,7 @@ func defineRelsNodes(n *relsNode, name string, spec relsSpec, taken map[string]s
 	}
 
 	doc := relsDoc(n, name, rowName, shadowed, taken)
-	if err := define(&relsDef{Name: name, Doc: doc, Body: body, From: fmt.Sprintf("%q", spec.Raw), Rename: spec.rename()}); err != nil {
+	if err := define(&relsDef{Name: name, Doc: doc, Body: body, From: fmt.Sprintf("%q", spec.Raw), Rename: spec.rename(), Root: root}); err != nil {
 		return err
 	}
 	for _, child := range n.children {
@@ -674,7 +719,7 @@ func defineRelsNodes(n *relsNode, name string, spec relsSpec, taken map[string]s
 			// interface and the caller type-switches on it.
 			continue
 		}
-		if err := defineRelsNodes(child, shapeTypeName(child), spec, taken, define); err != nil {
+		if err := defineRelsNodes(child, shapeTypeName(child), false, spec, taken, define); err != nil {
 			return err
 		}
 	}
@@ -808,4 +853,173 @@ func englishList(names []string) string {
 		return names[0] + " and " + names[1]
 	}
 	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+}
+
+// collisionWithDeclaration words the refusal for a name the package
+// already declares as something other than what this run would write.
+//
+// It is the cross-run twin of the message define() produces, and it
+// says the same two things: which name, and the way out. The way out
+// differs, because only a shape's own struct can be renamed on the
+// command line — a nested one is named for its table and the paths
+// beneath it, which is exactly what makes two shapes that reach one
+// node share one struct.
+//
+// isStruct says whether the name is taken by a struct type at all.
+// declaredNames records every top-level declaration, so the thing in
+// the way may be a func, a var or an alias — and telling its author
+// that their func carries the wrong fields sends them looking for
+// fields it does not have.
+func collisionWithDeclaration(def *relsDef, file string, isStruct bool) error {
+	where := "the package"
+	if file != "" {
+		where = file
+	}
+	what := "a " + def.Name + " with different fields"
+	if !isStruct {
+		what = def.Name + ", and it is not a struct type"
+	}
+	if def.Root {
+		return fmt.Errorf("shape %s generates %s, and %s already declares %s; the declaration that is already there is what a query written against this name would load, so this is a collision and not a struct to stand aside for — name this one outright, as -shape 'SomeName=%s'",
+			def.From, def.Name, where, what, def.Rename)
+	}
+	return fmt.Errorf("shape %s nests %s, and %s already declares %s; a nested shape is named for its table and the paths beneath it and cannot be renamed on the command line, so the two shapes have to be generated into one file — or the relation names they walk have to differ",
+		def.From, def.Name, where, what)
+}
+
+// declaredShapeFields renders the fields of every struct type the
+// package declares, keyed by name, in the form sameShape compares.
+//
+// declaredNames answers whether a name is taken. This answers what it
+// is taken *by*, which is the difference between a struct this
+// generator would have written anyway and one that merely arrived at
+// the same derived name from a different relation tree.
+func declaredShapeFields(dir, pkgName string) (map[string][]string, error) {
+	files, fset, err := packageFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]string{}
+	for _, af := range files {
+		if af.Name.Name != pkgName {
+			continue
+		}
+		for _, decl := range af.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || ts.Assign.IsValid() {
+					continue // an alias is not a struct declaration
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				out[ts.Name.Name] = structFieldSignature(fset, st)
+			}
+		}
+	}
+	return out, nil
+}
+
+// structFieldSignature renders one struct's fields as one string per
+// field: name, type and tag, with the whitespace gofmt distributes
+// between them collapsed. What survives is what the compiler and the
+// loader see, so two declarations agree here exactly when they are
+// the same struct.
+func structFieldSignature(fset *token.FileSet, st *ast.StructType) []string {
+	out := []string{}
+	if st.Fields == nil {
+		return out
+	}
+	for _, f := range st.Fields.List {
+		var typ bytes.Buffer
+		if err := printer.Fprint(&typ, fset, f.Type); err != nil {
+			// An expression that will not print is one the package
+			// does not compile with either; treating it as its own
+			// spelling keeps this from being the place that reports
+			// it.
+			typ.WriteString("?")
+		}
+		tag := ""
+		if f.Tag != nil {
+			if unquoted, err := strconv.Unquote(f.Tag.Value); err == nil {
+				tag = unquoted
+			} else {
+				tag = f.Tag.Value
+			}
+		}
+		rendered := strings.Join(strings.Fields(typ.String()), " ")
+		if len(f.Names) == 0 {
+			out = append(out, rendered+"\x00"+tag)
+			continue
+		}
+		for _, n := range f.Names {
+			out = append(out, n.Name+" "+rendered+"\x00"+tag)
+		}
+	}
+	return out
+}
+
+// sameShape reports whether a struct the package already declares
+// carries the fields this run would have written for the same name.
+//
+// The generated body is parsed rather than string-matched, so the two
+// sides go through one renderer: a hand-written struct that gofmt
+// aligned differently, or that groups its fields, is still the same
+// struct and still gets stood aside for.
+func sameShape(existing []string, def *relsDef) (bool, error) {
+	if def == nil {
+		return false, nil
+	}
+	if existing == nil {
+		// The name is declared by something that is not a struct
+		// type — a func, a var, an alias. Whatever it is, it is not
+		// this shape.
+		return false, nil
+	}
+	want, err := relsBodySignature(def.Body)
+	if err != nil {
+		return false, err
+	}
+	if len(want) != len(existing) {
+		return false, nil
+	}
+	for i := range want {
+		if want[i] != existing[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// relsBodySignature renders a body this generator built through the
+// same parser declaredShapeFields reads the package with, so the two
+// are compared as declarations rather than as text.
+func relsBodySignature(body []string) ([]string, error) {
+	src := "package p\ntype T struct {\n" + strings.Join(body, "\n") + "\n}\n"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "shape.go", src, 0)
+	if err != nil {
+		return nil, fmt.Errorf("generated struct does not parse: %w", err)
+	}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			if st, ok := ts.Type.(*ast.StructType); ok {
+				return structFieldSignature(fset, st), nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("generated struct does not parse: no struct type in %q", src)
 }

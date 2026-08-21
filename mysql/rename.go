@@ -99,6 +99,21 @@ type RenameDecision struct {
 type RenameAmbiguityError struct {
 	// Candidates are the unanswered pairs, in a deterministic order.
 	Candidates []RenameCandidate
+
+	// Advice replaces everything the message says about how to answer
+	// — the per-candidate flag lines and the closing note about the
+	// rename log alike — for a caller neither of them fits. Push is
+	// the one: it compares a Go schema against a live database, there
+	// is no migration directory anywhere in that, and the flags belong
+	// to a command that generates migrations. Sending a person to
+	// either would send them somewhere that does not exist.
+	//
+	// The candidates are still named the same way. It is only the two
+	// ways out that differ, and a message that names the wrong two is
+	// worse than one that names none.
+	//
+	// Empty means the generator's own wording.
+	Advice string
 }
 
 // Error names each ambiguity and both ways out of it.
@@ -109,13 +124,21 @@ func (e *RenameAmbiguityError) Error() string {
 		if c.Kind == RenameColumn {
 			fmt.Fprintf(&b, "  column %q on table %q is gone and %q (%s) has appeared\n",
 				c.From, c.Table, c.To, c.ToType)
-			fmt.Fprintf(&b, "    rename it:      --rename-column %s.%s=%s\n", c.Table, c.From, c.To)
-			fmt.Fprintf(&b, "    or drop it:     --drop-column %s.%s\n", c.Table, c.From)
+			if e.Advice == "" {
+				fmt.Fprintf(&b, "    rename it:      --rename-column %s.%s=%s\n", c.Table, c.From, c.To)
+				fmt.Fprintf(&b, "    or drop it:     --drop-column %s.%s\n", c.Table, c.From)
+			}
 			continue
 		}
 		fmt.Fprintf(&b, "  table %q is gone and %q has appeared with much the same columns\n", c.From, c.To)
-		fmt.Fprintf(&b, "    rename it:      --rename-table %s=%s\n", c.From, c.To)
-		fmt.Fprintf(&b, "    or drop it:     --drop-table %s\n", c.From)
+		if e.Advice == "" {
+			fmt.Fprintf(&b, "    rename it:      --rename-table %s=%s\n", c.From, c.To)
+			fmt.Fprintf(&b, "    or drop it:     --drop-table %s\n", c.From)
+		}
+	}
+	if e.Advice != "" {
+		b.WriteString(e.Advice)
+		return b.String()
 	}
 	b.WriteString("the answer is written to meta/_renames.json, so it is given once and replayed after that")
 	return b.String()
@@ -304,6 +327,60 @@ func typeFamily(t string) string {
 	return t
 }
 
+// DeclaredRenames reads the renames a schema states about itself —
+// every (*Col[T]).RenamedFrom and every (*Table).RenamedFrom — in the
+// shape ResolveRenames settles questions with.
+//
+// It exists because Push has nowhere else to look. GenerateMigration
+// keeps its answers in meta/_renames.json, beside the snapshots that
+// raised the questions; Push compares a Go schema against a live
+// database, and there is no migration directory anywhere in that. The
+// schema is the only thing both sides of a push have in common, and a
+// rename is a fact about the schema's history rather than about one
+// operator's terminal, so the schema is the honest place to keep it:
+// stated once, it answers the same question against every database the
+// schema is ever pushed to.
+//
+// GenerateMigration reads them as well, so a schema that states a
+// rename does not raise the question again on the generate path. What
+// it does not do is write them into the log — the log records answers
+// somebody gave, and this is not one.
+//
+// A declared rename that no longer describes a pending change is inert;
+// see renameStillPending.
+func DeclaredRenames(schema *Schema) []RenameDecision {
+	if schema == nil {
+		return nil
+	}
+	var out []RenameDecision
+	for _, t := range schema.Tables() {
+		if t == nil {
+			continue
+		}
+		if prev := t.PreviousName(); prev != "" {
+			out = append(out, RenameDecision{
+				Rename:   Rename{Kind: RenameTable, From: prev, To: t.Name()},
+				IsRename: true,
+			})
+		}
+		for _, c := range t.Columns() {
+			prev := c.PreviousName()
+			if prev == "" {
+				continue
+			}
+			// The table is named as the schema names it now, because a
+			// column rename is applied after the table rename in front
+			// of it has already run.
+			out = append(out, RenameDecision{
+				Rename:   Rename{Kind: RenameColumn, Table: t.Name(), From: prev, To: c.Name()},
+				IsRename: true,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	return out
+}
+
 // ResolveRenames matches recorded decisions against the candidates a
 // pair of snapshots produces and returns the renames to apply, plus the
 // candidates still unanswered.
@@ -347,14 +424,30 @@ func resolveOneKind(prev, cur *Snapshot, decisions []RenameDecision, kind Rename
 	for _, c := range candidates {
 		offered[c.key()] = true
 	}
-	answered := map[string]bool{}
+	// The refusals are read first, because a refusal outranks a rename
+	// naming the same object. The two answers are not the same shape: a
+	// rename names a pair, a refusal names only the object that is
+	// going. So an answer given for this run cannot outrank the
+	// schema's standing declaration by carrying the same key — the two
+	// keys coincide only when the two agree — and outranks it by naming
+	// the same column instead. Without this, "that column really is
+	// going" was inaudible against a RenamedFrom saying otherwise, and
+	// there was nothing a caller could say to be heard.
 	declined := map[string]bool{}
+	for _, d := range decisions {
+		if d.Kind == kind && !d.IsRename && d.To == "" {
+			declined[d.Kind.side(d.Table, d.From)] = true
+		}
+	}
+	answered := map[string]bool{}
 	for _, d := range decisions {
 		if d.Kind != kind {
 			continue
 		}
 		if !d.IsRename && d.To == "" {
-			declined[d.Kind.side(d.Table, d.From)] = true
+			continue
+		}
+		if declined[d.Kind.side(d.Table, d.From)] {
 			continue
 		}
 		answered[d.key()] = d.IsRename

@@ -4090,12 +4090,6 @@ func TestMySQLCheckViolationIsClassifiedOnBothServers(t *testing.T) {
 	t.Logf("%s reports a failed CHECK as error %d, constraint %q", server, se.Number, se.Constraint)
 }
 
-// mysqlLockRow is the row the contention tests fight over.
-type mysqlLockRow struct {
-	ID int64 `drop:"id"`
-	N  int64 `drop:"n"`
-}
-
 // mysqlContentionFixture creates a two-row table and returns it.
 func mysqlContentionFixture(t *testing.T, db *mysql.DB) (*mysql.Table, *mysql.Col[int64], *mysql.Col[int64]) {
 	t.Helper()

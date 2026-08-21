@@ -707,6 +707,148 @@ func Schema() *pg.Schema { return pg.NewSchema(Users) }
 	}
 }
 
+// schemaRenamedDeclared is schemaRenamed with the answer written where
+// the question is: the column says what it used to be called.
+const schemaRenamedDeclared = `package schema
+
+import "github.com/bernardoforcillo/drops/pg"
+
+var (
+	Users     = pg.NewTable("users")
+	UserID    = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
+	UserEmail = pg.Add(Users, pg.Text("emailAddress").NotNull().Unique().RenamedFrom("email"))
+)
+
+func Schema() *pg.Schema { return pg.NewSchema(Users) }
+`
+
+// push stops on a rename the way generate does, and --allow-destructive
+// is not what settles it.
+//
+// The two are different decisions and one flag must not make both.
+// "Yes, you may run statements that destroy data" is a permission about
+// consequences; "that column is being renamed, not dropped" is a claim
+// about what the change means. Before this, --allow-destructive applied
+// the drop-and-add without ever mentioning that a rename was possible —
+// so an operator who had granted the one had, without being asked,
+// granted the other.
+func TestCLIPushRefusesARenameAndAllowDestructiveDoesNotAnswerIt(t *testing.T) {
+	dsn := freshDatabase(t)
+	db := openDB(t, dsn)
+	p := newProject(t, dsn)
+	p.schema(schemaV1)
+	p.mustRun("push", "--schema", "./schema")
+	if _, err := db.Exec(context.Background(),
+		`INSERT INTO users (email) VALUES ($1)`, "ada@example.com"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	p.schema(schemaRenamed)
+	stdout, stderr, code := p.run("push", "--schema", "./schema")
+	if code != 3 {
+		t.Fatalf("push exited %d, want 3 (refused)\n%s%s", code, stdout, stderr)
+	}
+	out := stdout + stderr
+	for _, want := range []string{
+		"could be a rename or a drop-and-add",
+		`column "email" on table "users" is gone`,
+		`RenamedFrom("email")`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the refusal does not say %q:\n%s", want, out)
+		}
+	}
+
+	// The flag that answers the other question answers nothing here.
+	stdout, stderr, code = p.run("push", "--schema", "./schema", "--allow-destructive")
+	if code != 3 {
+		t.Fatalf("--allow-destructive pushed a rename it was never asked about (exit %d)\n%s%s", code, stdout, stderr)
+	}
+	if cols := columnsOf(t, db, "users"); cols["email"] == "" {
+		t.Fatalf("the refused push changed the table: %v", cols)
+	}
+
+	// And the two gates stack rather than replacing one another. The
+	// answer that the column really is going settles the rename
+	// question and leaves a DROP COLUMN standing, which is what
+	// --allow-destructive is for; neither flag alone gets past both.
+	stdout, stderr, code = p.run("push", "--schema", "./schema", "--drop-column", "users.email")
+	if code != 3 {
+		t.Fatalf("--drop-column alone exited %d, want 3 (the DROP is still destructive)\n%s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout+stderr, `DROP COLUMN "email"`) {
+		t.Errorf("the second refusal is not the destructive one:\n%s%s", stdout, stderr)
+	}
+	if cols := columnsOf(t, db, "users"); cols["email"] == "" {
+		t.Fatalf("the refused push changed the table: %v", cols)
+	}
+
+	// The flag that does answer it. A rename destroys nothing, so this
+	// one needs no destructive permission at all.
+	p.mustRun("push", "--schema", "./schema", "--rename-column", "users.email=emailAddress")
+	if cols := columnsOf(t, db, "users"); cols["emailAddress"] != "text" || cols["email"] != "" {
+		t.Fatalf("users after the push = %v", cols)
+	}
+	if got := scalar(t, db, `SELECT "emailAddress" FROM users`); got != "ada@example.com" {
+		t.Fatalf("the row did not survive the rename: emailAddress = %q", got)
+	}
+}
+
+// The durable answer. A flag answers the database in front of whoever
+// typed it; the schema answers every database it is ever pushed to,
+// which is the difference that matters once there is more than one.
+func TestCLIPushTakesTheRenameTheSchemaDeclares(t *testing.T) {
+	dsn := freshDatabase(t)
+	db := openDB(t, dsn)
+	p := newProject(t, dsn)
+	p.schema(schemaV1)
+	p.mustRun("push", "--schema", "./schema")
+	if _, err := db.Exec(context.Background(),
+		`INSERT INTO users (email) VALUES ($1)`, "ada@example.com"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	p.schema(schemaRenamedDeclared)
+	p.mustRun("push", "--schema", "./schema")
+	if got := scalar(t, db, `SELECT "emailAddress" FROM users`); got != "ada@example.com" {
+		t.Fatalf("the row did not survive the rename: emailAddress = %q", got)
+	}
+
+	// And it goes inert: the same schema, pushed again, is not looking
+	// for an "email" the database has not had since.
+	if out := p.mustRun("push", "--schema", "./schema"); !strings.Contains(out, "no changes") {
+		t.Errorf("a settled schema still wanted to change something:\n%s", out)
+	}
+}
+
+// The third way, for a person at a terminal: --interactive, with the
+// answer on stdin. It is opt-in on push for the same reason it is on
+// generate — a prompt drops decided to show on its own is one a scripted
+// run could receive by accident.
+func TestCLIPushAsksWhenToldTo(t *testing.T) {
+	dsn := freshDatabase(t)
+	db := openDB(t, dsn)
+	p := newProject(t, dsn)
+	p.schema(schemaV1)
+	p.mustRun("push", "--schema", "./schema")
+	if _, err := db.Exec(context.Background(),
+		`INSERT INTO users (email) VALUES ($1)`, "ada@example.com"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	p.schema(schemaRenamed)
+	stdout, stderr, code := p.runWithStdin("y\n", "push", "--schema", "./schema", "--interactive")
+	if code != 0 {
+		t.Fatalf("push exited %d\n%s%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "is users.emailAddress a rename of users.email?") {
+		t.Errorf("push did not ask:\n%s", stdout)
+	}
+	if got := scalar(t, db, `SELECT "emailAddress" FROM users`); got != "ada@example.com" {
+		t.Fatalf("the row did not survive the rename: emailAddress = %q", got)
+	}
+}
+
 // ----------------------------------------------------------------------
 // drift
 // ----------------------------------------------------------------------

@@ -32,7 +32,27 @@ type Table struct {
 	// (AddFilter) can be bypassed on its own with IgnoreFilters; an
 	// anonymous one (DefaultFilter) only by Unscoped. See filters.go.
 	filters []tableFilter
+
+	// renamedFrom is the name this table used to have, set by
+	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
+	renamedFrom string
 }
+
+// RenamedFrom states that this table is the table that used to be
+// called previous. It is the table-level counterpart of
+// (*Col[T]).RenamedFrom, and carries the same fact for the same
+// reason: a diff sees one table gone and another arrived, and nothing
+// but the schema can say they are the same table.
+//
+//	var Users = sqlite.NewTable("people").RenamedFrom("users")
+func (t *Table) RenamedFrom(previous string) *Table {
+	t.renamedFrom = previous
+	return t
+}
+
+// PreviousName returns the name the table was declared to have been
+// renamed from, or empty when it was not.
+func (t *Table) PreviousName() string { return t.renamedFrom }
 
 // OnInsert registers an INSERT hook, run before every INSERT renders.
 func (t *Table) OnInsert(h InsertHook) *Table {

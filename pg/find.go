@@ -504,8 +504,8 @@ func (f *FindBuilder) loadRelation(
 
 	expectsSlice := rel.Kind == HasManyKind || rel.Kind == MorphManyKind
 	if expectsSlice && relFieldType.Kind() != reflect.Slice {
-		return none, nil, fmt.Errorf("drops/pg: relation %q is HasMany — expected slice field, got %s",
-			rel.Name, relFieldType.Kind())
+		return none, nil, fmt.Errorf("drops/pg: relation %q is %s — expected slice field, got %s",
+			rel.Name, relationKindName(rel.Kind), relFieldType.Kind())
 	}
 
 	var childElemType reflect.Type
@@ -983,6 +983,25 @@ func relationKeyField(structT reflect.Type, col *Column) ([]int, bool) {
 // relationTargetField returns the index path of the struct field that
 // receives the relation. Lookup order: dropRel:"<name>" tag, then a
 // case-insensitive name match.
+//
+// The name fallback is a hazard, not a convenience to lean on. It
+// claims a field because of what the field is *called*, and a field
+// that only happens to share a relation's name has said nothing about
+// wanting to be one: an untagged Posts []Post is filled by
+// With("posts") whether the caller meant it as a relation or as a
+// cache they had already populated, and the walk reaches through
+// embedded structs, so a promoted field of the embedded row struct is
+// claimable too. What that usually produces is a confusing refusal —
+// a scalar column field is not a relation target and the query fails
+// naming a type nobody wrote down — and what it produces in the worst
+// case is a silent overwrite.
+//
+// It stays because removing it would break every struct written
+// against the earlier rule, and because a relation field named after
+// its relation is the overwhelmingly common spelling. Tag the field
+// anyway: `dropsgen -rels` writes the tag on every relation field it
+// emits, which is what makes the binding a thing the struct states
+// rather than a thing its field names happen to imply.
 func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 	var found []int
 	var byName []int
@@ -1142,4 +1161,27 @@ func (f *FindBuilder) loadMorphTo(
 	// fan out manually.
 	_ = node.children
 	return reflect.Value{}, nil, nil
+}
+
+// relationKindName renders a kind the way the declaration API spells
+// it, so an error about a mis-bound relation names the kind the
+// relation actually has. The guard on a slice field accepts more than
+// one kind, and hardcoding the commonest of them told a MorphMany
+// author to go looking for a HasMany they never wrote.
+func relationKindName(k RelationKind) string {
+	switch k {
+	case HasManyKind:
+		return "HasMany"
+	case HasOneKind:
+		return "HasOne"
+	case BelongsToKind:
+		return "BelongsTo"
+	case ManyToManyKind:
+		return "ManyToMany"
+	case MorphToKind:
+		return "MorphTo"
+	case MorphManyKind:
+		return "MorphMany"
+	}
+	return "an unknown kind"
 }

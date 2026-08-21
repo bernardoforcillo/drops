@@ -9,12 +9,43 @@ package schemagen
 
 import "github.com/bernardoforcillo/drops/pg"
 
+// Notes is the "notes" table, derived from Note.
+var (
+	Notes         = pg.NewTable("notes")
+	NoteID        = pg.Add(Notes, pg.BigSerial("id").PrimaryKey())
+	NoteBody      = pg.Add(Notes, pg.Text("body").NotNull())
+	NoteOwnerType = pg.Add(Notes, pg.Text("owner_type").NotNull())
+	NoteOwnerID   = pg.Add(Notes, pg.BigInt("owner_id").NotNull())
+)
+
 // Posts is the "posts" table, derived from Post.
 var (
 	Posts      = pg.NewTable("posts")
 	PostID     = pg.Add(Posts, pg.BigSerial("id").PrimaryKey())
 	PostUserID = pg.Add(Posts, pg.BigInt("user_id").NotNull())
 	PostTitle  = pg.Add(Posts, pg.Text("title").NotNull())
+)
+
+// PostTags is the "post_tags" table, derived from PostTag.
+var (
+	PostTags      = pg.NewTable("post_tags")
+	PostTagPostID = pg.Add(PostTags, pg.BigInt("post_id").NotNull())
+	PostTagTagID  = pg.Add(PostTags, pg.BigInt("tag_id").NotNull())
+)
+
+// Profiles is the "profiles" table, derived from Profile.
+var (
+	Profiles      = pg.NewTable("profiles")
+	ProfileID     = pg.Add(Profiles, pg.BigSerial("id").PrimaryKey())
+	ProfileUserID = pg.Add(Profiles, pg.BigInt("user_id").NotNull())
+	ProfileBio    = pg.Add(Profiles, pg.Text("bio").NotNull())
+)
+
+// Tags is the "tags" table, derived from Tag.
+var (
+	Tags     = pg.NewTable("tags")
+	TagID    = pg.Add(Tags, pg.BigSerial("id").PrimaryKey())
+	TagLabel = pg.Add(Tags, pg.Text("label").NotNull())
 )
 
 // Users is the "users" table, derived from User.

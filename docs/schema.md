@@ -288,7 +288,7 @@ is the package's own name and not the last element of its path, since
 every module past v1 ends its path in a version element —
 `github.com/gofrs/uuid/v5` is package `uuid`.
 
-`examples/schemagen` runs every direction over its two tables, and its
+`examples/schemagen` runs every direction over its tables, and its
 tests close the loop: the struct that generated the table and the
 struct generated from it agree field for field.
 
@@ -324,6 +324,15 @@ var (
 )
 ```
 
+`examples/schemagen` declares one relation of every kind — a profile
+for the `HasOne`, a junction for the `ManyToMany`, a notes table that
+is both halves of the polymorphic pair — and generates a shape for
+each. The integration suite loads all six from those generated
+structs against live PostgreSQL, including the empty case for every
+cardinality. That pairing is the point: a hand-written mirror and a
+generator can be wrong the same way, because one author wrote both
+expectations.
+
 A `-shape` is `[Name=]table:path[,path...]`, and the paths are the
 same strings `With()` takes — the shape and the query that fills it
 are written from one spelling:
@@ -353,6 +362,16 @@ The `drop:"-"` beside the `dropRel` is not decoration. A relation
 field sits at depth 0 and would out-rank a real column of the same
 name promoted from the embedded row struct, so it is opted out of
 column binding; the column is still scanned, through the embedding.
+
+Nor is the `dropRel` itself. The loader falls back to a
+case-insensitive field-name match when no field carries the tag, which
+is why a hand-written shape whose field is named after its relation
+appears to work without one — and it is a hazard rather than a
+convenience: a field is claimed because of what it is *called*, so an
+untagged `Posts []PostsRow` the caller meant as their own cache is
+filled by `With("posts")` all the same. The generator writes the tag
+on every relation field, which makes the binding something the struct
+states rather than something its field names imply.
 
 **How deep is exactly as deep as the paths go.** There is no "every
 relation": any schema with a back-reference makes that an infinite
@@ -390,10 +409,12 @@ not the one a codebase wants, name it outright:
 
 The same two rules as rows mode apply. A name the package already
 declares is **skipped**, with the header saying which name and which
-file — and here the hand-written struct is what the other generated
-structs nest, so it has to carry the same fields. And the output is
-byte-stable, including across a different arrangement of the same
-`-shape` arguments.
+file — but only when the struct already there carries the fields this
+run would have written. It is what the other generated structs nest,
+so "the same fields" is a requirement and not a courtesy; a
+declaration that disagrees is a collision, refused rather than stood
+aside for. And the output is byte-stable, including across a different
+arrangement of the same `-shape` arguments.
 
 Run `-rows` first: a shape nests the row struct of every table it
 reaches, and a missing one is an error naming it rather than a compile
@@ -407,9 +428,28 @@ its row structs again.
 
 Two shapes can derive the same name — `users:posts.tags` and
 `users:posts,tags` both arrive at `UsersWithPostsTags`, carrying
-different fields. That is refused, naming the struct and offering the
+different fields, because the derived name erases where a path was
+split. That is refused, naming the struct and offering the
 `-shape 'SomeName=…'` that resolves it; two shapes that arrive at the
 same name *and* the same fields are one declaration, not a refusal.
+
+The refusal holds across separate runs too, which is where it matters
+most: `-o` lets a package hold more than one shape file, and a second
+run that found the name already declared used to stand aside silently
+and leave the caller with a name resolving to somebody else's
+relations. The package's own declarations are the manifest — the
+fields of every struct it declares are read back and compared with the
+fields this run would have written — so nothing extra is checked in,
+and no name grows a character to carry the distinction.
+
+The one arrangement it cannot see is two `-rels` directives in one
+package that both leave `-o` unset: they name the same output file, so
+the second run stashes the first's output before reading anything and
+finds no declarations to disagree with. What it writes replaces them.
+That is what `-o` is for — give each directive its own
+`*_drops_rels.go` — and it is not something the generator can refuse,
+because a run whose `-shape` list simply changed looks exactly the
+same from here.
 
 ### AutoTable
 

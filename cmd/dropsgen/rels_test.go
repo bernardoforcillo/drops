@@ -496,3 +496,181 @@ func TestRowsRunsWithAShapeFileInThePackage(t *testing.T) {
 	}
 	mustBuild(t, dir)
 }
+
+// The same collision, split across two runs — which is where the
+// derived name stops being a name and becomes a hazard.
+//
+// Within one run the generator sees both trees and refuses. Across
+// two runs it sees only the second, finds the name already declared,
+// and stands aside as though a hand-written struct had claimed it.
+// The caller asked for a shape, got no error, and the name now
+// resolves to a struct with different fields — a query written
+// against it loads the wrong relations, or refuses to run at all
+// under StrictLoading.
+//
+// So the package's own declarations are the manifest: a name already
+// declared has to carry the fields this run would have written, or it
+// is a collision and gets the same refusal the in-run one does.
+func TestRelsRefusesANameAnotherFileDeclaresWithADifferentTree(t *testing.T) {
+	dir := relsFixture(t, "extra.go", `package fixture
+
+import "github.com/bernardoforcillo/drops/pg"
+
+// A second edge named "tags", so that "posts.tags" and "posts,tags"
+// are two different trees whose derived names are the same string.
+var _ = pg.NewRelations(Users).HasMany("tags", Tags, UserID, TagID)
+`)
+	if err := runRels(dir, []string{"users:posts.tags"}, "a"+relsFileSuffix); err != nil {
+		t.Fatalf("first shape file: %v", err)
+	}
+	err := runRels(dir, []string{"users:posts,tags"}, "b"+relsFileSuffix)
+	if err == nil {
+		t.Fatal("the second file was written against a name the first one owns, with different fields")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "UsersWithPostsTags") {
+		t.Errorf("error does not name the struct both runs derive: %s", msg)
+	}
+	if !strings.Contains(msg, "a"+relsFileSuffix) {
+		t.Errorf("error does not say which file already owns the name: %s", msg)
+	}
+	mustSuggestARunnableShape(t, dir, msg)
+	// And nothing was written: a run that cannot say what it means is
+	// not one that leaves half a file behind.
+	if _, err := os.Stat(filepath.Join(dir, "b"+relsFileSuffix)); !os.IsNotExist(err) {
+		t.Errorf("the refused run left a file behind: %v", err)
+	}
+	mustBuild(t, dir)
+}
+
+// The other half, and the one that must not become an error: a name
+// another shape file declares for the *same* tree is the struct this
+// run would have written, so it is still skipped rather than
+// redeclared. Two shape files that overlap are the ordinary case.
+func TestRelsStillSkipsANameAnotherFileDeclaresForTheSameTree(t *testing.T) {
+	dir := relsFixture(t)
+	if err := runRels(dir, []string{"users:posts"}, "a"+relsFileSuffix); err != nil {
+		t.Fatalf("first shape file: %v", err)
+	}
+	if err := runRels(dir, []string{"users:posts", "posts:comments"}, "b"+relsFileSuffix); err != nil {
+		t.Fatalf("a second file asking for the same shape was refused: %v", err)
+	}
+	mustBuild(t, dir)
+}
+
+// The skip rule is not "somebody got there first", it is "the struct
+// that is there is the struct this would have written". A
+// hand-written one that is not — a slice of the wrong row, a value
+// where the loader fills a pointer — is the drift the generator
+// exists to remove, and standing aside for it hides exactly that.
+func TestRelsRefusesAHandWrittenStructThatIsNotTheShape(t *testing.T) {
+	hand := `package fixture
+
+// UsersWithPosts is hand-written and wrong: the loader fills a slice
+// for a HasMany and refuses anything else.
+type UsersWithPosts struct {
+	UsersRow
+	Posts *PostsRow ` + "`drop:\"-\" dropRel:\"posts\"`" + `
+}
+`
+	dir := relsFixture(t, "hand.go", hand)
+	msg := relsError(t, dir, "users:posts")
+	if !strings.Contains(msg, "UsersWithPosts") || !strings.Contains(msg, "hand.go") {
+		t.Errorf("error does not name the struct or the file that declares it: %s", msg)
+	}
+	mustSuggestARunnableShape(t, dir, msg)
+}
+
+// The nested half of the same refusal, which is the branch the
+// message was reworded for.
+//
+// A shape's own struct can be renamed on the command line; a nested
+// one cannot, because it is named for its table and the paths beneath
+// it and that is exactly what makes two shapes reaching one node
+// share one struct. So the refusal has to say something else, and a
+// message that suggested -shape 'SomeName=…' here would be advice
+// that does not work.
+func TestRelsRefusesANestedNameTheDeclarationDoesNotMatch(t *testing.T) {
+	hand := `package fixture
+
+// PostsWithComments is what "users:posts.comments" nests, and this is
+// not it: the loader fills a slice for a HasMany.
+type PostsWithComments struct {
+	PostsRow
+	Comments *CommentsRow ` + "`drop:\"-\" dropRel:\"comments\"`" + `
+}
+`
+	dir := relsFixture(t, "hand.go", hand)
+	msg := relsError(t, dir, "users:posts.comments")
+	if !strings.Contains(msg, "PostsWithComments") || !strings.Contains(msg, "hand.go") {
+		t.Errorf("error does not name the nested struct or the file that declares it: %s", msg)
+	}
+	if strings.Contains(msg, "-shape 'SomeName=") {
+		t.Errorf("the refusal offers a rename a nested shape cannot take: %s", msg)
+	}
+}
+
+// And the nested collision split across two runs, which is the cross-run
+// hazard one level down from where it was first caught.
+//
+// The root names are kept apart on purpose — the second run names its
+// own struct outright — so the only thing left to disagree about is
+// the struct both runs derive for the node in the middle. That name
+// is not the caller's to change, so the way out is not a rename.
+func TestRelsRefusesANestedNameAnotherFileDeclaresWithADifferentTree(t *testing.T) {
+	dir := relsFixture(t, "extra.go", `package fixture
+
+import "github.com/bernardoforcillo/drops/pg"
+
+// A second edge named "tags" on users, so that a users node reached
+// with "posts.tags" and one reached with "posts,tags" are two trees
+// under one derived name.
+var _ = pg.NewRelations(Users).HasMany("tags", Tags, UserID, TagID)
+`)
+	if err := runRels(dir, []string{"posts:author.posts.tags"}, "a"+relsFileSuffix); err != nil {
+		t.Fatalf("first shape file: %v", err)
+	}
+	first, err := os.ReadFile(filepath.Join(dir, "a"+relsFileSuffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(first), "type UsersWithPostsTags struct") {
+		t.Fatalf("the first run did not nest the struct this test is about\n%s", first)
+	}
+	// The root is named outright so the two runs cannot collide there:
+	// what is left is the nested node, which no argument can rename.
+	err = runRels(dir, []string{"Other=posts:author.posts,author.tags"}, "b"+relsFileSuffix)
+	if err == nil {
+		t.Fatal("the second file redeclared a nested name the first one owns, with different fields")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "UsersWithPostsTags") || !strings.Contains(msg, "a"+relsFileSuffix) {
+		t.Errorf("error does not name the nested struct or the file that owns it: %s", msg)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b"+relsFileSuffix)); !os.IsNotExist(err) {
+		t.Errorf("the refused run left a file behind: %v", err)
+	}
+	mustBuild(t, dir)
+}
+
+// A name in the way is not always a struct.
+//
+// declaredNames records every top-level declaration, so the thing
+// holding the name may be a func, a var or an alias — and the refusal
+// has to say that rather than send its author looking for fields the
+// declaration does not have.
+func TestRelsSaysSoWhenTheNameIsNotAStructAtAll(t *testing.T) {
+	dir := relsFixture(t, "hand.go", `package fixture
+
+// UsersWithPosts is a func here, and the shape wants the name.
+func UsersWithPosts() {}
+`)
+	msg := relsError(t, dir, "users:posts")
+	if !strings.Contains(msg, "not a struct type") {
+		t.Errorf("the refusal does not say what is actually in the way: %s", msg)
+	}
+	if strings.Contains(msg, "with different fields") {
+		t.Errorf("the refusal credits a func with fields: %s", msg)
+	}
+	mustSuggestARunnableShape(t, dir, msg)
+}

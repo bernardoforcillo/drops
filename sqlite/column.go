@@ -30,6 +30,12 @@ type Column struct {
 	ref        *FK
 	pii        bool
 	managed    bool // drops writes this column, not the application
+
+	// renamedFrom is the name this column used to have, set by
+	// (*Col[T]).RenamedFrom. It is the one fact about a column that no
+	// comparison of two schemas can recover — see rename.go — and the
+	// schema is where Push can find it.
+	renamedFrom string
 }
 
 // FK describes a single-column foreign-key reference.
@@ -135,6 +141,39 @@ func (c *Col[T]) Managed() *Col[T] { c.Column.managed = true; return c }
 // IsManaged reports whether drops writes this column rather than the
 // application.
 func (c *Column) IsManaged() bool { return c.managed }
+
+// RenamedFrom states that this column is the column that used to be
+// called previous — the same column, the same data, a different name.
+//
+// Nothing in a pair of schemas can tell a rename from a drop and an
+// add, so drops asks rather than guesses, and this is the answer
+// written where the question is. GenerateMigration can record an
+// answer in the migration directory; Push has no migration directory,
+// and its refusal is otherwise unanswerable by anything durable. A
+// rename is a fact about the schema's history, the schema is what Push
+// reads, so the schema is where the fact belongs — and it then travels
+// to every database the schema is pushed to, not just to the one
+// whoever typed the flag was pointed at.
+//
+// It matters most here. A SQLite rename that goes unstated is not a
+// DROP COLUMN anybody can read in the statement list: the rebuild
+// copies the columns both sides name and simply leaves this one out,
+// so the data goes with nothing at all in the SQL to say so.
+//
+// The declaration is inert once the rename has happened: it is applied
+// only while the old name is still in the database and the new one is
+// not, so it may be left in place, and should be until every database
+// the schema is pushed to has moved past it.
+//
+//	sqlite.Add(Users, sqlite.Text("emailAddress").NotNull().RenamedFrom("email"))
+func (c *Col[T]) RenamedFrom(previous string) *Col[T] {
+	c.Column.renamedFrom = previous
+	return c
+}
+
+// PreviousName returns the name the column was declared to have been
+// renamed from, or empty when it was not. See (*Col[T]).RenamedFrom.
+func (c *Column) PreviousName() string { return c.renamedFrom }
 
 // Default sets a raw SQL default expression (e.g. "0", "CURRENT_TIMESTAMP").
 func (c *Col[T]) Default(sqlExpr string) *Col[T] {

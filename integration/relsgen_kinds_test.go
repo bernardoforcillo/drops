@@ -2,8 +2,10 @@ package integration_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/bernardoforcillo/drops/examples/schemagen"
 	"github.com/bernardoforcillo/drops/integration"
 	"github.com/bernardoforcillo/drops/pg"
 )
@@ -81,198 +83,154 @@ func TestPGGeneratedShapeKeepsTheRelationFieldOutOfTheScan(t *testing.T) {
 	}
 }
 
-// The four cardinalities the rest of the live suite never reaches.
+// The shapes the generator does not emit, refused by the loader.
 //
-// examples/schemagen declares a HasMany and a BelongsTo, so those two
-// are loaded from generated structs elsewhere in this file's
-// neighbour. HasOne, ManyToMany, MorphMany and MorphTo are the other
-// four the generator decides a field type for, and the decision is
-// worth nothing unless pg/find.go agrees. The structs below are
-// written by hand in exactly the shape cmd/dropsgen emits — the
-// generator test TestRelsShapeFollowsTheLoader pins that text — so
-// what this asserts is the other half: that the loader accepts that
-// shape and fills it, including the parent that matches nothing.
-func TestPGLoaderFillsEveryShapeTheGeneratorEmits(t *testing.T) {
+// Every kind's *positive* case now loads a generated struct against a
+// live server — see relsgen_test.go, which reaches all six. What
+// cannot be asserted from generated code is the other half of the
+// same decision: that binding a relation to the wrong kind of field
+// is refused rather than quietly filled with something. A generator
+// that chose the field type by preference rather than by what the
+// loader requires would still pass every test above; it fails here.
+func TestPGLoaderRefusesTheShapesTheGeneratorDoesNotEmit(t *testing.T) {
 	db := openPG(t)
 	ctx := context.Background()
+	f := relsgenTables(t, db)
 
-	users := pg.NewTable(integration.UniqueName(t, "pr_users"))
-	uid := pg.Add(users, pg.BigSerial("id").PrimaryKey())
-	uname := pg.Add(users, pg.Text("name").NotNull())
+	owner := insertUser(t, db, f, "owner@example.com", "Owner")
+	post := insertPostReturning(t, db, f, owner, "post")
+	insertProfile(t, db, f, owner, "bio")
+	insertPostTag(t, db, f, post, insertTag(t, db, f, "go"))
+	insertNote(t, db, f, relsgenMorphUsers, owner, "note")
 
-	profiles := pg.NewTable(integration.UniqueName(t, "pr_profiles"))
-	prid := pg.Add(profiles, pg.BigSerial("id").PrimaryKey())
-	pruid := pg.Add(profiles, pg.BigInt("userId").NotNull())
-	prbio := pg.Add(profiles, pg.Text("bio").NotNull())
+	for _, tc := range []struct {
+		what string
+		load func() error
+	}{
+		{"a HasMany bound to a pointer", func() error {
+			var rows []struct {
+				schemagen.UsersRow
+				Posts *schemagen.PostsRow `drop:"-" dropRel:"posts"`
+			}
+			return db.Find(f.Users).With("posts").All(ctx, &rows)
+		}},
+		{"a HasOne bound to a slice", func() error {
+			var rows []struct {
+				schemagen.UsersRow
+				Profile []schemagen.ProfilesRow `drop:"-" dropRel:"profile"`
+			}
+			return db.Find(f.Users).With("profile").All(ctx, &rows)
+		}},
+		{"a ManyToMany bound to a pointer", func() error {
+			var rows []struct {
+				schemagen.PostsRow
+				Tags *schemagen.TagsRow `drop:"-" dropRel:"tags"`
+			}
+			return db.Find(f.Posts).With("tags").All(ctx, &rows)
+		}},
+		{"a MorphMany bound to a pointer", func() error {
+			var rows []struct {
+				schemagen.UsersRow
+				Notes *schemagen.NotesRow `drop:"-" dropRel:"notes"`
+			}
+			return db.Find(f.Users).With("notes").All(ctx, &rows)
+		}},
+		{"a MorphTo bound to a concrete pointer", func() error {
+			var rows []struct {
+				schemagen.NotesRow
+				Owner *schemagen.UsersRow `drop:"-" dropRel:"owner"`
+			}
+			return db.Find(f.Notes).With("owner").All(ctx, &rows)
+		}},
+	} {
+		if err := tc.load(); err == nil {
+			t.Errorf("%s was accepted", tc.what)
+		} else {
+			t.Logf("%s: %v", tc.what, err)
+		}
+	}
+}
 
-	tags := pg.NewTable(integration.UniqueName(t, "pr_tags"))
-	tid := pg.Add(tags, pg.BigSerial("id").PrimaryKey())
-	tlabel := pg.Add(tags, pg.Text("label").NotNull())
+// What the dropRel tag is for, which no other live test in this suite
+// could tell you.
+//
+// Every generated shape names its relation field after the relation,
+// so pg/find.go's case-insensitive name fallback would have filled it
+// with the tag deleted, and every one of those tests would still
+// pass. The tag only becomes load-bearing when the field is named
+// something else — so that is what this loads.
+func TestPGRelationIsBoundByItsTagAndNotByTheFieldName(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	f := relsgenTables(t, db)
 
-	userTags := pg.NewTable(integration.UniqueName(t, "pr_user_tags"))
-	utu := pg.Add(userTags, pg.BigInt("userId").NotNull())
-	utt := pg.Add(userTags, pg.BigInt("tagId").NotNull())
+	author := insertUser(t, db, f, "author@example.com", "Author")
+	insertPost(t, db, f, author, "first")
 
-	notes := pg.NewTable(integration.UniqueName(t, "pr_notes"))
-	nid := pg.Add(notes, pg.BigSerial("id").PrimaryKey())
-	nbody := pg.Add(notes, pg.Text("body").NotNull())
-	ntyp := pg.Add(notes, pg.Text("ownerType").NotNull())
-	nown := pg.Add(notes, pg.BigInt("ownerId").NotNull())
-	_ = nid
-
-	type usersRow struct {
-		ID   int64  `drop:"id"`
-		Name string `drop:"name"`
+	// "articles" is not a relation this schema declares, and Articles
+	// is not a name the fallback could reach "posts" from. Only the
+	// tag connects them.
+	type shapeWithARenamedField struct {
+		schemagen.UsersRow
+		Articles []schemagen.PostsRow `drop:"-" dropRel:"posts"`
 	}
-	morphs := pg.NewMorphMap()
-	pg.RegisterMorph[usersRow](morphs, "users", users)
-
-	pg.NewRelations(users).
-		HasOne("profile", profiles, uid, pruid).
-		ManyToMany("tags", tags, userTags, utu, utt, uid, tid).
-		MorphMany("notes", notes, ntyp, nown, uid, "users")
-	pg.NewRelations(notes).MorphTo("owner", ntyp, nown, morphs)
-
-	for _, tbl := range []*pg.Table{notes, userTags, tags, profiles, users} {
-		dropPG(t, db, tbl)
+	var tagged []shapeWithARenamedField
+	if err := db.Find(f.Users).With("posts").All(ctx, &tagged); err != nil {
+		t.Fatalf("a field bound by its tag was refused: %v", err)
 	}
-	for _, tbl := range []*pg.Table{users, profiles, tags, userTags, notes} {
-		execPG(t, db, pg.CreateTable(tbl))
-	}
-
-	var back struct {
-		ID int64 `drop:"id"`
-	}
-	if err := db.Insert(users).Row(uname.Val("full")).Returning(uid).One(ctx, &back); err != nil {
-		t.Fatal(err)
-	}
-	full := back.ID
-	if err := db.Insert(users).Row(uname.Val("bare")).Returning(uid).One(ctx, &back); err != nil {
-		t.Fatal(err)
-	}
-	bare := back.ID
-
-	if _, err := db.Insert(profiles).Row(pruid.Val(full), prbio.Val("bio")).Exec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Insert(tags).Row(tlabel.Val("go")).Returning(tid).One(ctx, &back); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Insert(userTags).Row(utu.Val(full), utt.Val(back.ID)).Exec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Insert(notes).Row(nbody.Val("note"), ntyp.Val("users"), nown.Val(full)).Exec(ctx); err != nil {
-		t.Fatal(err)
-	}
-	_ = prid
-
-	type profilesRow struct {
-		ID     int64  `drop:"id"`
-		UserID int64  `drop:"userId"`
-		Bio    string `drop:"bio"`
-	}
-	type tagsRow struct {
-		ID    int64  `drop:"id"`
-		Label string `drop:"label"`
-	}
-	type notesRow struct {
-		ID        int64  `drop:"id"`
-		Body      string `drop:"body"`
-		OwnerType string `drop:"ownerType"`
-		OwnerID   int64  `drop:"ownerId"`
-	}
-	// Exactly the shape -rels emits for these three kinds.
-	type usersShape struct {
-		usersRow
-		Notes   []notesRow   `drop:"-" dropRel:"notes"`
-		Profile *profilesRow `drop:"-" dropRel:"profile"`
-		Tags    []tagsRow    `drop:"-" dropRel:"tags"`
-	}
-	var rows []usersShape
-	if err := db.Find(users).With("profile", "tags", "notes").OrderBy(uname.Asc()).All(ctx, &rows); err != nil {
-		t.Fatalf("hasOne/manyToMany/morphMany shape refused by the loader: %v", err)
-	}
-	if len(rows) != 2 {
-		t.Fatalf("loaded %d rows", len(rows))
-	}
-	bareRow, fullRow := rows[0], rows[1]
-	if fullRow.Name != "full" || bareRow.Name != "bare" {
-		t.Fatalf("ordering: %+v", rows)
-	}
-	if fullRow.Profile == nil || fullRow.Profile.Bio != "bio" {
-		t.Errorf("HasOne pointer did not load: %+v", fullRow.Profile)
-	}
-	if bareRow.Profile != nil {
-		t.Errorf("HasOne with no match is not nil: %+v", bareRow.Profile)
-	}
-	if len(fullRow.Tags) != 1 || fullRow.Tags[0].Label != "go" {
-		t.Errorf("ManyToMany slice did not load: %+v", fullRow.Tags)
-	}
-	if bareRow.Tags == nil {
-		t.Errorf("ManyToMany with no match came back nil, not empty")
-	}
-	if len(fullRow.Notes) != 1 || fullRow.Notes[0].Body != "note" {
-		t.Errorf("MorphMany slice did not load: %+v", fullRow.Notes)
-	}
-	if bareRow.Notes == nil {
-		t.Errorf("MorphMany with no match came back nil, not empty")
+	if len(tagged) != 1 || len(tagged[0].Articles) != 1 || tagged[0].Articles[0].Title != "first" {
+		t.Fatalf("the tagged field did not load: %+v", tagged)
 	}
 
-	// And the MorphTo side: the generator emits `any`.
-	type notesShape struct {
-		notesRow
-		Owner any `drop:"-" dropRel:"owner"`
+	// The same struct with the tag removed. Nothing else changes, and
+	// the relation no longer has anywhere to go.
+	type shapeWithoutTheTag struct {
+		schemagen.UsersRow
+		Articles []schemagen.PostsRow `drop:"-"`
 	}
-	var ns []notesShape
-	if err := db.Find(notes).With("owner").All(ctx, &ns); err != nil {
-		t.Fatalf("morphTo shape refused by the loader: %v", err)
+	var untagged []shapeWithoutTheTag
+	err := db.Find(f.Users).With("posts").All(ctx, &untagged)
+	if err == nil {
+		t.Fatalf("the same field without the tag loaded anyway: %+v", untagged)
 	}
-	if len(ns) != 1 {
-		t.Fatalf("loaded %d notes", len(ns))
+	if !strings.Contains(err.Error(), "dropRel") {
+		t.Errorf("the refusal does not name the tag that was missing: %v", err)
 	}
-	owner, ok := ns[0].Owner.(*usersRow)
-	if !ok {
-		t.Fatalf("MorphTo any holds %T, not a *usersRow", ns[0].Owner)
-	}
-	if owner.ID != full {
-		t.Errorf("MorphTo loaded user %d, want %d", owner.ID, full)
-	}
-	_ = bare
+}
 
-	// And the other half of "the shape follows the loader": the
-	// shapes the generator does not emit are refused rather than
-	// quietly filled, which is what makes the choice above a decision
-	// and not a preference.
-	type morphManyAsPointer struct {
-		usersRow
-		Notes *notesRow `drop:"-" dropRel:"notes"`
-	}
-	var wrongMany []morphManyAsPointer
-	if err := db.Find(users).With("notes").All(ctx, &wrongMany); err == nil {
-		t.Error("a MorphMany bound to a pointer was accepted")
-	} else {
-		t.Logf("MorphMany as a pointer: %v", err)
-	}
+// And the cost of the fallback existing at all, which is why the
+// generator writes the tag on every field rather than relying on the
+// name.
+//
+// A field is claimed for a relation because it is *named* like one,
+// whether or not anybody meant it as a relation field. The struct
+// below declares no relation — no dropRel anywhere — and the loader
+// fills it regardless, overwriting whatever the caller had put there.
+// The same rule reaches through embedding into the row struct, where
+// the fields are columns.
+func TestPGRelationFallbackClaimsAFieldThatOnlySharesTheName(t *testing.T) {
+	db := openPG(t)
+	ctx := context.Background()
+	f := relsgenTables(t, db)
 
-	type morphToAsPointer struct {
-		notesRow
-		Owner *usersRow `drop:"-" dropRel:"owner"`
-	}
-	var wrongMorph []morphToAsPointer
-	if err := db.Find(notes).With("owner").All(ctx, &wrongMorph); err == nil {
-		t.Error("a MorphTo bound to a concrete pointer was accepted")
-	} else {
-		t.Logf("MorphTo as a concrete pointer: %v", err)
-	}
+	author := insertUser(t, db, f, "author@example.com", "Author")
+	insertPost(t, db, f, author, "first")
 
-	type manyToManyAsPointer struct {
-		usersRow
-		Tags *tagsRow `drop:"-" dropRel:"tags"`
+	// Posts here is the caller's own field — a cache, a projection,
+	// anything. It carries no dropRel and declares no relation.
+	type notMeantAsARelation struct {
+		schemagen.UsersRow
+		Posts []schemagen.PostsRow
 	}
-	var wrongM2M []manyToManyAsPointer
-	if err := db.Find(users).With("tags").All(ctx, &wrongM2M); err == nil {
-		t.Error("a ManyToMany bound to a pointer was accepted")
-	} else {
-		t.Logf("ManyToMany as a pointer: %v", err)
+	var rows []notMeantAsARelation
+	if err := db.Find(f.Users).With("posts").All(ctx, &rows); err != nil {
+		t.Fatalf("find: %v", err)
 	}
+	if len(rows) != 1 {
+		t.Fatalf("loaded %d users, want 1", len(rows))
+	}
+	if len(rows[0].Posts) != 1 {
+		t.Fatalf("the fallback no longer fills an untagged field — pg/find.go's doc says it does: %+v", rows[0])
+	}
+	t.Logf("an untagged field named after the relation was filled with %d rows", len(rows[0].Posts))
 }

@@ -279,6 +279,9 @@ func TestPGNilPredicatesDoNotDisarmTheGlobalFilters(t *testing.T) {
 	// dereference, so nobody could reach the server with it. Now it
 	// renders, and what it must render is the guards.
 	t.Run("an all-nil Delete is still fenced by the filters", func(t *testing.T) {
+		// The Where is all nils on purpose; what fences the statement
+		// is the global filters, which is the thing under test.
+		//drops:lint ignore unfilteredwrite — the filters are the fence
 		if _, err := db.Delete(books).Where(nil, nil).Exec(ctx); err != nil {
 			t.Fatalf("delete: %v", err)
 		}

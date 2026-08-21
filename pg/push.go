@@ -42,6 +42,20 @@ type PushOptions struct {
 	// not a slow rebuild, it is every row of the table becoming
 	// visible to everyone the moment the push commits.
 	DropUnmanagedObjects bool
+
+	// Renames answers the rename questions this push raises, for one
+	// run. They are merged over what the schema itself declares — see
+	// DeclaredRenames — with these winning.
+	//
+	// This is the per-call answer, the one a command line carries. The
+	// durable one is (*Col[T]).RenamedFrom in the schema, and it is
+	// the better answer for anything that will be pushed more than
+	// once: a flag answers the database in front of you, a declaration
+	// answers every database the schema reaches.
+	//
+	// A candidate neither of them answers is not guessed at: Push
+	// returns *RenameAmbiguityError and executes nothing.
+	Renames []RenameDecision
 }
 
 // PushResult is the outcome of a Push call.
@@ -101,12 +115,16 @@ func (n SchemaNotice) String() string {
 // Behaviour:
 //   - Reads the current state of the configured schema via Introspect.
 //   - Builds a target snapshot from `schema`.
+//   - Settles the rename questions the change raises, or refuses,
+//     before anything below touches the server. See "A change that
+//     could be a rename".
 //   - Asks the server to respell the declared CHECK expressions,
 //     partial-index predicates, policy expressions and view bodies, so
 //     the two sides of the diff are written in the same dialect of
 //     PostgreSQL's own deparser. See "What the probe costs" below:
 //     this happens on a DryRun too.
-//   - Diffs the two using DiffOptions{Safe: opts.Safe}.
+//   - Diffs the two using DiffOptions{Safe: opts.Safe} and the renames
+//     it settled.
 //   - If DryRun, returns the statements unexecuted.
 //   - Otherwise applies them inside a single transaction; any failure
 //     rolls back the whole push. CREATE INDEX CONCURRENTLY is the one
@@ -169,6 +187,24 @@ func (n SchemaNotice) String() string {
 // leaves those out of the snapshot entirely, so no drop is proposed for
 // PostGIS's views or for the sequence behind a serial column.
 //
+// # A change that could be a rename
+//
+// A column the database has and the schema does not, paired with one
+// the schema has and the database does not, is either a rename or a
+// drop-and-add, and the two differ by the whole contents of the
+// column. Push cannot tell them apart any more than Diff can, so it
+// asks the same question GenerateMigration asks and returns
+// *RenameAmbiguityError rather than guessing — before any statement
+// runs, and whatever else the push was going to do.
+//
+// Answer it in the schema with (*Col[T]).RenamedFrom or
+// (*Table).RenamedFrom, which is durable and travels to every database
+// the schema is pushed to, or for one run with PushOptions.Renames.
+// A refusal is not something Safe or a destructive-statement
+// permission overrides: whether a change is a rename and whether its
+// consequences may be applied are two different questions, and one
+// answer should not stand in for the other.
+//
 // # What Push cannot see
 //
 // Introspect reads back most, not all, of what the schema layer can
@@ -223,6 +259,17 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}
 	desired := BuildSnapshot(schema)
 
+	// Before the probe, not after it. A push that is going to refuse
+	// should not first take an ACCESS EXCLUSIVE lock on every table
+	// carrying a CHECK constraint or a policy to answer a question it
+	// is about to throw away. Renames are settled from column names and
+	// types, which the probe does not touch.
+	renames, err := resolvePushRenames(current, desired,
+		mergeDecisions(DeclaredRenames(schema), opt.Renames))
+	if err != nil {
+		return nil, err
+	}
+
 	notices, err := renormaliseExpressions(ctx, db, current, desired)
 	if err != nil {
 		return nil, fmt.Errorf("drops/pg: normalise declared expressions: %w", err)
@@ -230,7 +277,7 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	notices = append(notices, unrepresentableIndexNotices(desired)...)
 	notices = append(notices, enumOrderNotices(current, desired)...)
 
-	stmts := Diff(current, desired, DiffOptions{Safe: opt.Safe})
+	stmts := Diff(current, desired, DiffOptions{Safe: opt.Safe, Renames: renames})
 	if !opt.DropUnmanagedIndexes {
 		var withheld []SchemaNotice
 		stmts, withheld = withhold(stmts, unmanagedIndexDrops(current, desired, opt.Safe))
@@ -272,6 +319,54 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}
 	return &PushResult{Statements: stmts, Applied: true, Notices: notices}, nil
 }
+
+// resolvePushRenames settles the rename questions this push raises, or
+// refuses.
+//
+// It is the same reasoning GenerateMigration applies, against the same
+// detector, for the same reason: a column gone from the database and
+// one arrived in the schema is either a rename or a drop-and-add, the
+// two differ by the whole contents of the column, and nothing in
+// either side says which. Push reaching that comparison without asking
+// the question was a second door into the data loss the question
+// exists to close — and the quieter of the two doors, because a push
+// that goes through executes immediately with no migration file for
+// anybody to read first.
+//
+// The answers come from the schema (DeclaredRenames) and from the call
+// (PushOptions.Renames), the call winning, merged by the caller. There
+// is no rename log here: a push has no migration directory, so the
+// advice on the refusal points at the schema instead.
+func resolvePushRenames(current, desired *Snapshot, answers []RenameDecision) ([]Rename, error) {
+	renames, unresolved := ResolveRenames(current, desired, answers)
+	if len(unresolved) > 0 {
+		return nil, &RenameAmbiguityError{Candidates: unresolved, Advice: pushRenameAdvice}
+	}
+	if err := validateRenames(current, desired, renames); err != nil {
+		return nil, err
+	}
+	return renames, nil
+}
+
+// pushRenameAdvice closes a push's refusal, in place of the flags and
+// the rename log the generator points at — a push has neither.
+//
+// The schema declaration comes first because it is the answer that
+// lasts: an operator answering at a terminal answers for the one
+// database in front of them, and the next database the schema is
+// pushed to asks again. The per-run answer is named second, and it is
+// the only way to say the other thing, that the column really is being
+// dropped — which is not a fact about the schema at all. Once such a
+// drop has been pushed the old column is gone and the question never
+// comes back, so there is nothing lasting to record.
+const pushRenameAdvice = "a rename is a fact about the schema's history and belongs with the schema:\n" +
+	"    pg.Add(Users, pg.Text(\"emailAddress\").RenamedFrom(\"email\"))\n" +
+	"    pg.NewTable(\"people\").RenamedFrom(\"users\")\n" +
+	"stated there it answers every database the schema is pushed to, and it goes inert once the rename has happened.\n" +
+	"For one run instead, or to say the column really is being dropped rather than renamed:\n" +
+	"    drops push --rename-column users.email=emailAddress   (or --drop-column users.email)\n" +
+	"    PushOptions.Renames, for a caller that is not the CLI: a RenameDecision naming the pair\n" +
+	"    renames it, one naming only the object that is going declines."
 
 // needsOwnTransaction reports whether a statement has to run outside
 // the push transaction. Only CONCURRENTLY index builds do: PostgreSQL

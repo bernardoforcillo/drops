@@ -11,9 +11,14 @@ import (
 // Renaming, on the command line.
 //
 // A diff cannot tell a rename from a drop and an add — see
-// drops/pg/rename.go — so the generator stops. This file is what it
-// stops with: four flags that state the answer up front, and, behind
-// --interactive, a prompt that asks about each pair instead.
+// drops/pg/rename.go — so `generate` stops, and so does `push`, which
+// reaches the same comparison against a live database. This file is
+// what both stop with: four flags that state the answer up front, and,
+// behind --interactive, a prompt that asks about each pair instead.
+//
+// `push` has a fifth answer these flags cannot carry, and it is the
+// better one: RenamedFrom on the column or table in the schema, which
+// outlives the terminal a flag is typed into. See pg/push.go.
 //
 // Prompting is opt-in rather than something drops works out for
 // itself. It could ask whether stdin looks like a terminal, and the
@@ -27,7 +32,9 @@ import (
 // and the answer drops would have to invent without one is the DROP
 // COLUMN that loses the column. So a scripted run states its answers
 // on the command line, once; drops writes them into the migration
-// directory, and every run after that finds them there.
+// directory, and every run after that finds them there. A push has no
+// such directory, which is the whole reason its lasting answer belongs
+// in the schema rather than here.
 
 // repeatedFlag is a string flag that can be given more than once.
 type repeatedFlag []string

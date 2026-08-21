@@ -253,6 +253,44 @@ func TestGeneratedShapeMatchesWhatTheLoaderFills(t *testing.T) {
 	}
 }
 
+// The other four kinds, which is the rest of the decision. A
+// generated struct exists for every kind the generator can emit, so
+// the live suite can load all six from generated types rather than
+// from a mirror somebody typed twice.
+func TestGeneratedShapeCoversEveryRelationKind(t *testing.T) {
+	for _, tc := range []struct {
+		shape reflect.Type
+		field string
+		want  reflect.Type
+		rel   string
+		why   string
+	}{
+		{reflect.TypeOf(schemagen.UsersWithProfile{}), "Profile", reflect.TypeOf((*schemagen.ProfilesRow)(nil)), "profile",
+			"HasOne loads at most one row, and a parent with no match keeps the nil"},
+		{reflect.TypeOf(schemagen.PostsWithTags{}), "Tags", reflect.TypeOf([]schemagen.TagsRow(nil)), "tags",
+			"ManyToMany fills a slice of the target's rows — never the junction's"},
+		{reflect.TypeOf(schemagen.UsersWithNotes{}), "Notes", reflect.TypeOf([]schemagen.NotesRow(nil)), "notes",
+			"MorphMany fills a slice"},
+		{reflect.TypeOf(schemagen.NotesWithOwner{}), "Owner", reflect.TypeOf((*any)(nil)).Elem(), "owner",
+			"MorphTo's concrete type varies row by row, so the loader requires interface kind"},
+	} {
+		f, ok := tc.shape.FieldByName(tc.field)
+		if !ok {
+			t.Errorf("%s has no %s field", tc.shape, tc.field)
+			continue
+		}
+		if f.Type != tc.want {
+			t.Errorf("%s.%s is %s, want %s — %s", tc.shape, tc.field, f.Type, tc.want, tc.why)
+		}
+		if got := f.Tag.Get("dropRel"); got != tc.rel {
+			t.Errorf("%s.%s is tagged dropRel:%q, want %q", tc.shape, tc.field, got, tc.rel)
+		}
+		if got := f.Tag.Get("drop"); got != "-" {
+			t.Errorf("%s.%s is tagged drop:%q, want \"-\"", tc.shape, tc.field, got)
+		}
+	}
+}
+
 // The shape carries the parent's columns by embedding, which is also
 // what gives the loader the key column it joins on: it looks the
 // join key up with the same field mapping the scanner uses, and that
@@ -279,10 +317,8 @@ func TestGeneratedRelsFileIsCurrent(t *testing.T) {
 	}
 	dir := copyPackageToTestdata(t, "schemagenrels")
 
-	cmd := exec.CommandContext(context.Background(),
-		"go", "run", "github.com/bernardoforcillo/drops/cmd/dropsgen",
-		"-rels", dir, "-shape", "users:posts", "-shape", "posts:author",
-		"-shape", "posts:author.posts")
+	args := append([]string{"run", "github.com/bernardoforcillo/drops/cmd/dropsgen", "-rels", dir}, shapeArgs(t)...)
+	cmd := exec.CommandContext(context.Background(), "go", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("dropsgen -rels failed: %v\n%s", err, out)
 	}
@@ -311,10 +347,8 @@ func TestGeneratedRelsFileIsByteStable(t *testing.T) {
 	dir := copyPackageToTestdata(t, "schemagenrelstwice")
 	run := func() string {
 		t.Helper()
-		cmd := exec.CommandContext(context.Background(),
-			"go", "run", "github.com/bernardoforcillo/drops/cmd/dropsgen",
-			"-rels", dir, "-shape", "users:posts", "-shape", "posts:author",
-			"-shape", "posts:author.posts")
+		args := append([]string{"run", "github.com/bernardoforcillo/drops/cmd/dropsgen", "-rels", dir}, shapeArgs(t)...)
+		cmd := exec.CommandContext(context.Background(), "go", args...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("dropsgen -rels failed: %v\n%s", err, out)
 		}
@@ -363,4 +397,37 @@ func copyPackageToTestdata(t *testing.T, prefix string) string {
 		}
 	}
 	return dir
+}
+
+// shapeArgs is the -shape list relations.go's //go:generate directive
+// carries, read out of the directive rather than repeated here.
+//
+// The file these tests check is the one `go generate` writes, so a
+// list kept separately would drift the moment a shape is added — and
+// it would drift silently, checking the generator against arguments
+// nobody runs while the shape that was actually added goes untested.
+func shapeArgs(t *testing.T) []string {
+	t.Helper()
+	src, err := os.ReadFile("relations.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(src), "\n") {
+		if !strings.HasPrefix(line, "//go:generate") || !strings.Contains(line, "-rels") {
+			continue
+		}
+		fields := strings.Fields(line)
+		var out []string
+		for i, f := range fields {
+			if f == "-shape" && i+1 < len(fields) {
+				out = append(out, "-shape", fields[i+1])
+			}
+		}
+		if len(out) == 0 {
+			t.Fatalf("the -rels directive in relations.go names no shapes: %s", line)
+		}
+		return out
+	}
+	t.Fatal("relations.go has no //go:generate directive for -rels")
+	return nil
 }

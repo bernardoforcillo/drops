@@ -22,6 +22,14 @@
 // the field name, the slice, the dropRel tag, the nested type — is
 // derived from the relation declaration in relations.go.
 //
+// The tables below declare more than a reader needs to follow the
+// workflow, and that is deliberate: the field type is the decision
+// -rels makes, it makes a different one for each of the six relation
+// kinds, and a kind no generated struct covers is a decision only a
+// hand-written mirror ever checks. So there is a profile for the
+// HasOne, a junction for the ManyToMany, and a notes table that is
+// both halves of the polymorphic pair.
+//
 //go:generate go run github.com/bernardoforcillo/drops/cmd/dropsgen -schema models.go
 package schemagen
 
@@ -50,4 +58,50 @@ type Post struct {
 	ID     int64  `drop:"id,primaryKey,autoIncrement"`
 	UserID int64  `drop:"user_id,notNull"`
 	Title  string `drop:"title,notNull"`
+}
+
+// Profile is the HasOne side. A user has at most one, and "at most"
+// is the whole difficulty: the row is either there or it is not, and
+// the generated field is a pointer because those are two states a
+// value struct only has one spelling for.
+//
+//drops:schema table=Profiles name=profiles
+type Profile struct {
+	ID     int64  `drop:"id,primaryKey,autoIncrement"`
+	UserID int64  `drop:"user_id,notNull"`
+	Bio    string `drop:"bio,notNull"`
+}
+
+// Tag is the far side of the ManyToMany, and PostTag is the junction
+// that joins it. The junction is a table like any other — it has to
+// be, because the loader queries it — but no shape ever nests its row
+// struct: a ManyToMany field holds the target's rows, and the
+// junction is the thing the reader never sees.
+//
+//drops:schema table=Tags name=tags
+type Tag struct {
+	ID    int64  `drop:"id,primaryKey,autoIncrement"`
+	Label string `drop:"label,notNull"`
+}
+
+// PostTag has no key of its own, which is what a junction usually
+// looks like: the pair is the identity.
+//
+//drops:schema table=PostTags name=post_tags
+type PostTag struct {
+	PostID int64 `drop:"post_id,notNull"`
+	TagID  int64 `drop:"tag_id,notNull"`
+}
+
+// Note is the polymorphic pair, both halves of it. owner_type names
+// the table the row is attached to and owner_id the row in it, so the
+// same table hangs off anything — which is why the MorphTo field is
+// an interface and the MorphMany field is a slice of plain notes.
+//
+//drops:schema table=Notes name=notes
+type Note struct {
+	ID        int64  `drop:"id,primaryKey,autoIncrement"`
+	Body      string `drop:"body,notNull"`
+	OwnerType string `drop:"owner_type,notNull"`
+	OwnerID   int64  `drop:"owner_id,notNull"`
 }

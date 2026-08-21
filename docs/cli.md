@@ -118,6 +118,13 @@ either:
 - `--drop-column users.email` — no, it really is going
 - `--drop-table users`
 
+A rename can also be stated in the schema itself, with
+`RenamedFrom` on the column or the table — see
+[`drops push`](#drops-push), which has no other place to keep one.
+`generate` reads those too, and does not copy them into the log: the
+log records answers somebody gave to a question, and a declaration is
+not one.
+
 Every answer, typed or prompted, is written to
 `<dir>/meta/_renames.json` alongside the snapshots. The next run reads
 it, so the question is asked once; committing the file is what makes a
@@ -163,6 +170,46 @@ where a reviewable file is the point.
 what it saw and declined to act on: an index the database has that
 your schema never declared, an index it cannot describe, an expression
 the server would not respell. See `pg/push.go` for the full list.
+
+#### Renames, on the push path
+
+`push` stops on a change that could be a rename for the same reason
+`generate` does, with the same message and the same exit code of 3.
+There is no migration directory here, so there is nowhere to record an
+answer — which is why the answer that lasts goes in the schema:
+
+```go
+pg.Add(Users, pg.Text("emailAddress").NotNull().RenamedFrom("email"))
+var People = pg.NewTable("people").RenamedFrom("users")
+```
+
+Stated there, it answers every database the schema is pushed to rather
+than the one whoever typed a flag was pointed at, and it goes inert
+once the rename has happened — the declaration only applies while the
+database still has the old name and the schema has only the new one,
+so it can be left in place until every database has caught up.
+`generate` reads it too, so the same schema means the same thing to
+both commands.
+
+A database that has *both* names is the one case a declaration cannot
+settle by itself: drops cannot tell a rename that has already run from
+one that has not, and refuses rather than pick. Say which with
+`--drop-column`.
+
+For one run there are `--rename-column`, `--rename-table`,
+`--drop-column`, `--drop-table` and `--interactive`, exactly as on
+`generate`. `--drop-column` is the only way to say the other thing —
+that the column really is going — and it belongs on the command line
+rather than in the schema: once such a drop has been pushed the old
+column is gone and the question never comes back. It outranks a
+`RenamedFrom` naming the same column, because an answer given for this
+run outranks the schema's standing one.
+
+`--allow-destructive` does **not** answer a rename question. The two
+are different decisions: whether a column is being renamed or dropped
+is a claim about what the change means, and whether a change that
+destroys data may run is a permission about consequences. One flag
+making both would mean granting the second silently granted the first.
 
 ### `drops drift`
 
@@ -223,7 +270,12 @@ say — the false-positive story matters more than the true-positive one
 ## Destructive changes
 
 `push`, `migrate` and `migrate down` run their statements through
-`pg.AnalyzeMigration` before applying anything. A statement that
+`pg.AnalyzeMigration` before applying anything. It reads statements, so
+it can only refuse what a statement says: a rename mistaken for a drop
+is refused earlier, by the rename question, and not here — see
+[Renames, on the push path](#renames-on-the-push-path).
+
+ A statement that
 destroys data or an object — `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`,
 `DROP TYPE`, `ALTER TYPE ... DROP VALUE` — stops the command, which
 prints each statement it is holding back and exits 3.

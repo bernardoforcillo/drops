@@ -805,13 +805,21 @@ func markPublishedOn(ctx context.Context, exec interface {
 // becomes available for retry at nextRetryAt with attempts bumped
 // and the error message stored in lastError.
 func (o *Outbox) MarkFailed(ctx context.Context, id int64, attempts int, nextRetryAt time.Time, lastErr string) error {
+	return markFailedOn(ctx, o.db, o.table, o.now().UTC(), id, attempts, nextRetryAt, lastErr)
+}
+
+// markFailedOn is the shared body used by Outbox.MarkFailed and the
+// in-transaction path in the per-aggregate worker.
+func markFailedOn(ctx context.Context, exec interface {
+	Exec(context.Context, string, ...any) (drops.Result, error)
+}, table string, now time.Time, id int64, attempts int, nextRetryAt time.Time, lastErr string) error {
 	if nextRetryAt.IsZero() {
-		sql := fmt.Sprintf("UPDATE %s SET `attempts` = ?, `lastError` = ?, `failedAt` = ? WHERE `id` = ?", Dialect.QuoteIdent(o.table))
-		_, err := o.db.Exec(ctx, sql, attempts, lastErr, o.now().UTC(), id)
+		sql := fmt.Sprintf("UPDATE %s SET `attempts` = ?, `lastError` = ?, `failedAt` = ? WHERE `id` = ?", Dialect.QuoteIdent(table))
+		_, err := exec.Exec(ctx, sql, attempts, lastErr, now, id)
 		return err
 	}
-	sql := fmt.Sprintf("UPDATE %s SET `attempts` = ?, `lastError` = ?, `availableAt` = ? WHERE `id` = ?", Dialect.QuoteIdent(o.table))
-	_, err := o.db.Exec(ctx, sql, attempts, lastErr, nextRetryAt.UTC(), id)
+	sql := fmt.Sprintf("UPDATE %s SET `attempts` = ?, `lastError` = ?, `availableAt` = ? WHERE `id` = ?", Dialect.QuoteIdent(table))
+	_, err := exec.Exec(ctx, sql, attempts, lastErr, nextRetryAt.UTC(), id)
 	return err
 }
 
@@ -1181,7 +1189,7 @@ func (w *OutboxWorker) runBatchInTx(ctx context.Context, tx *DB, events []Outbox
 		return markPublishedOn(ctx, tx, w.ob.table, w.now().UTC(), ids...)
 	}
 	for _, e := range events {
-		w.failOne(ctx, e, herr)
+		w.failOneOn(ctx, tx, e, herr)
 	}
 	return nil
 }
@@ -1193,7 +1201,7 @@ func (w *OutboxWorker) runBatchInTx(ctx context.Context, tx *DB, events []Outbox
 func (w *OutboxWorker) runSequentialInTx(ctx context.Context, tx *DB, events []OutboxEvent) error {
 	for _, e := range events {
 		if herr := w.handler(ctx, e); herr != nil {
-			w.failOne(ctx, e, herr)
+			w.failOneOn(ctx, tx, e, herr)
 			return nil
 		}
 		if err := markPublishedOn(ctx, tx, w.ob.table, w.now().UTC(), e.ID); err != nil {
@@ -1203,20 +1211,41 @@ func (w *OutboxWorker) runSequentialInTx(ctx context.Context, tx *DB, events []O
 	return nil
 }
 
-// failOne handles a per-event failure: bump attempts, compute next
-// retry time, mark terminal if MaxAttempts is reached.
-//
-// The failure is recorded on the Outbox's own connection rather than
-// on any transaction the caller is inside, so a rollback cannot undo
-// the attempt count — a poison event that rolls its transaction back
-// on every try would otherwise never reach MaxAttempts.
+// failOne handles a per-event failure on the unordered paths, which
+// hold no transaction: bump attempts, compute next retry time, mark
+// terminal if MaxAttempts is reached.
 func (w *OutboxWorker) failOne(ctx context.Context, e OutboxEvent, herr error) {
+	w.failOneOn(ctx, w.ob.db, e, herr)
+}
+
+// failOneOn is failOne against a specific handle.
+//
+// The per-aggregate paths pass their own transaction. Writing the
+// failure through the pool instead would want a second connection while
+// DrainAggregate's transaction still holds the first — a worker on a
+// pool of one stops dead at the first handler error, waiting for a
+// connection its own transaction is holding. MySQL makes that worse
+// than it is on PostgreSQL: the transaction also holds the aggregate's
+// GET_LOCK, which is session-scoped, so the stall keeps every other
+// worker out of that aggregate too.
+//
+// The argument for the pool is that a rollback must not be able to undo
+// an attempts bump, or a poison event whose transaction rolls back
+// every time never reaches MaxAttempts and retries forever. That is
+// worth stating and it does not apply here: both in-transaction callers
+// record the failure and immediately return nil, so the transaction
+// carrying the bump is the one that commits. Anything that later gives
+// those callers a way to fail after this point has to move the bump
+// back out.
+func (w *OutboxWorker) failOneOn(ctx context.Context, exec interface {
+	Exec(context.Context, string, ...any) (drops.Result, error)
+}, e OutboxEvent, herr error) {
 	attempts := e.Attempts + 1
 	var nextRetry time.Time
 	if w.maxAttempts == 0 || attempts < w.maxAttempts {
 		nextRetry = w.now().Add(w.computeBackoff(attempts))
 	}
-	if err := w.ob.MarkFailed(ctx, e.ID, attempts, nextRetry, herr.Error()); err != nil && w.onError != nil {
+	if err := markFailedOn(ctx, exec, w.ob.table, w.now().UTC(), e.ID, attempts, nextRetry, herr.Error()); err != nil && w.onError != nil {
 		w.onError(err)
 	}
 }

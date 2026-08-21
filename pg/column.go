@@ -51,6 +51,12 @@ type Column struct {
 	// which column a handle *is* has to see the two as equal — see
 	// key.
 	origin *Column
+
+	// renamedFrom is the name this column used to have, set by
+	// (*Col[T]).RenamedFrom. It is the one fact about a column that no
+	// comparison of two schemas can recover — see rename.go — and the
+	// schema is where Push can find it.
+	renamedFrom string
 }
 
 // FK describes a foreign-key reference.
@@ -111,6 +117,10 @@ func (c *Column) DefaultSQL() string { return c.defaultSQL }
 
 // ForeignKey returns the foreign-key reference, or nil if none.
 func (c *Column) ForeignKey() *FK { return c.ref }
+
+// PreviousName returns the name the column was declared to have been
+// renamed from, or empty when it was not. See (*Col[T]).RenamedFrom.
+func (c *Column) PreviousName() string { return c.renamedFrom }
 
 // IsManaged reports whether drops writes this column rather than the
 // application — the soft-delete marker, the timestamps a mixin keeps
@@ -275,6 +285,30 @@ func (c *Col[T]) OptimisticLock() *Col[T] {
 // a struct field for them would be redundant rather than missing.
 func (c *Col[T]) Managed() *Col[T] {
 	c.Column.managed = true
+	return c
+}
+
+// RenamedFrom states that this column is the column that used to be
+// called previous — the same column, the same data, a different name.
+//
+// Nothing in a pair of schemas can tell a rename from a drop and an
+// add, so drops asks rather than guesses, and this is the answer
+// written where the question is. GenerateMigration can record an
+// answer in the migration directory; Push has no migration directory,
+// and its refusal is otherwise unanswerable by anything durable. A
+// rename is a fact about the schema's history, the schema is what Push
+// reads, so the schema is where the fact belongs — and it then travels
+// to every database the schema is pushed to, not just to the one
+// whoever typed the flag was pointed at.
+//
+// The declaration is inert once the rename has happened: it is applied
+// only while the old name is still in the database and the new one is
+// not, so it may be left in place, and should be until every database
+// the schema is pushed to has moved past it.
+//
+//	pg.Add(Users, pg.Text("emailAddress").NotNull().RenamedFrom("email"))
+func (c *Col[T]) RenamedFrom(previous string) *Col[T] {
+	c.Column.renamedFrom = previous
 	return c
 }
 

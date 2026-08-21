@@ -10,6 +10,27 @@
 
 package schemagen
 
+// NotesWithOwner is one row of the "notes" table with owner loaded.
+//
+// It is what this query fills, and only this query — the relation
+// paths below are the ones the struct declares, and under
+// StrictLoading a query that loads fewer is refused:
+//
+//	var rows []NotesWithOwner
+//	db.Find(Notes).With("owner").All(ctx, &rows)
+//
+// The columns come from the embedded NotesRow. Each relation field is
+// tagged with the name the loader looks up, and typed the way the
+// loader fills it:
+//
+//   - Owner is an interface: "owner" is MorphTo, and the loaded
+//     parent's type varies row by row — the loader stores a
+//     pointer to it, so read it with a type switch.
+type NotesWithOwner struct {
+	NotesRow
+	Owner any `drop:"-" dropRel:"owner"`
+}
+
 // PostsWithAuthor is one row of the "posts" table with author loaded.
 //
 // It is what this query fills, and only this query — the relation
@@ -53,6 +74,52 @@ type PostsWithAuthorPosts struct {
 	Author *UsersWithPosts `drop:"-" dropRel:"author"`
 }
 
+// PostsWithTags is one row of the "posts" table with tags loaded.
+//
+// It is what this query fills, and only this query — the relation
+// paths below are the ones the struct declares, and under
+// StrictLoading a query that loads fewer is refused:
+//
+//	var rows []PostsWithTags
+//	db.Find(Posts).With("tags").All(ctx, &rows)
+//
+// The columns come from the embedded PostsRow. Each relation field is
+// tagged with the name the loader looks up, and typed the way the
+// loader fills it:
+//
+//   - Tags is a slice: "tags" is ManyToMany.
+//
+// A nil slice is not an empty relation. The loader assigns an empty
+// non-nil slice to a parent with no children, so a nil one means no
+// query ever filled it.
+type PostsWithTags struct {
+	PostsRow
+	Tags []TagsRow `drop:"-" dropRel:"tags"`
+}
+
+// UsersWithNotes is one row of the "users" table with notes loaded.
+//
+// It is what this query fills, and only this query — the relation
+// paths below are the ones the struct declares, and under
+// StrictLoading a query that loads fewer is refused:
+//
+//	var rows []UsersWithNotes
+//	db.Find(Users).With("notes").All(ctx, &rows)
+//
+// The columns come from the embedded UsersRow. Each relation field is
+// tagged with the name the loader looks up, and typed the way the
+// loader fills it:
+//
+//   - Notes is a slice: "notes" is MorphMany.
+//
+// A nil slice is not an empty relation. The loader assigns an empty
+// non-nil slice to a parent with no children, so a nil one means no
+// query ever filled it.
+type UsersWithNotes struct {
+	UsersRow
+	Notes []NotesRow `drop:"-" dropRel:"notes"`
+}
+
 // UsersWithPosts is one row of the "users" table with posts loaded.
 //
 // It is what this query fills, and only this query — the relation
@@ -74,4 +141,25 @@ type PostsWithAuthorPosts struct {
 type UsersWithPosts struct {
 	UsersRow
 	Posts []PostsRow `drop:"-" dropRel:"posts"`
+}
+
+// UsersWithProfile is one row of the "users" table with profile loaded.
+//
+// It is what this query fills, and only this query — the relation
+// paths below are the ones the struct declares, and under
+// StrictLoading a query that loads fewer is refused:
+//
+//	var rows []UsersWithProfile
+//	db.Find(Users).With("profile").All(ctx, &rows)
+//
+// The columns come from the embedded UsersRow. Each relation field is
+// tagged with the name the loader looks up, and typed the way the
+// loader fills it:
+//
+//   - Profile is a pointer: "profile" is HasOne, and a parent with
+//     no match keeps a nil, which a zero struct could not tell from
+//     a real row of zeros.
+type UsersWithProfile struct {
+	UsersRow
+	Profile *ProfilesRow `drop:"-" dropRel:"profile"`
 }

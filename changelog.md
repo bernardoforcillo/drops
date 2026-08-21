@@ -41,9 +41,27 @@ once a 1.0 is cut.
   its table and its paths (`UsersWithPostsComments`), which keeps a
   self-referential chain apart, and `-shape 'AuthorWithBooks=...'`
   names one outright. A name the package already declares is skipped
-  with a note in the header, as in rows mode; the output is
-  byte-stable, including across a different arrangement of the same
-  arguments.
+  with a note in the header, as in rows mode — but only when the
+  struct already there carries the fields this run would have written,
+  because the other generated structs nest it. A declaration that
+  disagrees is a collision and is refused, and that holds across
+  separate runs as well as within one: a derived name erases where a
+  path was split, so `users:posts.tags` and `users:posts,tags` arrive
+  at one name carrying different fields, and `-o` lets two runs write
+  two files into one package. The package's own declarations are read
+  back and compared, which costs nothing to check in and leaves the
+  names no longer than they were. The output is byte-stable, including
+  across a different arrangement of the same arguments.
+
+  `examples/schemagen` now declares one relation of every kind — a
+  profile for the `HasOne`, a junction for the `ManyToMany`, a notes
+  table that is both halves of the polymorphic pair — and generates a
+  shape for each, so the integration suite loads all six from
+  generated structs against live PostgreSQL rather than from
+  hand-written mirrors, including the empty case for every
+  cardinality. Four of the six previously had the generator's half and
+  the loader's half asserted separately, which is two expectations
+  written by one author and nothing mechanical tying them together.
 
   Each relation field also carries `drop:"-"`. It is not decoration: a
   relation field sits at depth 0 and would out-rank a real column of
@@ -107,6 +125,88 @@ once a 1.0 is cut.
   had not been told about a rename copied the table without that
   column and dropped the original in the same breath, with no `DROP
   COLUMN` anywhere in the file to warn anybody.
+
+- **Push asks the rename question too, and the schema is where the
+  answer lives.** Rename detection reached `GenerateMigration` and
+  stopped there. All three `Push` implementations went on calling
+  `Diff` with no renames and no ambiguity check, so `Push` was a
+  second door into exactly the data loss the feature exists to close —
+  and the quieter door, because a push has no migration file for
+  anybody to read before it runs. `drops push` at least refused the
+  `DROP COLUMN` as destructive, but `--allow-destructive` then applied
+  the drop-and-add without ever mentioning that a rename was possible;
+  a library caller of `pg.Push` or `mysql.Push` got no refusal at all;
+  and `sqlite.Push` was worse than either, because its rebuild copies
+  only the columns both sides name, so the renamed column's data went
+  with **no `DROP COLUMN` anywhere in the statement list** for the
+  destructive guard to catch.
+
+  All three now run the same check the generator runs and return
+  `*RenameAmbiguityError` before executing anything.
+
+  The answer comes from the schema. `(*Col[T]).RenamedFrom("email")`
+  and `(*Table).RenamedFrom("users")` state that a column or table is
+  the one that used to be called that — a fact about the schema's
+  history, kept in the thing `Push` already reads, rather than in a
+  migration directory a push does not have. Stated there it answers
+  every database the schema is pushed to instead of the one whoever
+  typed a flag was pointed at, and it goes inert on its own:
+  `renameStillPending` applies it only while the old name is in the
+  database and the new one is not, so it can be left in place until
+  every deployment has caught up. `DeclaredRenames` exposes what a
+  schema states, and `GenerateMigration` reads it too — but does not
+  copy it into `meta/_renames.json`, because that file records answers
+  somebody gave and a declaration is not one. `PushOptions.Renames`
+  takes the per-run answer, which is also the only way to say the
+  other thing — that the column really is being dropped — since once
+  such a drop has been pushed the question never comes back.
+
+  `drops push` grows `--rename-column`, `--rename-table`,
+  `--drop-column`, `--drop-table` and `--interactive`, the same five
+  `drops generate` has, and refuses with the same exit code of 3.
+  `--allow-destructive` is deliberately not one of them: whether a
+  column is being renamed or dropped is a claim about what a change
+  means, whether a change that destroys data may run is a permission
+  about consequences, and one flag answering both would have granting
+  the second silently grant the first.
+
+  Two smaller things fell out of it. `sqlite.Push` and `mysql.Push`
+  narrow the live side to the tables the schema declares, which
+  filtered out the very table a declared table rename is about — the
+  push then built the new table empty beside the old one and applied
+  the rename to nothing; a table the schema names as a former name is
+  now kept. And the refusal's wording follows its audience: the
+  message still names the columns, but a push does not print the
+  `--rename-column` lines or point at a rename log it has not got.
+
+  Two things about the precedence between the two answers. A refusal
+  given for this run now outranks a `RenamedFrom` naming the same
+  object, which is what `PushOptions.Renames` and the refusal's own
+  wording had been promising: the two answers are not the same shape —
+  a rename names a pair, a refusal names only the object that is going
+  — so the refusal could not outrank the declaration by carrying the
+  same key, and was simply not heard. An operator who had decided the
+  column really was going had nothing to say, and against a database
+  holding both names the replayed declaration failed with advice about
+  writing a migration, which a push has not got either.
+
+  And a table rename's claim on the old name now expires. A
+  declaration is meant to be left in the source until every deployment
+  has caught up, so it outlives the rename; the hole it opens in
+  `sqlite.Push`'s and `mysql.Push`'s narrowing must not. Once the
+  database carries the new name, whatever answers to the old one is
+  somebody else's table — and offering it to the diff as the previous
+  life of a declared table made the push either ask an unanswerable
+  question pairing the wrong table's columns, or, once told the old
+  name really was going, drop it.
+
+- **A rename decided on a run that changed nothing is still
+  recorded.** `GenerateMigration` returned its `NoOp` result before
+  writing `meta/_renames.json`, so an answer given on a run whose diff
+  came to nothing was dropped on the floor and had to be given again —
+  by a run that may have had nobody to give it. The log is now written
+  first. Nothing is written when no answer was given this run, so a
+  settled schema still writes nothing at all.
 
 - **`drops lint`: three query mistakes, caught before the query
   runs.** Drizzle ships an ESLint plugin whose flagship rule is
@@ -692,6 +792,29 @@ once a 1.0 is cut.
   error, so a bad pair now comes back as one instead of unwinding the
   caller.
 
+- **The safety analyser names the shape a lost rename makes.**
+  `AnalyzeStatements` now also reads a migration as a whole, not only
+  one statement at a time, and reports `unstated-table-rename` when a
+  DROP TABLE shares a migration with a CREATE TABLE of another name,
+  and `unstated-column-rename` when one table loses a column and gains
+  one (`drops/pg`, `drops/sqlite`, `drops/mysql`).
+
+  These are the two ambiguities `DetectRenames` cannot see and so
+  cannot refuse: a table rename where every column was renamed with it
+  leaves the two snapshots with no column names in common, and a column
+  rename that crosses a type family is not a candidate at all. Both
+  come out of the generator as the destructive pair, silently.
+
+  Both rules are graded `SeverityInfo` on purpose. `drop-table` is
+  already an error and `drop-column` an error or a warning depending on
+  the dialect, so a second finding at that level adds urgency to
+  nothing and would be the first rule anyone put in `Ignore`; and both
+  need *both* halves present, because a warning that fires on every
+  genuine drop is one people learn to skip. A rename the migration
+  states out loud accounts for the pair — which is what keeps the rule
+  off SQLite's table rebuild, the CREATE/copy/DROP/RENAME sequence
+  every column change on that dialect produces.
+
 ### Changed
 - **`NewEntity` now refuses a nullable column bound to a field that
   cannot hold NULL, and it refuses at package-var init time — so an
@@ -731,7 +854,81 @@ once a 1.0 is cut.
   Columns drops itself writes are exempt automatically; the rest must
   be mapped or named through `AllowUnmappedColumns`.
 
+- **The two outbox dialects agreed on failure bookkeeping.** `drops/pg`
+  wrote a handler failure through the draining transaction and
+  `drops/mysql` deliberately through the pool, each with a coherent
+  argument, and they cannot both be the library's answer. The pg answer
+  wins and `drops/mysql` now matches it: the per-aggregate paths record
+  the attempts bump on their own transaction via `failOneOn`.
+
+  The deciding argument is the pool. Writing the failure through
+  `Outbox.MarkFailed` asks the pool for a connection that
+  `DrainAggregate`'s own transaction is holding, so a worker on a pool
+  of one stopped at the first handler error and never came back — and
+  on MySQL that transaction also holds the aggregate's session-scoped
+  `GET_LOCK`, so the stall kept every other worker out of that
+  aggregate too. The losing argument — that a rollback must not be able
+  to undo an attempts bump, or a poison event never reaches
+  MaxAttempts — is recorded in the doc comment on `failOneOn` in both
+  packages, along with why it does not apply: both in-transaction
+  callers record the failure and immediately return nil, so the
+  transaction carrying the bump is the one that commits.
+
 ### Fixed
+- **The `dropRel` tag's fallback is documented as the hazard it is.**
+  `relationTargetField` looks a relation's field up by its `dropRel`
+  tag and then, failing that, by a case-insensitive field-name match.
+  Every shape the generator emits names its field after its relation,
+  so every live test passed with the tag deleted and nothing said what
+  the tag was for. The fallback claims a field because of what it is
+  *called*: an untagged `Posts []PostsRow` that the caller meant as
+  their own cache is filled by `With("posts")` all the same, and the
+  walk reaches through embedded structs into the row struct, where the
+  fields are columns. The doc comment now says so, and a live test
+  discriminates — a field named `Articles` carrying `dropRel:"posts"`
+  loads, the same field without the tag is refused.
+
+- **ClickHouse's keyset pagination walked off the end at the first NULL
+  key.** `clickhouse/cursor.go` still rendered a plain `col > ?` bound
+  to the cursor value, so a page whose last row had a NULL in a key
+  column produced a predicate that matched nothing — an empty page that
+  reads exactly like the end of the result set, on every page from then
+  on. `drops/pg` and `drops/sqlite` were made NULL-aware; ClickHouse
+  was left because its NULL ordering needed a decision rather than a
+  mechanical port.
+
+  The decision: ClickHouse's default is NULLS LAST in *both*
+  directions. PostgreSQL reaches its default by sorting NULL as the
+  largest value and SQLite and MySQL by sorting it as the smallest, so
+  on all three the placement flips with the direction. ClickHouse
+  instead carries a `nulls_direction` beside the sort direction and
+  defaults it to "same as direction, i.e. NULLS LAST", flipping only
+  for an explicit `NULLS FIRST` — so a descending walk leaves the NULLs
+  at the end where ascending put them. The guard is built against that,
+  honours an explicit `NullsFirst`/`NullsLast`, and reverses both
+  together when paging backward. `EncodeCursor` also follows a pointer
+  to its pointee (a nil one being the NULL) and unwraps a
+  `driver.Valuer`, as pg's does, so a Nullable key column can be a page
+  boundary at all.
+
+- **A ClickHouse cursor on a NaN or an infinity silently became a
+  cursor on zero.** `encodeCursorValue` discarded the marshal error on
+  the float branch, and JSON has no spelling for either, so the payload
+  carried a bare `null` that decoded straight back to `0` — a page that
+  ended on a NaN resumed from zero and replayed every row above it.
+  `EncodeCursor` now returns the error. ClickHouse sorts NaN into the
+  gap between the values and the NULLs, so this is reachable on any
+  `Float64` key.
+
+- **A MorphMany bound to a non-slice field was reported as a HasMany.**
+  The slice guard in `pg/find.go` accepts `HasManyKind` and
+  `MorphManyKind` but hardcoded the name of the first, so the one fact
+  the error stated about the relation was wrong and sent the reader
+  looking for a declaration that does not exist. The message now names
+  the kind it saw. The sibling dialects were checked and are correct:
+  `drops/sqlite` has no MorphMany, and both `ManyToMany` guards are
+  reachable only for that kind.
+
 - **A per-parent `Limit` on an eager-loaded relation dropped that
   relation's global filters.** An edge of a `Load` tree is normally a
   `Select().From(rel.To)`, so it carries the related table's guards for

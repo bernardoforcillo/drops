@@ -200,3 +200,79 @@ func TestMySQLOutboxPerAggregateStillDrainsEventsWithNoAggregate(t *testing.T) {
 		t.Error("an event with no aggregate was never delivered")
 	}
 }
+
+// The per-aggregate drain holds a transaction — and, on MySQL, a named
+// lock taken on that transaction's session — for the whole batch, so
+// anything it does while the batch is in flight has to go through that
+// transaction rather than back to the pool. A handler failure is the
+// case that did not: it wrote the attempts bump through
+// Outbox.MarkFailed, which asks the pool for a connection the drain's
+// own transaction is holding. On a pool of one the worker stops there
+// and never comes back.
+//
+// This is the same defect PostgreSQL had and fixed; the two dialects
+// disagreed about it until now. See mysql.OutboxWorker.failOneOn for
+// the argument that lost.
+func TestMySQLOutboxPerAggregateFailureFitsInOneConnection(t *testing.T) {
+	db, _ := openMySQLPinnedConn(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ob, tbl := mysqlOutboxFixture(t, db)
+	if err := db.InTx(ctx, func(tx *mysql.DB) error {
+		return ob.EmitWith(tx, ctx, "boom", map[string]string{},
+			mysql.EmitOptions{AggregateType: "cap", AggregateID: "one"})
+	}); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+
+	delivered := make(chan struct{}, 4)
+	w := mysql.NewOutboxWorker(ob).
+		WithOrdering(mysql.OrderingPerAggregate).
+		WithInterval(20 * time.Millisecond).
+		WithBackoff(func(int) time.Duration { return time.Hour }).
+		OnEvent(func(context.Context, mysql.OutboxEvent) error {
+			select {
+			case delivered <- struct{}{}:
+			default:
+			}
+			return errors.New("handler refused it")
+		})
+
+	runCtx, stop := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer stop()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = w.Run(runCtx)
+	}()
+
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler never ran")
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the worker never returned: the failure path waited for a connection its own transaction was holding")
+	}
+
+	// The bookkeeping landed, which is what says the write went through
+	// the drain's transaction rather than being lost with it.
+	var attempts int64
+	rows, err := db.Query(context.Background(), "SELECT `attempts` FROM `"+tbl.Name()+"`")
+	if err != nil {
+		t.Fatalf("read attempts: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("the outbox row is gone")
+	}
+	if err := rows.Scan(&attempts); err != nil {
+		t.Fatalf("scan attempts: %v", err)
+	}
+	if attempts < 1 {
+		t.Errorf("attempts is %d; the failure was never recorded", attempts)
+	}
+}

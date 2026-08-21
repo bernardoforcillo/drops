@@ -10,6 +10,56 @@ package schemagen
 
 import "time"
 
+// NotesRow is one row of the "notes" table, derived from its
+// declaration. Every column is bound, so pg.NewEntity needs no
+// exemption; a column that admits NULL is a pointer, because that
+// is the field type pg.NewEntity will let it bind to.
+type NotesRow struct {
+	ID        int64  `drop:"id"`
+	Body      string `drop:"body"`
+	OwnerType string `drop:"owner_type"`
+	OwnerID   int64  `drop:"owner_id"`
+}
+
+// NotesInsert is NotesRow without the columns a caller must not
+// supply.
+//
+// Omitted:
+//   - id — bigserial
+//
+// A pointer field is a column that admits NULL. Bind it with
+// (*pg.Col[T]).ValPtr: a nil writes NULL rather than a zero, and
+// the column is still in the INSERT — a column the database is
+// the one to fill is not in this struct at all.
+type NotesInsert struct {
+	Body      string `drop:"body"`
+	OwnerType string `drop:"owner_type"`
+	OwnerID   int64  `drop:"owner_id"`
+}
+
+// PostTagsRow is one row of the "post_tags" table, derived from its
+// declaration. Every column is bound, so pg.NewEntity needs no
+// exemption; a column that admits NULL is a pointer, because that
+// is the field type pg.NewEntity will let it bind to.
+type PostTagsRow struct {
+	PostID int64 `drop:"post_id"`
+	TagID  int64 `drop:"tag_id"`
+}
+
+// PostTagsInsert is PostTagsRow without the columns a caller must not
+// supply.
+//
+// The database fills none of this table's columns, so it omits nothing.
+//
+// A pointer field is a column that admits NULL. Bind it with
+// (*pg.Col[T]).ValPtr: a nil writes NULL rather than a zero, and
+// the column is still in the INSERT — a column the database is
+// the one to fill is not in this struct at all.
+type PostTagsInsert struct {
+	PostID int64 `drop:"post_id"`
+	TagID  int64 `drop:"tag_id"`
+}
+
 // PostsRow is one row of the "posts" table, derived from its
 // declaration. Every column is bound, so pg.NewEntity needs no
 // exemption; a column that admits NULL is a pointer, because that
@@ -33,6 +83,54 @@ type PostsRow struct {
 type PostsInsert struct {
 	UserID int64  `drop:"user_id"`
 	Title  string `drop:"title"`
+}
+
+// ProfilesRow is one row of the "profiles" table, derived from its
+// declaration. Every column is bound, so pg.NewEntity needs no
+// exemption; a column that admits NULL is a pointer, because that
+// is the field type pg.NewEntity will let it bind to.
+type ProfilesRow struct {
+	ID     int64  `drop:"id"`
+	UserID int64  `drop:"user_id"`
+	Bio    string `drop:"bio"`
+}
+
+// ProfilesInsert is ProfilesRow without the columns a caller must not
+// supply.
+//
+// Omitted:
+//   - id — bigserial
+//
+// A pointer field is a column that admits NULL. Bind it with
+// (*pg.Col[T]).ValPtr: a nil writes NULL rather than a zero, and
+// the column is still in the INSERT — a column the database is
+// the one to fill is not in this struct at all.
+type ProfilesInsert struct {
+	UserID int64  `drop:"user_id"`
+	Bio    string `drop:"bio"`
+}
+
+// TagsRow is one row of the "tags" table, derived from its
+// declaration. Every column is bound, so pg.NewEntity needs no
+// exemption; a column that admits NULL is a pointer, because that
+// is the field type pg.NewEntity will let it bind to.
+type TagsRow struct {
+	ID    int64  `drop:"id"`
+	Label string `drop:"label"`
+}
+
+// TagsInsert is TagsRow without the columns a caller must not
+// supply.
+//
+// Omitted:
+//   - id — bigserial
+//
+// A pointer field is a column that admits NULL. Bind it with
+// (*pg.Col[T]).ValPtr: a nil writes NULL rather than a zero, and
+// the column is still in the INSERT — a column the database is
+// the one to fill is not in this struct at all.
+type TagsInsert struct {
+	Label string `drop:"label"`
 }
 
 // UsersRow is one row of the "users" table, derived from its

@@ -37,7 +37,27 @@ type Table struct {
 	// origin is the table this one was copied from by As, and nil on
 	// a table as declared — see key.
 	origin *Table
+
+	// renamedFrom is the name this table used to have, set by
+	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
+	renamedFrom string
 }
+
+// RenamedFrom states that this table is the table that used to be
+// called previous. It is the table-level counterpart of
+// (*Col[T]).RenamedFrom, and carries the same fact for the same
+// reason: a diff sees one table gone and another arrived, and nothing
+// but the schema can say they are the same table.
+//
+//	var Users = mysql.NewTable("people").RenamedFrom("users")
+func (t *Table) RenamedFrom(previous string) *Table {
+	t.renamedFrom = previous
+	return t
+}
+
+// PreviousName returns the name the table was declared to have been
+// renamed from, or empty when it was not.
+func (t *Table) PreviousName() string { return t.renamedFrom }
 
 // NewTable creates a table in the connection's default database.
 func NewTable(name string) *Table {

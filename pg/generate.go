@@ -94,7 +94,11 @@ type GenerateResult struct {
 // meta/_journal.json.
 //
 // It is a no-op when there are no differences between the current Go
-// schema and the latest snapshot; no files are written in that case.
+// schema and the latest snapshot; no migration files are written in
+// that case. The one thing a no-op run still writes is RenameLogFile,
+// and only when this run was given an answer to record — a decision
+// that settles a question without moving the schema is still a
+// decision, and leaving it unrecorded means being asked again.
 //
 // It refuses, returning *RenameAmbiguityError and writing nothing, when
 // the change could be a rename and nothing on disk or in the options
@@ -143,7 +147,12 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 		return nil, err
 	}
 	decisions := mergeDecisions(recorded, opts.Renames)
-	renames, unresolved := ResolveRenames(prev, cur, decisions)
+	// The schema can state a rename of its own — see DeclaredRenames.
+	// That is a fact the schema carries, not an answer somebody gave
+	// to a question, so it settles the question without being written
+	// into the log, and a recorded answer wins where the two disagree.
+	resolving := mergeDecisions(DeclaredRenames(opts.Schema), decisions)
+	renames, unresolved := ResolveRenames(prev, cur, resolving)
 	if len(unresolved) > 0 {
 		// Nothing is written. A migration that turns a rename into a
 		// DROP COLUMN is worse than no migration at all, and this is the
@@ -156,8 +165,29 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 
 	diffOpts := DiffOptions{Safe: opts.Safe, Renames: renames}
 	statements := Diff(prev, cur, diffOpts)
+
+	var renameLogBytes []byte
+	if len(decisions) > 0 {
+		if renameLogBytes, err = marshalRenameLog(decisions); err != nil {
+			return nil, err
+		}
+	}
+	// A no-op run still records an answer it was just given. Not every
+	// decision moves the schema: saying "no, that column really is
+	// going" about a column the diff no longer proposes anything for
+	// settles the question and produces no statement, and returning
+	// here without writing it meant the same question came back on the
+	// next run — with the same nobody to answer it. Nothing is written
+	// when no answer was given this run, so a settled schema stays
+	// silent.
 	if len(statements) == 0 {
-		return &GenerateResult{NoOp: true}, nil
+		if len(opts.Renames) == 0 {
+			return &GenerateResult{NoOp: true}, nil
+		}
+		if err := opts.Write(RenameLogFile, renameLogBytes); err != nil {
+			return nil, fmt.Errorf("drops/pg: write rename log: %w", err)
+		}
+		return &GenerateResult{NoOp: true, RenameLog: renameLogBytes}, nil
 	}
 
 	name := opts.Name
@@ -196,13 +226,6 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 		downStmts := DiffDown(prev, cur, diffOpts)
 		if len(downStmts) > 0 {
 			downSQL = strings.Join(downStmts, "\n--> statement-breakpoint\n") + "\n"
-		}
-	}
-
-	var renameLogBytes []byte
-	if len(decisions) > 0 {
-		if renameLogBytes, err = marshalRenameLog(decisions); err != nil {
-			return nil, err
 		}
 	}
 

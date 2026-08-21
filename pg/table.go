@@ -70,7 +70,27 @@ type Table struct {
 	// implement default scopes — SoftDelete's "deletedAt IS NULL"
 	// guard, a tenancy axis. See filters.go.
 	filters []tableFilter
+
+	// renamedFrom is the name this table used to have, set by
+	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
+	renamedFrom string
 }
+
+// RenamedFrom states that this table is the table that used to be
+// called previous. It is the table-level counterpart of
+// (*Col[T]).RenamedFrom, and carries the same fact for the same
+// reason: a diff sees one table gone and another arrived, and nothing
+// but the schema can say they are the same table.
+//
+//	var Users = pg.NewTable("people").RenamedFrom("users")
+func (t *Table) RenamedFrom(previous string) *Table {
+	t.renamedFrom = previous
+	return t
+}
+
+// PreviousName returns the name the table was declared to have been
+// renamed from, or empty when it was not.
+func (t *Table) PreviousName() string { return t.renamedFrom }
 
 // NewTable creates a table in the default ("public") schema. The name
 // is validated and the constructor panics on invalid identifiers — see

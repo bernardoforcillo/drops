@@ -1,7 +1,5 @@
 package clickhouse
 
-import "github.com/bernardoforcillo/drops"
-
 // Mixin is the richer companion of the plain template functions in
 // template.go. ClickHouse exposes only InsertHook and SelectBuilder
 // default filters — UPDATE/DELETE happen via async ALTERs and are
@@ -60,10 +58,11 @@ type SoftDeleteMixin struct {
 // Apply implements Mixin.
 func (m *SoftDeleteMixin) Apply(t *Table) {
 	m.Cols = SoftDelete(t)
-	t.DefaultFilter(drops.ExprFunc(func(b *drops.Builder) {
-		m.Cols.DeletedAt.Column.WriteSQL(b)
-		b.WriteString(" IS NULL")
-	}))
+	// suffixExpr rather than a closure, so the guard is an expression
+	// node like every other predicate this package builds and the
+	// resolver walk terminates at a column rather than at a func value.
+	// The rendered bytes are the ones this mixin always emitted.
+	t.DefaultFilter(suffixExpr(m.Cols.DeletedAt.Column, " IS NULL"))
 }
 
 // AuditMixin registers "createdBy" and "updatedBy" columns of the

@@ -39,6 +39,13 @@ type Entity[T any] struct {
 	table      *Table
 	colFields  []entityColField
 	validators []Validator[T]
+
+	// tenantCol and tenantField are the column and struct field
+	// [Entity.ScopeByTenant] named, and are the write-side half of the
+	// axis: the read-side half lives on the table as a ContextFilter.
+	// See tenant.go.
+	tenantCol   *Column
+	tenantField []int
 }
 
 // Validator is called before Create / CreateMany with a pointer to
@@ -163,6 +170,15 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) (drops.Result, err
 	if err := e.runValidators(r); err != nil {
 		return nil, err
 	}
+	// The tenant is stamped onto the STRUCT, before the bindings are
+	// collected, so the caller's own value comes back carrying the
+	// tenant it was written under — and a row that already names a
+	// different tenant is refused rather than silently rewritten. The
+	// builder stamps the binding as well (see InsertBuilder.resolveCtx);
+	// doing it here too is what makes r agree with the row.
+	if err := e.stampTenant(ctx, r); err != nil {
+		return nil, err
+	}
 	v := reflect.ValueOf(r).Elem()
 	bindings := e.collectBindings(v)
 	if len(bindings) == 0 {
@@ -182,6 +198,14 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 	}
 	for i := range rs {
 		if err := e.runValidators(&rs[i]); err != nil {
+			return nil, err
+		}
+		// Every row, before any SQL is built. A batch is the normal
+		// size of a write here, so a stamp applied to some rows and not
+		// others is the outcome worth ruling out: half a million rows
+		// land owned and the rest owned by nobody, in one statement
+		// reported as a success.
+		if err := e.stampTenant(ctx, &rs[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -248,8 +272,26 @@ func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T] { q.sb.Limit(n); return 
 // Offset sets the OFFSET.
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 
-// Unscoped opts out of the table's DefaultFilter predicates.
+// Unscoped opts out of the table's automatic predicates — its
+// DefaultFilter list and its ContextFilter list alike. See
+// [SelectBuilder.Unscoped].
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+
+// GroupBy / Having / Limit-free chaining is available on the
+// underlying builder.
+func (q *EntityQuery[T]) Builder() *SelectBuilder { return q.sb }
+
+// ToSQLCtx renders the statement this query would send for ctx, with
+// every context filter resolved. It is what a test asserts on: a
+// round-trip against a single-tenant fixture passes while leaking, and
+// the rendered SQL is the only place the guard is visible.
+func (q *EntityQuery[T]) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	return q.sb.ToSQLCtx(ctx)
+}
+
+// Count returns the number of rows the query matches, scoped the same
+// way All is.
+func (q *EntityQuery[T]) Count(ctx context.Context) (int64, error) { return q.sb.Count(ctx) }
 
 // All executes the query and returns the matching rows as a typed
 // slice.

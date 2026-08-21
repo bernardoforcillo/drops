@@ -9,32 +9,24 @@ import "github.com/bernardoforcillo/drops"
 // subquery-oriented forms.
 
 // Exists renders EXISTS (<subquery>).
+//
+// The operand is held rather than closed over, so the statement inside
+// is scoped exactly as one written at the top level is — and, since
+// [Not] holds its operand too, Not(Exists(sub)) is scoped exactly as
+// NotExists(sub) is. See opExpr for why that pairing is the whole
+// point.
 func Exists(q drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("EXISTS (")
-		b.Append(q)
-		b.WriteByte(')')
-	})
+	return &opExpr{parts: []string{"EXISTS (", ")"}, operands: []drops.Expression{q}}
 }
 
 // NotExists renders NOT EXISTS (<subquery>).
 func NotExists(q drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("NOT EXISTS (")
-		b.Append(q)
-		b.WriteByte(')')
-	})
+	return &opExpr{parts: []string{"NOT EXISTS (", ")"}, operands: []drops.Expression{q}}
 }
 
 // Subquery wraps an expression (typically a SELECT) in parentheses for
 // use as a scalar subquery.
-func Subquery(q drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		b.Append(q)
-		b.WriteByte(')')
-	})
-}
+func Subquery(q drops.Expression) drops.Expression { return parens(q) }
 
 // InSub renders "<value> IN (<subquery>)".
 func InSub(value any, sub drops.Expression) drops.Expression {
@@ -47,13 +39,8 @@ func NotInSub(value any, sub drops.Expression) drops.Expression {
 }
 
 func subMembership(value any, op string, sub drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, value)
-		b.WriteByte(' ')
-		b.WriteString(op)
-		b.WriteString(" (")
-		b.Append(sub)
-		b.WriteString("))")
-	})
+	return &opExpr{
+		parts:    []string{"(", " " + op + " (", "))"},
+		operands: []drops.Expression{operandExpr(value), sub},
+	}
 }

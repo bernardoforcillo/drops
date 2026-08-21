@@ -21,11 +21,11 @@ type Table struct {
 	ttl        string
 	settings   []string // "key = value" raw pairs
 
-	// Lifecycle hooks and default filters — ClickHouse has no
-	// builder-side UPDATE/DELETE, so only InsertHook and
-	// SelectBuilder default filters are honoured. Empty by default.
-	insertHooks    []InsertHook
-	defaultFilters []drops.Expression
+	// scope carries every automatic predicate and lifecycle hook the
+	// table declares. It is a pointer, and an alias taken off this
+	// table SHARES it rather than copying it — see tableScope, and see
+	// Table.As.
+	scope *tableScope
 }
 
 // NewTable creates a table in the default database. The name is
@@ -33,14 +33,14 @@ type Table struct {
 // ErrInvalidIdentifier).
 func NewTable(name string) *Table {
 	mustIdent("table", name)
-	return &Table{name: name, byName: map[string]*Column{}}
+	return &Table{name: name, byName: map[string]*Column{}, scope: &tableScope{}}
 }
 
 // NewDatabaseTable scopes the table to an explicit database.
 func NewDatabaseTable(database, name string) *Table {
 	mustIdent("database", database)
 	mustIdent("table", name)
-	return &Table{database: database, name: name, byName: map[string]*Column{}}
+	return &Table{database: database, name: name, byName: map[string]*Column{}, scope: &tableScope{}}
 }
 
 // Name / Database / Alias accessors.
@@ -59,12 +59,13 @@ func (t *Table) Alias() string    { return t.alias }
 // pointing at the un-aliased table, which ClickHouse cannot resolve
 // once the alias has shadowed the name.
 //
-// Default filters are not rewritten. They were built against the
-// un-aliased columns and would name a relation the aliased query no
-// longer has in scope, so an aliased SELECT wants Unscoped plus an
-// explicit predicate. Dropping them instead would turn a tenant or
-// soft-delete guard into silence; leaving them makes the server reject
-// the query, which is the failure worth having.
+// The automatic predicates and the lifecycle hooks are SHARED with the
+// table rather than copied, and they are restated under the alias when
+// they render — see tableScope and Table.resolveFilterExprs. Both
+// halves of that used to be wrong, and each was wrong in its own
+// direction: the alias snapshotted a list that a later init would add
+// to, and the predicates it did carry named the un-aliased relation,
+// which ClickHouse answers with UNKNOWN_IDENTIFIER.
 //
 // The engine clauses — ORDER BY, PARTITION BY, PRIMARY KEY, SAMPLE BY —
 // keep pointing at the original's columns. Every one of them renders
@@ -86,6 +87,7 @@ func (t *Table) Alias() string    { return t.alias }
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
+	// cp.scope is the same pointer, on purpose: see tableScope.
 	cp.alias = alias
 	cp.columns = make([]*Column, len(t.columns))
 	cp.byName = make(map[string]*Column, len(t.byName))
@@ -173,20 +175,48 @@ func (t *Table) Setting(key, value string) *Table {
 
 // Hooks / default filters --------------------------------------------
 
-// OnInsert registers a hook invoked by InsertBuilder.WriteSQL.
+// OnInsert registers a hook invoked before an INSERT is rendered.
+//
+// The list lives in the shared [tableScope] under the same lock
+// [Table.ContextFilter] takes, so an alias taken before the hook was
+// registered still runs it.
 func (t *Table) OnInsert(h InsertHook) *Table {
-	t.insertHooks = append(t.insertHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.insertHooks = appendShared(t.scope.insertHooks, h)
 	return t
 }
 
 // DefaultFilter appends a predicate applied to every Select against
 // the table, unless the builder is marked Unscoped().
+//
+// The predicate is fixed at declaration time, but registration is not
+// assumed to be: the list lives in the shared [tableScope], so an alias
+// taken before SoftDelete still carries the guard the mixin registers.
+//
+// When the predicate depends on the request — the tenant, the acting
+// subject — use [Table.ContextFilter], whose predicate is built per
+// execution from a ctx.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.defaultFilters = appendShared(t.scope.defaultFilters, e)
 	return t
 }
 
-func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
+// DefaultFilters returns the table's default-scope predicates.
+func (t *Table) DefaultFilters() []drops.Expression { return t.defaultFilterList() }
+
+func (t *Table) insertHookList() []InsertHook {
+	if t == nil {
+		return nil
+	}
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.insertHooks
+}
+
+func (t *Table) hasInsertHooks() bool { return len(t.insertHookList()) > 0 }
 
 // Rendering helpers --------------------------------------------------
 
@@ -213,6 +243,14 @@ func (t *Table) writeFrom(b *drops.Builder) {
 func (t *Table) writeRef(b *drops.Builder) {
 	if t.alias != "" {
 		b.WriteIdent(t.alias)
+		return
+	}
+	// A table's automatic predicates are built from the declared column
+	// handles and may be rendering inside a statement whose FROM entry
+	// is an alias of this table. resolveFilterExprs installs the rename
+	// for the length of each such predicate; here is where it lands.
+	if renamed := b.RelationAlias(t.relRef()); renamed != "" {
+		b.WriteIdent(renamed)
 		return
 	}
 	t.writeName(b)

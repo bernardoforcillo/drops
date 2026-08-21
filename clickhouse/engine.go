@@ -150,3 +150,68 @@ func quoteIdents(names []string) []string {
 func quoteLiteral(s string) string {
 	return "'" + escapeQuoted(s, '\'') + "'"
 }
+
+// engineName returns the engine's name token — the identifier before
+// the parameter list — or "" when the spec does not start with one.
+//
+// It reads the rendered text rather than a field, so it answers the
+// same way for a typed constructor and for [Raw]. A schema that spells
+// its engine Raw("ReplicatedReplacingMergeTree('/p', '{replica}')") is
+// making exactly the declaration the typed constructors make, and a
+// check that only understood the typed ones would exempt the spelling
+// most production schemas use.
+func engineName(e Engine) string {
+	if e == nil {
+		return ""
+	}
+	b := drops.NewBuilder(Placeholder)
+	e.WriteEngine(b)
+	sql, _ := b.SQL()
+	i := 0
+	for i < len(sql) {
+		c := sql[i]
+		if c == '_' || (c >= '0' && c <= '9') ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			i++
+			continue
+		}
+		break
+	}
+	return sql[:i]
+}
+
+// mergingEngines are the MergeTree-family engines that FOLD rows
+// sharing a sorting key into one, as opposed to merely storing them in
+// sorted order.
+//
+// Membership is what [ErrTenantNotInSortingKey] turns on, and the list
+// is by behaviour rather than by name: plain MergeTree sorts and never
+// folds, so two tenants' rows with an equal key coexist; every engine
+// here replaces, cancels, sums or aggregates them instead. Graphite is
+// included for the same reason the others are — it rolls points up by
+// key — even though this package has no constructor for it, because a
+// schema can name it through [Raw].
+var mergingEngines = map[string]bool{
+	"ReplacingMergeTree":           true,
+	"CollapsingMergeTree":          true,
+	"VersionedCollapsingMergeTree": true,
+	"SummingMergeTree":             true,
+	"AggregatingMergeTree":         true,
+	"GraphiteMergeTree":            true,
+}
+
+// mergesBySortingKey reports whether name is one of the folding engines,
+// looking through the replication and shared-storage prefixes.
+//
+// The prefixes are stripped rather than enumerated because they compose
+// and they multiply: ClickHouse builds every family member's replicated
+// and shared variants by prefixing the name, so a list of full names
+// would have to be three times as long and would go stale on the next
+// storage backend. What Replicated adds is where the parts live, not
+// what a merge does to them.
+func mergesBySortingKey(name string) bool {
+	for _, prefix := range []string{"Shared", "Replicated"} {
+		name = strings.TrimPrefix(name, prefix)
+	}
+	return mergingEngines[name]
+}

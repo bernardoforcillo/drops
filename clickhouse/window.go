@@ -8,13 +8,20 @@ import "github.com/bernardoforcillo/drops"
 // lagInFrame / leadInFrame, which the Lag / Lead helpers emit.
 
 // Over wraps an aggregate or window function with an OVER clause.
+//
+// The function and every term of the window spec are held as operands
+// rather than closed over, so a scalar subquery written as a PARTITION
+// BY or ORDER BY term is reachable to the resolver. A window spec is an
+// easy place to forget: it is not a predicate, so it does not look like
+// somewhere a statement goes, and PARTITION BY (SELECT …) is perfectly
+// legal.
 func Over(fn drops.Expression, win *Window) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(fn)
-		b.WriteString(" OVER (")
-		win.writeBody(b)
-		b.WriteByte(')')
-	})
+	var o opBuilder
+	o.operand(fn)
+	o.text(" OVER (")
+	win.appendBody(&o)
+	o.text(")")
+	return o.done()
 }
 
 // Window describes the contents of an OVER (...) clause.
@@ -43,40 +50,37 @@ func (w *Window) OrderBy(exprs ...drops.Expression) *Window {
 // "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING".
 func (w *Window) Frame(spec string) *Window { w.frame = spec; return w }
 
-func (w *Window) writeBody(b *drops.Builder) {
+// appendBody writes the window spec into an opBuilder, so each term
+// stays an operand. It renders exactly the text the closure it replaces
+// rendered.
+func (w *Window) appendBody(o *opBuilder) {
 	first := true
 	if len(w.partition) > 0 {
-		b.WriteString("PARTITION BY ")
-		b.AppendList(", ", w.partition)
+		o.text("PARTITION BY ")
+		o.list(w.partition)
 		first = false
 	}
 	if len(w.order) > 0 {
 		if !first {
-			b.WriteByte(' ')
+			o.text(" ")
 		}
-		b.WriteString("ORDER BY ")
-		b.AppendList(", ", w.order)
+		o.text("ORDER BY ")
+		o.list(w.order)
 		first = false
 	}
 	if w.frame != "" {
 		if !first {
-			b.WriteByte(' ')
+			o.text(" ")
 		}
-		b.WriteString(w.frame)
+		o.text(w.frame)
 	}
 }
 
 // Window functions ----------------------------------------------------
 
-func RowNumber() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("row_number()") })
-}
-func Rank() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("rank()") })
-}
-func DenseRank() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("dense_rank()") })
-}
+func RowNumber() drops.Expression { return drops.Raw("row_number()") }
+func Rank() drops.Expression      { return drops.Raw("rank()") }
+func DenseRank() drops.Expression { return drops.Raw("dense_rank()") }
 
 // Lag renders lagInFrame(expr [, offset [, default]]) — ClickHouse's
 // spelling of the lag window function.

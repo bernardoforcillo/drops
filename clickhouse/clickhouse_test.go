@@ -633,12 +633,21 @@ func TestAliasDoesNotReachDDL(t *testing.T) {
 	}
 }
 
-// A default filter is built against the un-aliased columns and is not
-// rewritten by As — see the method's doc. Dropping it would silence a
-// tenant or soft-delete guard, so it is left in place and the server
-// rejects the query; an aliased SELECT wants Unscoped and an explicit
-// predicate. Pin the decision so a future change to it is deliberate.
-func TestAliasDoesNotRewriteDefaultFilters(t *testing.T) {
+// A default filter is built against the un-aliased columns and IS
+// restated under the alias when it renders — see
+// Table.resolveFilterExprs.
+//
+// This test previously pinned the opposite decision: the predicate went
+// out naming the un-aliased relation, which ClickHouse answers with
+// UNKNOWN_IDENTIFIER, on the reasoning that a query the server refuses
+// is a better failure than a guard silently dropped. Both halves of
+// that are true and the conclusion was still wrong, because there was a
+// third option: restate the predicate. The cost of the old answer was
+// that a scoped table — the one kind that must never lose its axis —
+// was the one kind that could not be queried under an alias at all, and
+// so could not be self-joined. The assertions below are the same two
+// statements, now asserting that each one runs AND carries its guard.
+func TestAliasRewritesDefaultFiltersUnderTheAlias(t *testing.T) {
 	db := clickhouse.New(nil)
 	tbl := clickhouse.NewTable("scoped")
 	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
@@ -647,9 +656,15 @@ func TestAliasDoesNotRewriteDefaultFilters(t *testing.T) {
 
 	s := tbl.As("s")
 	got, _ := db.Select(s.Col("id")).From(s).ToSQL()
-	want := `SELECT "s"."id" FROM "scoped" AS "s" WHERE ("scoped"."tenantId" = ?)`
+	want := `SELECT "s"."id" FROM "scoped" AS "s" WHERE ("s"."tenantId" = ?)`
 	if got != want {
 		t.Errorf("scoped\n  got:  %s\n  want: %s", got, want)
+	}
+	// The guard is still there — the rename moves it, it does not drop
+	// it — and it no longer names a relation the statement has no FROM
+	// entry for.
+	if strings.Contains(got, `"scoped"."tenantId"`) {
+		t.Errorf("aliased statement names the un-aliased relation: %s", got)
 	}
 
 	got, _ = db.Select(s.Col("id")).From(s).Unscoped().
@@ -658,7 +673,14 @@ func TestAliasDoesNotRewriteDefaultFilters(t *testing.T) {
 	if got != want {
 		t.Errorf("unscoped\n  got:  %s\n  want: %s", got, want)
 	}
-	_ = id
+
+	// The rename is scoped to the predicate that installs it: the base
+	// handle goes on qualifying with the table name.
+	got, _ = db.Select(id).From(tbl).ToSQL()
+	want = `SELECT "scoped"."id" FROM "scoped" WHERE ("scoped"."tenantId" = ?)`
+	if got != want {
+		t.Errorf("un-aliased\n  got:  %s\n  want: %s", got, want)
+	}
 }
 
 func TestAliasPanicsOnInvalidIdentifier(t *testing.T) {

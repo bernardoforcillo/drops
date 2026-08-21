@@ -103,28 +103,14 @@ func (c *Column) WriteSQL(b *drops.Builder) {
 	b.WriteIdent(c.name)
 }
 
-// As / Asc / Desc helpers.
-func (c *Column) As(alias string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(" AS ")
-		b.WriteIdent(alias)
-	})
-}
+// As / Asc / Desc helpers. Each holds the column rather than closing
+// over it, so nothing in this package renders through a func value the
+// resolver cannot walk — see opExpr.
+func (c *Column) As(alias string) drops.Expression { return aliasExpr(c, alias) }
 
-func (c *Column) Asc() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(" ASC")
-	})
-}
+func (c *Column) Asc() drops.Expression { return suffixExpr(c, " ASC") }
 
-func (c *Column) Desc() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(" DESC")
-	})
-}
+func (c *Column) Desc() drops.Expression { return suffixExpr(c, " DESC") }
 
 // Col is the typed handle for a column whose Go value type is T.
 type Col[T any] struct {

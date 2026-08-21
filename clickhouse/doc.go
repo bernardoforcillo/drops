@@ -34,6 +34,51 @@
 // builder-side UPDATE/DELETE); default filters on SelectBuilder
 // honour Unscoped() for opt-out.
 //
+// # Tenant scoping
+//
+// A table can declare an axis that every statement against it carries:
+//
+//	Events.ContextFilter(clickhouse.TenantFilter(EventTenantID)).
+//	    ScopeWritesByTenant(EventTenantID)
+//
+//	ctx := clickhouse.WithTenant(ctx, currentTenant)
+//
+// From there a SELECT takes the predicate and an INSERT takes the
+// stamp, whether it was built through an [Entity], through db.Select /
+// db.Insert, or by [VectorStore.Search] — because the axis lives on the
+// TABLE and is resolved by the executors rather than injected by one
+// entry point. A ctx with no tenant is [ErrTenantMissing] and no
+// statement at all. See tenant.go for the whole of it, including the
+// list of places the predicates do not reach.
+//
+// One consequence changes an existing habit: since a table's context
+// filters are resolved against a ctx, [SelectBuilder.ToSQL] no longer
+// necessarily shows the whole statement. [SelectBuilder.ToSQLCtx] does,
+// and it is what to log and what to assert on in a test.
+//
+// What this dialect's version of the feature does NOT have, because the
+// surface it would attach to does not exist here:
+//
+//   - no UPDATE or DELETE to carry a predicate, so the write side is
+//     stamping and refusal only. A mutation is an
+//     ALTER TABLE … UPDATE/DELETE, asynchronous and not transactional,
+//     and this package does not model one.
+//   - no upsert to gate. PostgreSQL's cross-tenant overwrite needs an
+//     ON CONFLICT DO UPDATE; ClickHouse's needs no statement at all,
+//     because a merging engine folds rows sharing a sorting key in the
+//     background. That is where the check went instead — see
+//     [ErrTenantNotInSortingKey].
+//   - no relations and no eager loader, so there is no child query to
+//     carry the axis into and no per-parent LIMIT rewrite to get wrong.
+//   - no query cache and no primary-key cache, so there is no cache key
+//     that could answer one tenant's question with another's rows.
+//   - no set operations, so a UNION operand cannot lose its scoping.
+//     CTE bodies and subquery operands are resolved recursively.
+//   - no bulk path of drops' own beyond the batch INSERT, which is
+//     stamped like any other. The native columnar protocol this
+//     package's doc points very large batches at is a driver API drops
+//     is not in: rows written that way are the caller's to stamp.
+//
 // Entity[T] (see entity.go) binds a Go struct to a Table and exposes
 // Create / CreateMany / Query — the narrow subset of CRUD that maps
 // to ClickHouse's Insert + Select builders. Entity.Validate registers

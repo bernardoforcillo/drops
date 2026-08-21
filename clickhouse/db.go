@@ -129,8 +129,24 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 }
 
 // ExecExpr renders e to SQL and runs it. Convenience for DDL helpers.
+//
+// It renders e FOR ctx rather than blind, which matters because "a DDL
+// helper" is what this method is for and not what it accepts: its
+// parameter is drops.Expression, so an [InsertBuilder] or a predicate
+// with a SELECT inside it goes through here exactly as a CREATE TABLE
+// does. It used to take a ctx and hand it only to the driver, so a
+// builder passed to it went out with none of its tables' context
+// filters and refused nothing on a ctx carrying no tenant — the one
+// executor in this package that had a ctx and threw it away.
+//
+// A genuinely opaque expression — every DDL helper in ddl.go, a
+// [drops.Raw] — has nothing to resolve and renders byte for byte what
+// it always did. See renderForCtx.
 func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, error) {
-	sql, args := ToSQL(e)
+	sql, args, err := renderForCtx(ctx, e)
+	if err != nil {
+		return nil, err
+	}
 	return db.Exec(ctx, sql, args...)
 }
 

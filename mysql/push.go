@@ -58,6 +58,20 @@ type PushOptions struct {
 	// SplitAlters emits one ALTER TABLE per column change rather than
 	// batching a table's changes. See DiffOptions.SplitAlters.
 	SplitAlters bool
+
+	// Renames answers the rename questions this push raises, for one
+	// run. They are merged over what the schema itself declares — see
+	// DeclaredRenames — with these winning.
+	//
+	// This is the per-call answer, the one a command line carries. The
+	// durable one is (*Col[T]).RenamedFrom in the schema, and it is
+	// the better answer for anything that will be pushed more than
+	// once: a flag answers the database in front of you, a declaration
+	// answers every database the schema reaches.
+	//
+	// A candidate neither of them answers is not guessed at: Push
+	// returns *RenameAmbiguityError and executes nothing.
+	Renames []RenameDecision
 }
 
 // PushResult is the outcome of a Push call.
@@ -127,6 +141,9 @@ func (n SchemaNotice) String() string {
 //   - Builds a target snapshot from schema.
 //   - Narrows the live side to the tables the schema declares; see
 //     ownedBy.
+//   - Settles the rename questions the change raises, or refuses,
+//     before anything below touches the server. See "A change that
+//     could be a rename".
 //   - Asks the server to respell the declared CHECK expressions, so
 //     both sides of the diff are written in the server's own dialect.
 //   - Diffs the two and, unless DryRun, applies the statements one at a
@@ -156,6 +173,21 @@ func (n SchemaNotice) String() string {
 // One ALTER TABLE is atomic in itself, so a batched statement that
 // fails leaves none of its own actions applied. The migration around it
 // is what is not atomic.
+//
+// # A change that could be a rename
+//
+// A column the database has and the schema does not, paired with one
+// the schema has and the database does not, is either a rename or a
+// drop-and-add, and the two differ by the whole contents of the
+// column. Push cannot tell them apart any more than Diff can, so it
+// asks the same question GenerateMigration asks and returns
+// *RenameAmbiguityError rather than guessing — before any statement
+// runs. There is no transaction around a push here, so the DROP COLUMN
+// the guess would have emitted is a commit nobody can take back.
+//
+// Answer it in the schema with (*Col[T]).RenamedFrom or
+// (*Table).RenamedFrom, which is durable and travels to every database
+// the schema is pushed to, or for one run with PushOptions.Renames.
 //
 // # An index the schema never declared
 //
@@ -223,7 +255,17 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		return nil, fmt.Errorf("drops/mysql: introspect: %w", err)
 	}
 	desired := BuildSnapshot(schema)
-	current := ownedBy(live, desired)
+	answers := mergeDecisions(DeclaredRenames(schema), opt.Renames)
+	current := ownedBy(live, desired, renamedAwayTables(live, answers)...)
+
+	// Before the probe, not after it: a push that is going to refuse
+	// should not first create and drop a table on the server to answer
+	// a question it is about to throw away. Renames are settled from
+	// column names and types, which the probe does not touch.
+	renames, err := resolvePushRenames(current, desired, answers)
+	if err != nil {
+		return nil, err
+	}
 
 	notices, err := probeCheckExpressions(ctx, db, opt.Database, server, current, desired)
 	if err != nil {
@@ -237,6 +279,7 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		Safe:        opt.Safe,
 		Server:      server,
 		SplitAlters: opt.SplitAlters,
+		Renames:     renames,
 	})
 	if !opt.DropUnmanagedIndexes {
 		var withheld []SchemaNotice
@@ -261,6 +304,54 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	res.Applied = true
 	return res, nil
 }
+
+// resolvePushRenames settles the rename questions this push raises, or
+// refuses.
+//
+// It is the same reasoning GenerateMigration applies, against the same
+// detector, for the same reason: a column gone from the database and
+// one arrived in the schema is either a rename or a drop-and-add, the
+// two differ by the whole contents of the column, and nothing in
+// either side says which. Push reaching that comparison without asking
+// the question was a second door into the data loss the question
+// exists to close — and here the door has no transaction behind it: a
+// DROP COLUMN commits itself, so a wrong guess is not something a
+// failed push rolls back.
+//
+// The answers come from the schema (DeclaredRenames) and from the
+// call (PushOptions.Renames), the call winning; the caller merges the
+// two because it needs the merged set before this point as well — see
+// renamedAwayTables. There is no rename log here: a push has no
+// migration directory, so the advice on the refusal points at the
+// schema instead.
+func resolvePushRenames(current, desired *Snapshot, answers []RenameDecision) ([]Rename, error) {
+	renames, unresolved := ResolveRenames(current, desired, answers)
+	if len(unresolved) > 0 {
+		return nil, &RenameAmbiguityError{Candidates: unresolved, Advice: pushRenameAdvice}
+	}
+	if err := validateRenames(current, desired, renames); err != nil {
+		return nil, err
+	}
+	return renames, nil
+}
+
+// pushRenameAdvice closes a push's refusal, in place of the flags and
+// the rename log the generator points at — a push has neither.
+//
+// The schema declaration comes first because it is the answer that
+// lasts: an operator answering at a terminal answers for the one
+// database in front of them, and the next database the schema is
+// pushed to asks again. The per-run answer is named second, and it is
+// the only way to say the other thing, that the column really is being
+// dropped — which is not a fact about the schema at all. Once such a
+// drop has been pushed the old column is gone and the question never
+// comes back, so there is nothing lasting to record.
+const pushRenameAdvice = "a rename is a fact about the schema's history and belongs with the schema:\n" +
+	"    mysql.Add(Users, mysql.Varchar(\"emailAddress\", 255).RenamedFrom(\"email\"))\n" +
+	"    mysql.NewTable(\"people\").RenamedFrom(\"users\")\n" +
+	"stated there it answers every database the schema is pushed to, and it goes inert once the rename has happened.\n" +
+	"For one run instead, or to say the column really is being dropped, use PushOptions.Renames: a\n" +
+	"RenameDecision naming the pair renames it, one naming only the object that is going declines."
 
 // currentDatabase returns the database the connection is pointed at,
 // which is empty when the DSN named none — in which case unqualified
@@ -301,7 +392,14 @@ func currentDatabase(ctx context.Context, db *DB) (string, error) {
 // The cost is that dropping a table means writing the DROP into a
 // migration rather than deleting the Go declaration and pushing, which
 // is the reviewable path anyway.
-func ownedBy(live, declared *Snapshot) *Snapshot {
+//
+// alsoKeep names tables to keep whatever the Schema says now — see
+// renamedAwayTables.
+func ownedBy(live, declared *Snapshot, alsoKeep ...string) *Snapshot {
+	keep := make(map[string]bool, len(alsoKeep))
+	for _, n := range alsoKeep {
+		keep[n] = true
+	}
 	out := &Snapshot{
 		ID:      live.ID,
 		PrevID:  live.PrevID,
@@ -310,9 +408,45 @@ func ownedBy(live, declared *Snapshot) *Snapshot {
 		Tables:  make(map[string]*TableSnapshot, len(live.Tables)),
 	}
 	for name, ts := range live.Tables {
-		if _, ok := declared.Tables[name]; ok {
+		if _, ok := declared.Tables[name]; ok || keep[ts.Name] {
 			out.Tables[name] = ts
 		}
+	}
+	return out
+}
+
+// renamedAwayTables names the tables a rename answer says a declared
+// table used to be called, while the rename is still ahead of this
+// database.
+//
+// The schema does not name them any more, which is precisely the
+// problem: ownedBy would file them under "somebody else's" and drop
+// them from the previous side a moment before the rename would have
+// named one — leaving the push to create the new table empty beside
+// the old one, with the rename it was told about applied to nothing. A
+// schema that says "people used to be users" has claimed users, and
+// this is what says so.
+//
+// The claim expires. A declaration is meant to be left in the source
+// until every deployment has caught up, so it outlives the rename; what
+// it must not outlive is its hold on the old name. Once live carries
+// the new name the rename has happened here, and whatever answers to
+// the old one now is somebody else's table — which is the case ownedBy
+// exists for. Keeping the hole open past that point offered that table
+// to the diff as the previous life of a table the schema does declare:
+// the push either asked an unanswerable question pairing its columns
+// with the wrong table's, or, once told the old name really was going,
+// dropped it.
+func renamedAwayTables(live *Snapshot, answers []RenameDecision) []string {
+	var out []string
+	for _, d := range answers {
+		if d.Kind != RenameTable || !d.IsRename || d.From == "" {
+			continue
+		}
+		if live.Tables[d.To] != nil {
+			continue
+		}
+		out = append(out, d.From)
 	}
 	return out
 }
@@ -639,16 +773,38 @@ func sqlStateByReflection(err error) string {
 // ----------------------------------------------------------------------
 
 // withholdUnmanagedIndexDrops removes from stmts every DROP INDEX that
-// targets an index the database has and the Go schema never declared,
-// returning what is left and a notice for each one held back.
+// targets an index the database has, the Go schema never declared, and
+// this push can actually leave standing — returning what is left and a
+// notice for each one held back.
 //
 // The statements are matched by text rather than re-derived, because
 // the text is what Diff produced from the same two snapshots a moment
 // earlier — anything that does not match is a drop Diff emitted for a
 // different reason (an index declared on both sides whose shape
 // changed) and has to go through.
+//
+// # Why an index over a departing column is not withheld
+//
+// Withholding exists because Push cannot tell an index the schema
+// stopped declaring from one somebody built by hand, and destroying the
+// second by mistake is worse than leaving the first behind. That
+// reasoning holds only while the index can survive the migration. An
+// index spanning a column this push drops cannot: MySQL takes a
+// single-column one away with the column, narrows a multi-column one
+// to what remains, and refuses the DROP COLUMN outright when the index
+// is UNIQUE and spans more than one column (1072) or is one a foreign
+// key needs (1553). See Diff.
+//
+// So withholding there protects nothing. It either leaves a narrowed
+// index the caller never asked for — under a notice claiming the index
+// was left alone, which by then is false — or it stops the push on a
+// server error with no explanation attached. Both were reachable under
+// the default options, which is where most pushes run. The drop goes
+// through instead, and the notice says the index was dropped and why,
+// so the fact still reaches the caller.
 func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]string, []SchemaNotice) {
 	withheld := map[string]SchemaNotice{}
+	var forced []SchemaNotice
 	for _, key := range sortedKeys(current.Tables) {
 		ct := current.Tables[key]
 		dt := desired.Tables[key]
@@ -662,6 +818,18 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 				}
 			}
 			sql := dropIndexSQL(ct.Name, name)
+			if lost := departingColumns(ct.Indexes[name], ct, dt); len(lost) > 0 {
+				forced = append(forced, SchemaNotice{
+					Rule:   "unmanaged-index",
+					Table:  ct.Name,
+					Object: name,
+					Message: fmt.Sprintf(
+						"index %q on %q is declared by no table in the Go schema, but it keys column %s, which this push drops; MySQL will not leave it as it is, so Push dropped the index rather than leave a narrowed one behind or stop on the column drop",
+						name, ct.Name, strings.Join(quoteIdents(lost), ", ")),
+					SQL: sql,
+				})
+				continue
+			}
 			withheld[sql] = SchemaNotice{
 				Rule:    "unmanaged-index",
 				Table:   ct.Name,
@@ -672,10 +840,10 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 		}
 	}
 	if len(withheld) == 0 {
-		return stmts, nil
+		return stmts, forced
 	}
 	kept := make([]string, 0, len(stmts))
-	var notices []SchemaNotice
+	notices := forced
 	for _, s := range stmts {
 		if n, ok := withheld[s]; ok {
 			notices = append(notices, n)
@@ -684,6 +852,25 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 		kept = append(kept, s)
 	}
 	return kept, notices
+}
+
+// departingColumns lists, in key order, the index's columns that this
+// push drops. A table the schema no longer declares is not one Push
+// narrows, so a nil desired side means nothing is departing.
+func departingColumns(idx *IndexSnapshot, current, desired *TableSnapshot) []string {
+	if idx == nil || desired == nil {
+		return nil
+	}
+	var out []string
+	for _, c := range idx.Columns {
+		if _, live := current.Columns[c]; !live {
+			continue
+		}
+		if _, kept := desired.Columns[c]; !kept {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // unrepresentableIndexNotices reports live indexes the snapshot cannot

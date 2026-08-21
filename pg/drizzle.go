@@ -53,13 +53,15 @@ type DrizzleHook func(ctx context.Context, tx *DB, entry DrizzleEntry) error
 
 // DrizzleMigrator runs migrations from a drizzle-kit-formatted directory.
 type DrizzleMigrator struct {
-	db     *DB
-	fsys   fs.FS
-	dir    string
-	schema string
-	table  string
-	before []DrizzleHook
-	after  []DrizzleHook
+	db          *DB
+	fsys        fs.FS
+	dir         string
+	schema      string
+	table       string
+	before      []DrizzleHook
+	after       []DrizzleHook
+	lockTimeout time.Duration
+	noLock      bool
 }
 
 // NewDrizzleMigrator wraps db with a migrator that reads from dir within
@@ -89,6 +91,33 @@ func (d *DrizzleMigrator) WithSchema(schema string) *DrizzleMigrator {
 func (d *DrizzleMigrator) WithTable(table string) *DrizzleMigrator {
 	d.table = table
 	return d
+}
+
+// WithLockTimeout caps how long Up waits for the migration lock before
+// giving up with [ErrMigrationLocked]. Zero, the default, waits as long
+// as the other run takes; the wait still ends when ctx does. See
+// [Migrator.WithLockTimeout], which this mirrors.
+func (d *DrizzleMigrator) WithLockTimeout(t time.Duration) *DrizzleMigrator {
+	if t > 0 {
+		d.lockTimeout = t
+	}
+	return d
+}
+
+// WithoutLock runs Up without taking the migration lock. The lock needs
+// a connection of its own for the duration of the run, so a pool capped
+// at one connection would deadlock against it; that is the case this
+// exists for. See [Migrator.WithoutLock].
+func (d *DrizzleMigrator) WithoutLock() *DrizzleMigrator { d.noLock = true; return d }
+
+// LockKey returns the advisory-lock key this migrator serialises on, so
+// an operator can find the holder in pg_locks. It is derived from the
+// history schema and table, which is what drizzle-kit itself would be
+// pointed at, so a drops run and a drizzle-kit run against the same
+// history do not both need to know the key to stay out of each other's
+// way — only that they are both drops.
+func (d *DrizzleMigrator) LockKey() int64 {
+	return lockKey("drops/pg:migrate:" + d.schema + "." + d.table)
 }
 
 // BeforeEach registers a hook that runs immediately before each
@@ -191,18 +220,25 @@ func (d *DrizzleMigrator) LoadEntries() ([]DrizzleEntry, error) {
 }
 
 // ensureSchema creates the drizzle schema and migration history table.
+//
+// Neither IF NOT EXISTS is atomic against a concurrent CREATE: both
+// sessions find the object absent, both write the catalogue row, and
+// the loser reports a duplicate key on pg_namespace_nspname_index or
+// pg_type_typname_nsp_index — catalogue indexes that name nothing an
+// operator has ever heard of. Up holds the migration lock so it never
+// sees this; Status does not. The failure means the object now exists,
+// which is what was asked for, so it is retried once rather than
+// reported.
 func (d *DrizzleMigrator) ensureSchema(ctx context.Context) error {
-	if _, err := d.db.Exec(ctx,
+	if err := execIgnoringConcurrentCreate(ctx, d.db,
 		fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, quoteIdent(d.schema))); err != nil {
 		return err
 	}
-	stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
+	return execIgnoringConcurrentCreate(ctx, d.db, fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
 		id SERIAL PRIMARY KEY,
 		hash text NOT NULL,
 		created_at bigint
-	)`, quoteIdent(d.schema), quoteIdent(d.table))
-	_, err := d.db.Exec(ctx, stmt)
-	return err
+	)`, quoteIdent(d.schema), quoteIdent(d.table)))
 }
 
 // appliedHashes returns the set of hashes already applied.
@@ -228,7 +264,24 @@ func (d *DrizzleMigrator) appliedHashes(ctx context.Context) (map[string]bool, e
 // Up applies every pending migration in journal order. Each migration
 // runs in its own transaction; failure of any statement rolls back that
 // migration only.
+//
+// The whole run is serialised against other runs by a PostgreSQL
+// advisory lock. It matters more here than it does for [Migrator]: the
+// drizzle history is keyed by hash with no unique constraint, so two
+// unsynchronised runs that both find a file pending would both apply
+// it and both record it, and a file whose SQL is not idempotent would
+// have run twice with nothing anywhere reporting it. See
+// [DrizzleMigrator.WithLockTimeout] to bound the wait and
+// [DrizzleMigrator.WithoutLock] to skip it.
 func (d *DrizzleMigrator) Up(ctx context.Context) error {
+	if d.noLock {
+		return d.up(ctx)
+	}
+	return withMigrationLock(ctx, d.db, d.LockKey(), d.schema+"."+d.table, d.lockTimeout,
+		func() error { return d.up(ctx) })
+}
+
+func (d *DrizzleMigrator) up(ctx context.Context) error {
 	if err := d.ensureSchema(ctx); err != nil {
 		return err
 	}

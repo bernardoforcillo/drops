@@ -14,7 +14,7 @@ type UpdateBuilder struct {
 	from      []*Table
 	wheres    []drops.Expression
 	returning []drops.Expression
-	unscoped  bool
+	scope     filterScope
 }
 
 // Set adds one or more assignments. Use (*Col[T]).Val(v) to bind a typed
@@ -30,9 +30,12 @@ func (u *UpdateBuilder) From(tables ...*Table) *UpdateBuilder {
 	return u
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a filter that is only sometimes present can be passed straight in
+// — but an UPDATE all of whose predicates were nil is an UPDATE with no
+// WHERE, and rewrites every row the table's filters still admit.
 func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
-	u.wheres = append(u.wheres, preds...)
+	u.wheres = append(u.wheres, dropNilPreds(preds)...)
 	return u
 }
 
@@ -42,11 +45,25 @@ func (u *UpdateBuilder) Returning(cols ...drops.Expression) *UpdateBuilder {
 	return u
 }
 
-// Unscoped opts out of the table's DefaultFilter predicates for this
-// UPDATE. Use when an administrative job must bypass a soft-delete or
-// tenant guard registered on the table.
+// Unscoped opts out of every global filter registered on the table —
+// named and anonymous alike. The blunt instrument: an administrative
+// job that means "every row, no scoping" wants it, and nothing
+// narrower does. To step around one guard while keeping the rest, name
+// it with IgnoreFilters.
 func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
-	u.unscoped = true
+	u.scope.unscoped = true
+	return u
+}
+
+// IgnoreFilters bypasses the named global filters on the table and
+// leaves every other one in place — see [SelectBuilder.IgnoreFilters].
+// Writing to a soft-deleted row without abandoning the table's other
+// scoping is the usual reason:
+//
+//	db.Update(Posts).IgnoreFilters(pg.FilterSoftDelete).
+//	    Set(Deleted.SetNull()).Where(id.Eq(7))
+func (u *UpdateBuilder) IgnoreFilters(names ...string) *UpdateBuilder {
+	u.scope.ignore(names...)
 	return u
 }
 
@@ -56,10 +73,7 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 	if u.table.hasUpdateHooks() {
 		sets = u.applyUpdateHooks()
 	}
-	wheres := u.wheres
-	if !u.unscoped && len(u.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), wheres...)
-	}
+	wheres := u.scope.apply(u.table, u.wheres)
 	b.WriteString("UPDATE ")
 	u.table.writeFrom(b)
 	b.WriteString(" SET ")

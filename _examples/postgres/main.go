@@ -30,7 +30,7 @@ var (
 	Users    = pg.NewTable("users")
 	UserID   = pg.Add(Users, pg.BigSerial("id").PrimaryKey())
 	UserName = pg.Add(Users, pg.Text("name").NotNull())
-	UserAge  = pg.Add(Users, pg.Integer("age"))
+	UserAge  = pg.Add(Users, pg.Integer("age").Nullable())
 
 	Posts      = pg.NewTable("posts")
 	PostID     = pg.Add(Posts, pg.BigSerial("id").PrimaryKey())

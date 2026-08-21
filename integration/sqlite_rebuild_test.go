@@ -655,7 +655,12 @@ func TestARebuildIsImpossibleUnderADependentView(t *testing.T) {
 	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
 	sqlite.Add(after, sqlite.Text("state"))
 
-	if _, err := sqlite.Push(ctx, db, sqlite.NewSchema(after)); err == nil {
+	// AllowDestructive because the change drops "legacy", which Push
+	// now refuses on its own. That refusal is not what this test is
+	// about: getting past it is what lets the engine's refusal be the
+	// one under test.
+	if _, err := sqlite.Push(ctx, db, sqlite.NewSchema(after),
+		sqlite.PushOptions{AllowDestructive: true}); err == nil {
 		t.Fatal("SQLite accepted the rename under a dependent view; docs/dialects.md now says otherwise")
 	} else if !strings.Contains(err.Error(), "open_invoices") {
 		t.Errorf("the rebuild failed for some other reason than the view: %v", err)

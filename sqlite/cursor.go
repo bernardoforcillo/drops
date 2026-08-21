@@ -1,10 +1,12 @@
 package sqlite
 
 import (
+	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -223,6 +225,27 @@ func encodeCursorValue(v any) (cursorVal, error) {
 	case []byte:
 		return cursorVal{T: cTypeBytes, V: json.RawMessage(`"` + base64.RawURLEncoding.EncodeToString(x) + `"`)}, nil
 	default:
+		// A nullable column is a pointer field on the row struct, so
+		// the value handed back from the last row of a page is a
+		// *string or a *time.Time rather than the bare type. Follow
+		// it — a nil one is the NULL the keyset guard knows how to
+		// page past.
+		if rv := reflect.ValueOf(v); rv.Kind() == reflect.Ptr {
+			if rv.IsNil() {
+				return cursorVal{T: cTypeNull, V: json.RawMessage("null")}, nil
+			}
+			return encodeCursorValue(rv.Elem().Interface())
+		}
+		// The other shape a nullable column takes on a row struct is an
+		// sql.NullString and its siblings, which say what they are worth
+		// through driver.Valuer — including that they are worth NULL.
+		if val, ok := v.(driver.Valuer); ok {
+			inner, err := val.Value()
+			if err != nil {
+				return cursorVal{}, fmt.Errorf("drops/sqlite: cursor value %T: %w", v, err)
+			}
+			return encodeCursorValue(inner)
+		}
 		return cursorVal{}, fmt.Errorf("drops/sqlite: cursor value type %T not supported", v)
 	}
 }
@@ -362,16 +385,26 @@ func orderKeyExpr(k OrderKey) drops.Expression {
 //	...
 //
 // The strict comparator on the i-th key flips per OrderKey.Desc and
-// per forward / backward paging direction. Equality on leading keys
-// uses Eq so it works for any comparable PG type.
+// per forward / backward paging direction. Both it and the equality on
+// the leading keys are NULL-aware: a cursor value of NULL compared
+// with = or > yields NULL rather than true, so a plain comparison
+// would drop the very row the walk is standing on and every row after
+// it — an empty page that reads exactly like the end of the result
+// set, on every page from then on.
 func keysetWhere(spec CursorSpec, values []any, forward bool) drops.Expression {
 	ors := make([]drops.Expression, 0, len(spec.Keys))
 	for i := range spec.Keys {
+		strict := keysetStrict(spec.Keys[i], values[i], forward)
+		if strict == nil {
+			// Nothing sorts past this key's value in this direction.
+			// The disjunct is absent rather than false, and the later
+			// keys still contribute theirs.
+			continue
+		}
 		ands := make([]drops.Expression, 0, i+1)
 		for j := 0; j < i; j++ {
-			ands = append(ands, Eq(spec.Keys[j].Col, values[j]))
+			ands = append(ands, keysetEq(spec.Keys[j], values[j]))
 		}
-		strict := keysetStrict(spec.Keys[i], values[i], forward)
 		ands = append(ands, strict)
 		if len(ands) == 1 {
 			ors = append(ors, ands[0])
@@ -382,20 +415,82 @@ func keysetWhere(spec CursorSpec, values []any, forward bool) drops.Expression {
 	if len(ors) == 1 {
 		return ors[0]
 	}
+	// Or() of nothing renders FALSE, which is the right answer: the
+	// cursor is sitting on the last row the ordering can reach.
 	return Or(ors...)
 }
 
+// keysetEq is the equality term for a leading key. NULL = NULL is
+// NULL, so a NULL cursor value has to be matched with IS NULL.
+func keysetEq(k OrderKey, v any) drops.Expression {
+	if v == nil {
+		return IsNull(k.Col)
+	}
+	return Eq(k.Col, v)
+}
+
+// keysetStrict is the "strictly past this value" term for one key, or
+// nil when nothing can be past it.
+//
+// SQLite sorts NULL as the smallest value, so an ORDER BY that says
+// nothing puts the NULLs first under ASC and last under DESC —
+// [nullsFirst] resolves that, and honours an explicit NULLS FIRST /
+// LAST when the spec carries one. For a key ordered ascending, which
+// is NULLS FIRST here:
+//
+//	value NULL     → col IS NOT NULL       (every non-NULL row follows)
+//	value non-NULL → col > v               (the NULLs are behind)
+//
+// and descending the two swap round: past a value lie the smaller
+// values and then the NULLs, and past a NULL lies nothing.
+//
+// Paging backward reverses the order, which reverses the direction and
+// the NULL placement together.
+//
+// The IS NULL disjunct is emitted only for a column the schema
+// declares nullable: it is one more range for the planner to merge,
+// and on a NOT NULL column it can never match.
 func keysetStrict(k OrderKey, v any, forward bool) drops.Expression {
-	// Forward: ASC → >, DESC → <
-	// Backward: ASC → <, DESC → >
-	desc := k.Desc
+	c := k.Col.col()
+	asc := !k.Desc
+	first := nullsFirst(k)
 	if !forward {
-		desc = !desc
+		asc = !asc
+		first = !first
 	}
-	if desc {
-		return Lt(k.Col, v)
+	if v == nil {
+		// Past a NULL lies everything else, but only when the NULLs
+		// come first in this direction.
+		if first {
+			return IsNotNull(c)
+		}
+		return nil
 	}
-	return Gt(k.Col, v)
+	var strict drops.Expression
+	if asc {
+		strict = Gt(c, v)
+	} else {
+		strict = Lt(c, v)
+	}
+	if !first && c.IsNullable() {
+		return Or(strict, IsNull(c))
+	}
+	return strict
+}
+
+// nullsFirst resolves a key's NULL placement to a plain "do the NULLs
+// come first", applying SQLite's default — NULL sorts as the smallest
+// value, so it is first under ASC and last under DESC — when the spec
+// does not say.
+func nullsFirst(k OrderKey) bool {
+	switch k.Nulls {
+	case NullsFirst:
+		return true
+	case NullsLast:
+		return false
+	default:
+		return !k.Desc
+	}
 }
 
 // cursorErrExpr renders as a guaranteed-false predicate that also

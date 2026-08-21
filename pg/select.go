@@ -25,7 +25,7 @@ type SelectBuilder struct {
 	ctes         []*CTE
 	recursiveCTE bool
 	setOps       []setOp // UNION / INTERSECT / EXCEPT continuations
-	unscoped     bool
+	scope        filterScope
 	err          error // deferred error (e.g. cursor decode failure) surfaced at Rows()
 }
 
@@ -73,9 +73,28 @@ func (s *SelectBuilder) DistinctOn(exprs ...drops.Expression) *SelectBuilder {
 // ForUpdate appends FOR UPDATE row locking.
 func (s *SelectBuilder) ForUpdate() *SelectBuilder { s.forUpdate = true; return s }
 
-// Unscoped opts out of the FROM table's DefaultFilter predicates for
-// this SELECT. Use to bypass a soft-delete or tenant guard.
-func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
+// Unscoped opts out of every global filter registered on the FROM
+// table — named and anonymous alike. It is the blunt instrument: it
+// cannot tell a soft-delete guard from a tenancy one, so a query that
+// only wants deleted rows loses its isolation with them. Reach for it
+// when you mean "no scoping at all"; otherwise name what you are
+// stepping around with IgnoreFilters.
+func (s *SelectBuilder) Unscoped() *SelectBuilder { s.scope.unscoped = true; return s }
+
+// IgnoreFilters bypasses the named global filters on the FROM table
+// and leaves every other one in place:
+//
+//	// soft-deleted rows too, still only this tenant's
+//	db.Select().From(Posts).IgnoreFilters(pg.FilterSoftDelete)
+//
+// Names come from [Table.AddFilter]; drops' own are the FilterSoftDelete
+// and FilterTenant constants. A name no filter on the table carries is
+// ignored — the builder may not have its FROM yet, and a typo that
+// leaves a filter standing returns too few rows rather than too many.
+func (s *SelectBuilder) IgnoreFilters(names ...string) *SelectBuilder {
+	s.scope.ignore(names...)
+	return s
+}
 
 // Join appends an INNER JOIN.
 func (s *SelectBuilder) Join(t *Table, on drops.Expression) *SelectBuilder {
@@ -101,9 +120,11 @@ func (s *SelectBuilder) FullJoin(t *Table, on drops.Expression) *SelectBuilder {
 	return s
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a caller can pass one that is only sometimes present without
+// first collecting the non-nil ones into a slice.
 func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
-	s.wheres = append(s.wheres, preds...)
+	s.wheres = append(s.wheres, dropNilPreds(preds)...)
 	return s
 }
 
@@ -114,8 +135,9 @@ func (s *SelectBuilder) GroupBy(exprs ...drops.Expression) *SelectBuilder {
 }
 
 // Having appends predicates to the HAVING clause (joined by AND).
+// Nil predicates are ignored, as in Where.
 func (s *SelectBuilder) Having(preds ...drops.Expression) *SelectBuilder {
-	s.havings = append(s.havings, preds...)
+	s.havings = append(s.havings, dropNilPreds(preds)...)
 	return s
 }
 
@@ -229,12 +251,12 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		b.WriteByte(' ')
 		j.table.writeFrom(b)
 		b.WriteString(" ON ")
-		b.Append(j.on)
+		// A nil condition is the empty conjunction, rendered where
+		// the grammar insists on a predicate. Writing nothing here
+		// produced SQL no server would parse.
+		b.Append(orTrue(j.on))
 	}
-	wheres := s.wheres
-	if !s.unscoped && s.from != nil && len(s.from.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), s.from.defaultFilters...), wheres...)
-	}
+	wheres := s.scope.apply(s.from, s.wheres)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)

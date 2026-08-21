@@ -7,7 +7,12 @@ var UserEntity = pg.NewEntity[User](Users)
 ```
 
 It precomputes the column-to-field mapping once, at startup, and checks
-it — see [schema.md](schema.md#drift).
+it — see [schema.md](schema.md#drift). Two things make it panic there:
+a column no field binds to, and a column that admits NULL bound to a
+field that cannot receive one. Both name the column, the likely cause
+and the escape hatch —
+[`AllowUnmappedColumns`](schema.md#drift) and
+[`AllowNullableColumns`](schema.md#nullability-drift).
 
 ## The operations
 
@@ -171,6 +176,42 @@ UserEntity.Query(db).LoadRel(UserPosts, func(p *pg.RelConfig) {
 })
 ```
 
+### The relation you forgot to load
+
+Go has no lazy loading, which is a feature — a field read never fires a
+query behind your back. But forget `Load(UserPosts)` and `user.Posts`
+is `nil`, which reads exactly like "this user has no posts". The wrong
+answer is silent.
+
+Nothing in Go can intercept a struct field read, so drops refuses the
+*query* instead:
+
+```go
+db := pg.New(drv)
+if devMode {
+    db = db.StrictLoading()
+}
+
+users, err := UserEntity.Query(db).All(ctx)
+// error: relation not loaded: "posts" on struct main.User — this query
+// never loaded it … Load it with .Load(users.Rel("posts")) …, or say
+// the query does not need it with .NoLoad(users.Rel("posts")) …
+```
+
+The check is structural: it walks the destination struct against the
+table's declared relations and refuses before the SELECT runs, so it
+costs no round trip. A query that genuinely does not need the relation
+says so, and is let through:
+
+```go
+UserEntity.Query(db).Load(UserPosts).NoLoad(UserProfile).All(ctx)
+```
+
+Turn it on in development and in tests, where the mistake surfaces as a
+failing test rather than a failing request. It is off by default and
+changes nothing when off. `Entity.Get` is exempt: it addresses a row by
+primary key and has no way to load a relation at all.
+
 ### Catching N+1 anyway
 
 If a query loop slips through, the detector will say so:
@@ -223,3 +264,52 @@ UserEntity.
 
 Each is documented in its own file in the `pg` package. They are
 PostgreSQL and SQLite only today.
+
+## Stepping around a global filter
+
+A table can carry filters drops AND-s into every statement without the
+call site asking — a soft-delete guard, a tenancy axis. They are named,
+and a query bypasses them one at a time:
+
+```go
+Posts.AddFilter("archived", PostArchived.Eq(false))
+
+// deleted rows too, and still only this tenant's, still not archived
+PostEntity.Query(db).IgnoreFilters(pg.FilterSoftDelete).All(ctx)
+```
+
+`pg.FilterSoftDelete` is the name `SoftDeleteMixin` registers its guard
+under; `pg.FilterTenant` names the predicate `ScopeByTenant` injects,
+which a deliberate cross-tenant report can drop the same way.
+
+`Unscoped()` still exists and is the blunt instrument: it drops every
+filter the table carries at once, which is what a migration or a
+backfill wants and almost never what a query does. It does not reach
+the `ScopeByTenant` guard — that one comes from the context rather than
+the table, and losing customer isolation as a side effect of asking for
+soft-deleted rows is exactly the accident `IgnoreFilters` exists to
+prevent.
+
+### How far a filter reaches
+
+A statement carries the filters of the table it is *about* — the
+`FROM` of a SELECT, the target of an UPDATE or DELETE. Two consequences
+are worth knowing before you rely on one:
+
+- **A joined table contributes nothing.** `db.Select().From(Authors).
+  Join(Books, …)` applies `Authors`' filters and not `Books`', so a
+  join onto a soft-deleted table sees the deleted rows. A filter is a
+  statement about which rows of a table are *the* rows; on the far side
+  of a join the query is already saying which rows it wants, and drops
+  will not quietly narrow it further. Say it yourself in the `ON`
+  clause or a `Where`.
+- **An eager-loaded relation does.** Each edge of a `Load` /`With` tree
+  is its own SELECT against the related table, so it carries that
+  table's filters — including when `RelConfig.Limit` caps the rows per
+  parent. A relation is loaded *as* that table, not joined onto this
+  one, which is why the two answers differ.
+
+`IgnoreFilters` and `Unscoped` speak only for the statement they are
+called on. Neither reaches into an eager-loaded relation's query, and
+there is no per-edge bypass: a relation's guards always apply. Load the
+related rows with their own query when you need to step around one.

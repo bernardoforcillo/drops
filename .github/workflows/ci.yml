@@ -20,11 +20,13 @@ jobs:
           go-version: '1.24'
           check-latest: true
       - run: go mod tidy
-      # The integration suite is a second module on purpose — its
-      # drivers must never reach a user's build. Tidying it here is what
-      # keeps that true: a dependency that creeps into the root module
-      # shows up as a diff, and a driver added to integration/ without
-      # its go.sum entry fails the same way.
+      # The integration suite and the CLI are separate modules on
+      # purpose — their drivers must never reach a user's build.
+      # Tidying them here is what keeps that true: a dependency that
+      # creeps into the root module shows up as a diff, and a driver
+      # added to either without its go.sum entry fails the same way.
+      - run: go mod tidy
+        working-directory: cmd/drops
       - run: go mod tidy
         working-directory: integration
       # Whole-tree diff: the root module has no external deps, so its
@@ -56,12 +58,48 @@ jobs:
         run: go test ./... -count=1
       - name: race
         run: go test ./... -race -count=1
-      # The integration module is not reachable from the root ./... , so
-      # without this it compiles for the first time in the integration
-      # job — after the servers have been paid for and started.
+      # Neither the CLI nor the integration module is reachable from
+      # the root ./... , so without this they compile for the first
+      # time in the integration job — after the servers have been paid
+      # for and started.
       - name: vet integration
         run: go vet ./...
         working-directory: integration
+
+  # ── the CLI module ───────────────────────────────────────────────────
+  # cmd/drops is a module of its own so the binary can link pgx while
+  # the library keeps its promise of having no dependencies. It is not
+  # in the root ./... , and its go.mod asks for a newer toolchain than
+  # the library's compatibility matrix does, so it gets its own job.
+  cli:
+    name: cli module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+          cache: true
+      - name: vet
+        run: go vet ./...
+        working-directory: cmd/drops
+      - name: build
+        run: go build ./...
+        working-directory: cmd/drops
+      - name: test
+        run: go test ./... -count=1
+        working-directory: cmd/drops
+
+      # The linter's own corpus proves it reports what it should. This
+      # step proves the other half: that it stays quiet over a codebase
+      # that is supposed to be clean.
+      - name: lint the tree with drops lint
+        run: |
+          go build -C cmd/drops -o "$PWD/bin/drops" .
+          ./bin/drops lint ./...
+          (cd cmd/drops && "$PWD/../../bin/drops" lint ./...)
+          (cd integration && "$PWD/../bin/drops" lint ./...)
 
   # ── integration ──────────────────────────────────────────────────────
   # Everything above tests the SQL drops *generates*, by comparing it to
@@ -136,6 +174,8 @@ jobs:
       - run: go install honnef.co/go/tools/cmd/staticcheck@latest
       - run: staticcheck ./...
       - run: staticcheck ./...
+        working-directory: cmd/drops
+      - run: staticcheck ./...
         working-directory: integration
 
   golangci-lint:
@@ -151,6 +191,23 @@ jobs:
       - uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+      # cmd/drops used to be linted as part of the root module. It is
+      # its own module now, so ./... no longer reaches it and it needs
+      # naming — the linter's coverage should not have quietly shrunk
+      # when the directory moved out.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: cmd/drops
+      # The integration module is the third one, and for a while it was
+      # the only one nothing here named: five noctx findings had
+      # accumulated in its harness because no job was looking. staticcheck
+      # and govulncheck below already scan all three; this is the linter
+      # catching up with them.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: integration
 
   # ── security ─────────────────────────────────────────────────────────
   govulncheck:
@@ -169,8 +226,11 @@ jobs:
           cache: true
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
-      # The root module has no dependencies to be vulnerable; the
-      # integration module has four drivers, which is where an advisory
-      # would actually land.
+      # The root module has no dependencies to be vulnerable. The CLI
+      # has pgx and the integration module has four drivers, which is
+      # where an advisory would actually land — and the CLI is the one
+      # people install, so it is scanned like the rest.
+      - run: govulncheck ./...
+        working-directory: cmd/drops
       - run: govulncheck ./...
         working-directory: integration

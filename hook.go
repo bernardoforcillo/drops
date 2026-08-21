@@ -22,11 +22,43 @@ type QueryEvent struct {
 	// contain secrets — redact before logging in untrusted contexts.
 	Args []any
 
-	// Duration is the elapsed time of the operation.
+	// Duration is the elapsed time of the operation, end to end: the
+	// wait for a connection plus the database's own work.
 	Duration time.Duration
+
+	// WaitDuration is the part of Duration spent queueing for a
+	// connection from the pool, before the database ever saw the
+	// statement. Only a Driver can measure it — drops sits on the far
+	// side of the pool — so it is set only when the driver reported it
+	// through [ReportConnWait].
+	WaitDuration time.Duration
+
+	// WaitKnown reports whether WaitDuration was measured. It exists to
+	// separate "the pool handed a connection over immediately" from
+	// "nobody was counting": both leave WaitDuration at zero and only
+	// the first is a fact. Emit queue-time metrics only when it is true.
+	WaitKnown bool
 
 	// Err is the error returned by the operation, or nil on success.
 	Err error
+}
+
+// QueryDuration returns the time the database itself spent on the
+// operation — Duration less the queue time — and whether that split is
+// actually known. When it is not, the total is returned with ok=false:
+// the caller may still want the number, but must not label it query
+// time, because everything the pool spent finding a connection is
+// still inside it.
+func (e QueryEvent) QueryDuration() (d time.Duration, ok bool) {
+	if !e.WaitKnown {
+		return e.Duration, false
+	}
+	if e.WaitDuration > e.Duration {
+		// Shouldn't happen, but a driver reporting a wait longer than
+		// the operation must not turn into a negative latency sample.
+		return 0, true
+	}
+	return e.Duration - e.WaitDuration, true
 }
 
 // Hook observes driver operations performed via a DB. It is purely

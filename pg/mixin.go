@@ -65,12 +65,16 @@ func (m *TimestampsMixin) Apply(t *Table) {
 	}))
 }
 
-// SoftDeleteMixin registers a "deletedAt" column, a DefaultFilter
-// (deletedAt IS NULL), and a DeleteHook that rewrites DELETE
-// statements as UPDATE deletedAt = now() — i.e. the row stays in
-// the table but is hidden by default. Use Unscoped() on any builder
-// to bypass the guard and operate on every row (including the
-// already-deleted ones).
+// SoftDeleteMixin registers a "deletedAt" column, a filter named
+// [FilterSoftDelete] (deletedAt IS NULL), and a DeleteHook that
+// rewrites DELETE statements as UPDATE deletedAt = now() — i.e. the
+// row stays in the table but is hidden by default.
+//
+// To read the hidden rows, name the guard:
+// IgnoreFilters(pg.FilterSoftDelete). That leaves every other filter
+// on the table — a tenancy axis, an authorisation rule — in force.
+// Unscoped() also works and drops all of them, which is what you want
+// for a migration and almost never what you want for a query.
 type SoftDeleteMixin struct {
 	Cols SoftDeleteCols
 }
@@ -79,7 +83,7 @@ type SoftDeleteMixin struct {
 func (m *SoftDeleteMixin) Apply(t *Table) {
 	m.Cols = SoftDelete(t)
 	deletedAt := m.Cols.DeletedAt.Column
-	t.DefaultFilter(IsNull(deletedAt))
+	t.AddFilter(FilterSoftDelete, IsNull(deletedAt))
 	t.OnDelete(DeleteHookFunc(func(d *DeleteBuilder) drops.Expression {
 		upd := d.DB().Update(d.Table()).
 			Set(&exprBinding{col: deletedAt, expr: drops.Raw("now()")})

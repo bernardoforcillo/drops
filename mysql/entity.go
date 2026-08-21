@@ -25,6 +25,12 @@ type Entity[T any] struct {
 	pks       []*Column
 	pkFields  [][]int
 	colFields []entityColField
+
+	// constraintFields maps an index or constraint name to the
+	// struct field a violation of it is reported against. Filled by
+	// MapConstraint; the names drops and MySQL generate are derived
+	// rather than stored — see (*Entity[T]).FieldError.
+	constraintFields map[string]string
 }
 
 type entityColField struct {
@@ -38,6 +44,8 @@ type EntityOption func(*entityConfig)
 type entityConfig struct {
 	allowUnmapped map[string]bool
 	allowAny      bool
+	allowNullable map[string]bool
+	allowAnyNull  bool
 }
 
 // AllowUnmappedColumns exempts the named columns from the check that
@@ -57,6 +65,32 @@ func AllowUnmappedColumns(names ...string) EntityOption {
 // AllowAnyUnmappedColumn disables the check entirely.
 func AllowAnyUnmappedColumn() EntityOption {
 	return func(c *entityConfig) { c.allowAny = true }
+}
+
+// AllowNullableColumns exempts the named columns from the check that
+// a column admitting NULL is bound to a field that can receive one.
+//
+// Use it where the database will never actually produce a NULL and
+// the constraint cannot say so — a column another writer keeps
+// populated, a view whose outer join can never miss. Naming the
+// columns leaves the check working everywhere else.
+func AllowNullableColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowNullable == nil {
+			c.allowNullable = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowNullable[n] = true
+		}
+	}
+}
+
+// AllowAnyNullableColumn disables the nullability check entirely, for
+// migrating a codebase with too many mismatches to fix at once;
+// prefer [AllowNullableColumns], which keeps the check working for
+// the columns you have not exempted.
+func AllowAnyNullableColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAnyNull = true }
 }
 
 // ErrKeyArity is returned when a key carries the wrong number of
@@ -135,8 +169,45 @@ func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entit
 		}
 		missing = append(missing, c.name)
 	}
-	return drift.Report("drops/mysql", rt.Name(), t.name, missing,
-		drift.SpareFields(rt, bound), "mysql.AllowUnmappedColumns")
+	if err := drift.Report("drops/mysql", rt.Name(), t.name, missing,
+		drift.SpareFields(rt, bound), "mysql.AllowUnmappedColumns"); err != nil {
+		return err
+	}
+	return checkNullability(rt, t, colFields, cfg)
+}
+
+// checkNullability reports columns that admit NULL bound to a field
+// that cannot receive one.
+//
+// The mismatch is invisible to the compiler — a column's T is the
+// type its comparisons take, and the scan destination is a field
+// drops reaches only by reflection — and invisible at run time too,
+// until the first row that happens to be NULL. NewEntity is the one
+// place both types are in scope. It fires on whether the column
+// admits NULL, not on whether it said so: a bare mysql.Text("bio") is
+// exactly the shape that has been accepting NULLs nobody declared.
+func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAnyNull {
+		return nil
+	}
+	var bad []drift.NullMismatch
+	for _, cf := range colFields {
+		c := cf.col
+		if !c.IsNullable() || cfg.allowNullable[c.Name()] {
+			continue
+		}
+		ft := drift.FieldTypeAt(rt, cf.field)
+		if ft == nil || drift.AcceptsNull(ft) {
+			continue
+		}
+		bad = append(bad, drift.NullMismatch{
+			Column:    c.Name(),
+			Field:     drift.FieldPath(rt, cf.field),
+			FieldType: ft.String(),
+			Stated:    c.nullStated,
+		})
+	}
+	return drift.ReportNullable("drops/mysql", rt.Name(), t.name, bad, "mysql.AllowNullableColumns")
 }
 
 // Table returns the entity's table.
@@ -258,8 +329,24 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 
-// Unscoped opts out of the table's DefaultFilter predicates.
+// Unscoped opts out of every global filter on the table — named and
+// anonymous alike; the blunt instrument. See [SelectBuilder.Unscoped].
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+
+// IgnoreFilters bypasses the named global filters and leaves every
+// other one standing — see [SelectBuilder.IgnoreFilters]. It is the
+// method to reach for on a table wearing more than one guard, where
+// Unscoped would drop the ones this query still wants.
+//
+//	postEntity.Query(db).IgnoreFilters(mysql.FilterSoftDelete).All(ctx)
+func (q *EntityQuery[T]) IgnoreFilters(names ...string) *EntityQuery[T] {
+	q.sb.IgnoreFilters(names...)
+	return q
+}
+
+// ToSQL renders the query without running it — the same statement All
+// and One would send.
+func (q *EntityQuery[T]) ToSQL() (string, []any) { return q.sb.ToSQL() }
 
 // All returns every matching row.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
@@ -291,7 +378,7 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	ins.Row(e.bindings(v, false)...)
 	res, err := ins.Exec(ctx)
 	if err != nil {
-		return err
+		return e.FieldError(err)
 	}
 	e.applyGeneratedKey(v, res)
 	return nil
@@ -309,7 +396,8 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	for i := range rows {
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
-	return ins.Exec(ctx)
+	res, err := ins.Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // UpsertMany inserts rows, updating the non-key columns of any that
@@ -328,7 +416,8 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	for i := range rows {
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
-	return ins.OnDuplicateKeyUpdateAll().Exec(ctx)
+	res, err := ins.OnDuplicateKeyUpdateAll().Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // Update writes every non-key column of r to the row its key
@@ -347,7 +436,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		return ErrNoAssignments
 	}
 	_, err = db.Update(e.table).Set(sets...).Where(pred).Exec(ctx)
-	return err
+	return e.FieldError(err)
 }
 
 // Save inserts r when every key field is zero, and updates it
@@ -365,7 +454,8 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
-	return db.Delete(e.table).Where(pred).Exec(ctx)
+	res, err := db.Delete(e.table).Where(pred).Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // bindings extracts column values from a row. skipKey omits the

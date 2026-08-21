@@ -38,4 +38,9 @@ coverage.html
 # Go workspace files (per-developer)
 go.work
 go.work.sum
+
+# The drops binary. `make cli` builds it inside cmd/drops, which is a
+# module of its own, so it lands beside that go.mod and not at the
+# repo root — an anchored /drops never sees it.
 /drops
+/cmd/drops/drops

@@ -150,3 +150,68 @@ func TestWithTenantContextRoundTrip(t *testing.T) {
 		t.Errorf("tenant from ctx: %v, %v", v, ok)
 	}
 }
+
+// Stream and Page are reads, and a read on a tenant-scoped entity owes
+// the tenant predicate. Both used to reach past the scoping — Stream
+// straight to the SelectBuilder, Page by building its own — which made
+// a batch job or a paginated listing the one way to read every
+// tenant's rows at once without asking for it.
+func TestScopeByTenantOnStream(t *testing.T) {
+	ent := tenantSchema(t)
+	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
+		return &fakeRows{cols: []string{"id", "tenantId", "name"}}, nil
+	}}
+	db := pg.New(fd)
+	ctx := pg.WithTenant(context.Background(), int64(42))
+
+	if err := ent.Query(db).Stream(ctx, func(*tenantUser) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	sql := fd.queries[0]
+	if !strings.Contains(sql, `"tenantId" = $`) {
+		t.Errorf("Stream must AND tenantId = $: %s", sql)
+	}
+}
+
+func TestScopeByTenantStreamRequiresCtxTenant(t *testing.T) {
+	ent := tenantSchema(t)
+	db := pg.New(&fakeDriver{})
+	err := ent.Query(db).Stream(context.Background(), func(*tenantUser) error { return nil })
+	if !errors.Is(err, pg.ErrTenantMissing) {
+		t.Errorf("Stream without WithTenant must fail closed, got %v", err)
+	}
+}
+
+func TestScopeByTenantOnPage(t *testing.T) {
+	tbl, ent := tenantSchemaTable(t)
+	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
+		return &fakeRows{cols: []string{"id", "tenantId", "name"}}, nil
+	}}
+	db := pg.New(fd)
+	ctx := pg.WithTenant(context.Background(), int64(42))
+
+	if _, err := ent.Page(db).OrderBy(pg.Asc(tbl.Col("id"))).Limit(10).All(ctx); err != nil {
+		t.Fatalf("Page: %v", err)
+	}
+	sql := fd.queries[0]
+	if !strings.Contains(sql, `"tenantId" = $`) {
+		t.Errorf("Page must AND tenantId = $: %s", sql)
+	}
+}
+
+func TestScopeByTenantPageRequiresCtxTenant(t *testing.T) {
+	tbl, ent := tenantSchemaTable(t)
+	db := pg.New(&fakeDriver{})
+	_, err := ent.Page(db).OrderBy(pg.Asc(tbl.Col("id"))).Limit(10).All(context.Background())
+	if !errors.Is(err, pg.ErrTenantMissing) {
+		t.Errorf("Page without WithTenant must fail closed, got %v", err)
+	}
+}
+
+// tenantSchemaTable is tenantSchema with the table handed back, for
+// the tests that have to name one of its columns.
+func tenantSchemaTable(t *testing.T) (*pg.Table, *pg.Entity[tenantUser]) {
+	t.Helper()
+	tbl := pg.AutoTable[tenantUser]("users")
+	return tbl, pg.NewEntity[tenantUser](tbl).ScopeByTenant(tbl.Col("tenantId"))
+}

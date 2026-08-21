@@ -1,6 +1,11 @@
 package pg
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"database/sql"
+	"reflect"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // ColumnType describes the SQL type of a column.
 type ColumnType interface {
@@ -21,6 +26,7 @@ type Column struct {
 	table      *Table
 	typ        ColumnType
 	notNull    bool
+	nullStated bool // NotNull, PrimaryKey or Nullable was called
 	primary    bool
 	unique     bool
 	defaultSQL string
@@ -30,12 +36,27 @@ type Column struct {
 	pii        bool // marked via (*Col[T]).AsPII()
 	managed    bool // drops writes this column, not the application
 
+	// goType is the Go value type the typed handle carries — the T of
+	// the *Col[T] this Column was created for. It is the one thing a
+	// generator reading a table declaration cannot recover any other
+	// way: T appears in no field of Col[T], so reflection over the
+	// handle cannot see it, and the SQL type is a lossy stand-in
+	// (uuid, citext and a domain type all arrive as text). Nil on a
+	// Column built without a typed handle — see GoType.
+	goType reflect.Type
+
 	// origin is the column this one was copied from by (*Table).As,
 	// and nil on a column as declared. An alias copy is a second
 	// handle on one column of one table, so everything that asks
 	// which column a handle *is* has to see the two as equal — see
 	// key.
 	origin *Column
+
+	// renamedFrom is the name this column used to have, set by
+	// (*Col[T]).RenamedFrom. It is the one fact about a column that no
+	// comparison of two schemas can recover — see rename.go — and the
+	// schema is where Push can find it.
+	renamedFrom string
 }
 
 // FK describes a foreign-key reference.
@@ -55,8 +76,32 @@ func (c *Column) Table() *Table { return c.table }
 // Type returns the column's SQL type.
 func (c *Column) Type() ColumnType { return c.typ }
 
+// GoType returns the Go value type the column's typed handle carries
+// — string for a pg.Text column, time.Time for a pg.Timestamp one,
+// whatever T was for pg.Custom[T].
+//
+// It is the companion of [Column.Type], which answers the same
+// question in SQL, and it exists for the generators: reading a table
+// declaration to emit the struct that binds to it means knowing the
+// field types, and the SQL type does not determine them.
+//
+// Nil for a column that was never built from a typed handle — the
+// ones AutoTable derives from a struct, which has the Go types
+// already. A caller that may meet one must say what it does about
+// nil rather than assume.
+func (c *Column) GoType() reflect.Type { return c.goType }
+
 // IsNotNull reports whether the column was declared NOT NULL.
 func (c *Column) IsNotNull() bool { return c.notNull }
+
+// IsNullable reports whether the column admits NULL.
+//
+// It is the complement of IsNotNull, named for the question that
+// matters at bind and scan time rather than for the DDL keyword, and
+// spelled the same in all four dialects so the shared checker asks
+// exactly one question. A PostgreSQL column admits NULL unless it
+// says otherwise, so a column that stated nothing answers true.
+func (c *Column) IsNullable() bool { return !c.notNull }
 
 // IsPrimaryKey reports whether the column was declared PRIMARY KEY.
 func (c *Column) IsPrimaryKey() bool { return c.primary }
@@ -72,6 +117,10 @@ func (c *Column) DefaultSQL() string { return c.defaultSQL }
 
 // ForeignKey returns the foreign-key reference, or nil if none.
 func (c *Column) ForeignKey() *FK { return c.ref }
+
+// PreviousName returns the name the column was declared to have been
+// renamed from, or empty when it was not. See (*Col[T]).RenamedFrom.
+func (c *Column) PreviousName() string { return c.renamedFrom }
 
 // IsManaged reports whether drops writes this column rather than the
 // application — the soft-delete marker, the timestamps a mixin keeps
@@ -170,7 +219,7 @@ type Col[T any] struct {
 
 func newCol[T any](name string, typ ColumnType) *Col[T] {
 	mustIdent("column", name)
-	return &Col[T]{Column: &Column{name: name, typ: typ}}
+	return &Col[T]{Column: &Column{name: name, typ: typ, goType: reflect.TypeOf((*T)(nil)).Elem()}}
 }
 
 // Builder methods — overridden so the chain returns *Col[T] instead of
@@ -178,12 +227,31 @@ func newCol[T any](name string, typ ColumnType) *Col[T] {
 
 func (c *Col[T]) NotNull() *Col[T] {
 	c.Column.notNull = true
+	c.Column.nullStated = true
+	return c
+}
+
+// Nullable states that the column admits NULL.
+//
+// It changes nothing in the DDL — a PostgreSQL column is nullable
+// unless it says otherwise — and everything in what drops will let
+// you bind it to: NewEntity requires the struct field bound to a
+// nullable column to be one that can receive NULL, so writing this is
+// how a schema says the field must be a *T or an sql.Null[T]. It is
+// the counterpart of NotNull, and the two are last-writer-wins.
+func (c *Col[T]) Nullable() *Col[T] {
+	c.Column.notNull = false
+	c.Column.nullStated = true
 	return c
 }
 
 func (c *Col[T]) PrimaryKey() *Col[T] {
 	c.Column.primary = true
 	c.Column.notNull = true
+	// A primary key states NOT NULL implicitly, and a schema that
+	// said PrimaryKey has decided about NULL as much as one that
+	// spelled it out.
+	c.Column.nullStated = true
 	return c
 }
 
@@ -217,6 +285,30 @@ func (c *Col[T]) OptimisticLock() *Col[T] {
 // a struct field for them would be redundant rather than missing.
 func (c *Col[T]) Managed() *Col[T] {
 	c.Column.managed = true
+	return c
+}
+
+// RenamedFrom states that this column is the column that used to be
+// called previous — the same column, the same data, a different name.
+//
+// Nothing in a pair of schemas can tell a rename from a drop and an
+// add, so drops asks rather than guesses, and this is the answer
+// written where the question is. GenerateMigration can record an
+// answer in the migration directory; Push has no migration directory,
+// and its refusal is otherwise unanswerable by anything durable. A
+// rename is a fact about the schema's history, the schema is what Push
+// reads, so the schema is where the fact belongs — and it then travels
+// to every database the schema is pushed to, not just to the one
+// whoever typed the flag was pointed at.
+//
+// The declaration is inert once the rename has happened: it is applied
+// only while the old name is still in the database and the new one is
+// not, so it may be left in place, and should be until every database
+// the schema is pushed to has moved past it.
+//
+//	pg.Add(Users, pg.Text("emailAddress").NotNull().RenamedFrom("email"))
+func (c *Col[T]) RenamedFrom(previous string) *Col[T] {
+	c.Column.renamedFrom = previous
 	return c
 }
 
@@ -288,6 +380,48 @@ func (c *Col[T]) Between(lo, hi T) drops.Expression { return Between(c.Column, l
 // Val binds a typed value as the column's payload in an INSERT row or
 // UPDATE assignment.
 func (c *Col[T]) Val(v T) ColumnValue { return &valueBinding[T]{col: c.Column, val: v} }
+
+// SetNull binds SQL NULL as the column's value.
+//
+// It is the typed counterpart of SetDefault: a parameter placeholder
+// bound to nil, not the literal token, so an INSERT that sometimes
+// writes NULL is the same statement as one that writes a value — one
+// entry in the server's plan cache rather than two — and the NULL
+// travels through AddArg like every other bound value, where hooks,
+// tracers and PII redaction can see it.
+//
+// It does not refuse a NOT NULL column. This is called on a request
+// path, and the database reports that violation precisely; turning it
+// into a panic would trade a FieldError that names the column for a
+// process failure.
+func (c *Col[T]) SetNull() ColumnValue {
+	return &valueBinding[any]{col: c.Column, val: nil}
+}
+
+// ValPtr binds *p, or NULL when p is nil. It is the shape an optional
+// struct field already has, and the one AutoTable and dropsgen read
+// as "this column is nullable".
+func (c *Col[T]) ValPtr(p *T) ColumnValue {
+	if p == nil {
+		return c.SetNull()
+	}
+	// Binding *p rather than p keeps the bound argument's Go type
+	// identical to what Val would have bound, so a hook, tracer or
+	// PII formatter sees one thing rather than two.
+	return c.Val(*p)
+}
+
+// ValNull binds v.V, or NULL when v is not Valid.
+func (c *Col[T]) ValNull(v sql.Null[T]) ColumnValue {
+	if !v.Valid {
+		return c.SetNull()
+	}
+	// The wrapper is unwrapped rather than handed to the driver:
+	// sql.Null[T].Value did not convert its payload before Go 1.25,
+	// so passing one through would make the parameter's fate depend
+	// on the toolchain.
+	return c.Val(v.V)
+}
 
 // Expr binds an arbitrary expression to the column.
 func (c *Col[T]) Expr(e drops.Expression) ColumnValue {

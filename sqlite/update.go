@@ -8,11 +8,11 @@ import (
 
 // UpdateBuilder builds an UPDATE statement. Create one via DB.Update.
 type UpdateBuilder struct {
-	db       *DB
-	table    *Table
-	sets     []ColumnValue
-	wheres   []drops.Expression
-	unscoped bool
+	db     *DB
+	table  *Table
+	sets   []ColumnValue
+	wheres []drops.Expression
+	scope  filterScope
 }
 
 // Set adds a column assignment.
@@ -28,16 +28,28 @@ func (u *UpdateBuilder) SetExpr(col *Column, expr drops.Expression) *UpdateBuild
 	return u
 }
 
-// Where AND-s the given predicates onto the statement.
+// Where AND-s the given predicates onto the statement. Nil predicates
+// are ignored, so a filter that is only sometimes present can be passed
+// straight in — but an UPDATE all of whose predicates were nil is an
+// UPDATE with no WHERE, and rewrites every row.
 func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
-	u.wheres = append(u.wheres, preds...)
+	u.wheres = append(u.wheres, dropNilPreds(preds)...)
 	return u
 }
 
-// Unscoped opts out of the table's DefaultFilter predicates for this
-// UPDATE (e.g. an admin job bypassing a soft-delete or tenant guard).
+// Unscoped opts out of every global filter on the table for this
+// UPDATE — named and anonymous alike; the blunt instrument, for an
+// admin job that means "no scoping at all". To step around one guard
+// and keep the rest, name it with [UpdateBuilder.IgnoreFilters].
 func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
-	u.unscoped = true
+	u.scope.unscoped = true
+	return u
+}
+
+// IgnoreFilters bypasses the named global filters on the table and
+// leaves every other one standing — see [SelectBuilder.IgnoreFilters].
+func (u *UpdateBuilder) IgnoreFilters(names ...string) *UpdateBuilder {
+	u.scope.ignore(names...)
 	return u
 }
 
@@ -47,10 +59,7 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 	if u.table.hasUpdateHooks() {
 		sets = u.applyUpdateHooks()
 	}
-	wheres := u.wheres
-	if !u.unscoped && len(u.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), u.table.defaultFilters...), wheres...)
-	}
+	wheres := u.scope.apply(u.table, u.wheres)
 	b.WriteString("UPDATE ")
 	u.table.writeName(b)
 	b.WriteString(" SET ")

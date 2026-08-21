@@ -9,6 +9,574 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **`dropsgen -rels`: the struct an eager load fills, generated.**
+  Rows mode emits what a `SELECT` of one table hands back. What was
+  still hand-written was the other shape — a parent with its children
+  attached — and it is the one most likely to be wrong, because four
+  things in it have to agree with declarations that live somewhere
+  else: the field name, the slice-versus-pointer choice, the `dropRel`
+  tag and the nested type. Three of the four fail silently. A relation
+  that does not load reads exactly like a parent with no children.
+
+  `dropsgen -rels ./db/schema -shape users:posts.comments` writes one
+  struct per shape, embedding the `<Table>Row` rows mode already emits
+  and adding one field per relation. The cardinalities follow the
+  loader rather than the declaration, because where the two could be
+  read differently `pg/find.go` is the one that decides: `HasMany`,
+  `ManyToMany` and `MorphMany` become a slice, and a parent with no
+  children is assigned an empty non-nil one, so `len()` is the answer
+  and a nil means nobody loaded it; `HasOne` and `BelongsTo` become a
+  pointer, because the loader leaves the field untouched when nothing
+  matches and a zeroed struct is indistinguishable from a real row of
+  zeros; `MorphTo` becomes an `any`, and a path through one is refused
+  here exactly as the loader refuses to descend past one.
+
+  The `-shape` paths are the same strings `With()` takes, so the shape
+  and the query that fills it are written from one spelling — and they
+  are the whole of how deep it goes. There is no "every relation": a
+  schema with a back-reference makes that an infinite type, and a
+  struct that declares a relation the query does not load is refused
+  outright under `StrictLoading`, so generating more than was asked
+  for would break the query it was generated for. A shape is named for
+  its table and its paths (`UsersWithPostsComments`), which keeps a
+  self-referential chain apart, and `-shape 'AuthorWithBooks=...'`
+  names one outright. A name the package already declares is skipped
+  with a note in the header, as in rows mode — but only when the
+  struct already there carries the fields this run would have written,
+  because the other generated structs nest it. A declaration that
+  disagrees is a collision and is refused, and that holds across
+  separate runs as well as within one: a derived name erases where a
+  path was split, so `users:posts.tags` and `users:posts,tags` arrive
+  at one name carrying different fields, and `-o` lets two runs write
+  two files into one package. The package's own declarations are read
+  back and compared, which costs nothing to check in and leaves the
+  names no longer than they were. The output is byte-stable, including
+  across a different arrangement of the same arguments.
+
+  `examples/schemagen` now declares one relation of every kind — a
+  profile for the `HasOne`, a junction for the `ManyToMany`, a notes
+  table that is both halves of the polymorphic pair — and generates a
+  shape for each, so the integration suite loads all six from
+  generated structs against live PostgreSQL rather than from
+  hand-written mirrors, including the empty case for every
+  cardinality. Four of the six previously had the generator's half and
+  the loader's half asserted separately, which is two expectations
+  written by one author and nothing mechanical tying them together.
+
+  Each relation field also carries `drop:"-"`. It is not decoration: a
+  relation field sits at depth 0 and would out-rank a real column of
+  the same name promoted from the embedded row struct, so the column
+  would scan into the slice. And `-rows` now moves any
+  `*_drops_rels.go` aside while it compiles the package, because a
+  shape only compiles while the row structs it names exist — without
+  that, generating the first shape made regenerating the row structs
+  impossible.
+
+- **`(*pg.Table).RelationNames`** lists the relations a table declares,
+  sorted — the counterpart of `FilterNames`, and what a tool that
+  walks a schema needs, since nothing outside the package can range
+  over the map.
+
+- **A rename is a rename, and drops stops rather than guess.** A
+  structural diff can see that `email` is gone and `emailAddress` has
+  arrived. It cannot see whether that was one rename or a drop and an
+  add, and until now it picked the second — `DROP COLUMN "email"` and
+  `ADD COLUMN "emailAddress"`, which is not a migration but data loss
+  with a green checkmark. `AnalyzeMigration` flagged the DROP as
+  destructive, which told the operator the migration was dangerous
+  rather than that it was wrong.
+
+  `DetectRenames` now finds the ambiguous pairs — a dropped column and
+  an added one on the same table whose types are in the same family, a
+  dropped table and an added one carrying the same columns — and
+  `GenerateMigration` returns `*RenameAmbiguityError` and writes
+  nothing while any of them is unanswered. That refusal is the part
+  that matters: CI has no terminal, and the answer drops would have to
+  invent without one is the `DROP COLUMN`. The family test is the
+  middle of the two useless extremes: identical types would miss a
+  rename that widened the column in the same step, and no test at all
+  would ask whether a dropped timestamp had become a boolean.
+
+  An answer is a `RenameDecision`, given through `GenerateOptions.Renames`
+  or on the command line — `--rename-column users.email=emailAddress`,
+  `--rename-table users=people`, `--drop-column users.email`,
+  `--drop-table users` — or, under `drops generate --interactive`, one
+  question per pair on stdin. Prompting is opt-in rather than inferred
+  from whether stdin looks like a terminal, because the portable form of
+  that question says yes to `/dev/null`, which is what a program with no
+  stdin is handed. Every answer is recorded in
+  `<dir>/meta/_renames.json`, next to the snapshots and the journal, so
+  the question is asked once and replayed after that: a colleague
+  generating from the same directory gets the same migration, and CI
+  finds an answer already there. drizzle-kit reads the journal and the
+  snapshots by name and ignores everything else, so the directory stays
+  shared.
+
+  The answer, once given, is applied by rewriting the previous snapshot
+  as if the rename had already run and diffing that, so a rename
+  combined with a type change comes out as the `RENAME` and the type
+  change rather than as a drop and an add. `DiffOptions.Renames` carries
+  it in all three dialects: PostgreSQL emits `ALTER TABLE ... RENAME
+  COLUMN`, MySQL emits `RENAME COLUMN` on a server that has it (8.0,
+  MariaDB 10.5.2) and `CHANGE COLUMN` on one that does not, and SQLite
+  emits `RENAME COLUMN` in front of everything else — including a
+  rebuild, whose `INSERT ... SELECT` then finds the column under the
+  name it is copying. SQLite was the worst of the three: a rebuild that
+  had not been told about a rename copied the table without that
+  column and dropped the original in the same breath, with no `DROP
+  COLUMN` anywhere in the file to warn anybody.
+
+- **Push asks the rename question too, and the schema is where the
+  answer lives.** Rename detection reached `GenerateMigration` and
+  stopped there. All three `Push` implementations went on calling
+  `Diff` with no renames and no ambiguity check, so `Push` was a
+  second door into exactly the data loss the feature exists to close —
+  and the quieter door, because a push has no migration file for
+  anybody to read before it runs. `drops push` at least refused the
+  `DROP COLUMN` as destructive, but `--allow-destructive` then applied
+  the drop-and-add without ever mentioning that a rename was possible;
+  a library caller of `pg.Push` or `mysql.Push` got no refusal at all;
+  and `sqlite.Push` was worse than either, because its rebuild copies
+  only the columns both sides name, so the renamed column's data went
+  with **no `DROP COLUMN` anywhere in the statement list** for the
+  destructive guard to catch.
+
+  All three now run the same check the generator runs and return
+  `*RenameAmbiguityError` before executing anything.
+
+  The answer comes from the schema. `(*Col[T]).RenamedFrom("email")`
+  and `(*Table).RenamedFrom("users")` state that a column or table is
+  the one that used to be called that — a fact about the schema's
+  history, kept in the thing `Push` already reads, rather than in a
+  migration directory a push does not have. Stated there it answers
+  every database the schema is pushed to instead of the one whoever
+  typed a flag was pointed at, and it goes inert on its own:
+  `renameStillPending` applies it only while the old name is in the
+  database and the new one is not, so it can be left in place until
+  every deployment has caught up. `DeclaredRenames` exposes what a
+  schema states, and `GenerateMigration` reads it too — but does not
+  copy it into `meta/_renames.json`, because that file records answers
+  somebody gave and a declaration is not one. `PushOptions.Renames`
+  takes the per-run answer, which is also the only way to say the
+  other thing — that the column really is being dropped — since once
+  such a drop has been pushed the question never comes back.
+
+  `drops push` grows `--rename-column`, `--rename-table`,
+  `--drop-column`, `--drop-table` and `--interactive`, the same five
+  `drops generate` has, and refuses with the same exit code of 3.
+  `--allow-destructive` is deliberately not one of them: whether a
+  column is being renamed or dropped is a claim about what a change
+  means, whether a change that destroys data may run is a permission
+  about consequences, and one flag answering both would have granting
+  the second silently grant the first.
+
+  Two smaller things fell out of it. `sqlite.Push` and `mysql.Push`
+  narrow the live side to the tables the schema declares, which
+  filtered out the very table a declared table rename is about — the
+  push then built the new table empty beside the old one and applied
+  the rename to nothing; a table the schema names as a former name is
+  now kept. And the refusal's wording follows its audience: the
+  message still names the columns, but a push does not print the
+  `--rename-column` lines or point at a rename log it has not got.
+
+  Two things about the precedence between the two answers. A refusal
+  given for this run now outranks a `RenamedFrom` naming the same
+  object, which is what `PushOptions.Renames` and the refusal's own
+  wording had been promising: the two answers are not the same shape —
+  a rename names a pair, a refusal names only the object that is going
+  — so the refusal could not outrank the declaration by carrying the
+  same key, and was simply not heard. An operator who had decided the
+  column really was going had nothing to say, and against a database
+  holding both names the replayed declaration failed with advice about
+  writing a migration, which a push has not got either.
+
+  And a table rename's claim on the old name now expires. A
+  declaration is meant to be left in the source until every deployment
+  has caught up, so it outlives the rename; the hole it opens in
+  `sqlite.Push`'s and `mysql.Push`'s narrowing must not. Once the
+  database carries the new name, whatever answers to the old one is
+  somebody else's table — and offering it to the diff as the previous
+  life of a declared table made the push either ask an unanswerable
+  question pairing the wrong table's columns, or, once told the old
+  name really was going, drop it.
+
+- **A rename decided on a run that changed nothing is still
+  recorded.** `GenerateMigration` returned its `NoOp` result before
+  writing `meta/_renames.json`, so an answer given on a run whose diff
+  came to nothing was dropped on the floor and had to be given again —
+  by a run that may have had nobody to give it. The log is now written
+  first. Nothing is written when no answer was given this run, so a
+  settled schema still writes nothing at all.
+
+- **`drops lint`: three query mistakes, caught before the query
+  runs.** Drizzle ships an ESLint plugin whose flagship rule is
+  "delete without a where clause", and it is the single most-cited
+  reason people install it. ESLint has to guess from a method name.
+  `go/analysis` is handed the type checker's answers whether it asks
+  or not, so a rule knows the value is a `*pg.DeleteBuilder` and knows
+  which package-level `*pg.Table` the statement targets.
+
+  `drops lint ./...` runs three analyzers, exported from
+  `cmd/drops/dropslint` so they also work under golangci-lint or
+  `go vet -vettool`. `unfilteredwrite` reports a DELETE or UPDATE
+  executed with nothing to bound it — MySQL's `LIMIT` on a write
+  counts as a bound; `Unscoped()` pointedly does not, since it removes
+  predicates rather than adding one. `unboundedread` reports an `All`
+  that reads every row: no `Where`, no `Limit`, and no
+  `Budget.MaxRows`, whose vocabulary it borrows deliberately — the two
+  are the build-time and run-time answers to one question, and
+  `MaxRows` is enforced by injecting a LIMIT on exactly the call the
+  rule watches. `loopload` reports a query that eager-loads a relation
+  and executes inside a loop: the N+1 `pg.WithN1Detector` reports at
+  run time, reported at build time instead.
+
+  A linter is judged on its false positives, so each rule says where
+  it stops. All three follow a builder within one function body and no
+  further, flow-insensitively — a `Where` anywhere on the value
+  counts, which misses the bug hidden under an `if` and never
+  mis-reads the careful spelling. A builder that is returned, passed
+  to a call, or aliased goes unreported. A statement is reported where
+  it *executes*, never where `ToSQL` renders it. `unboundedread` asks
+  the most before speaking: whole-row reads only, `All` only, and only
+  when it can name the table — a table built inside a function is one
+  whose size the analyzer cannot know and to which nobody can attach a
+  budget, so a finding there would be a finding with no fix.
+
+  A deliberate offender says so: `//drops:lint ignore <rule> — reason`
+  on the line, the line above, or the enclosing function's doc
+  comment. A table that really is small says so once on its
+  declaration, `//drops:lint lookup`, which travels as an analysis
+  fact to every package that imports the schema.
+
+  Running it over drops itself moved the rules twice. A MySQL batched
+  `UPDATE … LIMIT 2` was reported and should not have been; `Limit`
+  now bounds a write. Seventy-odd unit tests reading three-row fixture
+  tables built inside the test function were reported and should not
+  have been — the rule was answering a question about table size for
+  tables whose size it had no way to know, which is the requirement
+  that a target be nameable. The tree is clean now but for two
+  directives in the integration suite, where a test deliberately
+  rewrites a one-row table. `docs/lint.md` has the whole story.
+- **`drops.Multi`: a transaction as an inspectable value.** A
+  multi-step transaction has been an opaque closure passed to
+  `InTx`, and when step four fails at three in the morning the
+  closure returns one error and nothing else — not which step, not
+  what had already run. `drops.NewMulti().Run("team", …).Run("audit",
+  …)` describes the same transaction as an ordered list of named
+  steps; `Exec` runs them in one transaction, and a failure comes back
+  as a `*MultiError` carrying the step's name, its position, its
+  cause, and the `Results` of every step that had already succeeded.
+  Results are keyed by step name and read out typed via
+  `drops.StepResult[T]`; declaring a step with `drops.Step[T]` instead
+  of `Run` makes the writer's and the reader's types the same thing to
+  the compiler, so the run-time check cannot fail.
+
+  The sharper argument for it is `pg.RetryPolicy`, which re-runs an
+  arbitrary callback on a serialization failure. That is safe only by
+  convention — nothing stops a closure from having sent an email on
+  the attempt that got rolled back. A Multi is a list of steps that
+  can be enumerated with `Names()` before it ever runs, so "this
+  script touches these four things, in this order" becomes a fact CI
+  can assert rather than a comment. It does not make a step body pure;
+  it puts the shape of the transaction where a reviewer and a test can
+  see it.
+
+  `Multi` is not a second saga, and the doc says where the line is. A
+  Multi is *one* transaction: all steps or none, no compensations
+  because a failure leaves no trace, bounded to work short enough to
+  hold a transaction open. A saga is one transaction per step, durable
+  as it goes, and in exchange every step needs a compensating action
+  and those compensations are best-effort. A saga can leave the world
+  half-undone; a Multi cannot. It lives in the root package and takes
+  a `drops.Driver`, so it works for every dialect through the one
+  interface.
+
+- **`And` and `Or` drop nil predicates, in every dialect.** Building a
+  filter that depends on a request parameter meant accumulating into a
+  `[]drops.Expression` and appending under an `if`, because passing a
+  nil predicate was a nil-pointer dereference (pg, mysql, clickhouse)
+  or a dangling `( AND x AND )` that no server would parse (sqlite).
+  Nil now means what the caller meant by it — no restriction — so
+  `pg.And(nil, x, nil)` is `x`, and the `if` and the slice go away.
+  With nothing left to join, `And()` renders the identity `TRUE` and
+  `Or()` renders `FALSE`; SQLite's `And()` used to render `()`, which
+  was a syntax error.
+
+  The same rule is applied one layer up, where the nil actually
+  arrives: `Where`, `Having` and ClickHouse's `Prewhere` ignore nil
+  predicates, and a clause that is left with nothing is omitted rather
+  than emitted empty. A join's `ON` cannot be omitted — the grammar
+  demands a predicate — so a nil condition there renders the same
+  identity, `ON TRUE`, instead of the `ON` followed by nothing it
+  produced before. That the three live engines accept `TRUE`, `FALSE`
+  and `ON TRUE`, and agree on what they mean, is asserted against
+  PostgreSQL, MariaDB and SQLite in the integration suite; SQLite only
+  learned the two keywords in 3.23. `vector.And` / `vector.Or` already
+  dropped the zero `Filter`, which is the value-typed version of the
+  same idea — with one deliberate difference documented there: an empty
+  `vector.Or()` is *no constraint*, not `FALSE`, because that API
+  declines to express an unsatisfiable predicate at all.
+
+  The rule cuts the other way on a write, and the doc comments now say
+  so: `Delete(t).Where(nil)` used to be a nil dereference and is now a
+  DELETE with no `WHERE`. What still bounds it is the table's global
+  filters, which are merged in at render time and are unaffected by
+  what the caller passed — asserted against a live PostgreSQL with a
+  second tenant's row and a soft-deleted row in the table, since a
+  lost guard shows up as a row and not as a string difference.
+
+- **Query tagging from context (SQLCommenter).** A slow statement in
+  `pg_stat_statements` or a MySQL slow log says what ran and says
+  nothing about which line of application code ran it; the usual
+  recovery is to eyeball the top-20 and grep the codebase for
+  something shaped like them. `drops.WithQueryTags` puts the answer in
+  the statement. Tags on the context are appended as a trailing
+  comment in the SQLCommenter format Rails and EF Core emit —
+  `SELECT … /*action='show',controller='users',request_id='7f3a'*/` —
+  and the comment is the one part of a statement that survives into
+  every log, view and proxy downstream. `context.Context` is a
+  strictly better carrier for this than the thread-locals Rails uses,
+  because it already follows the request across goroutines.
+
+  This is not a `Hook`, and could not be: a hook fires after the
+  operation and its return value is discarded, so it can observe a
+  statement but never rewrite one. Tagging is therefore plumbed into
+  the statement path itself — `DB.Exec` and `DB.Query` in all four
+  dialects, which is where every builder's rendered SQL passes on its
+  way to the driver — rather than exposed as general SQL-rewriting
+  middleware, which drops deliberately refuses. The grammar is closed:
+  key-sorted encoded pairs in a trailing comment, nothing else.
+
+  Three decisions worth stating. The comment goes at the **end**, per
+  the spec: too much tooling switches on a statement's first token —
+  MySQL executes `/*!` and reads `/*+` as an optimizer hint, proxies
+  route reads and writes by leading keyword — and the usual argument
+  for a leading comment (a trailing one is lost when the statement is
+  wrapped in a subquery) does not apply, because the comment is
+  appended to a finished statement on its way to the driver, with no
+  composition left to happen. Keys and values are **percent-encoded**
+  to RFC 3986's unreserved set: they are application strings landing
+  inside a SQL comment, and a value containing `*/` would close it and
+  hand the rest of itself to the parser, so `*`, `/`, `'`, newline,
+  `!` and `+` all escape and the rendered comment can only ever
+  contain `[A-Za-z0-9-._~%'=,]`. Integration tests feed exactly that
+  payload — aimed at dropping the table the same statement reads — to
+  live PostgreSQL, MariaDB and SQLite, and confirm against
+  `pg_stat_activity` and `information_schema.processlist` that what
+  the server received is the comment that was written.
+
+  Query arguments are **not taggable**, structurally rather than by
+  documentation: a `Tag` holds two strings, with no `any`, `Stringer`
+  or `Valuer` to convert a bound value through, and
+  `drops.TagStatement` is handed the statement text and the context
+  only — the argument slice is not in scope where the comment is
+  built. Bound arguments are user data, and a tracing backend is not
+  where user data goes.
+
+  Cost is one `ctx.Value` lookup on a statement with no tags, which is
+  what the untagged path is: `BenchmarkExecUntagged` is unchanged
+  before and after (pg: ~207ns/2 allocs → ~201ns/2 allocs, within
+  noise). Tag values do become part of the statement text, so a
+  high-cardinality tag like a request id defeats statement caching for
+  as long as it is set — documented rather than forbidden, since
+  matching one logged statement to one trace is exactly what it is
+  for.
+
+- **Nullability, stated once and enforced from both ends.** Writing a
+  NULL through the builder had no typed spelling: `(*Col[T]).Val`
+  takes a `T`, so callers reached for `drops.Raw("NULL")` — which
+  splices a literal, turns one statement into two for the plan cache,
+  and routes the value around `AddArg`, where PII redaction, hooks and
+  tracers live — or re-declared the column as `Custom[*string]`, which
+  also re-types the operators and makes `Eq(nil)` a predicate that
+  compiles, binds NULL and is unconditionally false. In SQLite there
+  was no spelling at all: `Col[T]` has no `Expr`, the package has no
+  untyped `Bind`, and `ColumnValue`'s methods are unexported, so no
+  caller could put a NULL into an INSERT. `SetNull()`, `ValPtr(*T)`
+  and `ValNull(sql.Null[T])` now exist on `Col[T]` in all four
+  dialects; each binds a parameter, unwrapped to the value type `Val`
+  would have bound, so hooks and drivers see one thing rather than
+  two.
+
+  Reading was the mirror image and worse, because nothing checked it:
+  a nullable column bound to a `string` field was accepted at
+  declaration and failed at the first NULL row, in a scan, with
+  `database/sql`'s "converting NULL to string is unsupported" and a
+  column index. The type system cannot see it — a column's `T` is the
+  *operand* type its comparisons take, and the scan destination is a
+  struct field drops reaches only by reflection — so the check went
+  where both are in scope: `NewEntity` now refuses a column that
+  admits NULL bound to a field that cannot receive one, naming the
+  column, the field, its type and both fixes. It fires on whether the
+  column admits NULL rather than on whether it said so, because a bare
+  `pg.Text("bio")` is exactly the shape that has been accepting NULLs
+  nobody declared. The rule is one-directional: a NOT NULL column
+  bound to a `*T` is the legitimate "distinguish unset from zero"
+  idiom and passes. `AllowNullableColumns(names...)` and
+  `AllowAnyNullableColumn()` are the escape hatches, shaped like the
+  unmapped-column ones.
+
+  `Nullable()` and `IsNullable()` join `NotNull()` / `IsNotNull()` in
+  pg, sqlite and mysql — ClickHouse already had both, and is the
+  dialect that had this right all along: nullability there is an
+  opt-in that changes the column's type, so no existing ClickHouse
+  schema trips the check. `Nullable()` renders nothing in the other
+  three, where a column admits NULL unless it says otherwise, so no
+  snapshot churns and no migration appears.
+
+- **Row and insert structs, generated from the table declaration**
+  (`dropsgen -rows ./db/schema`). drizzle-orm's most-praised ergonomic
+  feature is `$inferSelect` / `$inferInsert`: the row type is derived
+  from the column table so it cannot drift, and the insert type omits
+  the columns the database will fill. Go cannot infer a struct from a
+  value, so the equivalent has to be generated — `dropsgen -schema`
+  already ran struct to table, and this is the inverse. `UsersRow` has
+  one field per column, the Go type that column's `*pg.Col[T]`
+  carries, and the `drop:` tag that binds it; `UsersInsert` is the
+  same minus a serial key, a column with a `DEFAULT`, a generated
+  column and anything `Managed()` marks as written by drops.
+
+  Nullability landing is what makes this worth generating rather than
+  writing. `pg.NewEntity` now refuses a column that admits NULL bound
+  to a field that cannot receive one, and refuses it at package-var
+  init — so the mistake a hand-written struct earns is a panic at
+  process start, or a scan failure in production on the first row that
+  happens to be NULL. A generator that reads nullability off the
+  declaration cannot emit that pairing: the nullable columns come out
+  as pointers, and the struct is correct by construction.
+
+  It reads the table by compiling one. A CLI cannot read a Go
+  variable, and parsing `pg.Add` calls out of the source would recover
+  the column names but not the Go types — a column's `T` lives in the
+  `*Col[T]` handle and appears in no field of it. So `-rows` reuses
+  the bridge `drops generate` and `drops push` already use: a
+  throwaway program that imports the schema package, calls its
+  `Schema()` function and prints what it finds as JSON, compiled by
+  the real compiler against the real declarations. `(*pg.Column).GoType`
+  is the one thing that had to be added for it, returning the value
+  type the handle carries — nil for an `AutoTable` column, which was
+  derived from a struct that already exists.
+
+  Two decisions the mode had to make. A struct whose name the package
+  already declares is **skipped**, with the name and its file recorded
+  in the generated file's header: two declarations of one name in one
+  package do not compile, so emitting a second one is not an option,
+  and overwriting a struct somebody maintains is not a generator's
+  call. And the output is byte-stable — including across the run that
+  reads the previous run's output, which is why the previous file is
+  moved aside before the bridge compiles the package, a step that also
+  keeps a stale generated file from breaking the run that would have
+  fixed it. A test runs the whole thing twice and compares bytes.
+
+  What it will not write, it refuses to write. A generated file that
+  does not compile is worse than no file, so the two shapes that would
+  produce one are errors naming the column: an instantiated generic
+  over a type from another package (`sql.Null[time.Time]` — reflect
+  reports the argument by package *name*, and there is no path left to
+  import), and two packages that share a name, which cannot both be
+  imported unqualified. Where a qualifier *can* be written it is the
+  package's own name rather than the last element of its import path,
+  and the import carries that name when the two differ — every module
+  past v1 ends its path in a version element, so `github.com/gofrs/`
+  `uuid/v5` is package `uuid`.
+
+  `examples/schemagen` now runs both directions over one table, and
+  its tests close the loop: the struct that generated the table and
+  the struct generated from that table agree field for field.
+
+- **Global filters carry names, and a query bypasses them one at a
+  time.** A table's implicit predicates — the soft-delete guard, a
+  tenancy axis, an authorisation rule — were anonymous, and the only
+  way past any of them was `Unscoped()`, which drops all of them. So a
+  report that legitimately wanted soft-deleted rows silently lost its
+  tenancy predicate: the caller asked to see deleted rows and got
+  another customer's. `Table.AddFilter(name, pred)` registers a filter
+  under a name and `IgnoreFilters(names...)` — on Select, Update,
+  Delete, Find and EntityQuery — drops only what it names. EF Core
+  shipped named query filters in 2025 for the same reason, which is
+  the field conceding that one anonymous global filter was a design
+  error; fixing it now, before there are users, is the cheap moment.
+
+  `SoftDeleteMixin` registers under `FilterSoftDelete` and
+  `ScopeByTenant` under `FilterTenant`, both constants rather than
+  strings a caller retypes. `Unscoped` stays, documented as the blunt
+  instrument: it drops every filter the *table* carries, which is what
+  a migration wants and almost never what a query does. It does not
+  reach the `ScopeByTenant` guard, which is built per query from the
+  ctx and is not a table filter — losing isolation as a side effect of
+  an unrelated `Unscoped` is the accident the feature exists to
+  prevent, so crossing tenants has to be said out loud with
+  `IgnoreFilters(FilterTenant)`. `DefaultFilter` still registers an
+  anonymous filter, and is still only reachable by `Unscoped`.
+  Available in pg, sqlite and mysql.
+
+- **An unloaded relation stops reading as an empty one.** Forget
+  `Load(UserPosts)` and `user.Posts` is `nil`, which is
+  indistinguishable from "this user has no posts" — a silent wrong
+  answer, and the Go ORM bug nobody in Go guards against. SQLAlchemy
+  has `raiseload` and Rails `strict_loading`, but both work by
+  intercepting the attribute read, and nothing in Go can interpose on
+  a struct field. So drops refuses the *query* instead:
+  `db.StrictLoading()` (or `.Strict()` on one query) walks the
+  destination struct against the table's declared relations and fails
+  before the SELECT runs, naming the relation, the struct, and both
+  the call that would have loaded it and the call that waives it.
+
+  The waiver is `NoLoad(rels...)` / `Without(names...)` — SQLAlchemy's
+  `noload`, meaning not "do not load", which is already the default,
+  but "I know it is not loaded and I will not read it". A destination
+  struct with no relation field is never refused; neither is
+  `Entity.Get`, which addresses a row by primary key and has no
+  relation-loading vocabulary, so the check there would be an
+  unconditional refusal rather than a signal about the query. The
+  check is off by default and meant for development and test builds,
+  where the mistake surfaces as a failing test rather than a failing
+  request. It does not overlap `N1Hook`: that counts SQL that already
+  ran, to catch the query a caller *did* write in a loop; this one
+  costs no round trip and catches the query a caller did not write.
+  pg descends the whole nested load tree; sqlite's `Find` loads one
+  level, so the check looks at one level.
+
+- **The `drops` CLI** — every step of the migration loop existed as a
+  library function and had no front end, so a project that wanted
+  drizzle-kit's workflow had to write its own `main` for each of them.
+  `drops generate`, `migrate` (with `migrate down`), `push`, `drift`,
+  `pull`, `baseline` and `status` now drive `pg.GenerateMigration`,
+  `pg.DrizzleMigrator`, `pg.Push`, `pg.Introspect` and
+  `pg.DetectDrift` directly. A CLI cannot read a Go variable, so the
+  schema-aware commands generate a program that imports the schema
+  package, call `func Schema() *pg.Schema`, and run it with `go run` —
+  the real compiler evaluating the real declarations. `push`,
+  `migrate` and `migrate down` route their statements through
+  `pg.AnalyzeMigration` and refuse the destructive ones without
+  `--allow-destructive`, naming each statement they held back;
+  `drift` exits 3 so it can gate a pipeline. The gate classifies a
+  statement collapsed to one line: the safety analyser's patterns join
+  their two halves with `.*`, which does not cross a newline, so a
+  wrapped `ALTER TABLE ... DROP COLUMN` — drizzle-kit's spelling, or an
+  edited file's — would otherwise be applied unremarked. `push` and
+  `baseline` refuse a `--pg-schema` other than `public`, because
+  `pg.Diff` writes unqualified identifiers and would put the tables in
+  whatever `search_path` points at while reporting success.
+- **`cmd/drops` is a module of its own** — the CLI needs a connection
+  and drops has no dependencies, so the binary began by speaking the
+  PostgreSQL v3 wire protocol itself, SCRAM-SHA-256 included: ~1,500
+  lines of hand-written, security-critical network code that one
+  author wrote and nobody audited. The constraint had a better answer.
+  `cmd/drops` now has its own `go.mod`, exactly as `integration/`
+  does, and links `github.com/jackc/pgx/v5` behind `drops/stdlib` like
+  any other program; the library's promise is untouched and CI still
+  proves it. Two things follow. `go install
+  github.com/bernardoforcillo/drops/cmd/drops@latest` is unchanged,
+  but a release of the CLI is tagged `cmd/drops/vX.Y.Z` — a nested
+  module carries its directory in the tag — and the `replace` that
+  builds it against the checkout has to come out first. And `drops
+  push`, alone among the commands, needs pgx in *your* `go.mod`: it is
+  the one whose generated program opens the connection, and `go run`
+  resolves that program's imports in your module rather than in the
+  binary's. It checks, and names the `go get`. `generate`, `drift` and
+  `status --schema` compile the same program without the connection
+  and need nothing but drops.
 - **Version bands in `drops/mirror`** — `Change.Version` decides which
   of two writes to a row the mirror keeps, and a `ReplacingMergeTree`
   never revisits that decision. Two incomparable spaces were in play
@@ -101,11 +669,264 @@ once a 1.0 is cut.
 - **Bare-identifier mode on `drops.Builder`** — `BareIdents` /
   `SetBareIdents`, so DDL that defines a table can render unqualified
   column references even when they are nested inside an expression.
+- **ClickHouse introspection, snapshots, `Diff` and `Push`** —
+  `clickhouse.Introspect` reads a table's real shape out of
+  `system.tables` and `system.columns` (columns and types, the engine
+  and its parameters, the sorting, primary, partition and sampling
+  keys, the table TTL, the SETTINGS, and which columns take part in
+  which key), `BuildSnapshot` derives the same shape from a
+  `clickhouse.Schema`, `Diff` produces the statements between the two
+  and `Push` applies them. The package doc said all four were planned;
+  `drops/mirror` had meanwhile grown its own `InspectMirror` over
+  `system.columns` because the dialect offered nothing, which put the
+  hole in the load-bearing part of the library.
+
+  `Diff` returns a `Plan` rather than the `[]string` the other
+  dialects return, because ClickHouse is the dialect where a schema
+  difference does not always have a statement behind it: there is no
+  `ALTER` for a table's engine, its partitioning, its primary key or —
+  beyond appending columns the same statement adds — its sorting key,
+  and none for a column taking part in any of them. Those come back as
+  `Refusal` values naming the remedy. On a `ReplacingMergeTree` the
+  sorting key is worth the emphasis: the engine collapses rows that
+  share it, so changing it is not a schema tweak but a change to what
+  "the same row" means.
+
+  A second category is reported rather than emitted. Where
+  introspection cannot read back what a declaration says — a column
+  TTL, which `system.columns` does not report — or where the server
+  re-renders an expression in its own spelling (`ts + INTERVAL 30 DAY`
+  reads back as `ts + toIntervalDay(30)`), drops withholds the
+  statement as a `Notice` carrying the SQL rather than re-emitting it
+  on every push for ever. Settings are compared only where the
+  declaration names them, since ClickHouse materialises an engine's
+  defaults into the metadata and a live `index_granularity` nobody
+  declared is not evidence that anyone removed it.
+
+  `clickhouse.Analyze` grades the statements a plan does carry —
+  metadata, a background rewrite of every part, or a deletion with no
+  way back — and it matters more here than in the other dialects
+  because a ClickHouse `ALTER` returns before its work is done:
+  `mutations_sync` defaults to 0, so a statement the server accepted
+  may have hours of rewriting still ahead of it in `system.mutations`.
+- **`clickhouse.ClassifyTypeChange`** — whether a column's type change
+  widens, is unprovable, or is refused outright, together with the
+  type a `MODIFY COLUMN` should actually set once a live
+  `LowCardinality` wrapper is carried onto it. `drops/mirror`'s
+  `Evolver` had this analysis to itself; it now calls the dialect for
+  it and keeps only the judgements that are about mirroring — chiefly
+  that a column losing its `Nullable` is merely unprovable for a table
+  in general and certain to fail for a mirror, because
+  `ClickHouseSink` writes NULL into every non-key column of every
+  tombstone.
+- **Queue time is reported separately from query time.** A statement's
+  `Duration` has always been two measurements added together — the
+  wait for a connection from the pool and the time the database took —
+  and they have opposite remedies, so their sum tells an operator
+  which question to ask only by accident. `drops.QueryEvent` now
+  carries `WaitDuration` and `WaitKnown`, and `QueryDuration()`
+  returns the difference.
+
+  drops cannot take that measurement on its own: `drops.Driver` is
+  three methods and acquisition happens inside whatever the caller
+  plugged in. So the split arrives through an optional interface a
+  pool may implement — `pg.ConnAcquirer`, one method that checks out a
+  single connection — with `pg.QueueTimed` putting a clock around the
+  checkout and nothing else, holding the connection until `Rows.Close`
+  or `Commit`, and reporting through `drops.ReportConnWait`. A driver
+  that measures the wait internally can report it directly.
+
+  A driver that reports nothing leaves `WaitKnown` false, and every
+  consumer treats that as unknown rather than zero: `drops/otel`
+  records the new `db.client.connection.wait_time` and
+  `db.client.operation.query_time` histograms only for events that
+  carry a real measurement, because a queue-time gauge reading zero
+  because nobody was counting looks exactly like a pool under no
+  pressure. `db.client.operation.duration` still means the total.
+- **`pg.Replicated` gained a post-write delay, and read routing gained
+  teeth.** Rails' `DatabaseSelector` has two things drops did not.
+  Half of the first turned out to exist under another name —
+  `pg.WithReadYourWrites` is the window, armed by a write and checked
+  by every read on the same context — but it was armed only by
+  `Replicated.Exec`, so a write committed through `InTx`, which is how
+  most writes worth reading back are made, left it unarmed and the
+  next read went to a possibly-lagging replica. It now arms at commit,
+  for transactions that actually wrote.
+
+  The same blind spot ran deeper: a write carrying a `RETURNING` clause
+  is issued through `Query`, not `Exec` — `InsertBuilder.Scan`,
+  `UpdateBuilder.Scan` and `DeleteBuilder.Scan` all do it, and it is
+  how a generated key comes back — and `Query` is the method that
+  routes to a replica. `INSERT ... RETURNING id` was therefore sent to
+  a replica and left the window unarmed. `Replicated.Query` now routes
+  by what the statement does rather than by the method it arrived on:
+  a statement whose leading keyword writes (or a `WITH` / `EXPLAIN`
+  containing one) goes to the primary and arms the window exactly as
+  `Exec` does.
+
+  `Replicated.WithWriteDelay` is the other half: for the given
+  duration after a write, that session's reads go to the primary
+  regardless of replication position. It is the floor `WithLSNTracking`
+  lacked — a caught-up replay position proves the row just written is
+  there and says nothing about what else the write set in motion — and
+  it widens a caller's window when it is longer, while leaving a
+  window explicitly cleared with `d=0` cleared.
+
+  `DB.InReadTx` makes "this only reads" enforced rather than assumed,
+  by the one party that can enforce it: PostgreSQL refuses writes
+  inside a read-only transaction with SQLSTATE 25006. `drops.Driver`
+  cannot ask for one — `Begin` takes a context and nothing else — so
+  drops issues `SET TRANSACTION READ ONLY` as the transaction's first
+  statement, and `pg.ReadOnlyBeginner` is the one-method extension a
+  driver can implement to save the round trip. When neither works the
+  call fails with `pg.ErrNotReadOnly` rather than handing back a
+  transaction that can write.
 - Smaller additions: `pg.SmallSerial`, `sqlite.Column.Asc/Desc/As`,
   `clickhouse.Bind`, `clickhouse.Table.OrderByColumns`,
   `(*Col[T]).Managed` on pg/sqlite/clickhouse.
+- **`clickhouse.ValidateSetting`** returns what
+  `clickhouse.Table.Setting` panics on, for code that has to answer
+  for a `SETTINGS` pair it did not write. `mirror.WithSetting` is the
+  first such caller: its arguments arrive from outside the program and
+  `DeriveClickHouse` reports everything else about its options as an
+  error, so a bad pair now comes back as one instead of unwinding the
+  caller.
+
+- **The safety analyser names the shape a lost rename makes.**
+  `AnalyzeStatements` now also reads a migration as a whole, not only
+  one statement at a time, and reports `unstated-table-rename` when a
+  DROP TABLE shares a migration with a CREATE TABLE of another name,
+  and `unstated-column-rename` when one table loses a column and gains
+  one (`drops/pg`, `drops/sqlite`, `drops/mysql`).
+
+  These are the two ambiguities `DetectRenames` cannot see and so
+  cannot refuse: a table rename where every column was renamed with it
+  leaves the two snapshots with no column names in common, and a column
+  rename that crosses a type family is not a candidate at all. Both
+  come out of the generator as the destructive pair, silently.
+
+  Both rules are graded `SeverityInfo` on purpose. `drop-table` is
+  already an error and `drop-column` an error or a warning depending on
+  the dialect, so a second finding at that level adds urgency to
+  nothing and would be the first rule anyone put in `Ignore`; and both
+  need *both* halves present, because a warning that fires on every
+  genuine drop is one people learn to skip. A rename the migration
+  states out loud accounts for the pair — which is what keeps the rule
+  off SQLite's table rebuild, the CREATE/copy/DROP/RENAME sequence
+  every column change on that dialect produces.
 
 ### Changed
+- **CI lints the integration module.** `golangci-lint` named the root
+  module and `cmd/drops` and nothing else, so the third module was the
+  one nobody was looking at — and five `noctx` findings had piled up in
+  its CLI harness while `staticcheck` and `govulncheck`, which do scan
+  all three, stayed green. The harness now builds every subprocess with
+  `exec.CommandContext`, on the test's own context where there is one,
+  so a run still going when its test ends is killed with it instead of
+  outliving the database the cleanup is about to drop.
+
+- **`sqlite.Push` now refuses a change that a table rebuild cannot
+  carry the data through, and applies nothing until somebody says
+  otherwise.** This is a breaking change for anyone relying on the old
+  silence: pushing a schema with a column removed used to apply
+  cleanly, the rebuild copied the columns both sides named, the data
+  was gone and `err` was `nil`.
+
+  It went unnoticed because no guard downstream of the SQL could have
+  caught it. On PostgreSQL a destructive change is a destructive
+  statement, so `drops push` reads its own plan and refuses the `DROP
+  COLUMN` in it. SQLite has no `ALTER COLUMN` and drops emits no `DROP
+  COLUMN`; the plan is a `CREATE`, an `INSERT … SELECT`, a `DROP
+  TABLE` and a `RENAME`, and those four are identical whether the
+  rebuild widens the table or empties half of it — the column that is
+  going is simply absent from the `INSERT`'s column list. The fact
+  lives in the diff, so that is where it is now computed:
+  `sqlite.DestructiveChanges(prev, cur, opts)` reads a snapshot pair
+  for what evolving one into the other destroys, and `Push` carries
+  the answer out rather than trying to recover it from the statements.
+
+  Six rules, named after `drops/pg`'s wherever the meaning is the same
+  so `drop-column` means here what it means there: `drop-column`,
+  `drop-table`, `alter-column-type` for text moving into a numeric
+  affinity (the copy converts as it goes, and `'007'` arrives as `7`),
+  `alter-column-set-not-null` for a column tightened over rows that
+  hold NULL, and `rebuild-drops-index` / `rebuild-stale-trigger` for
+  the index a rebuild will not put back and the trigger it puts back
+  broken. The last two are what `GenerateMigration` has always warned
+  about through `AnalyzeMigration` and `Push`, which prints no
+  migration for anyone to read, did not.
+
+  `PushOptions.AllowDestructive` applies them anyway — the same
+  permission `--allow-destructive` carries on PostgreSQL and the same
+  meaning, that somebody has read what the change destroys. It does
+  not answer a rename question and a rename answer does not permit a
+  drop; declining a rename says what the change means, the option says
+  whether it may run, and neither stands in for the other. Two things
+  deliberately do not trigger it, because an option needed on every
+  push is an option nobody reads: a rebuild that only widens a table
+  loses nothing, and `alter-column-set-not-null` is confirmed against
+  the rows first, so tightening a column that holds no NULL goes
+  through untouched. `DryRun` reports rather than refusing, in
+  `PushResult.Destructive`.
+
+- **The same guard now covers a `UNIQUE` added over duplicate rows and
+  a `CHECK` added over rows that break it.** Two more rules,
+  `add-unique-constraint` and `add-check-constraint`, of the same shape
+  as `alter-column-set-not-null` and failing the same way: the
+  rebuild's `INSERT … SELECT` dies partway on a constraint error and
+  the transaction rolls back. No data is lost, which is why they were
+  left out — and leaving them out is exactly the failure the NOT NULL
+  rule exists to turn into a readable refusal, with the documentation
+  claiming the rule set covered what a rebuild costs.
+
+  Like the NOT NULL rule they are probed rather than assumed, so
+  declaring a column unique that has held distinct values all along is
+  not a refusal demanding the override by reflex. The probes follow
+  SQLite's own semantics: NULLs are distinct in a unique index, so a
+  column of them is not a duplicate, and a `CHECK` fails only on a
+  value of false, so a row the expression is NULL for passes.
+
+  They read the table as the rebuild will present it rather than as it
+  stands — a column this push renames supplied under its new name, one
+  it adds under its default. That is not tidiness. SQLite re-reads a
+  double-quoted identifier matching no column as a string literal, so a
+  probe against the raw table asks a different question and answers it
+  confidently: a `GROUP BY` over the literal puts every row in one
+  group and refuses a push nothing is wrong with, and a `CHECK` over
+  the literal compares two constants and acquits one that is — a silent
+  acquittal, after which the push dies on the very constraint the probe
+  was asked about. All three shapes are pinned against a live engine.
+
+- **`NewEntity` now refuses a nullable column bound to a field that
+  cannot hold NULL, and it refuses at package-var init time — so an
+  upgraded program does not start until the schema says what it
+  means.** This is the breaking half of the nullability work above and
+  it will fire on ordinary existing code: a column declared
+  `pg.Text("name")` with neither `.NotNull()` nor `.Nullable()` emits
+  a nullable column, and a `Name string` field cannot receive what
+  that column is allowed to store. The old code was not terser, it was
+  wrong — the database really did accept NULL there — but the upgrade
+  is not silent and it is not lazy. The panic names every column, its
+  field, and both fixes; `AllowNullableColumns(names...)` waives it
+  per column and `AllowAnyNullableColumn()` waives it wholesale, for a
+  schema that is not ready to decide today.
+- **The two schema generators state nullability instead of leaving it
+  implicit.** `pg.AutoTable`'s doc comment claimed pointer types made
+  a column nullable "by default", which asserts that a non-pointer
+  does not — and the code did no such thing, leaving every untagged
+  column nullable. Both `AutoTable` (pg and sqlite) and
+  `dropsgen -schema` now read nullability off the field's type: a
+  pointer or an `sql.Null[T]` declares a nullable column, everything
+  else NOT NULL, with a new `null` tag option as the escape hatch for
+  a field whose type cannot say it. Nothing either generator emits can
+  be the unstated shape `NewEntity` now rejects. This changes the DDL
+  they produce for non-pointer untagged fields, from nullable to NOT
+  NULL: regenerate, read the schema diff, and expect `SET NOT NULL` to
+  fail where the column already holds NULLs — which is the latent bug
+  surfacing in the safest available place.
+- `dropsgen -introspect` gives a nullable column a pointer field, so
+  introspecting a live schema and regenerating its declaration returns
+  the schema it started from.
 - **`NewEntity` now rejects a column bound to no struct field**
   (`drops/pg`, `drops/sqlite`, `drops/clickhouse`). It used to skip it
   silently, so a renamed field or a mistyped `drop:` tag removed the
@@ -114,7 +935,394 @@ once a 1.0 is cut.
   Columns drops itself writes are exempt automatically; the rest must
   be mapped or named through `AllowUnmappedColumns`.
 
+- **The two outbox dialects agreed on failure bookkeeping.** `drops/pg`
+  wrote a handler failure through the draining transaction and
+  `drops/mysql` deliberately through the pool, each with a coherent
+  argument, and they cannot both be the library's answer. The pg answer
+  wins and `drops/mysql` now matches it: the per-aggregate paths record
+  the attempts bump on their own transaction via `failOneOn`.
+
+  The deciding argument is the pool. Writing the failure through
+  `Outbox.MarkFailed` asks the pool for a connection that
+  `DrainAggregate`'s own transaction is holding, so a worker on a pool
+  of one stopped at the first handler error and never came back — and
+  on MySQL that transaction also holds the aggregate's session-scoped
+  `GET_LOCK`, so the stall kept every other worker out of that
+  aggregate too. The losing argument — that a rollback must not be able
+  to undo an attempts bump, or a poison event never reaches
+  MaxAttempts — is recorded in the doc comment on `failOneOn` in both
+  packages, along with why it does not apply: both in-transaction
+  callers record the failure and immediately return nil, so the
+  transaction carrying the bump is the one that commits.
+
 ### Fixed
+- **Four PostgreSQL schema changes the diff could not see, and a view
+  it could not order around.** Each of the first three was the same
+  shape: the snapshot recorded a value, both producers filled it in,
+  and `pg.Diff` compared the name it hung under and nothing else. A
+  declared change therefore became a change the database never
+  received, with `DetectDrift` — which is two `Diff`s — reporting the
+  two sides in sync for ever after.
+
+  **The PRIMARY KEY, at one column.** `BuildSnapshot` recorded a key in
+  `CompositePrimaryKeys` only past two columns, on the reasoning that a
+  narrower one rides on the column definition; `Introspect` mirrored
+  that, and `alterColumns` never compared primary-key-ness at all. The
+  column definition carries a bool, and a bool cannot say which columns
+  a key spans — so a key that reached the diff only as a bool was a key
+  the diff could not compare. Narrowing `(orgId, userId)` to `(userId)`
+  emitted the `DROP CONSTRAINT` with no `ADD` behind it and the table
+  lost its key silently; widening the other way emitted the `ADD` with
+  no `DROP` in front of it and PostgreSQL refused the migration whole
+  (42P16). The map now holds the key at every width, from both
+  producers, and `dropPrimaryKey`/`addPrimaryKey` match the two sides
+  by column list as they always did for a wide key — so a key
+  PostgreSQL named `users_pkey` and the same key drops names
+  `usersIdPk` are still one key and still no work.
+
+  Two consequences worth stating. `ColumnSnapshot.PrimaryKey` stays
+  true for a one-column key, because that is drizzle-kit's spelling and
+  what `drops pull` reads to write `.PrimaryKey()` back out, but it is
+  no longer what emits the key: `columnDefSQL` leaves `PRIMARY KEY` out
+  of the `CREATE TABLE` and the key is stated as its own `ALTER TABLE
+  ... ADD CONSTRAINT` at every width, which is what `Diff`'s doc
+  comment already claimed for every other constraint. And a snapshot
+  drizzle-kit wrote, which spells a narrow key only on the column, is
+  read back rather than mistaken for a table with no key.
+
+  The cost of keeping both spellings is that a snapshot now states a
+  one-column key twice, which the v7 format has no way to mark. Every
+  reader inside drops collapses the pair — `tablePrimaryKey` prefers
+  the map and reads the column only when it is empty, `drops pull`
+  skips the table-level form when the column already carries it — but
+  a consumer outside drops that rendered both would declare one key
+  twice and PostgreSQL would refuse the pair (42P16). It is noted on
+  `CompositePKSnapshot`, since it is the one place a drops snapshot
+  stretches the round trip the format exists for.
+
+  **A UNIQUE re-scoped under an unchanged name.** Widening
+  `UNIQUE(email)` to `UNIQUE(email, orgId)` produced no statement at
+  all — `pg.Diff` returned the empty list — so the rule the schema
+  declared and the rule the database enforced disagreed with nothing to
+  say so. `dropUniques`/`addUniques` now compare the column list and
+  drop and re-add the constraint, as `dropChecks` already did for an
+  expression that moved.
+
+  **A foreign key's referential actions.** `fkName` is built from the
+  columns and the target, so a key that starts pointing somewhere else
+  arrives under a new name and was already a drop and an add — but `ON
+  DELETE CASCADE` becoming `ON DELETE RESTRICT` keeps every part of that
+  name, produced nothing, and left the database deleting the children
+  of a deleted parent the schema said it should refuse to delete.
+  Compared by value now; `SchemaTo` is deliberately left out of the
+  comparison, since `Introspect` fills it and `BuildSnapshot` leaves it
+  empty for a table that never named a schema.
+
+  **A sequence's attributes**, found by auditing the rest of the
+  snapshot for the same shape. `Introspect` reads `seqincrement`,
+  `seqmin`, `seqmax`, `seqstart`, `seqcache` and `seqcycle` back and
+  `BuildSnapshot` records whatever `SequenceOptions` named, and neither
+  reached a comparison: `INCREMENT BY 1` becoming `INCREMENT BY 10` was
+  applied by nothing and reported by nothing. One `ALTER SEQUENCE`
+  carries every clause that moved — one statement rather than one each,
+  because `MINVALUE` and `MAXVALUE` have to widen together. The two
+  sides are compared on the values the server would end up with rather
+  than on the pointers, so a declaration spelling out a default
+  `Introspect` leaves unset is not churn. `START WITH` is stated and is
+  not `RESTART`: it sets the value a future restart would return to and
+  moves nothing the sequence is handing out today. That last choice has
+  a cost, now listed under "What Push cannot see": a declaration that
+  raises `MINVALUE` above the value the sequence is sitting on, or
+  lowers `MAXVALUE` below it, cannot be applied without moving it, so
+  PostgreSQL refuses the `ALTER` (22023) and the push rolls back whole.
+  A refusal naming the sequence and both numbers is the honest answer —
+  the alternative reading of "leave the live sequence alone" would be
+  to go on reporting success and changing nothing, which is the failure
+  this entry exists to close — but where a sequence should resume is a
+  question only an operator can answer, with an `ALTER SEQUENCE ...
+  RESTART` of their own. The rest of the
+  audit came back clean — a CHECK's expression, a policy's clauses and
+  an index's shape are all compared; `IndexSnapshot.NullsNotDistinct`
+  and `.With` are in the struct for drizzle-kit's format and are filled
+  by neither producer, which `indexEqual`'s doc comment now says
+  instead of claiming everything else is compared.
+
+  **And the view.** A view the schema still declares stood through the
+  whole migration, so a column any surviving view reads could not be
+  dropped (2BP01) or retyped (0A000) — and the unchanged view was the
+  worse half, because a body that did not move emits no statement for
+  any ordering rule to reach. Ordering cannot close it, so the view is
+  no longer ordered, it is rebuilt: a migration that drops or retypes
+  any column of any table now takes down every view both sides declare,
+  ahead of the table DDL, and states each of them again afterwards in
+  view-on-view dependency order. That order is
+  read out of the bodies, since the snapshot records what a view says
+  and not what it reads, and it fixes a second bug on the way: a schema
+  declaring a view over a view could not be created at all when the
+  names sorted the wrong way round.
+
+  The rebuild happens whether or not the view was in the way, because
+  which columns a view reads is exactly what the snapshot does not
+  record — and it is cheap, since a view holds no rows. Two things it
+  is not free of, both now on `Diff`: a `GRANT` on the view does not
+  survive it, and a materialised view is repopulated by its `CREATE`.
+
+  The drops are plain, not `CASCADE`, and that is the deliberate half:
+  a `CASCADE` from a declared view would take an undeclared one
+  selecting from it along with it, silently and for good, against the
+  rule that `Push` does not drop what the Go schema never claimed.
+  Without it PostgreSQL refuses — naming the view it could not drop,
+  which is the declared one, and saying only that "other objects depend
+  on it". The object worth naming is the one nobody declared, and
+  `Push` is the half that knows which those are, so it now checks
+  before anything runs and refuses with both names and the three ways
+  out: declare the view with `Schema.AddView` so it is rebuilt too,
+  drop it by hand, or set `DropUnmanagedObjects`.
+
+  Two limits are listed under "What Push cannot see": an undeclared
+  view still refuses a column change on its own account, and a view
+  body that resolves against the table it selects from — `SELECT *`
+  above all — is respelled by the probe before the table DDL runs, so
+  the expansion names the column that is about to go.
+
+  Every case is proved against live PostgreSQL 16 in
+  `integration/pgdiffvalue_test.go`, asserting the catalogue rather than
+  the statement list — for the narrowed key in particular, since the
+  bug there was the statement that was absent — with the diff-level half
+  in `pg/diff_values_test.go`.
+- **A MySQL migration that dropped a column and something naming it
+  could not be applied either, and its order was worse than
+  PostgreSQL's.** `mysql.Diff` emitted the column changes in the middle
+  and the foreign keys at the end, so a `DROP COLUMN` on a referenced
+  table came out ahead of the `DROP FOREIGN KEY` on the table pointing
+  at it: InnoDB refused the column drop with 1553 before any of the
+  stale-name errors could fire. And with no transactional DDL, a
+  migration that fails part way stays part way applied.
+
+  The rules are not PostgreSQL's, and the differences are the work. Read
+  off MariaDB 10.11: a secondary index over the dropped column alone is
+  removed with the column (1091 afterwards) while one over several
+  columns is **narrowed** to the columns that remain and stays — so the
+  PostgreSQL rule that a dependent goes whole when any of its columns
+  goes is false here, and suppressing the `DROP INDEX` on that
+  reasoning would leave a narrowed index standing and the next push
+  asking for the same drop for ever. A `UNIQUE` key over the column
+  alone goes with it, but a multi-column one is not narrowed and the
+  column drop is refused with 1072. A `CHECK` naming only that column
+  goes with it on MariaDB and is refused on MySQL 8.0.16+ with 3959;
+  one naming a surviving column too is refused on both with 1054.
+  Either side of a foreign key refuses with 1553, the index the key
+  needs included. A single-column `PRIMARY KEY` goes with its column, a
+  composite one refuses with 1072.
+
+  Every one of them points the same way, so `Diff` now emits the
+  foreign-key drops first across every table — they are the only kind
+  that reaches across tables, and dropping the key is what lets the
+  `UNIQUE` or `PRIMARY KEY` it pointed at be dropped at all — then the
+  indexes, `CHECK`s and primary keys table by table, then the columns,
+  with the adds behind them. The column changes stay batched into one
+  `ALTER TABLE` per table, because splitting them would copy the table
+  twice. Nine shapes are pinned against live MariaDB in
+  `integration/mysqldropdeps_test.go`, the last putting every one into
+  a single migration, and `mysql/diff_droporder_test.go` guards the
+  order without a server.
+
+  One hazard is not an ordering problem and is unchanged: `DROP PRIMARY
+  KEY` on a table whose key covers an `AUTO_INCREMENT` column is 1075
+  wherever the statement is put — the safety analyser flags it.
+
+  Ordering is not the whole of it under the default options, which is
+  where most pushes run. `Push` withholds the drop of an index the Go
+  schema never declared, since it cannot tell one the schema stopped
+  declaring from one somebody made by hand — and a withheld statement
+  is never ordered at all. Where the index keys a column the push
+  drops, that left a narrowed index standing under a notice saying the
+  index had been left alone, which by then was false, or stopped the
+  push on 1072 or 1553 with nothing to explain it. MySQL will not leave
+  such an index as it is whatever Push does, so withholding preserved
+  nothing; the drop now goes through by default, under a notice naming
+  the index and the departing column. An unmanaged index over columns
+  the push does not touch is still left alone, which is what the option
+  is for. Both halves are pinned in
+  `integration/mysqldropdeps_test.go`.
+- **A PostgreSQL migration that dropped a column and something naming
+  it could not be applied.** `pg.Diff` emitted the column drop first
+  and the constraint, index or policy drop after it, and PostgreSQL had
+  already taken the second along with the first — so the statement
+  named an object that no longer existed (SQLSTATE 42704) and, because
+  `Push` runs its plan in one transaction, the whole migration rolled
+  back with nothing done. Dropping a column carrying a UNIQUE was the
+  reported shape; the same order broke a CHECK, an index, and a
+  composite PRIMARY KEY losing one of its columns, and it does not
+  need a rename anywhere near it.
+
+  The mirror image was a refusal rather than a stale name. A column
+  another table's foreign key points at, or a policy reads, cannot be
+  dropped at all while that object stands (SQLSTATE 2BP01) — and
+  neither of those lives on the same table, so no per-table pass could
+  have got the order right. `DROP TABLE`, which drops emits `CASCADE`,
+  had the same effect on the foreign keys pointing at it from tables
+  that survive: the `DROP CONSTRAINT` that followed named a constraint
+  the cascade had already taken.
+
+  `Diff` now emits the drops grouped by kind across every table and in
+  dependency order — foreign keys, then the table drops, then policies,
+  UNIQUE, the primary key, CHECK and indexes, and only then the
+  columns — with the adds unchanged behind them. Ordering rather than
+  suppression, because the two are not equivalent: a constraint can be
+  dropped while every column it spans stays, and deciding whether an
+  index names a column would mean modelling PostgreSQL's dependency
+  graph, expressions included, which the snapshot deliberately does not
+  record. Ten cases are pinned down against a live PostgreSQL in
+  `integration/pgdropdeps_test.go` and
+  `integration/pgdropdeps_all_test.go`, the last of them putting every
+  shape into one migration, since a fix that grouped the drops by shape
+  rather than by kind would still pass the nine taken one at a time.
+
+  One dependent kind is left out, and named as such on `Diff`: a view
+  the schema still declares stands through the whole migration, so a
+  column any surviving view selects still cannot be dropped (2BP01),
+  whether that view's body changed or not. Closing it means dropping
+  surviving views up front and rebuilding them in dependency order,
+  which needs a record of the columns a view names that the snapshot
+  does not keep. And `Push` only reaches the policy case with
+  `DropUnmanagedObjects`: under the default it withholds the `DROP
+  POLICY` — deliberately, since dropping a policy nobody declared opens
+  the table up — and the `DROP COLUMN` behind it is then refused.
+
+  MySQL/MariaDB's diff was written from the same shape and has the same
+  fault — `DROP COLUMN` ahead of the `DROP INDEX`, the `DROP
+  CONSTRAINT` and the `DROP FOREIGN KEY` — which MariaDB 10.11 rejects
+  with 1091 for the two stale names, 1553 for a column an FK's index
+  needs, and 1072 for a column of the primary key. It is not fixed
+  here.
+
+- **`drops push` asked about an unstated rename after `--drop-column`
+  had answered it.** The safety analyser reads statements and nothing
+  else — deliberately, since it is also handed migration files drops
+  did not write — so it went on reporting a `DROP COLUMN` beside an
+  `ADD COLUMN` as the shape a rename makes, printed directly beneath
+  the answer the operator had just given. It is right about the SQL and
+  wrong about the run, and advice like that teaches people to stop
+  reading the output. The analyser keeps its contract; the CLI, which
+  is the one layer holding both the plan and the answers, now drops the
+  `unstated-column-rename` and `unstated-table-rename` notices whose
+  every object has a decision on record. A half-answered question
+  stays: a migration that drops two columns from one table and has an
+  answer for one of them still has something to ask.
+
+- **The `dropRel` tag's fallback is documented as the hazard it is.**
+  `relationTargetField` looks a relation's field up by its `dropRel`
+  tag and then, failing that, by a case-insensitive field-name match.
+  Every shape the generator emits names its field after its relation,
+  so every live test passed with the tag deleted and nothing said what
+  the tag was for. The fallback claims a field because of what it is
+  *called*: an untagged `Posts []PostsRow` that the caller meant as
+  their own cache is filled by `With("posts")` all the same, and the
+  walk reaches through embedded structs into the row struct, where the
+  fields are columns. The doc comment now says so, and a live test
+  discriminates — a field named `Articles` carrying `dropRel:"posts"`
+  loads, the same field without the tag is refused.
+
+- **ClickHouse's keyset pagination walked off the end at the first NULL
+  key.** `clickhouse/cursor.go` still rendered a plain `col > ?` bound
+  to the cursor value, so a page whose last row had a NULL in a key
+  column produced a predicate that matched nothing — an empty page that
+  reads exactly like the end of the result set, on every page from then
+  on. `drops/pg` and `drops/sqlite` were made NULL-aware; ClickHouse
+  was left because its NULL ordering needed a decision rather than a
+  mechanical port.
+
+  The decision: ClickHouse's default is NULLS LAST in *both*
+  directions. PostgreSQL reaches its default by sorting NULL as the
+  largest value and SQLite and MySQL by sorting it as the smallest, so
+  on all three the placement flips with the direction. ClickHouse
+  instead carries a `nulls_direction` beside the sort direction and
+  defaults it to "same as direction, i.e. NULLS LAST", flipping only
+  for an explicit `NULLS FIRST` — so a descending walk leaves the NULLs
+  at the end where ascending put them. The guard is built against that,
+  honours an explicit `NullsFirst`/`NullsLast`, and reverses both
+  together when paging backward. `EncodeCursor` also follows a pointer
+  to its pointee (a nil one being the NULL) and unwraps a
+  `driver.Valuer`, as pg's does, so a Nullable key column can be a page
+  boundary at all.
+
+- **A ClickHouse cursor on a NaN or an infinity silently became a
+  cursor on zero.** `encodeCursorValue` discarded the marshal error on
+  the float branch, and JSON has no spelling for either, so the payload
+  carried a bare `null` that decoded straight back to `0` — a page that
+  ended on a NaN resumed from zero and replayed every row above it.
+  `EncodeCursor` now returns the error. ClickHouse sorts NaN into the
+  gap between the values and the NULLs, so this is reachable on any
+  `Float64` key.
+
+- **A MorphMany bound to a non-slice field was reported as a HasMany.**
+  The slice guard in `pg/find.go` accepts `HasManyKind` and
+  `MorphManyKind` but hardcoded the name of the first, so the one fact
+  the error stated about the relation was wrong and sent the reader
+  looking for a declaration that does not exist. The message now names
+  the kind it saw. The sibling dialects were checked and are correct:
+  `drops/sqlite` has no MorphMany, and both `ManyToMany` guards are
+  reachable only for that kind.
+
+- **A per-parent `Limit` on an eager-loaded relation dropped that
+  relation's global filters.** An edge of a `Load` tree is normally a
+  `Select().From(rel.To)`, so it carries the related table's guards for
+  free. Asking for at most N children per parent takes a different
+  route — `RelConfig.Limit` rewrites the edge into a hand-written
+  `ROW_NUMBER() OVER (PARTITION BY …)` statement — and that writer
+  never spelled the guards out. So adding `.Limit(n)` to a load, a
+  change that reads as "give me fewer of these", silently widened what
+  came back: on a live server, an author whose books table carried a
+  soft-delete guard and a tenancy guard returned the soft-deleted book
+  and the other tenant's book once the cap was added, and neither
+  without it. The rewrite now AND-s in `rel.To`'s filters, so a capped
+  load and an uncapped one scope identically.
+- **`mysql.EntityQuery` had no `IgnoreFilters`.** The builders got it
+  and the entity layer did not, which left an entity query on a
+  doubly-guarded table holding only `Unscoped` — the all-or-nothing the
+  named filters exist to replace.
+- **`pg.EntityQuery.Stream` and `pg.Entity.Page` read every tenant's
+  rows.** `ScopeByTenant` promises that every read on the entity is
+  narrowed to the ctx tenant, and Get / Query.All / Query.One / Update
+  / Delete all honoured it. Stream reached straight for the
+  `SelectBuilder` and Page built its own statement, so both skipped the
+  tenant predicate and the `AuthorizeWith` guard entirely — which made
+  an export or a paginated listing the one way to read across every
+  customer without asking for it, and made a missing ctx tenant a
+  silent full-table read instead of `ErrTenantMissing`. Against a live
+  server with two tenants in the table, both returned all of them.
+  drops/sqlite's Page had this right already.
+- **`sqlite`'s `SoftDeleteByID` and `Restore` wrote past every filter
+  on the table, not just the one they meant to.** Both have to reach a
+  row the soft-delete guard is hiding, and the only tool for that was
+  `Unscoped()` — which also drops the tenancy or authorisation filter
+  that decides *which* row the statement may touch. Against a live
+  engine, soft-deleting id 2 on a table filtered to tenant 7 hid
+  tenant 8's row. They now name the guard they are stepping around,
+  `IgnoreFilters(FilterSoftDelete)`, and stay inside the rest.
+  `SoftDeleteMixin` also stopped registering a second copy of the
+  filter `SoftDelete` had already installed, which had been doubling
+  the predicate in every rendered WHERE.
+- **`clickhouse.Analyze` graded a statement by the text of its column
+  comment.** Every keyword the rules match is also an ordinary English
+  word, and the matcher read the whole statement including its
+  literals. A `MODIFY COLUMN` carrying `COMMENT 'we remove this in Q3'`
+  matched the `REMOVE` rule and came back as a metadata change that
+  "touches no data", which is the opposite of what a type change does
+  and is said reassuringly; an `ADD COLUMN` whose comment mentioned a
+  drop table raised a destructive finding and cried wolf. Literals are
+  emptied out before the rules run now.
+- **A ClickHouse column comment could escape its own string literal.**
+  `drops/clickhouse` quoted literals the way `drops/pg` does, by
+  doubling the single quote, and ClickHouse's lexer is not PostgreSQL's:
+  it reads C-style escapes inside a literal. A comment ending in a
+  backslash therefore escaped its own closing quote and ran on into the
+  rest of the statement, and a comment of `\' OR 1=1 --` left the
+  literal altogether — through `CreateTable`, through `Diff`'s
+  `COMMENT COLUMN`, and through the `MODIFY COLUMN` restatement that
+  carries a comment. A comment is the one string in a schema statement
+  that drops did not write itself. The backslash is escaped first now.
 - **`Dec` added a negated delta, so an unsigned counter climbed.** In
   all three dialects. The constraint behind `Inc`/`Dec` admits the
   unsigned types, and negating an unsigned value wraps, so
@@ -328,6 +1536,108 @@ once a 1.0 is cut.
   was dead code because the query-result caching pg has was never
   wired up. `All`/`One` now read through it with the same single-flight
   stampede protection the PK path had.
+- **`pg`'s scanner disagreed with the root one about embedded
+  unexported structs.** `pg/scan.go` carried a fork of the reflection
+  walk that skipped unexported fields before it reached the anonymous
+  ones, so a row type factoring its timestamps into an unexported
+  `audit` lost those columns — scanned into a discard sink, zero values
+  in the struct, no error. The root scanner walks the embedded type
+  first and explains why. `pg` now uses `drops.StructFields` rather
+  than a second copy of the rules, which also brings pg the root's
+  collision rule: a name reachable at two depths belongs to the
+  shallower field, and an embedded `time.Time` or `sql.Scanner`
+  receives a column instead of lending its fields. `sqlite` and
+  `mysql` were already on the root scanner; `clickhouse` still carries
+  the same fork.
+- **A keyset cursor sitting on a NULL paged nothing, forever.**
+  `pg.EncodeCursor(spec, nil, …)` rendered `note > $1` bound to nil,
+  which under three-valued logic matches no row — so every page after
+  the first came back empty and looked exactly like the end of the
+  result set. The keyset guard is now NULL-aware, as `mysql`'s already
+  was: it is written against the `NULLS FIRST` / `NULLS LAST`
+  placement the spec asks for, the equality on leading keys uses
+  `IS NULL`, and paging backward reverses the placement along with the
+  direction. `EncodeCursor` also follows a pointer, since a nullable
+  column arrives from the last row of a page as a `*T`.
+- **Two racing migrators failed inside PostgreSQL's catalogue.**
+  `CREATE TABLE IF NOT EXISTS` and `CREATE SCHEMA IF NOT EXISTS` are
+  not atomic against a concurrent `CREATE`, so a rolling deploy that
+  ran the migrator once per replica reported a duplicate key on
+  `pg_type_typname_nsp_index` or `pg_namespace_nspname_index` — names
+  that tell an operator nothing. `Migrator.Up`/`Down` and
+  `DrizzleMigrator.Up` now hold a PostgreSQL advisory lock for the
+  whole run, so the loser waits and then finds nothing to do. It
+  matters most for the drizzle migrator, whose history is keyed by
+  hash with no unique constraint: unsynchronised, two runs would both
+  apply a pending file and both record it. `WithLockTimeout` turns the
+  wait into `ErrMigrationLocked`, `WithoutLock` opts out for a pool too
+  small to lend the lock a connection, and `LockKey` names the key to
+  look for in `pg_locks`.
+- **The outbox's per-aggregate worker delivered events out of order.**
+  `OrderingPerAggregate` ended each tick by falling through to the
+  unordered drain, which selects every pending row regardless of
+  aggregate — so the two cases where the ordered pass delivers nothing,
+  an aggregate whose advisory lock another worker holds and an
+  aggregate parked behind a failed event, were exactly the cases where
+  the same tick delivered that aggregate's events anyway. The fallback
+  is now `DrainUnaggregated`, which sees only the events that carry no
+  aggregate and therefore no ordering promise. `DrainAggregate` also
+  stops at the first event that is not available yet rather than
+  stepping over it, since a failed event pushed into the future by its
+  backoff was letting the events emitted behind it go first.
+  `mysql/outbox.go` is a copy of the same design and still has both.
+- **`drops.TagStatement(ctx, "")` returned `" /*…*/"`.** The separator
+  keeps the comment off the end of the statement; with no statement
+  there is nothing to separate it from.
+- **`sqlite.NewEntity` could not see a key declared on the table.** A
+  SQLite primary key arrives two ways — `(*Col[T]).PrimaryKey()` or
+  `Table.PrimaryKey(a, b)` — and `NewEntity` read only the first, so a
+  table declared the other way panicked "table has no PRIMARY KEY"
+  beside a `CreateTable` that had been reading both spellings all
+  along. It now reads both. `Table.PrimaryKey` also states NOT NULL on
+  each member, as the column spelling already did: SQLite's
+  table-level PRIMARY KEY does not enforce it — the legacy bug it
+  keeps for compatibility — so on a live engine the key column really
+  did take a NULL, and took a second identical NULL row after it. The
+  two spellings now describe the same table, and drops/pg's `inKey`
+  exemption in the nullability check is deliberately *not* copied
+  here, because in SQLite it is not true.
+- **`mysql.CreateTable` silently dropped every `CHECK` constraint.**
+  The migration path emits `ALTER TABLE … ADD CONSTRAINT … CHECK`
+  for a new table too, so one declaration built two different tables
+  depending on which layer built it: against live MariaDB 10.11 the
+  `CreateTable` one accepted rows the `Push` one rejects. `CHECK`
+  clauses are now rendered inside the table body, in name order, after
+  the keys.
+- **`clickhouse.Push` sent a `CREATE TABLE` whose `ENGINE` was a Go
+  comment.** A table nobody called `.Engine(…)` on renders a marker
+  where the engine belongs, which `CreateTableErr` exists to catch and
+  `Push` was not calling. `Push` now returns `ErrEngineRequired`,
+  naming the table, before it reads the server — so `DryRun` is
+  refused on the same terms, and `AllowRefused` does not waive it,
+  that flag being about changes ClickHouse will not make rather than
+  statements it cannot parse.
+- **A ClickHouse `SETTINGS` value was concatenated unchecked.**
+  `SETTINGS` is a comma-separated list and `MODIFY SETTING` is the
+  same list of one, so a value carrying a comma outside a literal set
+  this setting and whatever the rest of the string named; a comment
+  opener did worse, ending the list while leaving the statement valid,
+  so every setting after it was silently never applied.
+  `Table.Setting` and `SelectBuilder.Setting` now panic on a pair that
+  is not one setting — declaration-time loudness, like `mustIdent` —
+  and the check is narrow enough that `'tier_a,tier_b'` and
+  `disk(name = 'd', type = cache)` still go through. The reachable
+  caller was `vector.Query.Params`, a map the caller fills: a key that
+  is not a setting name is now dropped rather than rendered, and a
+  string parameter ending in a backslash no longer escapes its own
+  closing quote.
+- **`clickhouse` snapshots flagged columns the partition key merely
+  contains the name of.** `columnsNamedBy` was a substring search, so
+  a column named `s` came back `inPartitionKey: true` under
+  `toYYYYMM(ts)` — written into the snapshot file the next reader
+  believes. The rendering is now split into identifier-shaped words
+  and the name has to equal one; quoting falls away with the
+  delimiters, so it works for `drops.Raw` expressions too.
 
 
 ## [0.6.0] - 2026-08-16

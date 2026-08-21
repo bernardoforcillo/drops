@@ -21,7 +21,7 @@ type SelectBuilder struct {
 	distinct bool
 	forShare bool
 	forUpd   string
-	unscoped bool
+	scope    filterScope
 
 	// fromExprs are arbitrary FROM sources — a CTE reference, a
 	// derived table, a JSON_TABLE call — comma-joined after the
@@ -84,9 +84,11 @@ func (s *SelectBuilder) RightJoin(t *Table, on drops.Expression) *SelectBuilder 
 	return s
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a caller can pass one that is only sometimes present without
+// first collecting the non-nil ones into a slice.
 func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
-	s.wheres = append(s.wheres, preds...)
+	s.wheres = append(s.wheres, dropNilPreds(preds)...)
 	return s
 }
 
@@ -97,7 +99,7 @@ func (s *SelectBuilder) GroupBy(exprs ...drops.Expression) *SelectBuilder {
 }
 
 func (s *SelectBuilder) Having(preds ...drops.Expression) *SelectBuilder {
-	s.havings = append(s.havings, preds...)
+	s.havings = append(s.havings, dropNilPreds(preds)...)
 	return s
 }
 
@@ -135,8 +137,24 @@ func (s *SelectBuilder) ForUpdateSkipLocked() *SelectBuilder {
 // be called second is how a read-modify-write loses a row.
 func (s *SelectBuilder) ForShare() *SelectBuilder { s.forShare = true; return s }
 
-// Unscoped opts out of the FROM table's DefaultFilter predicates.
-func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
+// Unscoped opts out of every global filter on the FROM table — named
+// and anonymous alike. The blunt instrument: it cannot tell a
+// soft-delete guard from a tenancy one. Name what you are stepping
+// around with IgnoreFilters instead.
+func (s *SelectBuilder) Unscoped() *SelectBuilder { s.scope.unscoped = true; return s }
+
+// IgnoreFilters bypasses the named global filters on the FROM table and
+// leaves every other one standing:
+//
+//	db.Select().From(posts).IgnoreFilters(mysql.FilterSoftDelete)
+//
+// Names come from [Table.AddFilter]. A name no filter carries is
+// ignored — a typo that leaves a filter standing returns too few rows,
+// never too many.
+func (s *SelectBuilder) IgnoreFilters(names ...string) *SelectBuilder {
+	s.scope.ignore(names...)
+	return s
+}
 
 // WriteSQL renders the SELECT.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
@@ -171,12 +189,11 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteByte(' ')
 		j.table.writeFrom(b)
 		b.WriteString(" ON ")
-		b.Append(j.on)
+		// A nil condition is the empty conjunction, rendered where
+		// the grammar insists on a predicate.
+		b.Append(orTrue(j.on))
 	}
-	wheres := s.wheres
-	if !s.unscoped && s.from != nil && len(s.from.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), s.from.defaultFilters...), wheres...)
-	}
+	wheres := s.scope.apply(s.from, s.wheres)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)

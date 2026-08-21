@@ -170,6 +170,17 @@ func typeString(e ast.Expr) string {
 		return typeString(t.X) + "." + t.Sel.Name
 	case *ast.ArrayType:
 		return "[]" + typeString(t.Elt)
+	case *ast.IndexExpr:
+		// A generic instantiation with one argument — sql.Null[string]
+		// is the one that matters here, since writing it is how a
+		// field says its column is optional.
+		return typeString(t.X) + "[" + typeString(t.Index) + "]"
+	case *ast.IndexListExpr:
+		args := make([]string, len(t.Indices))
+		for i, ix := range t.Indices {
+			args[i] = typeString(ix)
+		}
+		return typeString(t.X) + "[" + strings.Join(args, ", ") + "]"
 	default:
 		return fmt.Sprintf("%T", e)
 	}

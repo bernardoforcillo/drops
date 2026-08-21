@@ -23,8 +23,7 @@ type Page[T any] struct {
 // inspect cursors directly.
 //
 // The token is the same opaque, backend-stamped string [EncodeCursor]
-// produces, over the same ordering fingerprint. PostgreSQL's Page
-// builder has a private gob format of its own; here one format serves
+// produces, over the same ordering fingerprint — one format serving
 // both entry points, so a cursor handed out by Page can be spent on a
 // hand-built SELECT over the same keys, and one taken from another
 // dialect's store is rejected either way.
@@ -84,10 +83,11 @@ func (p *PageBuilder[T]) AllowNonUniqueKey() *PageBuilder[T] {
 	return p
 }
 
-// Where appends predicates joined by AND. Composes with the cursor
-// guard so additional filters narrow the page set.
+// Where appends predicates joined by AND, ignoring the nil ones.
+// Composes with the cursor guard so additional filters narrow the page
+// set.
 func (p *PageBuilder[T]) Where(preds ...drops.Expression) *PageBuilder[T] {
-	p.wheres = append(p.wheres, preds...)
+	p.wheres = append(p.wheres, dropNilPreds(preds)...)
 	return p
 }
 

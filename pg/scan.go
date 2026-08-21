@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
-	"sync"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -19,17 +17,18 @@ var ErrNoRows = errors.New("drops/pg: no rows in result set")
 // reflection scanner without going through a builder.
 func ScanOne(rows drops.Rows, dest any) error { return scanOne(rows, dest) }
 
-// ScanAll consumes every row from rows into dest (pointer to
-// slice of struct or *struct). Exported for the same reason as
-// ScanOne.
+// ScanAll consumes every row from rows into dest (pointer to a slice
+// of struct, *struct or — for a single-column result — scalar).
+// Exported for the same reason as ScanOne.
 func ScanAll(rows drops.Rows, dest any) error { return scanAll(rows, dest) }
 
 // scanAll consumes rows into dest, which must be a pointer to a slice
-// of structs or pointer-to-structs. Mapping rules:
-//   - struct field tag `drop:"col"` is honoured (use `drop:"-"` to skip)
-//   - otherwise, both the field name and its snake_case form match
-//   - embedded structs are walked
-//   - unmatched columns are scanned into a discard sink
+// of structs, pointer-to-structs or — for a single-column result —
+// scalars, as [drops.ScanAll] accepts. The struct-to-column mapping is
+// the one [drops.ScanOne] documents — a `drop:"col"` tag names the
+// column, an untagged field matches its own name and its camelCase
+// form, embedded structs are walked whether or not the embedded type
+// is exported, and an unmatched column goes to a discard sink.
 func scanAll(rows drops.Rows, dest any) error {
 	defer rows.Close()
 
@@ -41,7 +40,32 @@ func scanAll(rows drops.Rows, dest any) error {
 	if slice.Kind() != reflect.Slice {
 		return fmt.Errorf("drops/pg: All requires a pointer to slice, got *%s", slice.Kind())
 	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
 	elemType := slice.Type().Elem()
+	// A single-column result into a slice of scalars, the shape SELECT
+	// id produces. It has to be decided before the struct unwrap below,
+	// because some scalars are structs: a []time.Time taken apart
+	// field-by-field matches no column at all and comes back as a slice
+	// of zero timestamps with a nil error, which is the same query
+	// through the same rows answering differently depending on whether
+	// the caller reached [drops.ScanAll] or this one.
+	if drops.IsScalarDest(elemType) {
+		if len(cols) > 1 {
+			return fmt.Errorf("drops/pg: All into *[]%s needs a single-column result, got %d columns %v",
+				elemType, len(cols), cols)
+		}
+		for rows.Next() {
+			ptr := reflect.New(elemType)
+			if err := rows.Scan(ptr.Interface()); err != nil {
+				return err
+			}
+			slice.Set(reflect.Append(slice, ptr.Elem()))
+		}
+		return rows.Err()
+	}
 	isPtr := elemType.Kind() == reflect.Ptr
 	structType := elemType
 	if isPtr {
@@ -49,11 +73,6 @@ func scanAll(rows drops.Rows, dest any) error {
 	}
 	if structType.Kind() != reflect.Struct {
 		return fmt.Errorf("drops/pg: slice element must be struct or *struct, got %s", structType.Kind())
-	}
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return err
 	}
 	fields := fieldMap(structType)
 
@@ -126,109 +145,14 @@ func scanRowInto(rows drops.Rows, structVal reflect.Value, cols []string, fields
 	return rows.Scan(targets...)
 }
 
-// fieldMap is cached because reflection over a struct type is the same
-// for every row of the same query.
-var fieldMapCache sync.Map // map[reflect.Type]map[string][]int
-
-func fieldMap(t reflect.Type) map[string][]int {
-	if v, ok := fieldMapCache.Load(t); ok {
-		return v.(map[string][]int)
-	}
-	m := map[string][]int{}
-	var walk func(reflect.Type, []int)
-	walk = func(t reflect.Type, prefix []int) {
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if !f.IsExported() {
-				continue
-			}
-			idx := append(append([]int(nil), prefix...), i)
-			tag := f.Tag.Get("drop")
-			if tag == "-" {
-				continue
-			}
-			if tag != "" {
-				// Honour the comma-separated form
-				// (`drop:"col,opt,opt=val"`) used by AutoTable so the
-				// scanner and the auto-declared schema agree on the
-				// column name.
-				name := tag
-				if j := strings.IndexByte(tag, ','); j >= 0 {
-					name = tag[:j]
-				}
-				m[name] = idx
-				continue
-			}
-			if f.Anonymous && f.Type.Kind() == reflect.Struct {
-				walk(f.Type, idx)
-				continue
-			}
-			m[f.Name] = idx
-			m[camelCase(f.Name)] = idx
-		}
-	}
-	walk(t, nil)
-	fieldMapCache.Store(t, m)
-	return m
-}
-
-// camelCase converts PascalCase to camelCase. It treats runs of
-// capitals as a single word so the second word's first letter is
-// the boundary marker:
+// fieldMap resolves a struct type to its column → field-index map.
 //
-//	"UserID"     → "userId"
-//	"HTTPStatus" → "httpStatus"
-//	"Name"       → "name"
-//
-// Used as the fallback column-name match for untagged struct fields.
-func camelCase(s string) string {
-	if s == "" {
-		return ""
-	}
-	// First pass: identify word boundaries via the snake_case logic,
-	// then re-stitch with the second-word-onwards title-cased.
-	type word struct{ start, end int }
-	var words []word
-	startW := 0
-	for i := 1; i < len(s); i++ {
-		c := s[i]
-		isUpper := c >= 'A' && c <= 'Z'
-		if isUpper {
-			prev := s[i-1]
-			prevLower := prev >= 'a' && prev <= 'z'
-			nextLower := i+1 < len(s) && s[i+1] >= 'a' && s[i+1] <= 'z'
-			if prevLower || nextLower {
-				words = append(words, word{startW, i})
-				startW = i
-			}
-		}
-	}
-	words = append(words, word{startW, len(s)})
-
-	var b strings.Builder
-	b.Grow(len(s))
-	for wi, w := range words {
-		if wi == 0 {
-			// Lowercase the entire first word.
-			for i := w.start; i < w.end; i++ {
-				c := s[i]
-				if c >= 'A' && c <= 'Z' {
-					c += 'a' - 'A'
-				}
-				b.WriteByte(c)
-			}
-			continue
-		}
-		// Capitalise the first letter, lowercase the rest.
-		first := s[w.start]
-		b.WriteByte(first) // already uppercase by construction
-		for i := w.start + 1; i < w.end; i++ {
-			c := s[i]
-			if c >= 'A' && c <= 'Z' {
-				c += 'a' - 'A'
-			}
-			b.WriteByte(c)
-		}
-	}
-	return b.String()
-}
+// It is the root scanner's map, not a second one: pg's builders and
+// the root's [drops.ScanOne] scan the same structs, so a struct that
+// bound differently depending on which entry point a caller reached
+// would be a trap rather than a dialect difference. The root memoises
+// the result per type and documents the matching rules, including the
+// two this package used to get wrong — an embedded unexported struct
+// lends its exported fields instead of being skipped, and a name
+// reachable at two depths belongs to the shallower field.
+func fieldMap(t reflect.Type) map[string][]int { return drops.StructFields(t) }

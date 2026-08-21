@@ -1,6 +1,7 @@
 package mysql_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -382,12 +383,10 @@ func TestDropCheckSpellingFollowsTheServer(t *testing.T) {
 }
 
 func TestDiffDownReversesTheMigration(t *testing.T) {
-	prev := mysql.BuildSnapshot(mysql.NewSchema(mysql.NewTable("keep").
-		AddCheck("ck", "1 = 1")))
 	// A table with no columns is not a table; give it one.
 	keep := mysql.NewTable("keep")
 	mysql.Add(keep, mysql.BigSerial("id").PrimaryKey())
-	prev = mysql.BuildSnapshot(mysql.NewSchema(keep))
+	prev := mysql.BuildSnapshot(mysql.NewSchema(keep))
 
 	added := mysql.NewTable("added")
 	mysql.Add(added, mysql.BigSerial("id").PrimaryKey())
@@ -620,7 +619,10 @@ func TestServerInfoCapabilities(t *testing.T) {
 }
 
 func TestPushRequiresASchema(t *testing.T) {
-	if _, err := mysql.Push(t.Context(), nil, nil); err != mysql.ErrSchemaRequired {
+	// context.Background rather than t.Context: the latter arrived in
+	// Go 1.24 and this module declares go 1.22, so vet's stdversion
+	// check rejects it.
+	if _, err := mysql.Push(context.Background(), nil, nil); err != mysql.ErrSchemaRequired {
 		t.Fatalf("err = %v, want ErrSchemaRequired", err)
 	}
 }

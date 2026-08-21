@@ -22,6 +22,7 @@ type Seeder struct {
 	db   *DB
 	ops  []seedOp
 	noTx bool
+	gen  *Gen
 }
 
 // seedOp is the unit of work the Seeder applies. Generic over T at
@@ -31,8 +32,34 @@ type seedOp interface {
 	run(db *DB, ctx context.Context) error
 }
 
+// seedResettable is implemented by the ops that carry state across a
+// run — the generated-row plans, which accumulate what they created.
+type seedResettable interface {
+	reset()
+}
+
+// DefaultSeed is the PRNG seed a Seeder starts with. It is a constant
+// rather than something drawn from the clock so that a seed run is
+// reproducible whether or not anybody remembered to pin it.
+const DefaultSeed uint64 = 1
+
 // NewSeeder returns a Seeder bound to db.
-func NewSeeder(db *DB) *Seeder { return &Seeder{db: db} }
+func NewSeeder(db *DB) *Seeder { return &Seeder{db: db, gen: NewGen(DefaultSeed)} }
+
+// WithSeed sets the integer the generated-row plans draw from — see
+// [SeedMany]. The same seed against a clean database produces the same
+// rows, which is the whole point: a test that fails on generated data
+// is re-runnable only if the number that produced it is written down.
+// Returns the seeder for chaining.
+func (s *Seeder) WithSeed(seed uint64) *Seeder {
+	s.gen = NewGen(seed)
+	return s
+}
+
+// Gen returns the Seeder's generator. Useful for a [SeedDo] step that
+// wants to draw from the same reproducible stream as the rest of the
+// run rather than start an unrelated one.
+func (s *Seeder) Gen() *Gen { return s.gen }
 
 // WithoutTransaction disables the transactional wrapper Apply uses
 // by default. Returns the seeder for chaining.
@@ -68,7 +95,18 @@ func SeedDo(s *Seeder, fn func(db *DB, ctx context.Context) error) *Seeder {
 // Apply runs every registered op in declaration order. By default
 // wraps the run in a transaction; on first error the transaction
 // rolls back and the failure is returned.
+//
+// The generator is rewound to its seed first, and the generated-row
+// plans forget what a previous Apply created, so applying the same
+// Seeder twice against a clean database inserts the same rows twice
+// rather than continuing where the last run left off.
 func (s *Seeder) Apply(ctx context.Context) error {
+	s.gen.Reset()
+	for _, op := range s.ops {
+		if r, ok := op.(seedResettable); ok {
+			r.reset()
+		}
+	}
 	run := func(db *DB) error {
 		for i, op := range s.ops {
 			if err := op.run(db, ctx); err != nil {

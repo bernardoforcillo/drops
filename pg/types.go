@@ -63,10 +63,19 @@ func (p parametrisedType) TypeSQL() string {
 //	json / jsonb             → json.RawMessage
 //	bytea                    → []byte
 //
-// Nullability is represented orthogonally — the Go type is the value
-// type; use IsNull / IsNotNull to test for NULL. Pointer wrappers can be
-// declared via Custom[*string] when the application wants nullable
-// scanning.
+// Nullability is represented orthogonally: the Go type parameter is
+// the *value* type, which is what Eq, In and Between compare against
+// whether or not the column admits NULL. Say which it is with
+// NotNull or Nullable, test for it with IsNull / IsNotNull, write it
+// with SetNull / ValPtr / ValNull, and scan it into a *T or a named
+// sql.Null[T] field.
+//
+// Do not reach for Custom[*string] to get nullable scanning: it
+// re-types the operators too, so Eq(nil) compiles, binds NULL, and is
+// unconditionally false. And do not *embed* an sql.Null[T] in an
+// entity struct — that promotes its Scan onto the struct, which then
+// claims to be a single-column destination; declare it as a named
+// field.
 
 // Text columns -----------------------------------------------------------
 

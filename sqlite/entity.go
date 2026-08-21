@@ -15,8 +15,8 @@ import (
 // Entity[T]. It precomputes the column↔struct-field mapping for T and
 // offers Get / Create / Update / Delete plus a fluent Query. T must be
 // a struct with a field bound to each column (by `drop:"col"` tag, or
-// by field name / camelCase), and the table must have a single-column
-// primary key.
+// by field name / camelCase), and the table must have a primary key —
+// declared either on its columns or on the table itself.
 type Entity[T any] struct {
 	table *Table
 	// pk / pkField describe the primary key when it is a single
@@ -62,14 +62,11 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	}
 	fields := drops.StructFields(rt)
 
-	var pks []*Column
-	for _, c := range t.columns {
-		if c.primary {
-			pks = append(pks, c)
-		}
-	}
+	pks := primaryKeyColumns(t)
 	if len(pks) == 0 {
-		panic(fmt.Sprintf("drops/sqlite: NewEntity[%s]: table %q has no PRIMARY KEY", rt.Name(), t.name))
+		panic(fmt.Sprintf("drops/sqlite: NewEntity[%s]: table %q has no PRIMARY KEY; "+
+			"mark a column .PrimaryKey() or declare the key on the table with PrimaryKey(cols...)",
+			rt.Name(), t.name))
 	}
 	pkFields := make([][]int, len(pks))
 	for i, c := range pks {
@@ -99,12 +96,36 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	return &Entity[T]{table: t, pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields}
 }
 
+// primaryKeyColumns returns t's PRIMARY KEY columns in key order,
+// whichever of the two declarations the schema used.
+//
+// A key arrives either as Table.PrimaryKey(cols...) or by marking
+// columns with (*Col[T]).PrimaryKey(), and drops/pg's own
+// primaryKeyColumns says why every reader has to accept both: a table
+// declared one way silently loses its key in a reader that knows only
+// the other. CreateTable here already reads both spellings, so a
+// reader that did not disagreed with the DDL it was rendered beside.
+func primaryKeyColumns(t *Table) []*Column {
+	if pk := t.compositePK; len(pk) > 0 {
+		return pk
+	}
+	var out []*Column
+	for _, c := range t.columns {
+		if c.primary {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // EntityOption configures [NewEntity].
 type EntityOption func(*entityConfig)
 
 type entityConfig struct {
 	allowUnmapped map[string]bool
 	allowAny      bool
+	allowNullable map[string]bool
+	allowAnyNull  bool
 }
 
 // AllowUnmappedColumns exempts the named columns from the check that
@@ -128,6 +149,32 @@ func AllowAnyUnmappedColumn() EntityOption {
 	return func(c *entityConfig) { c.allowAny = true }
 }
 
+// AllowNullableColumns exempts the named columns from the check that
+// a column admitting NULL is bound to a field that can receive one.
+//
+// Use it where the database will never actually produce a NULL and
+// the constraint cannot say so — a column another writer keeps
+// populated, a view whose outer join can never miss. Naming the
+// columns leaves the check working everywhere else.
+func AllowNullableColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowNullable == nil {
+			c.allowNullable = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowNullable[n] = true
+		}
+	}
+}
+
+// AllowAnyNullableColumn disables the nullability check entirely, for
+// migrating a codebase with too many mismatches to fix at once;
+// prefer [AllowNullableColumns], which keeps the check working for
+// the columns you have not exempted.
+func AllowAnyNullableColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAnyNull = true }
+}
+
 // checkDrift reports columns bound to no struct field — see
 // [github.com/bernardoforcillo/drops/internal/drift].
 func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
@@ -147,8 +194,45 @@ func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entit
 		}
 		missing = append(missing, c.name)
 	}
-	return drift.Report("drops/sqlite", rt.Name(), t.name, missing,
-		drift.SpareFields(rt, bound), "sqlite.AllowUnmappedColumns")
+	if err := drift.Report("drops/sqlite", rt.Name(), t.name, missing,
+		drift.SpareFields(rt, bound), "sqlite.AllowUnmappedColumns"); err != nil {
+		return err
+	}
+	return checkNullability(rt, t, colFields, cfg)
+}
+
+// checkNullability reports columns that admit NULL bound to a field
+// that cannot receive one.
+//
+// The mismatch is invisible to the compiler — a column's T is the
+// type its comparisons take, and the scan destination is a field
+// drops reaches only by reflection — and invisible at run time too,
+// until the first row that happens to be NULL. NewEntity is the one
+// place both types are in scope. It fires on whether the column
+// admits NULL, not on whether it said so: a bare sqlite.Text("bio") is exactly
+// the shape that has been accepting NULLs nobody declared.
+func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAnyNull {
+		return nil
+	}
+	var bad []drift.NullMismatch
+	for _, cf := range colFields {
+		c := cf.col
+		if !c.IsNullable() || cfg.allowNullable[c.Name()] {
+			continue
+		}
+		ft := drift.FieldTypeAt(rt, cf.field)
+		if ft == nil || drift.AcceptsNull(ft) {
+			continue
+		}
+		bad = append(bad, drift.NullMismatch{
+			Column:    c.Name(),
+			Field:     drift.FieldPath(rt, cf.field),
+			FieldType: ft.String(),
+			Stated:    c.nullStated,
+		})
+	}
+	return drift.ReportNullable("drops/sqlite", rt.Name(), t.name, bad, "sqlite.AllowNullableColumns")
 }
 
 // Table returns the entity's table.
@@ -584,6 +668,12 @@ func (q *EntityQuery[T]) applyScopes(ctx context.Context) error {
 	if q.scopesApplied {
 		return nil
 	}
+	// A query that named FilterTenant asked for the cross-tenant read
+	// explicitly, so it must skip tenantPredicate entirely — that call
+	// errors when the ctx carries no tenant.
+	if q.sb.scope.ignores(FilterTenant) {
+		return q.applyGuardOnly(ctx)
+	}
 	tenantPred, err := q.e.tenantPredicate(ctx)
 	if err != nil {
 		return err
@@ -615,11 +705,43 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 }
 
 // Limit / Offset bound the result window.
-// Unscoped opts out of the table's DefaultFilter predicates for this
-// query. Without it a soft-deleted row is unreachable through the
-// entity at all, which makes an audit or a restore flow impossible to
-// write.
+// Unscoped opts out of every global filter registered on the table —
+// the blunt instrument; see [SelectBuilder.Unscoped]. The tenant guard
+// [Entity.ScopeByTenant] installs is deliberately out of its reach: it
+// comes from the ctx, not the table, and losing customer isolation as a
+// side effect of asking for soft-deleted rows is the accident this API
+// exists to prevent. Drop it by naming it — IgnoreFilters(FilterTenant).
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+
+// IgnoreFilters bypasses the named global filters and leaves every
+// other one standing:
+//
+//	// this tenant's rows, deleted ones included
+//	posts.Query(db).IgnoreFilters(sqlite.FilterSoftDelete).All(ctx)
+//
+// Beyond the table's own filters it also accepts [FilterTenant], which
+// drops the isolation predicate [Entity.ScopeByTenant] injects — a
+// cross-tenant read is a real need, and one that should read as one at
+// the call site.
+func (q *EntityQuery[T]) IgnoreFilters(names ...string) *EntityQuery[T] {
+	q.sb.IgnoreFilters(names...)
+	return q
+}
+
+// applyGuardOnly applies the authorisation guard without the tenant
+// predicate. Dropping tenancy by name never drops authorisation with
+// it — they are separate scopes and only one was named.
+func (q *EntityQuery[T]) applyGuardOnly(ctx context.Context) error {
+	guardPred, err := q.e.guardPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if guardPred != nil {
+		q.sb.Where(guardPred)
+	}
+	q.scopesApplied = true
+	return nil
+}
 
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }

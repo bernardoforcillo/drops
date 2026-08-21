@@ -79,7 +79,7 @@ func TestCompositeUpdateExcludesKeyColumnsFromSet(t *testing.T) {
 
 func TestCompositePatchKey(t *testing.T) {
 	tbl := ckTable()
-	role := sqlite.Add(tbl, sqlite.Text("note"))
+	role := sqlite.Add(tbl, sqlite.Text("note").NotNull())
 	ent := sqlite.NewEntity[ckMembershipNote](tbl)
 	d := &entDriver{}
 	_, err := ent.PatchKey(sqlite.New(d), context.Background(),

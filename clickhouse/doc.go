@@ -40,6 +40,41 @@
 // per-row validators that run before Create / CreateMany; on
 // CreateMany the first failing row aborts the whole batch.
 //
+// # Schema introspection, diffing and Push
+//
+// Introspect reads a table's real shape out of system.tables and
+// system.columns — columns and types, the engine and its parameters,
+// the sorting, primary, partition and sampling keys, the table's TTL
+// and SETTINGS, and which columns take part in which key.
+// BuildSnapshot derives the same shape from a Go [Schema], Diff
+// produces the statements between the two, and Push applies them.
+//
+// Diff returns a [Plan] rather than the []string the other dialects
+// return, because ClickHouse is the dialect where a schema difference
+// does not always have a statement behind it. There is no ALTER that
+// changes a table's engine, its partitioning, its primary key or —
+// beyond appending columns the same statement adds — its sorting key,
+// and no ALTER touches a column that takes part in any of those keys.
+// Those differences come back as [Refusal] values naming the remedy,
+// which is always a new table and a copy.
+//
+// The sorting key is worth singling out. A ReplacingMergeTree
+// collapses rows that share it, so it is not a layout choice that
+// happens to affect performance — it is the definition of "the same
+// row". Changing it changes which rows are one row, and every group
+// the old key merged comes back apart.
+//
+// [Analyze] grades the statements a plan does carry: metadata, a
+// rewrite of every part in a background mutation, or a deletion with
+// no way back. It matters more here than elsewhere because a
+// ClickHouse ALTER returns before its work is done — mutations_sync
+// defaults to 0 — so a statement the server accepted may have hours of
+// rewriting still ahead of it in system.mutations.
+//
+// drops/mirror builds on the same analysis for its own evolution
+// planner, which layers per-column opt-ins over it and knows things
+// about a mirror the dialect cannot know — see mirror.Evolver.
+//
 // What this package does NOT try to mirror from drops/pg:
 //
 //   - per-row UPDATE/DELETE (ClickHouse mutations are asynchronous and
@@ -47,5 +82,7 @@
 //     SQL when you need them)
 //   - ON CONFLICT (handled by engine choice, e.g. ReplacingMergeTree)
 //   - Foreign keys / referential integrity (ClickHouse has none)
-//   - Schema introspection and Push (planned)
+//   - a DiffDown. Reversing a ClickHouse migration is mostly not
+//     something a statement can do, and a function whose name promises
+//     it would be lying.
 package clickhouse

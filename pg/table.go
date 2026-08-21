@@ -50,6 +50,10 @@ type Table struct {
 	// SECURITY. Policies are only enforced when this is true.
 	rlsEnabled bool
 
+	// rlsForced mirrors PG's ALTER TABLE ... FORCE ROW LEVEL
+	// SECURITY: policies apply to the table's owner too.
+	rlsForced bool
+
 	// insertHooks / updateHooks / deleteHooks are the optional
 	// lifecycle hooks registered on this table. They are invoked by
 	// the corresponding builders during WriteSQL. Empty by default —
@@ -59,12 +63,34 @@ type Table struct {
 	updateHooks []UpdateHook
 	deleteHooks []DeleteHook
 
-	// defaultFilters are predicates applied automatically by
-	// SelectBuilder / UpdateBuilder / DeleteBuilder unless the caller
-	// opts out with Unscoped(). Used to implement default scopes
-	// (e.g. SoftDelete's "deleted_at IS NULL" guard).
-	defaultFilters []drops.Expression
+	// filters are the predicates applied automatically by
+	// SelectBuilder / UpdateBuilder / DeleteBuilder. A named filter
+	// (AddFilter) can be bypassed one at a time with IgnoreFilters;
+	// an anonymous one (DefaultFilter) only by Unscoped. Used to
+	// implement default scopes — SoftDelete's "deletedAt IS NULL"
+	// guard, a tenancy axis. See filters.go.
+	filters []tableFilter
+
+	// renamedFrom is the name this table used to have, set by
+	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
+	renamedFrom string
 }
+
+// RenamedFrom states that this table is the table that used to be
+// called previous. It is the table-level counterpart of
+// (*Col[T]).RenamedFrom, and carries the same fact for the same
+// reason: a diff sees one table gone and another arrived, and nothing
+// but the schema can say they are the same table.
+//
+//	var Users = pg.NewTable("people").RenamedFrom("users")
+func (t *Table) RenamedFrom(previous string) *Table {
+	t.renamedFrom = previous
+	return t
+}
+
+// PreviousName returns the name the table was declared to have been
+// renamed from, or empty when it was not.
+func (t *Table) PreviousName() string { return t.renamedFrom }
 
 // NewTable creates a table in the default ("public") schema. The name
 // is validated and the constructor panics on invalid identifiers — see
@@ -123,6 +149,20 @@ func (t *Table) Rel(name string) *Relation {
 	return r
 }
 
+// RelationNames returns the names of every relation declared on t,
+// sorted. It is the counterpart of [Table.FilterNames]: a table can
+// already be asked whether it has one relation, and this asks it
+// which ones it has — the question a tool that walks a schema has to
+// ask, because nothing outside the package can range over the map.
+func (t *Table) RelationNames() []string {
+	out := make([]string, 0, len(t.relations))
+	for name := range t.relations {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Name returns the table's unqualified name.
 func (t *Table) Name() string { return t.name }
 
@@ -152,14 +192,15 @@ func (t *Table) Alias() string { return t.alias }
 //
 // What is not rewritten is anything the caller built and drops only
 // re-emits: a predicate, and a Patch operation. Both are closed over
-// the handles they were given. A default filter registered by
+// the handles they were given. A global filter registered by
 // SoftDeleteMixin, or an authz guard built from the package-level
 // columns, still qualifies with the table name — so against a query
 // whose only FROM entry is the alias PostgreSQL raises 42P01, and in a
 // self-join the guard binds to whichever side is un-aliased rather
-// than to the one you meant. Scope an aliased query with Unscoped and
-// an explicit predicate built from the alias's own handles, and build
-// a Patch for an aliased entity from the alias's handles too.
+// than to the one you meant. Scope an aliased query with Unscoped (or
+// IgnoreFilters, when only one filter is in the way) plus an explicit
+// predicate built from the alias's own handles, and build a Patch for
+// an aliased entity from the alias's handles too.
 //
 // Indexes are shared with the base table for the same reason — an
 // index's column list may hold arbitrary expressions — so Index.Table
@@ -266,7 +307,7 @@ func (t *Table) As(alias string) *Table {
 	cp.insertHooks = append([]InsertHook(nil), t.insertHooks...)
 	cp.updateHooks = append([]UpdateHook(nil), t.updateHooks...)
 	cp.deleteHooks = append([]DeleteHook(nil), t.deleteHooks...)
-	cp.defaultFilters = append([]drops.Expression(nil), t.defaultFilters...)
+	cp.filters = append([]tableFilter(nil), t.filters...)
 	return &cp
 }
 
@@ -419,12 +460,58 @@ func (t *Table) OnDelete(h DeleteHook) *Table {
 	return t
 }
 
-// DefaultFilter appends a predicate applied to every Select / Update /
-// Delete against the table, unless the builder is marked Unscoped().
-// Filters compose with AND.
+// DefaultFilter appends an anonymous predicate applied to every
+// Select / Update / Delete against the table. Filters compose with AND.
+//
+// Anonymous means nothing can bypass it but Unscoped(), which bypasses
+// every other filter on the table at the same time. Prefer AddFilter,
+// which gives the predicate a name a single query can step around
+// without giving up the rest of the table's scoping.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.filters = append(t.filters, tableFilter{pred: e})
 	return t
+}
+
+// AddFilter appends a predicate under name, applied to every Select /
+// Update / Delete against the table exactly as DefaultFilter's is —
+// except that a query can bypass this one alone, by name:
+//
+//	Posts.AddFilter(pg.FilterSoftDelete, pg.IsNull(deletedAt))
+//	db.Select().From(Posts).IgnoreFilters(pg.FilterSoftDelete)
+//
+// Names are per table and re-registering one appends a second filter
+// rather than replacing the first, so both apply and IgnoreFilters
+// drops both. An empty name panics: it would register a filter that
+// reads as named at the call site and behaves as anonymous at the
+// query, which is the failure this whole mechanism exists to prevent.
+func (t *Table) AddFilter(name string, e drops.Expression) *Table {
+	if name == "" {
+		panic("drops/pg: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
+	}
+	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	return t
+}
+
+// Filters returns the table's global-filter predicates in registration
+// order, named and anonymous alike.
+func (t *Table) Filters() []drops.Expression {
+	out := make([]drops.Expression, len(t.filters))
+	for i, f := range t.filters {
+		out[i] = f.pred
+	}
+	return out
+}
+
+// FilterNames returns the names of the table's named filters in
+// registration order. Anonymous filters contribute nothing.
+func (t *Table) FilterNames() []string {
+	var out []string
+	for _, f := range t.filters {
+		if f.name != "" {
+			out = append(out, f.name)
+		}
+	}
+	return out
 }
 
 // AddIndex registers an index to be created alongside the table. The
@@ -439,9 +526,14 @@ func (t *Table) AddIndex(idx *Index) *Table {
 // Indexes returns the indexes registered with AddIndex.
 func (t *Table) Indexes() []*Index { return t.indexes }
 
-// PrimaryKey declares a composite PRIMARY KEY spanning cols. Call
-// only when the PK has more than one column; single-column PKs
-// continue to be declared on the column via *Col[T].PrimaryKey().
+// PrimaryKey declares the table's PRIMARY KEY spanning cols.
+//
+// It is the spelling for a key of more than one column, which cannot
+// ride on a column definition, and it accepts a key of one — the
+// snapshot, the CREATE TABLE and the diff all treat that identically
+// to the same key declared with (*Col[T]).PrimaryKey(), so a schema
+// that narrows a two-column key to one by editing this call is a
+// migration and not a silent divergence.
 func (t *Table) PrimaryKey(cols ...ColRef) *Table {
 	t.compositePK = make([]*Column, len(cols))
 	for i, c := range cols {
@@ -515,6 +607,18 @@ func (t *Table) EnableRLS() *Table { t.rlsEnabled = true; return t }
 
 // RLSEnabled reports whether the table has RLS enabled.
 func (t *Table) RLSEnabled() bool { return t.rlsEnabled }
+
+// ForceRLS marks the table as having Row-Level Security forced —
+// ALTER TABLE ... FORCE ROW LEVEL SECURITY, which subjects the
+// table's owner to its own policies instead of exempting them.
+//
+// Like AddPolicy it is inert until EnableRLS is also called: PostgreSQL
+// keeps the two flags apart, and forcing a table nothing filters
+// filters nothing.
+func (t *Table) ForceRLS() *Table { t.rlsForced = true; return t }
+
+// RLSForced reports whether the table has RLS forced.
+func (t *Table) RLSForced() bool { return t.rlsForced }
 
 // AddPolicy attaches a row-level security policy to the table.
 // Policies are inert until EnableRLS is also called.

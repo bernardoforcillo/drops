@@ -1,10 +1,7 @@
 package pg
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"reflect"
@@ -25,9 +22,16 @@ type Page[T any] struct {
 // the cursor encoding/decoding internal — callers never construct or
 // inspect cursors directly.
 //
-// Cursors are opaque, URL-safe base64 strings whose payload is a
-// gob-encoded slice of the ordering columns' values. Stable as long
-// as the OrderBy spec doesn't change between calls.
+// Cursors are opaque, URL-safe base64 strings — the same encoding
+// [EncodeCursor] produces, and the same keyset guard [AfterCursor]
+// builds from them, because a page walked through this builder and a
+// page walked through the SELECT builder are the same walk. Stable as
+// long as the OrderBy spec doesn't change between calls.
+//
+// A page is a read like any other, so it carries the entity's scoping:
+// the [Entity.ScopeByTenant] axis and the [Entity.AuthorizeWith] guard
+// both narrow which rows may appear on it, and a missing ctx tenant or
+// subject fails the page rather than widening it.
 type PageBuilder[T any] struct {
 	e        *Entity[T]
 	db       *DB
@@ -74,10 +78,11 @@ func (p *PageBuilder[T]) OrderBy(cols ...OrderingColumn) *PageBuilder[T] {
 	return p
 }
 
-// Where appends predicates joined by AND. Composes with the cursor
-// guard so additional filters narrow the page set.
+// Where appends predicates joined by AND, ignoring the nil ones.
+// Composes with the cursor guard so additional filters narrow the page
+// set.
 func (p *PageBuilder[T]) Where(preds ...drops.Expression) *PageBuilder[T] {
-	p.wheres = append(p.wheres, preds...)
+	p.wheres = append(p.wheres, dropNilPreds(preds)...)
 	return p
 }
 
@@ -108,6 +113,24 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	}
 
 	sel := p.db.Select().From(p.e.table)
+	// A page is a read like any other, so it owes the entity's scoping
+	// — the tenant axis and the authorisation guard both narrow which
+	// rows may appear on it, and a page that skipped them handed the
+	// caller another tenant's rows with a cursor to walk more of them.
+	tenantPred, err := p.e.tenantPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if tenantPred != nil {
+		sel.Where(tenantPred)
+	}
+	guardPred, err := p.e.guardPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if guardPred != nil {
+		sel.Where(guardPred)
+	}
 	for _, w := range p.wheres {
 		sel.Where(w)
 	}
@@ -202,95 +225,53 @@ func orderingExpr(o OrderingColumn) drops.Expression {
 	return o.col.Desc()
 }
 
+// cursorSpec restates the ordering columns as the cursor shape the
+// keyset guard is written against.
+//
+// The ORDER BY these columns render — [Column.Asc] and [Column.Desc] —
+// carries no NULLS clause, so PostgreSQL applies its per-direction
+// default, and NullsDefault is what [nullsFirst] resolves against the
+// same default. The two therefore cannot drift.
+func cursorSpec(orderBys []OrderingColumn) CursorSpec {
+	keys := make([]OrderKey, len(orderBys))
+	for i, o := range orderBys {
+		keys[i] = OrderKey{Col: o.col, Desc: !o.asc}
+	}
+	return CursorSpec{Keys: keys}
+}
+
 // cursorGuard builds the WHERE predicate that moves past the supplied
 // cursor.
 //
-// Single-column form:   WHERE col >  $1   (ascending) — or < for desc
-// Multi-column form:    WHERE (col1, col2) > ($1, $2) — homogeneous
-// directions only; mixed asc/desc falls back to the explicit
-// disjunction form so the comparison stays well-defined.
+// It is [keysetWhere], the guard the SELECT builder's AfterCursor uses,
+// rather than a second row-comparison written here. The row comparison
+// this used to render — (c1, c2) > ($1, $2) — is not NULL-aware, and a
+// nullable ordering column is the ordinary case rather than an exotic
+// one: a page whose last row held a NULL rendered a comparison against
+// NULL, which matches nothing, so the walk reported no further rows and
+// stopped short of every row behind that NULL with nothing anywhere
+// saying why. See [keysetStrict] for what replaces it.
 func cursorGuard(orderBys []OrderingColumn, cursor string) (drops.Expression, error) {
-	vals, err := decodeCursor(cursor)
+	vals, err := Cursor(cursor).Decode()
 	if err != nil {
 		return nil, fmt.Errorf("drops/pg: invalid cursor: %w", err)
 	}
 	if len(vals) != len(orderBys) {
 		return nil, fmt.Errorf("drops/pg: cursor has %d value(s), OrderBy has %d column(s)", len(vals), len(orderBys))
 	}
-	allAsc, allDesc := true, true
-	for _, o := range orderBys {
-		if o.asc {
-			allDesc = false
-		} else {
-			allAsc = false
-		}
-	}
-	if allAsc || allDesc {
-		// Row-comparison form: PostgreSQL evaluates lexicographically.
-		op := ">"
-		if allDesc {
-			op = "<"
-		}
-		return drops.ExprFunc(func(b *drops.Builder) {
-			b.WriteByte('(')
-			for i, o := range orderBys {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				o.col.WriteSQL(b)
-			}
-			b.WriteString(") ")
-			b.WriteString(op)
-			b.WriteString(" (")
-			for i, v := range vals {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				b.AddArg(v)
-			}
-			b.WriteByte(')')
-		}), nil
-	}
-	// Mixed-direction fallback: tie-break disjunction. For columns
-	// c1 ASC, c2 DESC, the guard is:
-	//
-	//   c1 > v1 OR (c1 = v1 AND c2 < v2)
-	//
-	// Generalises N-wise via cumulative-equality prefixes.
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		for i := range orderBys {
-			if i > 0 {
-				b.WriteString(" OR ")
-			}
-			// Equality prefix for previous columns.
-			b.WriteByte('(')
-			for j := 0; j < i; j++ {
-				if j > 0 {
-					b.WriteString(" AND ")
-				}
-				orderBys[j].col.WriteSQL(b)
-				b.WriteString(" = ")
-				b.AddArg(vals[j])
-			}
-			if i > 0 {
-				b.WriteString(" AND ")
-			}
-			orderBys[i].col.WriteSQL(b)
-			if orderBys[i].asc {
-				b.WriteString(" > ")
-			} else {
-				b.WriteString(" < ")
-			}
-			b.AddArg(vals[i])
-			b.WriteByte(')')
-		}
-		b.WriteByte(')')
-	}), nil
+	return keysetWhere(cursorSpec(orderBys), vals, true), nil
 }
 
 // encodeCursor extracts the ordering-column values from the last row
-// and gob-encodes them inside a URL-safe base64 string.
+// and hands them to [EncodeCursor], which is the encoding
+// [Cursor.Decode] and the keyset guard both read.
+//
+// It used to gob-encode the values, which could not carry two of the
+// shapes an ordering column most often has: a nil pointer, which is how
+// a NULL arrives on the row struct, gob refuses outright, and a
+// time.Time inside an interface needs a gob.Register nothing performed
+// — so paging by a timestamp, the column keyset pagination exists for,
+// failed on the first page boundary.
 func encodeCursor[T any](e *Entity[T], orderBys []OrderingColumn, row T) (string, error) {
 	v := reflect.ValueOf(&row).Elem()
 	vals := make([]any, len(orderBys))
@@ -308,22 +289,9 @@ func encodeCursor[T any](e *Entity[T], orderBys []OrderingColumn, row T) (string
 		}
 		vals[i] = v.FieldByIndex(idx).Interface()
 	}
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(vals); err != nil {
+	cur, err := EncodeCursor(cursorSpec(orderBys), vals...)
+	if err != nil {
 		return "", err
 	}
-	return base64.RawURLEncoding.EncodeToString(buf.Bytes()), nil
-}
-
-// decodeCursor is the inverse of encodeCursor.
-func decodeCursor(s string) ([]any, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		return nil, err
-	}
-	var vals []any
-	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&vals); err != nil {
-		return nil, err
-	}
-	return vals, nil
+	return string(cur), nil
 }

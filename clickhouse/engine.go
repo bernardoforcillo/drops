@@ -120,6 +120,16 @@ func quoteIdents(names []string) []string {
 	return out
 }
 
+// quoteLiteral wraps s as a ClickHouse string literal.
+//
+// The backslash is escaped first and it is not optional: ClickHouse's
+// lexer reads C-style escapes inside a string literal, so a comment
+// ending in one — 'C:\' — swallows its own closing quote and the rest
+// of the statement with it, and a comment of \' OR 1=1 -- leaves the
+// literal entirely. Doubling the quote, which is what the PostgreSQL
+// dialect does and where this function came from, is right there and
+// not enough here.
 func quoteLiteral(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }

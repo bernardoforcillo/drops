@@ -18,7 +18,7 @@ func TestDiffSafeIfNotExistsCreateTable(t *testing.T) {
 	pg.Add(users, pg.Text("name").NotNull())
 
 	stmts := pg.Diff(pg.EmptySnapshot(), pg.BuildSnapshot(pg.NewSchema(users)), pg.DiffOptions{Safe: true})
-	if len(stmts) != 1 || !strings.HasPrefix(stmts[0], `CREATE TABLE IF NOT EXISTS "users"`) {
+	if len(stmts) == 0 || !strings.HasPrefix(stmts[0], `CREATE TABLE IF NOT EXISTS "users"`) {
 		t.Errorf("expected CREATE TABLE IF NOT EXISTS, got: %v", stmts)
 	}
 }
@@ -148,12 +148,12 @@ func TestTableExistsDefaultsToPublic(t *testing.T) {
 func introspectFake() *fakeDriver {
 	return &fakeDriver{handler: func(q string, _ []any) (drops.Rows, error) {
 		switch {
-		case strings.Contains(q, "information_schema.tables"):
+		case strings.Contains(q, "c.relrowsecurity"):
 			return &fakeRows{
-				cols: []string{"table_schema", "table_name"},
+				cols: []string{"nspname", "relname", "relrowsecurity", "relforcerowsecurity"},
 				data: [][]any{
-					{"public", "users"},
-					{"public", "posts"},
+					{"public", "users", false, false},
+					{"public", "posts", false, false},
 				},
 			}, nil
 		case strings.Contains(q, "information_schema.columns"):

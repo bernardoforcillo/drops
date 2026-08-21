@@ -12,6 +12,7 @@ ClickHouse and Qdrant.
 | [Getting started](getting-started.md) | Install, connect, first query, first entity. Twenty minutes. |
 | [Declaring a schema](schema.md) | Tables, columns, types — and how to keep the schema and the struct from drifting apart. |
 | [Entities and CRUD](entities.md) | Get / Create / Update / Delete, composite keys, relations, pagination. |
+| [The `drops` CLI](cli.md) | generate, migrate, push, drift, pull, baseline, status — and how a CLI reads a Go schema. |
 
 ## By topic
 
@@ -21,6 +22,7 @@ ClickHouse and Qdrant.
 | [Vector search](vector-search.md) | One query vocabulary over pgvector, ClickHouse and Qdrant. |
 | [OLTP → OLAP → vector](mirror.md) | Keeping one table mirrored across all three, without three schema declarations. |
 | [Testing](testing.md) | The two suites, why the second exists, and which of your tests belongs in which. |
+| [`drops lint`](lint.md) | Three query mistakes caught at build time, and the false-positive story for each. |
 
 ## Reference
 

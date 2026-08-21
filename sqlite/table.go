@@ -24,11 +24,35 @@ type Table struct {
 
 	// Lifecycle hooks (see hooks.go) and default filters. All are
 	// optional; a table with none renders SQL unchanged.
-	insertHooks    []InsertHook
-	updateHooks    []UpdateHook
-	deleteHooks    []DeleteHook
-	defaultFilters []drops.Expression
+	insertHooks []InsertHook
+	updateHooks []UpdateHook
+	deleteHooks []DeleteHook
+
+	// filters are the global-filter predicates. A named one
+	// (AddFilter) can be bypassed on its own with IgnoreFilters; an
+	// anonymous one (DefaultFilter) only by Unscoped. See filters.go.
+	filters []tableFilter
+
+	// renamedFrom is the name this table used to have, set by
+	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
+	renamedFrom string
 }
+
+// RenamedFrom states that this table is the table that used to be
+// called previous. It is the table-level counterpart of
+// (*Col[T]).RenamedFrom, and carries the same fact for the same
+// reason: a diff sees one table gone and another arrived, and nothing
+// but the schema can say they are the same table.
+//
+//	var Users = sqlite.NewTable("people").RenamedFrom("users")
+func (t *Table) RenamedFrom(previous string) *Table {
+	t.renamedFrom = previous
+	return t
+}
+
+// PreviousName returns the name the table was declared to have been
+// renamed from, or empty when it was not.
+func (t *Table) PreviousName() string { return t.renamedFrom }
 
 // OnInsert registers an INSERT hook, run before every INSERT renders.
 func (t *Table) OnInsert(h InsertHook) *Table {
@@ -49,17 +73,55 @@ func (t *Table) OnDelete(h DeleteHook) *Table {
 	return t
 }
 
-// DefaultFilter appends a predicate applied automatically to every
-// Select / Update / Delete against the table, unless the builder opts
-// out with Unscoped(). Used to implement default scopes (soft-delete
-// hiding, tenant guards).
+// DefaultFilter appends an anonymous predicate applied automatically to
+// every Select / Update / Delete against the table.
+//
+// Anonymous means only Unscoped() can bypass it — and Unscoped bypasses
+// every other filter on the table at the same time. Prefer AddFilter,
+// which names the predicate so one query can step around it while the
+// table's remaining scoping stays in force.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.defaultFilters = append(t.defaultFilters, e)
+	t.filters = append(t.filters, tableFilter{pred: e})
 	return t
 }
 
-// DefaultFilters returns the table's default-scope predicates.
-func (t *Table) DefaultFilters() []drops.Expression { return t.defaultFilters }
+// AddFilter appends a predicate under name, applied exactly as
+// DefaultFilter's is except that a query can bypass this one alone:
+//
+//	posts.AddFilter(sqlite.FilterSoftDelete, deletedAt.IsNull())
+//	db.Select().From(posts).IgnoreFilters(sqlite.FilterSoftDelete)
+//
+// An empty name panics: it would read as named at the call site and
+// behave as anonymous at the query.
+func (t *Table) AddFilter(name string, e drops.Expression) *Table {
+	if name == "" {
+		panic("drops/sqlite: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
+	}
+	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	return t
+}
+
+// DefaultFilters returns the table's global-filter predicates in
+// registration order, named and anonymous alike.
+func (t *Table) DefaultFilters() []drops.Expression {
+	out := make([]drops.Expression, len(t.filters))
+	for i, f := range t.filters {
+		out[i] = f.pred
+	}
+	return out
+}
+
+// FilterNames returns the names of the table's named filters in
+// registration order. Anonymous filters contribute nothing.
+func (t *Table) FilterNames() []string {
+	var out []string
+	for _, f := range t.filters {
+		if f.name != "" {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
 
 func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
 func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
@@ -114,10 +176,19 @@ func (t *Table) As(alias string) *Table {
 
 // PrimaryKey declares a composite (multi-column) primary key. For a
 // single-column key use (*Col[T]).PrimaryKey() instead.
+//
+// Like the column-level spelling it states NOT NULL on each member,
+// last-writer-wins over an earlier Nullable. That is not decoration:
+// SQLite's own PRIMARY KEY does not enforce it — a legacy bug it
+// keeps for compatibility — so a key column that does not say NOT NULL
+// really will accept a NULL, and the two spellings of the same key
+// would otherwise describe two different tables.
 func (t *Table) PrimaryKey(cols ...ColRef) *Table {
 	t.compositePK = make([]*Column, len(cols))
 	for i, c := range cols {
-		t.compositePK[i] = c.col()
+		col := c.col()
+		col.notNull, col.nullStated = true, true
+		t.compositePK[i] = col
 	}
 	return t
 }

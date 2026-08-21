@@ -39,7 +39,8 @@ statement. That is `integration/`.
 `integration/` is a separate Go module, so the drivers it needs — pgx,
 go-sql-driver/mysql, clickhouse-go — cannot reach a user's build. drops
 itself still has no dependencies, and the CI `tidy` job still asserts
-it.
+it. `cmd/drops` is a third module for the same reason: the binary
+links pgx, and nothing a user imports can reach it.
 
 SQLite's driver is pure Go, so a third of the suite runs with nothing
 installed:

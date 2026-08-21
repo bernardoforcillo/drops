@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/bernardoforcillo/drops"
@@ -22,6 +23,7 @@ type Column struct {
 	table      *Table
 	typ        ColumnType
 	notNull    bool
+	nullStated bool // NotNull, PrimaryKey or Nullable was called
 	primary    bool
 	unique     bool
 	autoInc    bool
@@ -39,6 +41,12 @@ type Column struct {
 	// which column a handle *is* has to see the two as equal — see
 	// key.
 	origin *Column
+
+	// renamedFrom is the name this column used to have, set by
+	// (*Col[T]).RenamedFrom. It is the one fact about a column that no
+	// comparison of two schemas can recover — see rename.go — and the
+	// schema is where Push can find it.
+	renamedFrom string
 }
 
 // FK describes a single-column foreign-key reference.
@@ -63,6 +71,14 @@ func (c *Column) HasDefault() bool      { return c.hasDefault }
 func (c *Column) DefaultSQL() string    { return c.defaultSQL }
 func (c *Column) ForeignKey() *FK       { return c.ref }
 func (c *Column) Comment() string       { return c.comment }
+
+// IsNullable reports whether the column admits NULL. It is the
+// complement of IsNotNull, named for the question that matters at
+// bind and scan time and spelled the same in all four dialects so the
+// shared checker asks exactly one question. A MySQL column admits
+// NULL unless it says otherwise, so one that stated nothing answers
+// true.
+func (c *Column) IsNullable() bool { return !c.notNull }
 
 // KeyPrefixLength returns the prefix length the column carries into a
 // PRIMARY KEY or UNIQUE KEY, or zero when it has none.
@@ -128,7 +144,16 @@ func newCol[T any](name string, typ ColumnType) *Col[T] {
 }
 
 // NotNull marks the column NOT NULL.
-func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull = true; return c }
+func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull, c.Column.nullStated = true, true; return c }
+
+// Nullable states that the column admits NULL.
+//
+// It changes nothing in the DDL — a MySQL column is nullable unless
+// it says otherwise — and everything in what drops will let you bind
+// it to: NewEntity requires the struct field bound to a nullable
+// column to be one that can receive NULL. It is the counterpart of
+// NotNull, and the two are last-writer-wins.
+func (c *Col[T]) Nullable() *Col[T] { c.Column.notNull, c.Column.nullStated = false, true; return c }
 
 // PrimaryKey marks the column part of the PRIMARY KEY. Declaring it on
 // more than one column declares a composite key, which Entity
@@ -136,6 +161,8 @@ func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull = true; return c }
 func (c *Col[T]) PrimaryKey() *Col[T] {
 	c.Column.primary = true
 	c.Column.notNull = true
+	// A primary key states NOT NULL implicitly.
+	c.Column.nullStated = true
 	return c
 }
 
@@ -156,6 +183,37 @@ func (c *Col[T]) Unique() *Col[T] { c.Column.unique = true; return c }
 // Managed marks the column as written by drops rather than by the
 // application. NewEntity's drift check skips managed columns.
 func (c *Col[T]) Managed() *Col[T] { c.Column.managed = true; return c }
+
+// RenamedFrom states that this column is the column that used to be
+// called previous — the same column, the same data, a different name.
+//
+// Nothing in a pair of schemas can tell a rename from a drop and an
+// add, so drops asks rather than guesses, and this is the answer
+// written where the question is. GenerateMigration can record an
+// answer in the migration directory; Push has no migration directory,
+// and its refusal is otherwise unanswerable by anything durable. A
+// rename is a fact about the schema's history, the schema is what Push
+// reads, so the schema is where the fact belongs — and it then travels
+// to every database the schema is pushed to, not just to the one
+// whoever typed the flag was pointed at.
+//
+// MySQL has no transactional DDL, so an unstated rename applied here
+// is a DROP COLUMN that no rollback undoes.
+//
+// The declaration is inert once the rename has happened: it is applied
+// only while the old name is still in the database and the new one is
+// not, so it may be left in place, and should be until every database
+// the schema is pushed to has moved past it.
+//
+//	mysql.Add(Users, mysql.Varchar("emailAddress", 255).NotNull().RenamedFrom("email"))
+func (c *Col[T]) RenamedFrom(previous string) *Col[T] {
+	c.Column.renamedFrom = previous
+	return c
+}
+
+// PreviousName returns the name the column was declared to have been
+// renamed from, or empty when it was not. See (*Col[T]).RenamedFrom.
+func (c *Column) PreviousName() string { return c.renamedFrom }
 
 // Default sets a raw SQL DEFAULT expression ("0", "CURRENT_TIMESTAMP").
 func (c *Col[T]) Default(sqlExpr string) *Col[T] {
@@ -277,6 +335,40 @@ func (c *Column) As(alias string) drops.Expression {
 
 // Val binds a typed value for INSERT / UPDATE.
 func (c *Col[T]) Val(v T) ColumnValue { return columnValue{col: c.Column, val: v} }
+
+// SetNull binds SQL NULL as the column's value.
+//
+// It is the typed counterpart of Expr(drops.Raw("NULL")) and differs
+// where it matters: a parameter placeholder bound to nil, so an
+// INSERT that sometimes writes NULL is the same statement as one that
+// writes a value, and the NULL travels through the same binding every
+// other value does.
+//
+// It does not refuse a NOT NULL column: that violation is one the
+// server reports precisely, and turning it into a panic on a request
+// path would trade a good error for a process failure.
+func (c *Col[T]) SetNull() ColumnValue { return columnValue{col: c.Column, val: nil} }
+
+// ValPtr binds *p, or NULL when p is nil. It is the shape an optional
+// struct field already has.
+func (c *Col[T]) ValPtr(p *T) ColumnValue {
+	if p == nil {
+		return c.SetNull()
+	}
+	// Binding *p rather than p keeps the bound argument's Go type
+	// identical to what Val would have bound.
+	return c.Val(*p)
+}
+
+// ValNull binds v.V, or NULL when v is not Valid.
+func (c *Col[T]) ValNull(v sql.Null[T]) ColumnValue {
+	if !v.Valid {
+		return c.SetNull()
+	}
+	// Unwrapped rather than handed to the driver: sql.Null[T].Value
+	// did not convert its payload before Go 1.25.
+	return c.Val(v.V)
+}
 
 // Expr assigns a raw SQL expression to the column instead of a bound
 // value.

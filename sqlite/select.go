@@ -21,12 +21,27 @@ type SelectBuilder struct {
 
 	ctes         []*CTE
 	recursiveCTE bool
-	unscoped     bool
+	scope        filterScope
 }
 
-// Unscoped opts out of the FROM table's DefaultFilter predicates for
-// this SELECT (e.g. to read soft-deleted rows).
-func (s *SelectBuilder) Unscoped() *SelectBuilder { s.unscoped = true; return s }
+// Unscoped opts out of every global filter on the FROM table — named
+// and anonymous alike. The blunt instrument: it cannot tell a
+// soft-delete guard from a tenancy one, so a query that only wants
+// deleted rows loses its isolation with them. Name what you are
+// stepping around with IgnoreFilters instead.
+func (s *SelectBuilder) Unscoped() *SelectBuilder { s.scope.unscoped = true; return s }
+
+// IgnoreFilters bypasses the named global filters on the FROM table and
+// leaves every other one standing:
+//
+//	db.Select().From(posts).IgnoreFilters(sqlite.FilterSoftDelete)
+//
+// Names come from [Table.AddFilter]; drops' own are FilterSoftDelete
+// and FilterTenant. A name no filter carries is ignored.
+func (s *SelectBuilder) IgnoreFilters(names ...string) *SelectBuilder {
+	s.scope.ignore(names...)
+	return s
+}
 
 type joinClause struct {
 	kind  string // "JOIN", "LEFT JOIN", ...
@@ -52,9 +67,11 @@ func (s *SelectBuilder) LeftJoin(t *Table, on drops.Expression) *SelectBuilder {
 	return s
 }
 
-// Where AND-s the given predicates onto the statement.
+// Where AND-s the given predicates onto the statement. Nil predicates
+// are ignored, so a caller can pass one that is only sometimes present
+// without first collecting the non-nil ones into a slice.
 func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
-	s.wheres = append(s.wheres, preds...)
+	s.wheres = append(s.wheres, dropNilPreds(preds)...)
 	return s
 }
 
@@ -93,12 +110,11 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteByte(' ')
 		j.table.writeFrom(b)
 		b.WriteString(" ON ")
-		b.Append(j.on)
+		// A nil condition is the empty conjunction, rendered where
+		// the grammar insists on a predicate.
+		b.Append(orTrue(j.on))
 	}
-	wheres := s.wheres
-	if !s.unscoped && s.table != nil && len(s.table.defaultFilters) > 0 {
-		wheres = append(append([]drops.Expression(nil), s.table.defaultFilters...), wheres...)
-	}
+	wheres := s.scope.apply(s.table, s.wheres)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		b.AppendList(" AND ", wheres)

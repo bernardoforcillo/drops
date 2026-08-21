@@ -34,6 +34,13 @@ import (
 // The TTL passed to WithLSNTracking is the maximum age of a cached
 // replica LSN reading. Lower values catch up faster (more lag-aware
 // routing) at the cost of more pg_last_wal_replay_lsn round-trips.
+//
+// LSN routing answers a narrow question — has this replica replayed
+// past the write — and a yes proves the written row is there and
+// nothing else. Anything the write set in motion downstream of it is
+// outside what the comparison can see. [Replicated.WithWriteDelay] is
+// the floor underneath this: for the delay after a write, reads go to
+// the primary whatever the replay positions say.
 
 // WithLSNTracking enables LSN-based replica routing on r. TTL is the
 // max age of cached per-replica LSN samples; a query asks a replica

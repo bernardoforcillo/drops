@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
+	_ "modernc.org/sqlite"
+
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/sqlite"
 	"github.com/bernardoforcillo/drops/stdlib"
-	_ "modernc.org/sqlite"
 )
 
 func openSQLite(t *testing.T) *sqlite.DB {
@@ -153,7 +154,7 @@ func TestEntityCRUDAgainstTheEngine(t *testing.T) {
 	tbl := sqlite.NewTable("users")
 	id := sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey().AutoIncrement())
 	name := sqlite.Add(tbl, sqlite.Text("name").NotNull())
-	sqlite.Add(tbl, sqlite.Integer("age"))
+	sqlite.Add(tbl, sqlite.Integer("age").NotNull())
 	exec(t, db, sqlite.CreateTable(tbl))
 
 	type user struct {

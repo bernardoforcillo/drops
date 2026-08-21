@@ -274,11 +274,21 @@ func VectorLiteral(v []float32) drops.Expression {
 // settingsFrom pulls ClickHouse SETTINGS out of the portable Params
 // bag. Only string-renderable scalars are forwarded; keys meant for
 // another backend are ignored, so one Query stays runnable everywhere.
+//
+// A key that is not a setting name is dropped rather than rendered.
+// This is the one place a SETTINGS key can reach the SQL without an
+// author having written it — Params is a map the caller fills, and a
+// caller who fills it from a request would otherwise be writing the
+// clause. Dropping it keeps the query runnable, which is what the rest
+// of this function does with everything it cannot render.
 func settingsFrom(q vector.Query) map[string]string {
 	var out map[string]string
 	for k, v := range q.Params {
 		rest, ok := strings.CutPrefix(k, "clickhouse.")
 		if !ok {
+			continue
+		}
+		if validateSettingKey(rest) != nil {
 			continue
 		}
 		s, ok := settingValue(v)
@@ -296,7 +306,12 @@ func settingsFrom(q vector.Query) map[string]string {
 func settingValue(v any) (string, bool) {
 	switch n := v.(type) {
 	case string:
-		return "'" + strings.ReplaceAll(n, "'", "\\'") + "'", true
+		// The backslash goes first: escaping only the quote leaves a
+		// value ending in one — "tier\" — escaping the closing quote
+		// instead of standing for itself, and the literal open over
+		// everything the renderer writes after it.
+		esc := strings.ReplaceAll(n, `\`, `\\`)
+		return "'" + strings.ReplaceAll(esc, "'", `\'`) + "'", true
 	case bool:
 		if n {
 			return "1", true

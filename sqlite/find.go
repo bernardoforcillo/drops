@@ -22,6 +22,12 @@ type FindBuilder struct {
 	table *Table
 	sel   *SelectBuilder
 	withs []string
+
+	// strict / waived drive the strict-loading check in strict.go:
+	// whether an unloaded relation field refuses the query, and which
+	// relations the caller has said it will not read.
+	strict bool
+	waived []string
 }
 
 // Find begins a relational query against t. The result type passed to
@@ -29,9 +35,10 @@ type FindBuilder struct {
 // struct-field mapping rules as Select.All).
 func (db *DB) Find(t *Table) *FindBuilder {
 	return &FindBuilder{
-		db:    db,
-		table: t,
-		sel:   db.Select(colExprs(t)...).From(t),
+		db:     db,
+		table:  t,
+		sel:    db.Select(colExprs(t)...).From(t),
+		strict: db.strictLoading,
 	}
 }
 
@@ -46,6 +53,14 @@ func (f *FindBuilder) With(names ...string) *FindBuilder {
 // Where appends predicates joined by AND to the root query.
 func (f *FindBuilder) Where(preds ...drops.Expression) *FindBuilder {
 	f.sel.Where(preds...)
+	return f
+}
+
+// IgnoreFilters bypasses the named global filters on the root table and
+// leaves every other one standing — see [SelectBuilder.IgnoreFilters].
+// Eager-loaded relations keep their own table's filters either way.
+func (f *FindBuilder) IgnoreFilters(names ...string) *FindBuilder {
+	f.sel.IgnoreFilters(names...)
 	return f
 }
 
@@ -72,6 +87,12 @@ func (f *FindBuilder) All(ctx context.Context, dest any) error {
 		if f.table.Relation(name) == nil {
 			return fmt.Errorf("drops/sqlite: unknown relation %q on table %q", name, f.table.Name())
 		}
+	}
+	// Likewise the strict-loading check: a relation the destination
+	// struct declares and this query never loads is refused here,
+	// before the SELECT, not discovered as a nil field downstream.
+	if err := f.checkStrictLoading(dest); err != nil {
+		return err
 	}
 	if err := f.sel.All(ctx, dest); err != nil {
 		return err

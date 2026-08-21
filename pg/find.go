@@ -19,6 +19,12 @@ type FindBuilder struct {
 	sel    *SelectBuilder
 	roots  []*relNode
 	relErr error // first deferred path-parse error, surfaced from All
+
+	// strict / waived drive the strict-loading check in strict.go:
+	// whether an unloaded relation field refuses the query, and which
+	// root-level relations the caller has said it will not read.
+	strict bool
+	waived []string
 }
 
 // relNode is one node in the parsed eager-load tree. A path such as
@@ -35,6 +41,10 @@ type relNode struct {
 	limit    int
 	offset   int
 	children []*relNode
+	// waived are relations on this edge's target struct that the
+	// caller declared it will not read — the nested half of the
+	// strict-loading waiver. See strict.go.
+	waived []string
 }
 
 // mergeRelPath inserts a dot-separated path into a relNode forest,
@@ -76,9 +86,11 @@ type RelConfig struct {
 }
 
 // Where AND-s predicates into this relation's batched query, filtering
-// the related rows (e.g. only published posts).
+// the related rows (e.g. only published posts). Nil predicates are
+// ignored, as in [SelectBuilder.Where]; the related table's own global
+// filters apply either way.
 func (c *RelConfig) Where(preds ...drops.Expression) *RelConfig {
-	c.node.wheres = append(c.node.wheres, preds...)
+	c.node.wheres = append(c.node.wheres, dropNilPreds(preds)...)
 	return c
 }
 
@@ -171,7 +183,7 @@ func (c *RelConfig) LoadRel(rel *Relation, fn func(*RelConfig)) *RelConfig {
 // All/One determines what columns are scanned (via the same struct-field
 // mapping rules as Select.All).
 func (db *DB) Find(t *Table) *FindBuilder {
-	return &FindBuilder{db: db, table: t, sel: db.Select().From(t)}
+	return &FindBuilder{db: db, table: t, sel: db.Select().From(t), strict: db.strictLoading}
 }
 
 // Where appends predicates joined by AND.
@@ -192,10 +204,26 @@ func (f *FindBuilder) Limit(n int64) *FindBuilder { f.sel.Limit(n); return f }
 // Offset sets the OFFSET.
 func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
 
-// Unscoped opts out of the table's DefaultFilter predicates for the
-// root SELECT. Eager-loaded relations inherit their own table's
-// scopes independently.
+// Unscoped opts out of every global filter on the table for the root
+// SELECT — the blunt instrument; see [SelectBuilder.Unscoped].
+// Eager-loaded relations inherit their own table's scopes
+// independently.
 func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
+
+// IgnoreFilters bypasses the named global filters on the root table
+// and leaves every other one standing — see
+// [SelectBuilder.IgnoreFilters]. Eager-loaded relations keep their own
+// table's filters either way.
+func (f *FindBuilder) IgnoreFilters(names ...string) *FindBuilder {
+	f.sel.IgnoreFilters(names...)
+	return f
+}
+
+// ignoresFilter reports whether this query named filter in an
+// IgnoreFilters call. Read by the entity layer for the filters it
+// builds per query rather than registering on the table — the tenant
+// guard — which nothing on the table can carry.
+func (f *FindBuilder) ignoresFilter(name string) bool { return f.sel.scope.ignores(name) }
 
 // HasEagerLoads reports whether any relations have been queued for
 // eager loading via With / WithRel. Used by Entity[T] to decide
@@ -301,6 +329,12 @@ func (f *FindBuilder) All(ctx context.Context, dest any) error {
 	// Validate the whole tree up front so a typo in any path — at any
 	// depth — fails fast, before a single query runs.
 	if err := validateRelTree(f.table, f.roots); err != nil {
+		return err
+	}
+	// Likewise the strict-loading check: a relation the destination
+	// struct declares and this query never loads is refused here,
+	// before the SELECT, not discovered as a nil field downstream.
+	if err := f.checkStrictLoading(destStructType(dest)); err != nil {
 		return err
 	}
 	if err := f.sel.All(ctx, dest); err != nil {
@@ -470,8 +504,8 @@ func (f *FindBuilder) loadRelation(
 
 	expectsSlice := rel.Kind == HasManyKind || rel.Kind == MorphManyKind
 	if expectsSlice && relFieldType.Kind() != reflect.Slice {
-		return none, nil, fmt.Errorf("drops/pg: relation %q is HasMany — expected slice field, got %s",
-			rel.Name, relFieldType.Kind())
+		return none, nil, fmt.Errorf("drops/pg: relation %q is %s — expected slice field, got %s",
+			rel.Name, relationKindName(rel.Kind), relFieldType.Kind())
 	}
 
 	var childElemType reflect.Type
@@ -914,6 +948,16 @@ func (f *FindBuilder) buildPerParentLimitedSQL(
 		b.WriteString(" AND ")
 		Eq(rel.MorphTypeCol, rel.MorphType).WriteSQL(b)
 	}
+	// The child table's global filters, which the uncapped path gets
+	// for free from Select().From(rel.To). This writer builds its SQL
+	// by hand, so it has to spell them out — and without them, adding
+	// a per-parent cap to a load quietly widened it, handing back the
+	// soft-deleted and out-of-tenant children the same load returns
+	// correctly when it is uncapped.
+	for _, w := range rel.To.Filters() {
+		b.WriteString(" AND ")
+		w.WriteSQL(b)
+	}
 	for _, w := range node.wheres {
 		b.WriteString(" AND ")
 		w.WriteSQL(b)
@@ -939,6 +983,25 @@ func relationKeyField(structT reflect.Type, col *Column) ([]int, bool) {
 // relationTargetField returns the index path of the struct field that
 // receives the relation. Lookup order: dropRel:"<name>" tag, then a
 // case-insensitive name match.
+//
+// The name fallback is a hazard, not a convenience to lean on. It
+// claims a field because of what the field is *called*, and a field
+// that only happens to share a relation's name has said nothing about
+// wanting to be one: an untagged Posts []Post is filled by
+// With("posts") whether the caller meant it as a relation or as a
+// cache they had already populated, and the walk reaches through
+// embedded structs, so a promoted field of the embedded row struct is
+// claimable too. What that usually produces is a confusing refusal —
+// a scalar column field is not a relation target and the query fails
+// naming a type nobody wrote down — and what it produces in the worst
+// case is a silent overwrite.
+//
+// It stays because removing it would break every struct written
+// against the earlier rule, and because a relation field named after
+// its relation is the overwhelmingly common spelling. Tag the field
+// anyway: `dropsgen -rels` writes the tag on every relation field it
+// emits, which is what makes the binding a thing the struct states
+// rather than a thing its field names happen to imply.
 func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 	var found []int
 	var byName []int
@@ -1098,4 +1161,27 @@ func (f *FindBuilder) loadMorphTo(
 	// fan out manually.
 	_ = node.children
 	return reflect.Value{}, nil, nil
+}
+
+// relationKindName renders a kind the way the declaration API spells
+// it, so an error about a mis-bound relation names the kind the
+// relation actually has. The guard on a slice field accepts more than
+// one kind, and hardcoding the commonest of them told a MorphMany
+// author to go looking for a HasMany they never wrote.
+func relationKindName(k RelationKind) string {
+	switch k {
+	case HasManyKind:
+		return "HasMany"
+	case HasOneKind:
+		return "HasOne"
+	case BelongsToKind:
+		return "BelongsTo"
+	case ManyToManyKind:
+		return "ManyToMany"
+	case MorphToKind:
+		return "MorphTo"
+	case MorphManyKind:
+		return "MorphMany"
+	}
+	return "an unknown kind"
 }

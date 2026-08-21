@@ -100,7 +100,12 @@ func (db *DB) Insert(t *Table) *InsertBuilder {
 }
 
 // Exec runs a raw SQL statement (with "?" placeholders).
+//
+// Query tags on ctx (see [drops.WithQueryTags]) are appended to sql as
+// a trailing comment before anything else looks at it, so the hook and
+// system.query_log both report the same statement text.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	sql = drops.TagStatement(ctx, sql)
 	start := time.Now()
 	res, err := db.drv.Exec(ctx, sql, args...)
 	db.emit(ctx, drops.QueryEvent{
@@ -110,8 +115,10 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 	return res, err
 }
 
-// Query runs a raw SQL query.
+// Query runs a raw SQL query. Query tags on ctx are appended as a
+// trailing comment, as in [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	sql = drops.TagStatement(ctx, sql)
 	start := time.Now()
 	rows, err := db.drv.Query(ctx, sql, args...)
 	db.emit(ctx, drops.QueryEvent{

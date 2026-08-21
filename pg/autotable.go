@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/bernardoforcillo/drops/internal/drift"
 )
 
 // secretTypePrefix is the reflection name prefix every
@@ -33,6 +35,8 @@ var secretPkgPath = reflect.TypeOf(Secret[string]{}).PkgPath()
 //	autoIncrement        — use the serial family (BigSerial / Serial /
 //	                       SmallSerial) for the column's type
 //	notNull              — NOT NULL
+//	null                 — the column admits NULL even though the
+//	                       field's type does not say so
 //	unique               — UNIQUE
 //	default=<sql>        — raw DEFAULT clause (no parameterisation)
 //	version              — mark as the optimistic-lock version column
@@ -52,8 +56,13 @@ var secretPkgPath = reflect.TypeOf(Secret[string]{}).PkgPath()
 //	[]byte                → bytea
 //	time.Time             → timestamptz
 //	json.RawMessage       → jsonb
-//	*T                    → same as T, column is nullable unless
-//	                        `notNull` is set explicitly
+//	*T                    → same as T, column NULL-able
+//
+// Nullability comes from the field's type, not from the absence of a
+// tag: a pointer or an sql.Null[T] field declares a nullable column,
+// everything else declares NOT NULL. `null` overrides that for a
+// field whose type cannot say it — a named type with its own Scan
+// method behind an optional column.
 //
 // Custom types — uuid, jsonb columns backed by app structs, etc. —
 // fall back to drops.Custom; declare them by hand instead.
@@ -102,6 +111,7 @@ type autoOpts struct {
 	PK      bool
 	AutoInc bool
 	NotNull bool
+	Null    bool
 	Unique  bool
 	Default string
 	Version bool
@@ -152,6 +162,8 @@ func parseAutoTag(raw string) (autoOpts, error) {
 			opts.AutoInc = true
 		case "notNull":
 			opts.NotNull = true
+		case "null":
+			opts.Null = true
 		case "unique":
 			opts.Unique = true
 		case "version":
@@ -167,43 +179,63 @@ func parseAutoTag(raw string) (autoOpts, error) {
 			return opts, fmt.Errorf("unknown drop tag option %q", k)
 		}
 	}
+	if opts.NotNull && opts.Null {
+		return opts, fmt.Errorf("`notNull` and `null` contradict each other; drop one or the other")
+	}
 	return opts, nil
 }
 
-// makeAutoColumn assembles a *Column from a parsed field. Pointer
-// types make the column nullable by default unless `notNull` is set.
+// makeAutoColumn assembles a *Column from a parsed field.
+//
+// Nullability is read off the field's type — a pointer or an
+// sql.Null[T] gives a nullable column, anything else NOT NULL — so
+// the table AutoTable derives always states it, and NewAutoEntity
+// cannot trip the nullability check its own NewEntity runs.
 func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Column {
 	ft := f.Type
 	for ft.Kind() == reflect.Ptr {
 		ft = ft.Elem()
 	}
+	// An sql.Null[T] field carries no SQL type of its own — it says
+	// the column is optional and wraps the type that does.
+	if payload, ok := drift.NullPayload(ft); ok {
+		ft = payload
+	}
 	// pg.Secret[T] always serialises as encrypted bytea — bypass
 	// the type-table mapping below.
 	if isSecretType(ft) {
 		c := &Column{name: opts.Name, typ: simpleType("bytea")}
-		applyAutoOpts(c, opts)
+		applyAutoOpts(c, f.Type, opts)
 		return c
 	}
 	// pg.Money stores as bigint (minor units).
 	if isMoneyType(ft) {
 		c := &Column{name: opts.Name, typ: simpleType("bigint")}
-		applyAutoOpts(c, opts)
+		applyAutoOpts(c, f.Type, opts)
 		return c
 	}
 	// pg.Point stores as geography(Point, 4326).
 	if isPointType(ft) {
 		c := &Column{name: opts.Name, typ: simpleType("geography(Point,4326)")}
-		applyAutoOpts(c, opts)
+		applyAutoOpts(c, f.Type, opts)
 		return c
 	}
 	ct := autoColumnType(structName, f.Name, ft, opts.AutoInc)
 	c := &Column{name: opts.Name, typ: ct}
-	applyAutoOpts(c, opts)
+	applyAutoOpts(c, f.Type, opts)
 	return c
 }
 
-// applyAutoOpts stamps the parsed flags onto c.
-func applyAutoOpts(c *Column, opts autoOpts) {
+// applyAutoOpts stamps the parsed flags onto c. ft is the field's
+// declared type, which decides nullability unless a tag overrides it.
+func applyAutoOpts(c *Column, ft reflect.Type, opts autoOpts) {
+	// Every derived column states nullability, and the field type is
+	// the statement: the tag options only override it.
+	c.notNull = !drift.InferNullable(ft)
+	c.nullStated = true
+	if opts.Null {
+		c.notNull = false
+	}
 	if opts.PK {
 		c.primary = true
 		c.notNull = true

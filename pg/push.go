@@ -1009,6 +1009,26 @@ func tableRowEstimates(ctx context.Context, db *DB, schema string) (map[string]i
 // table holds data is not a reason to go ahead and destroy it, and it
 // is not a reason to report it as data loss either — the caller would
 // be granting consent for a table nobody has looked inside.
+//
+// # It carries no tenant predicate, on purpose
+//
+// This is the one statement Push sends against a caller's own table
+// rather than against the catalogues, so it is the one place the
+// question "should this carry the tenant axis" arises at all — and the
+// answer is that carrying it would be wrong, not merely unnecessary.
+// What has to be settled is whether the table is empty for EVERYBODY,
+// because that is what DROP TABLE and DROP COLUMN decide. A predicate
+// on the ctx tenant would answer "empty for me", and the first tenant
+// to push a destructive change from an account with no rows in it
+// would take every other tenant's rows with it — consent given for one
+// tenant's data, spent on all of it.
+//
+// Nothing anybody owns leaves the server either way: the statement
+// selects EXISTS, so what comes back is one boolean about the table,
+// which is the object Push is reconciling. The reasoning is repeated
+// as the exemption in pg/scopeexec_test.go, where the executor census
+// requires every door that can send a statement for a scoped table to
+// carry the axis or to say why it must not.
 func tableHasRows(ctx context.Context, db *DB, schema, table string) (bool, error) {
 	stmt := fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s.%s LIMIT 1)`,
 		quoteIdent(schema), quoteIdent(table))

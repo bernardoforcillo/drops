@@ -18,11 +18,12 @@ import (
 //
 // An optional drops.Hook can be attached via WithHook to observe every
 // driver operation — query logging, slow-query alerts, tracing, metrics.
-// The hook is propagated into the transaction-bound DBs returned by
-// Begin and InTx, and InTx emits "begin"/"commit"/"rollback" events for
-// the transaction lifecycle. For full lifecycle observability prefer
-// InTx; with an explicit Begin you must call Commit/Rollback yourself,
-// and those bypass the hook unless you wrap them.
+// The hook and the [Tracer] are both propagated into the transaction-
+// bound DBs returned by Begin and InTx — see bind — and InTx emits
+// "begin"/"commit"/"rollback" events for the transaction lifecycle. For
+// full lifecycle observability prefer InTx; with an explicit Begin you
+// must call Commit/Rollback yourself, and those bypass the hook unless
+// you wrap them.
 type DB struct {
 	drv    drops.Driver
 	hook   drops.Hook
@@ -87,7 +88,43 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return &DB{drv: tx, hook: db.hook}, tx, nil
+	return db.bind(tx), tx, nil
+}
+
+// bind returns the *DB every statement inside a transaction goes out
+// through: this DB's configuration, with the transaction handle where
+// the pool used to be.
+//
+// It exists because there were two of these literals — one in Begin,
+// one in inTxOnce — and both were spelled &DB{drv: tx, hook: db.hook},
+// which carried the hook and dropped the rest by omission. A field
+// added to DB is dropped by both of them and by neither on purpose,
+// which is the defect the tracer already was: WithTracer produced a
+// span for every statement outside a transaction and none for any
+// statement inside one, so a trace went dark at exactly the boundary a
+// latency investigation follows it across, and the two statements
+// [DB.InTxAs] sends — the SET LOCAL ROLE and the set_config that say
+// which identity the work ran under — were the first to vanish. The
+// hook was propagated throughout, so the audit trail was intact and
+// nothing was ever unobservable twice: this is observability, not a
+// leak.
+//
+// A field a transaction-bound DB must NOT carry is dropped here, once,
+// with the reason, rather than at two call sites by not being typed:
+//
+//   - retry. A [RetryPolicy] re-runs a whole transaction, and this DB
+//     is already inside one. A nested InTx that retried would re-run
+//     its body against a transaction the failed attempt had already
+//     aborted, where PostgreSQL answers every further statement with
+//     25P02 until the outer transaction ends — so the retry could not
+//     succeed, and would spend its attempts finding that out. Retrying
+//     belongs to the outermost InTx, which has the policy.
+//
+// pg/db_bind_internal_test.go holds both halves to that: every field
+// of DB has a disposition here, and each disposition is what bind
+// does.
+func (db *DB) bind(tx drops.Tx) *DB {
+	return &DB{drv: tx, hook: db.hook, tracer: db.tracer}
 }
 
 // InTx runs fn inside a transaction. The transaction is committed if fn
@@ -144,7 +181,7 @@ func (db *DB) inTxOnce(ctx context.Context, fn func(*DB) error) (err error) {
 	if berr != nil {
 		return berr
 	}
-	inner := &DB{drv: tx, hook: db.hook}
+	inner := db.bind(tx)
 	rollback := func() error {
 		rctx, cancel := rollbackCtx(ctx)
 		defer cancel()

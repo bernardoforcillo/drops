@@ -1439,16 +1439,27 @@ func TestPGScopeByTenantThroughAnAliasHandle(t *testing.T) {
 	}
 }
 
-// The limitation As's doc comment states, pinned against the server
-// that enforces it. A default filter is an already-built expression
-// closed over the handles it was given, so aliasing the table does not
-// move it: SoftDeleteMixin's guard goes on naming the un-aliased
-// table, and a SELECT whose only FROM entry is the alias cannot
-// resolve it. Rewriting the filter would mean rebuilding arbitrary
-// expressions, so the documented route out is Unscoped plus an
-// explicit predicate — which has to keep working, or the limitation
-// has no exit.
-func TestPGDefaultFilterIsNotRewrittenByAnAlias(t *testing.T) {
+// A default filter reaches an aliased table, pinned against the server
+// that would refuse it otherwise.
+//
+// This case used to assert the opposite, and was right when it was
+// written: a filter is an already-built expression closed over the
+// handles it was given, so SoftDeleteMixin's guard went on naming the
+// un-aliased table and a SELECT whose only FROM entry was the alias
+// could not resolve it — 42P01, a statement that cannot run rather
+// than a widened result. Rewriting the expression is still impossible,
+// so the filter is RENDERED under a relation rename instead: for the
+// length of each predicate, a reference to "alias_softdel" resolves to
+// the alias. See Table.resolveFilterExprs.
+//
+// It is asserted against a real server because the failure it replaced
+// was a server error and nothing else: the old shape rendered
+// perfectly well, and only PostgreSQL knew the relation it named was
+// not in the FROM list. Two rows are seeded, one of them soft-deleted,
+// so a guard that is present and powerless — the alias resolving but
+// the predicate lost — fails here too rather than passing for having
+// returned some rows.
+func TestPGDefaultFilterIsRewrittenByAnAlias(t *testing.T) {
 	db := openPG(t)
 	ctx := context.Background()
 	tbl := pg.NewTable(integration.UniqueName(t, "alias_softdel"))
@@ -1462,21 +1473,29 @@ func TestPGDefaultFilterIsNotRewrittenByAnAlias(t *testing.T) {
 	if _, err := db.Insert(tbl).Row(name.Val("live")).Exec(ctx); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	// The deleted row goes in with its timestamp already set, so the
+	// seeding never depends on the guard it is here to test.
+	if _, err := db.Exec(ctx, fmt.Sprintf(
+		`INSERT INTO %q ("name", "deletedAt") VALUES ('gone', now())`, tbl.Name())); err != nil {
+		t.Fatalf("seed the deleted row: %v", err)
+	}
 
 	u := tbl.As("u")
 	var rows []struct {
 		Name string `drop:"name"`
 	}
-	err := db.Select(u.Col("name")).From(u).All(ctx, &rows)
-	if err == nil {
-		t.Fatal("a scoped table aliased into a bare SELECT should not resolve its guard")
+	if err := db.Select(u.Col("name")).From(u).All(ctx, &rows); err != nil {
+		t.Fatalf("a scoped table aliased into a bare SELECT has to resolve its guard: %v", err)
 	}
-	if !strings.Contains(err.Error(), "42P01") {
-		t.Errorf("expected 42P01 from the un-rewritten guard, got: %v", err)
+	if len(rows) != 1 || rows[0].Name != "live" {
+		t.Errorf("got %+v, want the one live row — the guard reached the alias but its predicate did not", rows)
 	}
 
-	// The documented way through: opt out of the guard and restate it
-	// from the alias's own handles.
+	// Opting out and restating the guard from the alias's own handles
+	// still works, and has to: it is the documented route for the two
+	// shapes the rename cannot decide for you — a filter embedding a
+	// subquery that selects from the base table in its own right, and
+	// a self-join whose predicate names the un-aliased side.
 	rows = nil
 	if err := db.Select(u.Col("name")).
 		From(u).
@@ -1487,6 +1506,17 @@ func TestPGDefaultFilterIsNotRewrittenByAnAlias(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Name != "live" {
 		t.Errorf("got %+v, want the one live row", rows)
+	}
+
+	// And Unscoped really did drop the guard rather than the alias
+	// merely surviving it: with no predicate at all both rows come
+	// back.
+	rows = nil
+	if err := db.Select(u.Col("name")).From(u).Unscoped().All(ctx, &rows); err != nil {
+		t.Fatalf("Unscoped: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Errorf("got %+v, want both rows once the guard is opted out of", rows)
 	}
 }
 

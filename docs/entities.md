@@ -306,7 +306,11 @@ reach further than the entity they are spelled on:
   source checks that keep the axis honest are a lint over one package —
   so declare RLS with `EnableRLS` / `AddPolicy` on every table that
   holds more than one tenant's rows, and read this bullet as defence in
-  depth.
+  depth. Then run the request through `db.InTxAs(ctx, session, fn)`,
+  which is the other half of that: it establishes the role and the
+  settings a policy reads back with `current_setting` for exactly the
+  lifetime of one transaction, and aborts rather than running the body
+  as the pool's own user when it cannot.
 - `AuthorizeWith` AND-s the guard's predicate into every Get / Query /
   Update / Delete. A `MembershipGuard`'s junction subquery is a
   statement drops composed rather than SQL text, so the junction table's

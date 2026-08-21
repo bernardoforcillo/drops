@@ -137,6 +137,21 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **`WithTracer` produced no spans inside a transaction** (`drops/pg`).
+  `Begin` and `InTx` built the transaction-bound `*DB` as
+  `&DB{drv: tx, hook: db.hook}` — twice, in two places — which carried
+  the hook and dropped the tracer by not mentioning it. So a trace went
+  dark at the `BEGIN` and came back at the `COMMIT`, across exactly the
+  span of statements a latency investigation follows it over, and the
+  first two statements to vanish were the `SET LOCAL ROLE` and the
+  `set_config` `InTxAs` sends to establish the identity everything
+  after them runs under. The hook was propagated throughout, so the
+  audit trail was intact and this was observability only. Both literals
+  are now one `bind` method that says per field what a transactional
+  `*DB` carries and why — the retry policy is still deliberately
+  dropped, since a nested retry would re-run its body against a
+  transaction PostgreSQL has already aborted — and a census fails when
+  `DB` grows a field nobody has decided about.
 - **A `DefaultFilter` holding a statement drops did not build was never
   offered to the resolver** (`drops/pg`). The walk over a table's
   default filters is guarded by a fast path that asks, without building

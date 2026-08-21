@@ -133,11 +133,10 @@ func (f *execFixture) record(sql string, args []any) {
 func (f *execFixture) statements() []renderedStmt {
 	out := append([]renderedStmt(nil), f.rendered...)
 	for _, st := range f.drv.Statements() {
-		// A transaction boundary is a driver call and not a statement:
-		// [dropstest.Driver] records begin, commit and rollback with no
-		// SQL at all rather than inventing the text, so there is
-		// nothing in one for an axis to be carried by and nothing sent
-		// to a server by it. Seeder.Apply wraps its inserts in one.
+		// Skipping the transaction boundaries narrows what the census
+		// is asked of, so it is declared as an exemption rather than
+		// decided here: see exemptAxisNarrowings["transaction
+		// boundary"], which is checked in both directions.
 		if st.Op != dropstest.OpExec && st.Op != dropstest.OpQuery {
 			continue
 		}
@@ -418,6 +417,142 @@ func execRender(f *execFixture, stmt ctxSQLable, ctx context.Context) error {
 	return nil
 }
 
+// exemptAxisNarrowings names a place where these censuses ask LESS of
+// what an executor produced than "a predicate on the tenant column,
+// qualified with the relation the statement names", with the reason.
+//
+// They are exemptions in everything but name: each one lets something
+// past a check that would otherwise fail it. Neither was written where
+// a reader auditing the exemptions would find it — one was a comment
+// inside execFixture.statements, the other an arm of carriesTenantAxis
+// — and an exemption nobody can enumerate is one nobody can review.
+// Both are sound; that is the argument for writing them down, not
+// against it.
+//
+// They differ from exemptExecutors in what they name. That map names a
+// DOOR that carries no axis at all. These name a SHAPE in which the
+// axis is carried differently, or a driver call there is no statement
+// in — so they are checked differently too:
+// TestEveryAxisNarrowingIsDeclared asserts of each that it is still
+// real and still needed, which is what stops an entry outliving the
+// arm it describes.
+var exemptAxisNarrowings = map[string]string{
+	"transaction boundary": "a begin, commit or rollback is a driver call and not a statement: [dropstest.Driver] records the three with no SQL at all rather than inventing the text \"BEGIN\", so there is nothing in one for a predicate to be part of and nothing sent to a server by it that could return a row. Seeder.Apply wraps its inserts in one and Push wraps its DDL in another. The filter is on the Op rather than on the text being empty, so a boundary that did carry SQL would be censused like any other statement",
+	"COPY":                 "a COPY is an INSERT with the row bodies moved off the statement, and it carries the axis the way an INSERT does — the tenant column in the destination list, the tenant value in the stream — because neither has a WHERE clause for a predicate to reach. carriesTenantAxis reads the column list, on the same terms and in the same arm as INSERT; the tenant among the streamed values is asserted by the same containsArg every other case uses, out of what execDriver.Copy recorded. What is NOT admitted is a bare mention of the column in any other statement, which is why the arm is spelled as a prefix test",
+}
+
+// TestEveryAxisNarrowingIsDeclared keeps exemptAxisNarrowings honest in
+// both directions: an entry with no reason fails, an entry no check
+// knows how to verify fails, and — the direction that matters — an
+// entry describing something the censuses no longer do fails too.
+func TestEveryAxisNarrowingIsDeclared(t *testing.T) {
+	// One check per narrowing, keyed by the same name, so a map entry
+	// and the thing it describes cannot come apart: an entry with no
+	// check is an exemption nobody verifies, and a check with no entry
+	// is a narrowing that has gone undeclared again.
+	checks := map[string]func(*testing.T){}
+
+	checks["transaction boundary"] = func(t *testing.T) {
+		// Still real: a boundary carries no SQL, so it would fail the
+		// axis check for want of anything to carry one.
+		drv := dropstest.New()
+		tx, err := drv.Begin(context.Background())
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		if err := tx.Commit(context.Background()); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		for _, st := range drv.Statements() {
+			if st.SQL != "" {
+				t.Errorf("a %s now carries SQL (%q) — census it instead of skipping it", st.Op, st.SQL)
+			}
+			if carriesTenantAxis(st.SQL, "ex_rows") {
+				t.Errorf("a %s reads as carrying the axis — the narrowing is hiding something", st.Op)
+			}
+		}
+		// Still needed: some executor really does open a transaction.
+		if !anyExecutorProduces(t, func(st dropstest.Statement) bool {
+			return st.Op == dropstest.OpBegin
+		}) {
+			t.Error("no executor opens a transaction any more — drop the narrowing and census every recorded call")
+		}
+	}
+
+	checks["COPY"] = func(t *testing.T) {
+		const stamped = `COPY "ex_rows" ("id", "tenantId", "name") FROM STDIN`
+		// Still real: the statement carries no predicate, so only the
+		// stamped-column arm can be reading it as scoped.
+		if strings.Contains(stamped, `"ex_rows"."tenantId" = $`) {
+			t.Fatal("this COPY carries a predicate — the narrowing is not what admits it")
+		}
+		if !carriesTenantAxis(stamped, "ex_rows") {
+			t.Errorf("a stamped COPY no longer reads as carrying the axis: %q", stamped)
+		}
+		// And it admits only a stamped one: a COPY without the tenant
+		// column in its destination list is still a leak.
+		if unstamped := `COPY "ex_rows" ("id", "name") FROM STDIN`; carriesTenantAxis(unstamped, "ex_rows") {
+			t.Errorf("a COPY with no tenant column reads as carrying the axis: %q", unstamped)
+		}
+		// Still needed: some executor really does send a COPY.
+		if !anyExecutorProduces(t, func(st dropstest.Statement) bool {
+			return strings.HasPrefix(st.SQL, "COPY ")
+		}) {
+			t.Error("no executor sends a COPY any more — drop the narrowing and the arm it describes")
+		}
+	}
+
+	for name, reason := range exemptAxisNarrowings {
+		if reason == "" {
+			t.Errorf("axis narrowing %q carries no reason — an exemption without one is a leak with a name", name)
+		}
+		check, ok := checks[name]
+		if !ok {
+			t.Errorf("axis narrowing %q has no check — an exemption nothing verifies is how the Push exemption came to state a reason that was not true", name)
+			continue
+		}
+		t.Run(name, check)
+	}
+	for name := range checks {
+		if exemptAxisNarrowings[name] == "" {
+			t.Errorf("a check keeps the %q narrowing honest and no entry declares it — put it back in exemptAxisNarrowings with its reason", name)
+		}
+	}
+}
+
+// anyExecutorProduces runs every censused case with a tenant on ctx and
+// reports whether any of them produced a call matching want. It is how
+// a narrowing proves it is still needed: one that describes something
+// no executor does any more is an entry to delete, not a check to keep
+// passing.
+//
+// A COPY does not reach [dropstest.Driver] — execDriver intercepts it —
+// so the fixture's own rendered statements are searched too, under the
+// Op the recorder would have given them.
+func anyExecutorProduces(t *testing.T, want func(dropstest.Statement) bool) bool {
+	t.Helper()
+	for _, tc := range executorEntryPoints() {
+		f := newExecFixture()
+		if tc.rows != nil {
+			tc.rows(f.drv)
+		}
+		if err := tc.run(f, execCtx()); err != nil {
+			continue
+		}
+		for _, st := range f.drv.Statements() {
+			if want(st) {
+				return true
+			}
+		}
+		for _, st := range f.rendered {
+			if want(dropstest.Statement{Op: dropstest.OpExec, SQL: st.sql, Args: st.args}) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // exemptExecutors names an executor that deliberately carries no axis,
 // with the reason. Each entry has to say why carrying one would be
 // WRONG or impossible, not merely inconvenient.
@@ -429,8 +564,61 @@ var exemptExecutors = map[string]string{
 	"DB.StartPoolMetrics": "samples the driver's connection pool on a timer and sends no statement at all; the ctx is the sampler's lifetime",
 	"DB.InTx":             "runs the caller's function against a transactional *DB, and every statement inside it goes out through one of the executors this table covers",
 	"DB.InTxAs":           "runs the caller's function against a transactional *DB, exactly as DB.InTx does, so every statement inside it goes out through one of the executors this table covers. The two it sends of its own — SET LOCAL ROLE and set_config — name no relation and select no row, so there is nothing in either for a tenant predicate to scope: what they establish is the identity PostgreSQL evaluates a row-level security policy against, which is the layer beneath these predicates and not a substitute for one",
-	"Push":                "reconciles the SCHEMA: every statement it sends is DDL — CREATE, ALTER, DROP — against relations rather than rows, and DDL has no WHERE clause and no row for a tenant predicate to select. What it must not do is destroy a relation nobody declared, which is ownedBy's promise and TestPushWithholdsUnmanagedObjects's assertion",
+	"Push":                "reconciles the SCHEMA, and the axis would be WRONG in the one statement it sends against a caller's table. Not every statement it sends is DDL — it reads the catalogues to introspect and to estimate rows, and before it destroys anything it asks each affected table whether it holds any row at all (tableHasRows). The DDL has no WHERE clause and no row for a predicate to select; the emptiness probe has both, and must not use them. What it settles is whether the table is empty for EVERYBODY, which is what a DROP TABLE or a DROP COLUMN turns on — scoped to the ctx tenant it would answer 'empty for me', and the first tenant to push a destructive change from an empty account would take every other tenant's rows with it. It selects EXISTS, so what comes back is one boolean about the table and never a row anybody owns. What Push must not do is destroy a relation nobody declared, which is ownedBy's promise and TestPushWithholdsUnmanagedObjects's assertion",
 	"Subscribe":           "sends LISTEN and no statement against the entity's table: the change feed is a whole-table stream by construction, and the one place it reads a row is Entity.Get, which is in this table and carries the axis. What crosses tenants is the primary key of a changed row, which is what a change feed publishes — a consumer that must not see other tenants' keys filters the stream, or reads the feed behind row-level security",
+}
+
+// TestPushProbesEmptinessAcrossEveryTenant holds the Push exemption to
+// what it now says.
+//
+// The reason that stood here before claimed every statement Push sends
+// is DDL, which was never true — it reads the catalogues, and one
+// statement it sends goes against a caller's own table: the emptiness
+// probe that decides whether a destructive change may proceed. A
+// reason nothing asserts is a reason that can quietly become the
+// opposite of the truth, which is exactly what happened, so the
+// corrected half is asserted here rather than only written down.
+//
+// The table is scoped and the ctx carries a tenant, and the probe still
+// asks about the whole relation. That is the behaviour the exemption
+// depends on: consent to destroy is given for a table, and a probe
+// that answered "empty for me" would spend one tenant's consent on
+// every tenant's rows.
+func TestPushProbesEmptinessAcrossEveryTenant(t *testing.T) {
+	tbl := pg.NewTable("users")
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	pg.Add(tbl, pg.Text("amount").NotNull())
+	tenant := pg.Add(tbl, pg.BigInt("tenantId").NotNull())
+	tbl.ContextFilter(pg.TenantFilter(tenant))
+
+	// No estimate for "users" is reltuples = -1, a table nothing has
+	// analysed, which is what sends Push to the probe; the probe
+	// answers that it is not empty, so the DROP COLUMN is withheld.
+	drv := pushDriver(sharedDatabase(), map[string]int64{}, map[string]bool{"users": false})
+	_, err := pg.Push(execCtx(), pg.New(drv), pg.NewSchema(tbl))
+	if !errors.Is(err, pg.ErrDestructivePush) {
+		t.Fatalf("Push: %v, want %v — the probe has to have decided something for this to be a test of it",
+			err, pg.ErrDestructivePush)
+	}
+
+	var probes []string
+	for _, q := range drv.SQL() {
+		if strings.Contains(q, "SELECT EXISTS") {
+			probes = append(probes, q)
+		}
+	}
+	if len(probes) != 1 {
+		t.Fatalf("emptiness probes = %v, want exactly one", probes)
+	}
+	if want := `SELECT EXISTS (SELECT 1 FROM "public"."users" LIMIT 1)`; probes[0] != want {
+		t.Errorf("probe = %q, want %q", probes[0], want)
+	}
+	if strings.Contains(probes[0], "tenantId") {
+		t.Errorf("the probe carries the tenant axis: %q\n"+
+			"it decides whether a DROP may destroy the table, so it has to ask whether the table is "+
+			"empty for everybody — scoped, it would let one tenant's consent destroy another's rows",
+			probes[0])
+	}
 }
 
 // TestEveryExecutorCarriesTheTenantAxis is the first half: with a

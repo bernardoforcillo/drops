@@ -3,6 +3,7 @@ package pg_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -327,6 +328,24 @@ var exemptConstructors = map[string]string{
 	"CreateMaterializedView": "DDL: a matview outlives the request, so a resolved body would pin one tenant",
 }
 
+// exemptWidenedConstructors is the same promise for the constructors
+// only the WIDENED census can see: those returning something rendered
+// into a statement without being an expression. It is separate from
+// exemptConstructors because each census checks its own map in both
+// directions, and an entry that excuses a constructor the other census
+// cannot see would fail there as stale.
+var exemptWidenedConstructors = map[string]string{
+	// The same rule the three view constructors above are exempt under,
+	// for the other schema object that stores an expression. An index's
+	// key expressions and its partial-index predicate are rendered by
+	// CREATE INDEX, in a migration, with no ctx and no tenant — and an
+	// index built for the tenant who happened to run the migration
+	// would index one tenant's rows for everybody. See
+	// exemptRelationEntryPoints["Index.Where"], which is the same
+	// object refusing the same thing from the other census.
+	"NewIndex": "DDL: an index is a declaration rendered by the migrator, so a resolved key or predicate would pin one tenant",
+}
+
 // TestEveryOperandConstructorIsCensused is the enforcement the previous
 // four rounds lacked: it reads the package's own source and requires
 // every exported function returning a drops.Expression that takes an
@@ -345,7 +364,7 @@ func TestEveryOperandConstructorIsCensused(t *testing.T) {
 
 	var missing []string
 	for _, name := range censusOperandConstructors(t) {
-		if covered[name] || exemptConstructors[name] != "" {
+		if covered[name] || exemptConstructors[name] != "" || exemptWidenedConstructors[name] != "" {
 			continue
 		}
 		missing = append(missing, name)
@@ -1117,12 +1136,40 @@ type pgSyntax struct {
 // counts.
 func loadPgSyntax(t *testing.T) *pgSyntax {
 	t.Helper()
+	return loadPgSyntaxWith(t)
+}
+
+// loadPgSyntaxWith is loadPgSyntax over the package source PLUS the
+// synthetic sources in extra, each the text of one additional file of
+// package pg.
+//
+// It exists so that a check can be pointed at a package that contains
+// the shape it is supposed to refuse. A check nobody has ever seen fail
+// is a check nobody has tested, and every bypass closed in this round
+// was found by someone writing the bypass rather than by reading the
+// checker: see pg/scopecheckself_test.go, which rebuilds each one and
+// requires the check to name it.
+func loadPgSyntaxWith(t *testing.T, extra ...string) *pgSyntax {
+	t.Helper()
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
 		return !strings.HasSuffix(fi.Name(), "_test.go")
 	}, 0)
 	if err != nil {
 		t.Fatalf("parse package: %v", err)
+	}
+	var files []*ast.File
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			files = append(files, f)
+		}
+	}
+	for i, src := range extra {
+		f, err := parser.ParseFile(fset, fmt.Sprintf("synthetic%d.go", i), src, 0)
+		if err != nil {
+			t.Fatalf("parse synthetic source %d: %v", i, err)
+		}
+		files = append(files, f)
 	}
 	p := &pgSyntax{
 		fset:    fset,
@@ -1132,8 +1179,8 @@ func loadPgSyntax(t *testing.T) *pgSyntax {
 		methods: map[string]map[string]*ast.FuncDecl{},
 		bearing: map[string]bool{},
 	}
-	for _, pkg := range pkgs {
-		for _, f := range pkg.Files {
+	{
+		for _, f := range files {
 			for _, d := range f.Decls {
 				if fn, ok := d.(*ast.FuncDecl); ok {
 					if fn.Recv == nil {
@@ -1186,25 +1233,12 @@ func loadPgSyntax(t *testing.T) *pgSyntax {
 				p.bearing[name], changed = true, true
 			}
 		}
-		for name, it := range p.ifaces {
-			if p.bearing[name] || it.Methods == nil {
+		for name := range p.ifaces {
+			if p.bearing[name] {
 				continue
 			}
-			var want []string
-			for _, m := range it.Methods.List {
-				for _, n := range m.Names {
-					want = append(want, n.Name)
-				}
-			}
-			if len(want) == 0 {
-				continue
-			}
-			for impl := range p.structs {
-				if !p.bearing[impl] || !hasAllMethods(p.methods[impl], want) {
-					continue
-				}
+			if p.interfaceHolds(name, p.bearing) {
 				p.bearing[name], changed = true, true
-				break
 			}
 		}
 		if !changed {
@@ -1220,6 +1254,70 @@ func hasAllMethods(have map[string]*ast.FuncDecl, want []string) bool {
 		}
 	}
 	return true
+}
+
+// interfaceHolds reports whether a field declared with this local
+// interface type can hold an expression a caller supplied, given the
+// set of package types that already can.
+//
+// It answers by what the interface DEMANDS, and the three answers are
+// three different reasons — which is the point, because the version
+// that only knew the third had a hole a caller could walk through:
+//
+//   - an interface that embeds drops.Expression holds one by
+//     definition. This is the bypass that was open. The check asked
+//     only "which bearing struct in this package implements it?", and
+//     for `type holder interface{ drops.Expression }` the answer was
+//     "none of them, it declares no methods of its own" — so a field
+//     typed holder was read as holding nothing, and everything the
+//     round-6 and round-7 checks say about expression-bearing fields
+//     stopped applying to it. An interface is a promise about what a
+//     value can do, and this one promises exactly the thing the
+//     resolver walks.
+//   - an interface that demands nothing at all — `any`, or one that
+//     embeds only interfaces from other packages — holds anything,
+//     including a statement.
+//   - otherwise it holds one when some bearing type in the package
+//     satisfies its own methods, which is how ColumnValue qualifies:
+//     exprBinding holds a drops.Expression and implements it.
+//
+// The first two are fail-closed answers: an interface whose method set
+// a caller's expression can satisfy is treated as holding one, because
+// being wrong in that direction costs a check that asks for scoping
+// where none was needed, and being wrong the other way costs a
+// statement nobody walked.
+func (p *pgSyntax) interfaceHolds(name string, bearing map[string]bool) bool {
+	it := p.ifaces[name]
+	if it == nil {
+		return false
+	}
+	if it.Methods == nil || len(it.Methods.List) == 0 {
+		return true
+	}
+	var own []string
+	for _, m := range it.Methods.List {
+		if len(m.Names) == 0 {
+			if isExpressionType(m.Type) {
+				return true
+			}
+			if e := typeName(m.Type); e != "" && p.ifaces[e] != nil && p.interfaceHolds(e, bearing) {
+				return true
+			}
+			continue
+		}
+		for _, n := range m.Names {
+			own = append(own, n.Name)
+		}
+	}
+	if len(own) == 0 {
+		return true
+	}
+	for impl := range bearing {
+		if bearing[impl] && p.methods[impl] != nil && hasAllMethods(p.methods[impl], own) {
+			return true
+		}
+	}
+	return false
 }
 
 // bearsExpression reports whether a value of type e can carry an
@@ -1274,6 +1372,20 @@ func typeName(e ast.Expr) string {
 // cp.distinctOn without ever looking at s.distinctOn has not resolved
 // anything, and a check that accepted the assignment would have passed
 // on the day the leak was written.
+//
+// The closure also follows the receiver into PACKAGE-LEVEL functions
+// that are handed it, and that is not a refinement. While it followed
+// methods only, a renderer that delegated —
+//
+//	func (s *SelectBuilder) WriteSQL(b *drops.Builder) { writeDistinct(b, s) }
+//
+// — read no field at all as far as this walk was concerned, so every
+// field writeDistinct rendered was invisible to
+// TestNoRenderedExpressionListIsInvisibleToTheResolver and to the
+// candidate walk in TestEveryStatementBearingExpressionIsReachableByTheResolver.
+// Extracting a helper is an ordinary edit, and it must not be able to
+// take a field out of the checks' sight; the rebuilt bypass is in
+// pg/scopecheckself_test.go.
 func (p *pgSyntax) fieldsRead(recv string, seeds ...string) map[string]bool {
 	st := p.structs[recv]
 	if st == nil {
@@ -1285,39 +1397,132 @@ func (p *pgSyntax) fieldsRead(recv string, seeds ...string) map[string]bool {
 			fields[n.Name] = true
 		}
 	}
-	read, seen := map[string]bool{}, map[string]bool{}
-	queue := append([]string(nil), seeds...)
+	var sites []walkSite
+	for _, s := range seeds {
+		sites = append(sites, walkSite{fn: p.methods[recv][s]})
+	}
+	return p.fieldsReadAt(recv, fields, sites)
+}
+
+// fieldsReadAt is fieldsRead over walk sites rather than method names,
+// so a caller can seed the walk with a package-level function that
+// renders the type without being a method of it.
+func (p *pgSyntax) fieldsReadAt(recv string, fields map[string]bool, sites []walkSite) map[string]bool {
+	read := map[string]bool{}
+	queue := append([]walkSite(nil), sites...)
+	seen := map[string]bool{}
 	for len(queue) > 0 {
-		name := queue[0]
+		site := queue[0]
 		queue = queue[1:]
-		if seen[name] {
+		fn := site.fn
+		if fn == nil {
 			continue
 		}
-		seen[name] = true
-		fn := p.methods[recv][name]
-		if fn == nil || len(fn.Recv.List[0].Names) == 0 {
+		self := site.self
+		if self == "" {
+			if fn.Recv == nil || len(fn.Recv.List[0].Names) == 0 {
+				continue
+			}
+			self = fn.Recv.List[0].Names[0].Name
+		}
+		key := funcKey(fn) + "/" + self
+		if seen[key] {
 			continue
 		}
-		self := fn.Recv.List[0].Names[0].Name
+		seen[key] = true
 		ast.Inspect(fn, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			base, ok := sel.X.(*ast.Ident)
-			if !ok || base.Name != self {
-				return true
-			}
-			if fields[sel.Sel.Name] {
-				read[sel.Sel.Name] = true
-			}
-			if p.methods[recv][sel.Sel.Name] != nil {
-				queue = append(queue, sel.Sel.Name)
+			switch v := n.(type) {
+			case *ast.SelectorExpr:
+				base, ok := v.X.(*ast.Ident)
+				if !ok || base.Name != self {
+					return true
+				}
+				if fields[v.Sel.Name] {
+					read[v.Sel.Name] = true
+				}
+				if m := p.methods[recv][v.Sel.Name]; m != nil {
+					queue = append(queue, walkSite{fn: m})
+				}
+			case *ast.CallExpr:
+				for _, site := range p.helperSites(v, self) {
+					queue = append(queue, site)
+				}
 			}
 			return true
 		})
 	}
 	return read
+}
+
+// walkSite is one function to walk, and the name the value being walked
+// goes by inside it — the receiver's own name in a method, and the
+// parameter it arrived as in a package-level helper.
+type walkSite struct {
+	fn   *ast.FuncDecl
+	self string
+}
+
+// funcKey names a declaration for the visited set: a package-level
+// function by its name, a method by receiver and name.
+func funcKey(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return fn.Name.Name
+	}
+	return typeName(fn.Recv.List[0].Type) + "." + fn.Name.Name
+}
+
+// helperSites returns the package-level functions this call hands the
+// value named self to, each paired with the parameter name it arrives
+// under. That is what lets the walks above follow a renderer or a
+// resolver that delegates to a free function.
+func (p *pgSyntax) helperSites(call *ast.CallExpr, self string) []walkSite {
+	id, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	var fn *ast.FuncDecl
+	for _, f := range p.funcs {
+		if f.Name.Name == id.Name {
+			fn = f
+			break
+		}
+	}
+	if fn == nil || fn.Type.Params == nil {
+		return nil
+	}
+	var out []walkSite
+	for i, a := range call.Args {
+		arg, ok := a.(*ast.Ident)
+		if !ok || arg.Name != self {
+			continue
+		}
+		if name := paramNameAt(fn.Type.Params, i); name != "" && name != "_" {
+			out = append(out, walkSite{fn: fn, self: name})
+		}
+	}
+	return out
+}
+
+// paramNameAt returns the name of the i'th parameter of a signature,
+// counting grouped declarations (a, b int) as the two they are.
+func paramNameAt(fl *ast.FieldList, i int) string {
+	pos := 0
+	for _, f := range fl.List {
+		if len(f.Names) == 0 {
+			if pos == i {
+				return ""
+			}
+			pos++
+			continue
+		}
+		for _, n := range f.Names {
+			if pos == i {
+				return n.Name
+			}
+			pos++
+		}
+	}
+	return ""
 }
 
 // fieldsResolved returns the fields of the receiver type that the
@@ -1363,22 +1568,41 @@ func (p *pgSyntax) fieldsResolved(recv string, seeds ...string) map[string]bool 
 	}
 
 	resolved, seen := map[string]bool{}, map[string]bool{}
-	queue := append([]string(nil), seeds...)
+	var queue []walkSite
+	for _, s := range seeds {
+		queue = append(queue, walkSite{fn: p.methods[recv][s]})
+	}
 	for len(queue) > 0 {
-		name := queue[0]
+		site := queue[0]
 		queue = queue[1:]
-		if seen[name] {
+		fn := site.fn
+		if fn == nil || fn.Type.Params == nil {
 			continue
 		}
-		seen[name] = true
-		fn := p.methods[recv][name]
-		if fn == nil || len(fn.Recv.List[0].Names) == 0 {
+		self := site.self
+		if self == "" {
+			if fn.Recv == nil || len(fn.Recv.List[0].Names) == 0 {
+				continue
+			}
+			self = fn.Recv.List[0].Names[0].Name
+		}
+		if seen[funcKey(fn)+"/"+self] {
 			continue
 		}
-		self := fn.Recv.List[0].Names[0].Name
+		seen[funcKey(fn)+"/"+self] = true
 		for _, called := range p.methodsCalledOn(fn, self, recv) {
-			queue = append(queue, called)
+			queue = append(queue, walkSite{fn: p.methods[recv][called]})
 		}
+		// The receiver handed whole to a package-level helper is walked
+		// there, under the name it arrives as: a resolver that delegates
+		// to a free function resolves exactly as much as one that
+		// delegates to a method of its own.
+		ast.Inspect(fn, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				queue = append(queue, p.helperSites(call, self)...)
+			}
+			return true
+		})
 
 		ctxName := ""
 		for _, param := range fn.Type.Params.List {
@@ -1514,20 +1738,98 @@ func mentionsIdent(n ast.Node, name string) bool {
 	return found
 }
 
-// statementBuilders are the four builders this invariant is about, with
-// the method each one renders through. Every one of them renders from
-// WriteSQL and resolves in resolveCtx; the pair is spelled out rather
-// than assumed so a fifth builder cannot be added without saying which
-// of its methods is which.
-var statementBuilders = []struct {
+// statementBuilder is one type this invariant is about: the methods it
+// renders through, and the methods the resolver enters it by.
+type statementBuilder struct {
 	name    string
-	render  string
-	resolve string
-}{
-	{"SelectBuilder", "WriteSQL", "resolveCtx"},
-	{"UpdateBuilder", "WriteSQL", "resolveCtx"},
-	{"DeleteBuilder", "WriteSQL", "resolveCtx"},
-	{"InsertBuilder", "WriteSQL", "resolveCtx"},
+	render  []string
+	resolve []string
+}
+
+// statementBuilders derives the types the invariant covers, and the
+// derivation is the point rather than a tidy-up.
+//
+// It used to be four names in a slice literal — inside the check whose
+// entire purpose is ending lists of names. A fifth builder would have
+// been checked on the day someone remembered to add a line, which is
+// the same promise resolveExpr's type switch made before round 7 broke
+// it, and the same promise resolveCTEs made before round 6 broke it.
+//
+// So the list is computed from the one place that already decides what
+// a statement is: resolveExpr's own type switch. Every arm of it that
+// hands back a resolved expression is an interface; a package type
+// implementing one of those arms is a type the resolver can enter, and
+// the arm's expression-answering methods are HOW it enters — which
+// makes them the resolve seeds. The render seeds are every method that
+// takes a *drops.Builder, because that is what rendering is.
+//
+// Nothing here names SelectBuilder, WriteSQL or resolveCtx. Add a fifth
+// builder and it is covered before it has a test of its own; that
+// claim is not left to trust, and pg/scopecheckself_test.go adds one to
+// a synthetic package and requires this check to catch its unwalked
+// field.
+func statementBuilders(t *testing.T, p *pgSyntax) []statementBuilder {
+	t.Helper()
+	arms := resolverArms(t, p)
+	var out []statementBuilder
+	for _, name := range sortedKeys(p.structs) {
+		var resolve []string
+		for _, arm := range sortedKeys(arms) {
+			if hasAllMethods(p.methods[name], arms[arm]) {
+				resolve = append(resolve, p.expressionAnsweringMethods(arm)...)
+			}
+		}
+		if len(resolve) == 0 {
+			continue
+		}
+		var render []string
+		for m, fn := range p.methods[name] {
+			if takesBuilder(fn.Type) {
+				render = append(render, m)
+			}
+		}
+		if len(render) == 0 {
+			continue
+		}
+		sort.Strings(render)
+		sort.Strings(resolve)
+		out = append(out, statementBuilder{name: name, render: render, resolve: resolve})
+	}
+	return out
+}
+
+// expressionAnsweringMethods returns the methods of an interface — its
+// own and those of the local interfaces it embeds — that hand back a
+// drops.Expression. Those are the methods through which the resolver
+// gets a resolved value back, as opposed to the ones through which it
+// merely asks a question.
+func (p *pgSyntax) expressionAnsweringMethods(name string) []string {
+	it := p.ifaces[name]
+	if it == nil || it.Methods == nil {
+		return nil
+	}
+	var out []string
+	for _, m := range it.Methods.List {
+		if len(m.Names) == 0 {
+			if e := typeName(m.Type); e != "" && p.ifaces[e] != nil {
+				out = append(out, p.expressionAnsweringMethods(e)...)
+			}
+			continue
+		}
+		ft, ok := m.Type.(*ast.FuncType)
+		if !ok || ft.Results == nil {
+			continue
+		}
+		for _, r := range ft.Results.List {
+			if isExpressionType(elementType(r.Type)) {
+				for _, n := range m.Names {
+					out = append(out, n.Name)
+				}
+				break
+			}
+		}
+	}
+	return out
 }
 
 // resolverOwnedFields names the expression-bearing builder fields the
@@ -1569,25 +1871,43 @@ var resolverOwnedFields = map[string]string{
 // into a call that holds the ctx (fieldsResolved), because a call
 // without a ctx cannot resolve anything against one.
 func TestNoRenderedExpressionListIsInvisibleToTheResolver(t *testing.T) {
-	p := loadPgSyntax(t)
+	for _, problem := range invisibleExpressionListProblems(t, loadPgSyntax(t)) {
+		t.Error(problem)
+	}
+}
+
+// invisibleExpressionListProblems is the check body, returning what it
+// found rather than reporting it, so the same code can be pointed at a
+// synthetic package that contains the defect — see
+// pg/scopecheckself_test.go. A check that has never been seen to fail
+// is a check nobody has tested.
+func invisibleExpressionListProblems(t *testing.T, p *pgSyntax) []string {
+	t.Helper()
+	var problems []string
 	rendered := map[string]bool{}
 
-	for _, b := range statementBuilders {
+	builders := statementBuilders(t, p)
+	if len(builders) == 0 {
+		t.Fatalf("no type in this package implements an arm of resolveExpr and renders — the derivation has gone stale")
+	}
+	// The walks have to be doing something. Asked of each builder these
+	// would fail for an honest type that holds no expressions at all,
+	// so they are asked of the derived set as a whole: if no builder
+	// anywhere reads a field, or none hands one to the ctx, the closure
+	// walk or the taint walk has gone stale and every verdict below is
+	// vacuous.
+	anyRead, anyResolved := false, false
+	for _, b := range builders {
 		st := p.structs[b.name]
-		if st == nil {
-			t.Fatalf("%s is not a struct in this package — the check has gone stale", b.name)
+		renders := p.fieldsRead(b.name, b.render...)
+		resolves := p.fieldsRead(b.name, b.resolve...)
+		resolved := p.fieldsResolved(b.name, b.resolve...)
+		if len(renders) == 0 {
+			problems = append(problems, fmt.Sprintf("%s: %v reads no field at all — a renderer that reads nothing renders nothing", b.name, b.render))
+			continue
 		}
-		renders := p.fieldsRead(b.name, b.render)
-		resolves := p.fieldsRead(b.name, b.resolve)
-		resolved := p.fieldsResolved(b.name, b.resolve)
-		if len(renders) == 0 || len(resolves) == 0 {
-			t.Fatalf("%s: %s or %s reads no field at all — the closure walk has gone stale",
-				b.name, b.render, b.resolve)
-		}
-		if len(resolved) == 0 {
-			t.Fatalf("%s: %s hands no field to the ctx at all — the taint walk has gone stale",
-				b.name, b.resolve)
-		}
+		anyRead = anyRead || len(resolves) > 0
+		anyResolved = anyResolved || len(resolved) > 0
 		for _, f := range st.Fields.List {
 			if !p.bearsExpression(f.Type) {
 				continue
@@ -1599,16 +1919,23 @@ func TestNoRenderedExpressionListIsInvisibleToTheResolver(t *testing.T) {
 				}
 				rendered[key] = true
 				if resolves[n.Name] && !resolved[n.Name] && resolverOwnedFields[key] == "" {
-					t.Errorf("%s: %s: %s reads it but never hands it to the ctx — a field the resolver only LOOKS at is a field the renderer alone walks",
-						p.fset.Position(n.Pos()), key, b.resolve)
+					problems = append(problems, fmt.Sprintf("%s: %s: %v reads it but never hands it to the ctx — a field the resolver only LOOKS at is a field the renderer alone walks",
+						p.fset.Position(n.Pos()), key, b.resolve))
 				}
 				if resolves[n.Name] || resolverOwnedFields[key] != "" {
 					continue
 				}
-				t.Errorf("%s: %s: %s renders it and %s never reads it — a statement written there is invisible to the resolver",
-					p.fset.Position(n.Pos()), key, b.render, b.resolve)
+				problems = append(problems, fmt.Sprintf("%s: %s: %v renders it and %v never reads it — a statement written there is invisible to the resolver",
+					p.fset.Position(n.Pos()), key, b.render, b.resolve))
 			}
 		}
+	}
+
+	if !anyRead {
+		t.Fatalf("no builder's resolve closure reads a field at all — the closure walk has gone stale")
+	}
+	if !anyResolved {
+		t.Fatalf("no builder's resolve closure hands a field to the ctx at all — the taint walk has gone stale")
 	}
 
 	// The other direction: an exemption naming a field that is no
@@ -1616,9 +1943,11 @@ func TestNoRenderedExpressionListIsInvisibleToTheResolver(t *testing.T) {
 	// exists, is a reason that has stopped being true.
 	for key := range resolverOwnedFields {
 		if !rendered[key] {
-			t.Errorf("exempt field %q is no longer a rendered expression-bearing field — drop the exemption", key)
+			problems = append(problems, fmt.Sprintf("exempt field %q is no longer a rendered expression-bearing field — drop the exemption", key))
 		}
 	}
+	sort.Strings(problems)
+	return problems
 }
 
 // ----------------------------------------------------------------------
@@ -1821,16 +2150,52 @@ func TestEveryBuilderOperandMethodIsCensused(t *testing.T) {
 	}
 }
 
-// operandReceivers are the types whose exported methods put a caller's
-// operand into one of the four statements: the builders themselves and
-// the ON CONFLICT handle, which writes into the InsertBuilder's
-// conflict clause on its behalf.
-var operandReceivers = map[string]bool{
-	"SelectBuilder":  true,
-	"UpdateBuilder":  true,
-	"DeleteBuilder":  true,
-	"InsertBuilder":  true,
-	"ConflictUpdate": true,
+// operandReceivers derives the types whose exported methods put a
+// caller's operand into a statement: the statement builders, and the
+// handles they hand out that write into the statement on their behalf —
+// ConflictUpdate is one, and it holds the *InsertBuilder it is
+// configuring, which is what "on its behalf" looks like from the
+// source.
+//
+// It was five names in a map, which is the smell this round went
+// looking for: a list a check knows and could have computed. Nothing
+// here names a builder, so a fifth one, and the handle IT hands out,
+// are censused on the day they are written.
+func operandReceivers(t *testing.T, p *pgSyntax) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	for _, b := range statementBuilders(t, p) {
+		out[b.name] = true
+	}
+	for {
+		changed := false
+		for recv := range out {
+			for _, fn := range p.methods[recv] {
+				if fn.Type.Results == nil {
+					continue
+				}
+				for _, r := range fn.Type.Results.List {
+					tn := typeName(r.Type)
+					if tn == "" || out[tn] || p.structs[tn] == nil || !p.bearing[tn] {
+						continue
+					}
+					// A handle that writes into the statement holds the
+					// builder it is writing into. A method that merely
+					// answers with a *Table or a *Column hands back
+					// scenery, not a way into this statement.
+					for _, f := range p.structs[tn].Fields.List {
+						if out[typeName(f.Type)] {
+							out[tn], changed = true, true
+							break
+						}
+					}
+				}
+			}
+		}
+		if !changed {
+			return out
+		}
+	}
 }
 
 // censusBuilderOperandMethods returns the exported methods of those
@@ -1839,10 +2204,11 @@ var operandReceivers = map[string]bool{
 func censusBuilderOperandMethods(t *testing.T) []string {
 	t.Helper()
 	p := loadPgSyntax(t)
+	receivers := operandReceivers(t, p)
 	seen := map[string]bool{}
 	var out []string
 	for recv, ms := range p.methods {
-		if !operandReceivers[recv] {
+		if !receivers[recv] {
 			continue
 		}
 		for name, fn := range ms {
@@ -2011,7 +2377,7 @@ func TestEveryWidenedOperandConstructorIsCensused(t *testing.T) {
 	census := censusWidenedOperandConstructors(t)
 	var missing []string
 	for _, name := range census {
-		if covered[name] || exemptConstructors[name] != "" {
+		if covered[name] || exemptConstructors[name] != "" || exemptWidenedConstructors[name] != "" {
 			continue
 		}
 		missing = append(missing, name)
@@ -2035,6 +2401,14 @@ func TestEveryWidenedOperandConstructorIsCensused(t *testing.T) {
 			t.Errorf("exempt constructor %q no longer takes an operand — drop the exemption", name)
 		}
 	}
+	for name, reason := range exemptWidenedConstructors {
+		if reason == "" {
+			t.Errorf("exempt constructor %q carries no reason — an exemption without one is a leak with a name", name)
+		}
+		if !present[name] {
+			t.Errorf("exempt constructor %q no longer takes an operand — drop the exemption", name)
+		}
+	}
 }
 
 // censusWidenedOperandConstructors returns the exported package-level
@@ -2043,12 +2417,13 @@ func TestEveryWidenedOperandConstructorIsCensused(t *testing.T) {
 func censusWidenedOperandConstructors(t *testing.T) []string {
 	t.Helper()
 	p := loadPgSyntax(t)
+	rendered := renderedResultTypes(t, p)
 	var out []string
 	for _, fn := range p.funcs {
 		if !fn.Name.IsExported() || fn.Type.Results == nil {
 			continue
 		}
-		if !takesWideOperand(fn.Type.Params) || !returnsRendered(fn.Type.Results) {
+		if !takesWideOperand(fn.Type.Params) || !returnsRendered(rendered, fn.Type.Results) {
 			continue
 		}
 		out = append(out, fn.Name.Name)
@@ -2069,18 +2444,50 @@ func takesWideOperand(fl *ast.FieldList) bool {
 	return false
 }
 
-// renderedResultTypes are the package's own types that a statement
+// renderedResultTypes derives the package's own types that a statement
 // renders but that are not drops.Expression: a constructor returning
 // one of these is holding a caller's expression on the way into a
 // statement, exactly as an expression constructor is.
-var renderedResultTypes = map[string]bool{
-	"CTE":            true,
-	"SelectBuilder":  true,
-	"UpdateBuilder":  true,
-	"DeleteBuilder":  true,
-	"InsertBuilder":  true,
-	"ConflictUpdate": true,
-	"ColumnValue":    true,
+//
+// Seven names in a map is how this started, and each of the three ways
+// a type qualifies was one of the names somebody remembered:
+//
+//   - it renders itself — it has a render site, its own method or a
+//     package-level helper handed a *drops.Builder;
+//   - a renderer reads it out of a field, which is how CTE and
+//     ColumnValue arrive;
+//   - it is a handle a builder hands out to write into the statement,
+//     which is ConflictUpdate.
+//
+// Computed, it is a superset of the list it replaces, so the census
+// around it got wider rather than narrower.
+func renderedResultTypes(t *testing.T, p *pgSyntax) map[string]bool {
+	out := operandReceivers(t, p)
+	for name, st := range p.structs {
+		sites := p.renderSites(name)
+		if len(sites) == 0 {
+			continue
+		}
+		out[name] = true
+		fields := map[string]bool{}
+		fieldType := map[string]string{}
+		for _, f := range st.Fields.List {
+			for _, n := range f.Names {
+				fields[n.Name] = true
+				fieldType[n.Name] = typeName(f.Type)
+			}
+		}
+		for f := range p.fieldsReadAt(name, fields, sites) {
+			tn := fieldType[f]
+			if tn == "" {
+				continue
+			}
+			if p.structs[tn] != nil || p.ifaces[tn] != nil || p.aliases[tn] != nil {
+				out[tn] = true
+			}
+		}
+	}
+	return out
 }
 
 // returnsRendered reports whether any result is rendered into a
@@ -2089,12 +2496,12 @@ var renderedResultTypes = map[string]bool{
 // that answers a bare expression, and the round-5 rule — exactly one
 // result, and that result an expression — would have let the first one
 // past without a word.
-func returnsRendered(fl *ast.FieldList) bool {
+func returnsRendered(rendered map[string]bool, fl *ast.FieldList) bool {
 	if fl == nil {
 		return false
 	}
 	for _, f := range fl.List {
-		if isExpressionType(f.Type) || renderedResultTypes[typeName(f.Type)] {
+		if isExpressionType(f.Type) || rendered[typeName(f.Type)] {
 			return true
 		}
 	}

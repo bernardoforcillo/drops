@@ -1,9 +1,9 @@
 package pg_test
 
 import (
+	"fmt"
 	"go/ast"
 	"sort"
-	"strings"
 	"testing"
 )
 
@@ -42,7 +42,19 @@ import (
 //   - TestNoResolutionEntryPointNamesAStatementType requires every
 //     resolution path to reach those types through resolveExpr rather
 //     than through a type assertion of its own, which is what keeps the
-//     first test's answer true everywhere.
+//     first test's answer true everywhere;
+//   - TestNoPartialCopyOfTheResolversArms is the round-8 addition, and
+//     it found a live one. Dispatching on interfaces is not enough if
+//     something else asks the same question in advance with a shorter
+//     list: a fast path that admitted two of resolveExpr's three arms
+//     skipped the walk entirely for the third, which is the arm that
+//     keeps a foreign statement fail-closed.
+//
+// What a resolution path IS, is derived as well. It used to be a name
+// prefix — resolve*, plus two names spelled out — so a resolver called
+// anything else was invisible to the second check. It is now "has the
+// ctx in its hands, or is handed the expression by something that
+// does", which is a property of the function rather than of its name.
 //
 // Both are checked in both directions, so a stale exemption fails as
 // loudly as a missing one — the pattern round 5 established.
@@ -61,22 +73,42 @@ var resolverExemptions = map[string]string{
 // second one was written.
 func TestEveryStatementBearingExpressionIsReachableByTheResolver(t *testing.T) {
 	p := loadPgSyntax(t)
-	arms := resolverArms(t, p)
-	renders := p.typesRenderingCallerExpressions()
-
-	candidates := map[string]bool{}
-	for name := range renders {
-		if p.methods[name]["WriteSQL"] == nil {
-			// Not a drops.Expression: it is reached as part of one, and
-			// whatever holds it is the candidate.
-			continue
-		}
-		candidates[name] = true
-	}
+	candidates := p.expressionRenderingStatementTypes()
 	if !candidates["SelectBuilder"] || !candidates["opExpr"] {
 		t.Fatalf("the candidate walk no longer finds SelectBuilder and opExpr — it has gone stale; found %v",
 			sortedKeys(candidates))
 	}
+	for _, problem := range unreachableRenderingTypeProblems(t, p) {
+		t.Error(problem)
+	}
+}
+
+// expressionRenderingStatementTypes returns the package types that
+// render an expression a caller supplied AND are expressions
+// themselves, so that a statement written into one is reached — or is
+// not — through resolveExpr. A type that renders one without being one
+// is reached as part of whatever holds it, and that holder is the
+// candidate.
+func (p *pgSyntax) expressionRenderingStatementTypes() map[string]bool {
+	candidates := map[string]bool{}
+	for name := range p.typesRenderingCallerExpressions() {
+		if p.methods[name]["WriteSQL"] == nil {
+			continue
+		}
+		candidates[name] = true
+	}
+	return candidates
+}
+
+// unreachableRenderingTypeProblems is the check body, returning what it
+// found rather than reporting it, so the same code can be pointed at a
+// synthetic package built to slip past it — see
+// pg/scopecheckself_test.go.
+func unreachableRenderingTypeProblems(t *testing.T, p *pgSyntax) []string {
+	t.Helper()
+	arms := resolverArms(t, p)
+	candidates := p.expressionRenderingStatementTypes()
+	var problems []string
 
 	for _, name := range sortedKeys(candidates) {
 		if reason := resolverExemptions[name]; reason != "" {
@@ -85,26 +117,29 @@ func TestEveryStatementBearingExpressionIsReachableByTheResolver(t *testing.T) {
 		if armFor(arms, p.methods[name]) != "" {
 			continue
 		}
-		t.Errorf("%s renders an expression a caller supplied and implements none of resolveExpr's arms (%v): a statement written into it renders unresolved and is sent",
-			name, sortedKeys(arms))
+		problems = append(problems, fmt.Sprintf("%s renders an expression a caller supplied and implements none of resolveExpr's arms (%v): a statement written into it renders unresolved and is sent",
+			name, sortedKeys(arms)))
 	}
 
 	// The other direction: an exemption for a type that no longer
 	// renders a caller's expression, no longer exists, or has since
 	// become reachable, is a reason that has stopped being true.
-	for name, reason := range resolverExemptions {
+	for _, name := range sortedKeys(resolverExemptions) {
+		reason := resolverExemptions[name]
 		if reason == "" {
-			t.Errorf("exempt type %q carries no reason — an exemption without one is a leak with a name", name)
+			problems = append(problems, fmt.Sprintf("exempt type %q carries no reason — an exemption without one is a leak with a name", name))
 		}
 		if !candidates[name] {
-			t.Errorf("exempt type %q no longer renders a caller's expression — drop the exemption", name)
+			problems = append(problems, fmt.Sprintf("exempt type %q no longer renders a caller's expression — drop the exemption", name))
 			continue
 		}
 		if arm := armFor(arms, p.methods[name]); arm != "" {
-			t.Errorf("exempt type %q implements %s and so IS reachable — drop the exemption or the method",
-				name, arm)
+			problems = append(problems, fmt.Sprintf("exempt type %q implements %s and so IS reachable — drop the exemption or the method",
+				name, arm))
 		}
 	}
+	sort.Strings(problems)
+	return problems
 }
 
 // armFor returns the name of the resolveExpr arm a type with these
@@ -260,17 +295,17 @@ func (p *pgSyntax) typesRenderingCallerExpressions() map[string]bool {
 	renderRead := map[string]map[string]bool{}
 	fieldTypes := map[string]map[string]ast.Expr{}
 	for name, st := range p.structs {
-		var seeds []string
-		for m, fn := range p.methods[name] {
-			if takesBuilder(fn.Type) {
-				seeds = append(seeds, m)
-			}
-		}
-		if len(seeds) == 0 {
+		sites := p.renderSites(name)
+		if len(sites) == 0 {
 			continue
 		}
-		sort.Strings(seeds)
-		renderRead[name] = p.fieldsRead(name, seeds...)
+		fields := map[string]bool{}
+		for _, f := range st.Fields.List {
+			for _, n := range f.Names {
+				fields[n.Name] = true
+			}
+		}
+		renderRead[name] = p.fieldsReadAt(name, fields, sites)
 		fieldTypes[name] = map[string]ast.Expr{}
 		for _, f := range st.Fields.List {
 			for _, n := range f.Names {
@@ -279,6 +314,18 @@ func (p *pgSyntax) typesRenderingCallerExpressions() map[string]bool {
 		}
 	}
 
+	// holds asks whether a field of this type can carry a caller's
+	// expression. The interface case goes through interfaceHolds, and
+	// that is the closure of a bypass someone built: this used to ask
+	// only "which rendering struct implements it?", so a field declared
+	//
+	//	type attackHolder interface{ drops.Expression }
+	//
+	// held nothing as far as the check was concerned — the interface
+	// declares no methods of ITS OWN, so the implementor search had
+	// nothing to search for — and the type holding it was not a
+	// candidate for the resolver to be able to enter. An interface that
+	// embeds drops.Expression holds exactly what the resolver walks.
 	holds := func(e ast.Expr) bool {
 		if isExpressionType(elementType(e)) {
 			return true
@@ -290,18 +337,7 @@ func (p *pgSyntax) typesRenderingCallerExpressions() map[string]bool {
 		if renders[name] {
 			return true
 		}
-		if it := p.ifaces[name]; it != nil {
-			want := p.interfaceMethods(name)
-			if len(want) == 0 {
-				return false
-			}
-			for impl := range renders {
-				if hasAllMethods(p.methods[impl], want) {
-					return true
-				}
-			}
-		}
-		return false
+		return p.interfaceHolds(name, renders)
 	}
 
 	for {
@@ -321,6 +357,39 @@ func (p *pgSyntax) typesRenderingCallerExpressions() map[string]bool {
 			return renders
 		}
 	}
+}
+
+// renderSites returns everywhere a value of this type is rendered: its
+// own methods that take a *drops.Builder, and the package-level
+// functions that take one along with the value itself.
+//
+// The second half is the closure of the second bypass. The checks
+// looked at methods, so a type whose rendering lived in a free function
+//
+//	func writeAttack(b *drops.Builder, a *attackNode) { a.inner.WriteSQL(b) }
+//
+// rendered a caller's expression that no check could see it render.
+// Where the rendering lives is an implementation detail; whether the
+// resolver can reach what it renders is not.
+func (p *pgSyntax) renderSites(name string) []walkSite {
+	var sites []walkSite
+	for _, m := range sortedKeys(p.methods[name]) {
+		if takesBuilder(p.methods[name][m].Type) {
+			sites = append(sites, walkSite{fn: p.methods[name][m]})
+		}
+	}
+	for _, fn := range p.funcs {
+		if fn.Type.Params == nil || !takesBuilder(fn.Type) {
+			continue
+		}
+		for _, param := range fn.Type.Params.List {
+			if typeName(param.Type) != name || len(param.Names) == 0 {
+				continue
+			}
+			sites = append(sites, walkSite{fn: fn, self: param.Names[0].Name})
+		}
+	}
+	return sites
 }
 
 // takesBuilder reports whether ft takes a *drops.Builder — which is
@@ -366,27 +435,26 @@ func takesBuilder(ft *ast.FuncType) bool {
 // whole point.
 func TestNoResolutionEntryPointNamesAStatementType(t *testing.T) {
 	p := loadPgSyntax(t)
-	renders := p.typesRenderingCallerExpressions()
-
-	entryPoints := map[string]*ast.FuncDecl{}
-	for _, fn := range p.funcs {
-		if isResolutionEntryPoint(fn.Name.Name) {
-			entryPoints[fn.Name.Name] = fn
-		}
-	}
-	for recv, ms := range p.methods {
-		for name, fn := range ms {
-			if isResolutionEntryPoint(name) {
-				entryPoints[recv+"."+name] = fn
-			}
-		}
-	}
+	entryPoints := p.ctxReachingFuncs()
 	for _, want := range []string{"resolveExpr", "resolveExprs", "resolveCTEs", "resolveSets", "renderForCtx", "SelectBuilder.resolveCtx"} {
 		if entryPoints[want] == nil {
 			t.Fatalf("%s is no longer a resolution entry point — this check has gone stale", want)
 		}
 	}
 
+	for _, problem := range namedStatementTypeProblems(p) {
+		t.Error(problem)
+	}
+}
+
+// namedStatementTypeProblems is the check body, returning what it found
+// rather than reporting it, so the same code can be pointed at a
+// synthetic package that hides the assertion where the old discovery
+// could not see it — see pg/scopecheckself_test.go.
+func namedStatementTypeProblems(p *pgSyntax) []string {
+	renders := p.typesRenderingCallerExpressions()
+	entryPoints := p.ctxReachingFuncs()
+	var problems []string
 	for _, name := range sortedKeys(entryPoints) {
 		fn := entryPoints[name]
 		ast.Inspect(fn, func(n ast.Node) bool {
@@ -404,21 +472,274 @@ func TestNoResolutionEntryPointNamesAStatementType(t *testing.T) {
 				if tn == "" || !renders[tn] || p.ifaces[tn] != nil {
 					continue
 				}
-				t.Errorf("%s: %s type-asserts %s by name — dispatch on what the value can do, the way resolveExpr does; a named type here is a second copy of the resolver's list and stale from today",
-					p.fset.Position(e.Pos()), name, tn)
+				problems = append(problems, fmt.Sprintf("%s: %s type-asserts %s by name — dispatch on what the value can do, the way resolveExpr does; a named type here is a second copy of the resolver's list and stale from today",
+					p.fset.Position(e.Pos()), name, tn))
 			}
 			return true
 		})
 	}
+	sort.Strings(problems)
+	return problems
 }
 
-// isResolutionEntryPoint reports whether a function of this name is
-// part of resolving a statement for its ctx. The two names outside the
-// resolve* family are the executors' way in: renderForCtx is what
-// ExecExpr resolves through, and ToSQLCtx is what every builder
-// resolves through.
-func isResolutionEntryPoint(name string) bool {
-	return strings.HasPrefix(name, "resolve") || name == "renderForCtx" || name == "ToSQLCtx"
+// TestNoPartialCopyOfTheResolversArms is the third of these checks, and
+// it exists because the round-8 audit found one.
+//
+// resolveExpr dispatches on interfaces, and round 7 made that stick.
+// What it could not see is a switch somewhere else that asks the same
+// question in advance — a fast path deciding whether walking a list can
+// do anything at all is a legitimate thing to want, and
+// Table.resolveDefaultFilterExprs has one, because the common default
+// filter is a soft-delete guard with no statement in it and building a
+// resolution chain for it is pure cost.
+//
+// A pre-check like that is a COPY of resolveExpr's arm list, and the
+// copy was stale: it admitted *SelectBuilder and subqueryResolver and
+// knew nothing of the ctxStatement arm, so a default filter holding a
+// statement drops did not build was never offered to the resolver, and
+// the fail-closed answer that arm exists to give was skipped. It
+// rendered, and was sent, on a ctx with no tenant.
+//
+// So: any type switch in this package that names one of resolveExpr's
+// arms has to admit them all. "Admit" is by method set rather than by
+// name — a case whose interface demands a subset of an arm's methods
+// catches everything that arm catches, which is why naming ctxStatement
+// covers ctxResolvable and why a pre-check need not repeat the whole
+// switch. A switch that names none of the arms is not a copy and is not
+// this check's business.
+func TestNoPartialCopyOfTheResolversArms(t *testing.T) {
+	p := loadPgSyntax(t)
+	for _, problem := range partialArmCopyProblems(t, p) {
+		t.Error(problem)
+	}
+}
+
+// partialArmCopyProblems is the check body, returning what it found
+// rather than reporting it — see pg/scopecheckself_test.go, which
+// rebuilds the stale copy and requires this to name it.
+func partialArmCopyProblems(t *testing.T, p *pgSyntax) []string {
+	t.Helper()
+	arms := resolveExprArmNames(t, p)
+	var problems []string
+	for _, key := range sortedKeys(p.allFuncs()) {
+		fn := p.allFuncs()[key]
+		if fn.Name.Name == "resolveExpr" {
+			continue
+		}
+		ast.Inspect(fn, func(n ast.Node) bool {
+			sw, ok := n.(*ast.TypeSwitchStmt)
+			if !ok {
+				return true
+			}
+			var named []string
+			for _, stmt := range sw.Body.List {
+				cc, ok := stmt.(*ast.CaseClause)
+				if !ok {
+					continue
+				}
+				for _, e := range cc.List {
+					if tn := typeName(e); tn != "" && p.ifaces[tn] != nil {
+						named = append(named, tn)
+					}
+				}
+			}
+			if !namesAnyArm(named, arms) {
+				return true
+			}
+			for _, arm := range arms {
+				if armAdmitted(p, arm, named) {
+					continue
+				}
+				problems = append(problems, fmt.Sprintf(
+					"%s: %s decides in advance what resolveExpr can enter and admits nothing that catches its %s arm — a partial copy of the arm list skips the walk for exactly the shape the arm was added for",
+					p.fset.Position(sw.Pos()), key, arm))
+			}
+			return true
+		})
+	}
+	sort.Strings(problems)
+	return problems
+}
+
+// resolveExprArmNames returns every interface resolveExpr's type switch
+// dispatches on, in source order.
+func resolveExprArmNames(t *testing.T, p *pgSyntax) []string {
+	t.Helper()
+	fn := p.allFuncs()["resolveExpr"]
+	if fn == nil {
+		t.Fatalf("resolveExpr is no longer a package-level function — this check has gone stale")
+	}
+	var out []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		cc, ok := n.(*ast.CaseClause)
+		if !ok {
+			return true
+		}
+		for _, e := range cc.List {
+			if tn := typeName(e); tn != "" && p.ifaces[tn] != nil {
+				out = append(out, tn)
+			}
+		}
+		return true
+	})
+	if len(out) == 0 {
+		t.Fatalf("resolveExpr dispatches on no interface at all — this check has gone stale")
+	}
+	return out
+}
+
+// namesAnyArm reports whether a switch names one of resolveExpr's arms,
+// which is what makes it a copy of the decision rather than an
+// unrelated switch.
+func namesAnyArm(named, arms []string) bool {
+	for _, n := range named {
+		for _, arm := range arms {
+			if n == arm {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// armAdmitted reports whether one of the named interfaces catches
+// everything the arm catches: its method set is a subset of the arm's,
+// so every value dispatched to the arm satisfies it too.
+func armAdmitted(p *pgSyntax, arm string, named []string) bool {
+	want := map[string]bool{}
+	for _, m := range p.interfaceMethods(arm) {
+		want[m] = true
+	}
+	for _, n := range named {
+		ms := p.interfaceMethods(n)
+		if len(ms) == 0 {
+			continue
+		}
+		covers := true
+		for _, m := range ms {
+			if !want[m] {
+				covers = false
+				break
+			}
+		}
+		if covers {
+			return true
+		}
+	}
+	return false
+}
+
+// allFuncs returns every function and method in the package, keyed by
+// name — a package-level function by its own, a method by receiver and
+// name.
+func (p *pgSyntax) allFuncs() map[string]*ast.FuncDecl {
+	out := map[string]*ast.FuncDecl{}
+	for _, fn := range p.funcs {
+		out[fn.Name.Name] = fn
+	}
+	for recv, ms := range p.methods {
+		for name, fn := range ms {
+			out[recv+"."+name] = fn
+		}
+	}
+	return out
+}
+
+// ctxReachingFuncs returns every function in the package that resolving
+// a statement can pass through, keyed by name — a package-level
+// function by its own name, a method by receiver and name.
+//
+// It answers by what a function CAN SEE, and that is the closure of the
+// third bypass. Discovery used to be by name: resolve*, plus
+// renderForCtx and ToSQLCtx spelled out because they break the pattern.
+// So a resolution path called anything else — prepareStatement,
+// applyScope, walk — was not a resolution path as far as the check was
+// concerned, and could type-assert *SelectBuilder by name with nothing
+// to say so. A naming convention is not an invariant; it is a habit,
+// and the check was enforcing the habit rather than the rule.
+//
+// What makes a function part of resolution is that it has the ctx in
+// its hands, or that something which does hands it the expression it
+// was resolving:
+//
+//   - a function or method taking a context.Context is a seed. It can
+//     resolve, so a type assertion in it is a copy of resolveExpr's
+//     decision;
+//   - a function it calls with an expression-bearing parameter is one
+//     too, transitively — otherwise the assertion moves one call
+//     deeper into a helper that takes no ctx and the check goes quiet
+//     again, which is the same bypass wearing a different name.
+func (p *pgSyntax) ctxReachingFuncs() map[string]*ast.FuncDecl {
+	all := map[string]*ast.FuncDecl{}
+	byName := map[string][]*ast.FuncDecl{}
+	for _, fn := range p.funcs {
+		all[fn.Name.Name] = fn
+		byName[fn.Name.Name] = append(byName[fn.Name.Name], fn)
+	}
+	for recv, ms := range p.methods {
+		for name, fn := range ms {
+			all[recv+"."+name] = fn
+			byName[name] = append(byName[name], fn)
+		}
+	}
+
+	out := map[string]*ast.FuncDecl{}
+	var queue []string
+	for key, fn := range all {
+		if fn.Type.Params == nil {
+			continue
+		}
+		for _, param := range fn.Type.Params.List {
+			if isContextType(param.Type) {
+				out[key], queue = fn, append(queue, key)
+				break
+			}
+		}
+	}
+	for len(queue) > 0 {
+		key := queue[0]
+		queue = queue[1:]
+		ast.Inspect(out[key], func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var name string
+			switch fun := call.Fun.(type) {
+			case *ast.Ident:
+				name = fun.Name
+			case *ast.SelectorExpr:
+				name = fun.Sel.Name
+			default:
+				return true
+			}
+			for _, fn := range byName[name] {
+				if !p.takesExpression(fn) {
+					continue
+				}
+				k := funcKey(fn)
+				if out[k] == nil {
+					out[k], queue = fn, append(queue, k)
+				}
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// takesExpression reports whether a function is handed an expression to
+// work on — the shape of a helper a resolver delegates the decision to.
+func (p *pgSyntax) takesExpression(fn *ast.FuncDecl) bool {
+	if fn.Type.Params == nil {
+		return false
+	}
+	for _, param := range fn.Type.Params.List {
+		if p.bearsExpression(param.Type) {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys[V any](m map[string]V) []string {

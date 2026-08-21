@@ -115,6 +115,24 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **A `DefaultFilter` holding a statement drops did not build was never
+  offered to the resolver** (`drops/pg`). The walk over a table's
+  default filters is guarded by a fast path that asks, without building
+  anything, whether walking the list could change it — worth having,
+  since the common filter is a soft-delete guard with no statement in
+  it. The guard was a copy of `resolveExpr`'s type switch written as a
+  list of type names, and it had gone stale in the same direction the
+  switch itself once had: it admitted a `*SelectBuilder` and the
+  expressions this package wraps around a statement, and knew nothing
+  of the arm that handles a statement type a CALLER wrote. That arm is
+  what keeps a foreign statement fail-closed — it asks for the ctx form,
+  so a filter refusing for want of a tenant refuses the statement around
+  it — and the fast path skipped the question. The filter rendered its
+  inner statement blind: render-time defaults, no context filters, no
+  refusal, on a `context.Background()` with no tenant at all. It now
+  dispatches on the same interfaces `resolveExpr` does, and
+  `TestNoResolutionEntryPointNamesAStatementType` fails any future copy
+  of that decision, wherever it is written and whatever it is called.
 - **`Dec` added a negated delta, so an unsigned counter climbed.** In
   all three dialects. The constraint behind `Inc`/`Dec` admits the
   unsigned types, and negating an unsigned value wraps, so

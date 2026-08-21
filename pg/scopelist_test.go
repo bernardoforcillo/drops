@@ -538,3 +538,95 @@ func TestFiltersWithoutStatementsRenderUnchanged(t *testing.T) {
 		}
 	})
 }
+
+// ----------------------------------------------------------------------
+// The fast path in front of the walk
+// ----------------------------------------------------------------------
+
+// listForeign is a statement drops did not build: it has a WriteSQL and
+// a ToSQLCtx, which is all [pg.DB.ExecExpr] and resolveExpr's
+// ctxStatement arm ask of one. Its WriteSQL renders the statement
+// inside it blind — no ctx, so no context filters — which is exactly
+// what a foreign statement type does and why the resolver asks it for
+// its ctx form instead.
+type listForeign struct {
+	inner *pg.SelectBuilder
+	// asked records the ctx form being requested, so a test can tell
+	// "rendered correctly by luck" from "asked, and answered".
+	asked *bool
+}
+
+func (f listForeign) WriteSQL(b *drops.Builder) {
+	b.WriteString("EXISTS (")
+	f.inner.WriteSQL(b)
+	b.WriteString(")")
+}
+
+func (f listForeign) ToSQLCtx(ctx context.Context) (string, []any, error) {
+	*f.asked = true
+	sql, args, err := f.inner.ToSQLCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	return "EXISTS (" + sql + ")", args, nil
+}
+
+// TestDefaultFilterFastPathAdmitsEveryShapeTheResolverEnters is the
+// behavioural half of the round-8 audit, and it names a real leak.
+//
+// resolveDefaultFilterExprs is guarded by mayHoldStatements, a fast
+// path that answers "can walking this list do anything at all?" without
+// building a chain — worth having, because a soft-delete guard is the
+// common case and it holds no statement. But the guard was a COPY of
+// resolveExpr's type switch, written as a list of names, and it went
+// stale exactly the way the switch itself did before round 7: it
+// admitted *SelectBuilder and subqueryResolver, and knew nothing of the
+// ctxStatement arm.
+//
+// So a default filter whose predicate is a statement drops did not
+// build was never offered to the resolver at all. The ctxStatement arm
+// exists to keep that case FAIL-CLOSED — it asks the foreign statement
+// for its ctx form so that a filter refusing for want of a tenant
+// refuses the whole statement — and the fast path skipped the question.
+// On a ctx with no tenant this rendered and was sent:
+//
+//	SELECT "gate_rows"."id" FROM "gate_rows" WHERE (EXISTS (SELECT ... FROM "gate_posts"))
+//
+// with the inner statement carrying its render-time defaults and none
+// of its context filters: another tenant's rows, through the exported
+// API, from the feature that decides what a request may see.
+func TestDefaultFilterFastPathAdmitsEveryShapeTheResolverEnters(t *testing.T) {
+	db := pg.New(nil)
+	posts := reachTable("gate_posts")
+
+	asked := false
+	tbl := pg.NewTable("gate_rows")
+	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	tbl.DefaultFilter(listForeign{
+		inner: db.Select(posts.Col("id")).From(posts),
+		asked: &asked,
+	})
+
+	// With a tenant: the foreign statement is asked for its ctx form.
+	// It renders through its own WriteSQL either way — finished SQL
+	// numbered from $1 cannot be spliced into the statement around it,
+	// which is what ctxResolvable documents — so what the ctx form buys
+	// is the refusal below, and being asked is the assertion here.
+	sel := db.Select(id).From(tbl)
+	if _, _, err := sel.ToSQLCtx(listCtx()); err != nil {
+		t.Fatalf("ToSQLCtx: %v", err)
+	}
+	if !asked {
+		t.Errorf("the foreign statement in the default filter was never asked for its ctx form")
+	}
+
+	// And with no tenant the whole statement is refused, rather than
+	// sent with the guard's inner statement unscoped.
+	sql, _, err := db.Select(id).From(tbl).ToSQLCtx(context.Background())
+	if !errors.Is(err, pg.ErrTenantMissing) {
+		t.Fatalf("got = %v (sql %q), want %v", err, sql, pg.ErrTenantMissing)
+	}
+	if sql != "" {
+		t.Errorf("got sql = %q, want no statement at all", sql)
+	}
+}

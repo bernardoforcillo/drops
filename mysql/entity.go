@@ -25,6 +25,19 @@ type Entity[T any] struct {
 	pks       []*Column
 	pkFields  [][]int
 	colFields []entityColField
+
+	// rowType is T with its pointers stripped, kept so the entity can
+	// name the context-filter slot it owns on the shared table — see
+	// rowScopeFilterKey.
+	rowType reflect.Type
+
+	// tenantCol / tenantField are the axis [Entity.ScopeByTenant]
+	// declared, nil on an entity that declared none. The read-side
+	// predicate they build is registered on the table; these two are
+	// what a WRITE needs, which is a column to stamp and the field to
+	// stamp it from.
+	tenantCol   *Column
+	tenantField []int
 }
 
 type entityColField struct {
@@ -113,7 +126,15 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	if err := checkDrift(rt, t, colFields, cfg); err != nil {
 		panic(err.Error())
 	}
-	return &Entity[T]{table: t, pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields}
+	return &Entity[T]{
+		table:     t,
+		pk:        pk,
+		pkField:   pkField,
+		pks:       pks,
+		pkFields:  pkFields,
+		colFields: colFields,
+		rowType:   rt,
+	}
 }
 
 // checkDrift reports columns bound to no struct field — see
@@ -286,6 +307,9 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // leaves the field alone rather than failing: the row is inserted
 // either way, and silently reporting an id of 0 would be worse.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	v := reflect.ValueOf(r).Elem()
 	ins := db.Insert(e.table)
 	ins.Row(e.bindings(v, false)...)
@@ -307,6 +331,13 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
+		// Stamped one row at a time, before any of them is bound: a
+		// batch half of which carries the ctx tenant and half of which
+		// carries whatever the caller left in the struct is the shape
+		// nobody can reason about afterwards.
+		if err := e.stampTenant(ctx, &rows[i]); err != nil {
+			return nil, err
+		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
 	return ins.Exec(ctx)
@@ -326,6 +357,9 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
+		if err := e.stampTenant(ctx, &rows[i]); err != nil {
+			return nil, err
+		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
 	return ins.OnDuplicateKeyUpdateAll().Exec(ctx)
@@ -333,9 +367,23 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 
 // Update writes every non-key column of r to the row its key
 // addresses.
+//
+// On a tenant-scoped entity the tenant column is one of those non-key
+// columns, so the row's own tenant is stamped from ctx before the
+// assignments are taken. Without that an Update of a struct whose
+// tenant field is zero — one built from a form, or from a decoded
+// request body — would write that zero over a row it is otherwise
+// allowed to touch, and hand it to no tenant at all; a struct carrying
+// somebody else's tenant is [ErrTenantMismatch] rather than a
+// transfer of ownership. Which row is addressed is a separate
+// question, and the table's context filter answers it: the WHERE
+// clause carries the ctx tenant like every other statement's.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if e.pkIsZero(r) {
 		return ErrPKNotSet
+	}
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
 	}
 	pred, err := e.pkPredicate(e.pkValuesOf(r))
 	if err != nil {

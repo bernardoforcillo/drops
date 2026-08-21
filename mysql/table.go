@@ -32,12 +32,18 @@ type Table struct {
 	// origin is the table this one was copied from by As, and nil on
 	// a table as declared — see key.
 	origin *Table
+
+	// scope carries the request-scoped half of the table's automatic
+	// predicates. It is a pointer, and an alias taken off this table
+	// SHARES it rather than copying it — see tableScope, and see
+	// Table.As.
+	scope *tableScope
 }
 
 // NewTable creates a table in the connection's default database.
 func NewTable(name string) *Table {
 	mustIdent("table", name)
-	return &Table{name: name, byName: map[string]*Column{}}
+	return &Table{name: name, byName: map[string]*Column{}, scope: &tableScope{}}
 }
 
 // NewDatabaseTable scopes the table to an explicit database, which is
@@ -49,6 +55,7 @@ func NewDatabaseTable(database, name string) *Table {
 		database: database,
 		name:     name,
 		byName:   map[string]*Column{},
+		scope:    &tableScope{},
 	}
 }
 
@@ -77,20 +84,40 @@ func (t *Table) Alias() string    { return t.alias }
 //
 // What is not rewritten is anything the caller built and drops only
 // re-emits: a predicate, and the expression inside a [SetExpr]. Both
-// are closed over the handles they were given. A default filter
-// registered against the declared columns therefore still qualifies
-// with the table name, and against a query whose only FROM entry is
-// the alias MySQL answers 1054 — so scope an aliased query with
-// Unscoped and an explicit predicate built from the alias's own
-// handles.
+// are closed over the handles they were given, so they go on naming the
+// relation those handles belong to.
 //
-// The copy is a snapshot. A column, index, default filter or check
-// added to the base table after As returned does not reach the alias,
-// and none added to the alias reaches the table. That matters because
-// Go initialises package-level variables before it runs init: an alias
-// declared as a var beside its table is taken before any init that
-// adds to the schema. Take the alias at the query site, or after the
-// schema is complete.
+// The table's own automatic predicates are the exception, and the
+// exception is a repair rather than an inconsistency. A
+// [Table.DefaultFilter] or a [Table.ContextFilter] is built from the
+// declared column handles and then rendered into a statement whose FROM
+// entry may be an alias, where `users`.`deletedAt` names a relation the
+// statement never mentions and MySQL answers 1054 — a query that cannot
+// run, not a widened result. So they are rendered under a relation
+// rename that resolves the declared table to this instance's alias, and
+// a scoped table is queryable under an alias like any other. See
+// Table.resolveFilterExprs. A predicate the caller wrote AT the query
+// is still theirs: build it from the handles of the relation the
+// statement names.
+//
+// The copy is a snapshot of everything the DECLARATION owns. A column,
+// index, default filter or check added to the base table after As
+// returned does not reach the alias, and none added to the alias
+// reaches the table. That matters because Go initialises package-level
+// variables before it runs init: an alias declared as a var beside its
+// table is taken before any init that adds to the schema. Take the
+// alias at the query site, or after the schema is complete.
+//
+// The request-scoped half is shared rather than copied, and the
+// asymmetry is deliberate. A context filter — a tenant axis, an authz
+// guard — states who may see a row, and an alias that silently lacked
+// one would render, on a ctx carrying no tenant at all and without
+// refusing, DELETE `u` FROM `users` AS `u`: no predicate, every
+// tenant's rows, and nothing walks a DELETE back. So a filter follows
+// the relation, which is what tableScope holds; the consequence, worth
+// stating plainly, is that registering one on an alias registers it on
+// the table and so on every other alias of it. Where two genuinely
+// different scopings are wanted, they are two tables.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
@@ -203,12 +230,35 @@ func (t *Table) PrimaryKeyColumns() []*Column {
 // writeRef writes the reference used in FROM / column qualification:
 // the alias when there is one, otherwise the (database-qualified)
 // name.
+//
+// A handle on the declared table also renders as an alias while the
+// builder is inside a fragment that renamed the relation: that is how
+// an automatic predicate built from the package-level columns follows
+// the table into an aliased query. See resolveFilterExprs.
 func (t *Table) writeRef(b *drops.Builder) {
 	if t.alias != "" {
 		b.WriteIdent(t.alias)
 		return
 	}
+	if renamed := b.RelationAlias(t.relRef()); renamed != "" {
+		b.WriteIdent(renamed)
+		return
+	}
 	t.writeName(b)
+}
+
+// relRef names the relation a column belonging to this table qualifies
+// with when the table is not aliased, in the spelling
+// [drops.Builder.RelationAlias] keys renames by.
+//
+// A database-qualified table is keyed by "database.table", because
+// that is what it renders as and because two databases may each have a
+// "users" — MySQL's database being what PostgreSQL calls a schema.
+func (t *Table) relRef() string {
+	if t.database == "" {
+		return t.name
+	}
+	return t.database + "." + t.name
 }
 
 // writeName writes the database-qualified table name, no alias.

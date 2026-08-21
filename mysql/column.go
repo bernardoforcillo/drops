@@ -222,13 +222,10 @@ func (c *Col[T]) Lte(v T) drops.Expression { return cmp(c.Column, "<=", v) }
 
 // EqCol compares two columns.
 func (c *Col[T]) EqCol(other ColRef) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		c.Column.WriteSQL(b)
-		b.WriteString(" = ")
-		other.col().WriteSQL(b)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " = ", ")"},
+		operands: []drops.Expression{c.Column, other.col()},
+	}
 }
 
 func (c *Col[T]) IsNull() drops.Expression    { return nullCheck(c.Column, true) }
@@ -236,23 +233,20 @@ func (c *Col[T]) IsNotNull() drops.Expression { return nullCheck(c.Column, false
 
 // In renders (col IN (?, ?, …)). An empty list renders FALSE: nothing
 // is a member of the empty set, and MySQL rejects "IN ()" outright.
+//
+// The values are typed, so none of them can be a statement and this
+// form has nothing for the resolver to walk. It is built from the same
+// node the untyped [In] is anyway: one node kind is what keeps the
+// walk from having to know which constructors exist.
 func (c *Col[T]) In(values ...T) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		if len(values) == 0 {
-			b.WriteString("(FALSE)")
-			return
-		}
-		b.WriteByte('(')
-		c.Column.WriteSQL(b)
-		b.WriteString(" IN (")
-		for i, v := range values {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.AddArg(v)
-		}
-		b.WriteString("))")
-	})
+	if len(values) == 0 {
+		return drops.Raw("(FALSE)")
+	}
+	vals := make([]any, len(values))
+	for i, v := range values {
+		vals[i] = v
+	}
+	return inExpr(c.Column, "IN", vals)
 }
 
 // Asc / Desc produce ORDER BY terms.
@@ -260,19 +254,21 @@ func (c *Column) Asc() drops.Expression  { return orderTerm(c, " ASC") }
 func (c *Column) Desc() drops.Expression { return orderTerm(c, " DESC") }
 
 func orderTerm(c *Column, dir string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(dir)
-	})
+	return &opExpr{parts: []string{"", dir}, operands: []drops.Expression{c}}
 }
 
 // As aliases a column in a SELECT projection.
-func (c *Column) As(alias string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(" AS ")
-		b.WriteIdent(alias)
-	})
+func (c *Column) As(alias string) drops.Expression { return aliasExpr(c, alias) }
+
+// aliasExpr renders "<e> AS <alias>", holding e.
+//
+// It is what [Column.As] and the package-level [As] are made of, and it
+// holds its operand for the same reason every other node does:
+// As(Subquery(sel), "recent") in a projection is an ordinary
+// scalar-subquery idiom, and a closure there hid the statement from the
+// walk.
+func aliasExpr(e drops.Expression, alias string) drops.Expression {
+	return &opExpr{parts: []string{"", ""}, operands: []drops.Expression{e}, alias: alias}
 }
 
 // Val binds a typed value for INSERT / UPDATE.
@@ -285,27 +281,18 @@ func (c *Col[T]) Expr(e drops.Expression) ColumnValue {
 }
 
 func cmp(c *Column, op string, v any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		c.WriteSQL(b)
-		b.WriteByte(' ')
-		b.WriteString(op)
-		b.WriteByte(' ')
-		b.AddArg(v)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " " + op + " ", ")"},
+		operands: []drops.Expression{c, drops.Param{Value: v}},
+	}
 }
 
 func nullCheck(c *Column, isNull bool) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		c.WriteSQL(b)
-		if isNull {
-			b.WriteString(" IS NULL)")
-		} else {
-			b.WriteString(" IS NOT NULL)")
-		}
-	})
+	tail := " IS NOT NULL)"
+	if isNull {
+		tail = " IS NULL)"
+	}
+	return &opExpr{parts: []string{"(", tail}, operands: []drops.Expression{c}}
 }
 
 // ColumnValue is a column bound to a value or expression for
@@ -313,6 +300,19 @@ func nullCheck(c *Column, isNull bool) drops.Expression {
 type ColumnValue interface {
 	column() *Column
 	writeValue(b *drops.Builder)
+
+	// valueExpr returns the assigned value as an Expression the
+	// resolver can walk.
+	//
+	// It exists because an INSERT flattens its rows to expressions the
+	// moment they are bound (see alignRow), and a binding wrapped in a
+	// drops.ExprFunc there is a statement the walk cannot reach:
+	// INSERT … VALUES ((SELECT `id` FROM `accounts` …)) rendered its
+	// body through WriteSQL, which has no ctx, and so read every
+	// tenant's accounts to compute a value stored in this tenant's row.
+	// Every implementation renders through this method, so what the
+	// walk sees and what the statement writes cannot drift apart.
+	valueExpr() drops.Expression
 
 	// rebind returns the same assignment restated against col, which
 	// names the same column through another handle on its table. Its
@@ -328,7 +328,8 @@ type columnValue struct {
 }
 
 func (v columnValue) column() *Column              { return v.col }
-func (v columnValue) writeValue(b *drops.Builder)  { b.AddArg(v.val) }
+func (v columnValue) valueExpr() drops.Expression  { return drops.Param{Value: v.val} }
+func (v columnValue) writeValue(b *drops.Builder)  { b.Append(v.valueExpr()) }
 func (v columnValue) rebind(c *Column) ColumnValue { v.col = c; return v }
 
 type exprValue struct {
@@ -337,7 +338,19 @@ type exprValue struct {
 }
 
 func (v exprValue) column() *Column             { return v.col }
+func (v exprValue) valueExpr() drops.Expression { return v.expr }
 func (v exprValue) writeValue(b *drops.Builder) { b.Append(v.expr) }
+
+// boundExpr / withBoundExpr implement exprBound: this is the one
+// binding kind in the package whose value is an expression, so it is
+// the one the resolver has anything to walk into. The copy is what
+// keeps the binding reusable — see resolveSets.
+func (v exprValue) boundExpr() drops.Expression { return v.expr }
+
+func (v exprValue) withBoundExpr(e drops.Expression) ColumnValue {
+	v.expr = e
+	return v
+}
 
 // rebind moves the assignment's target but not its expression: that
 // one was built by the caller out of the handles the caller held, and

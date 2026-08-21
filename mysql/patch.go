@@ -146,12 +146,17 @@ func (o *incOp[T]) rebind(c *Column) ColumnValue {
 	cp.col = c
 	return &cp
 }
-func (o *incOp[T]) writeValue(b *drops.Builder) {
-	o.col.WriteSQL(b)
-	b.WriteByte(' ')
-	b.WriteByte(o.op)
-	b.WriteByte(' ')
-	b.AddArg(o.delta)
+func (o *incOp[T]) writeValue(b *drops.Builder) { b.Append(o.valueExpr()) }
+
+// valueExpr holds the operands rather than writing them, like every
+// other expression in the package. Nothing can hide in this one — a
+// column and a Go value — but building it the same way is what lets
+// the resolver walk a SET list without knowing which operations exist.
+func (o *incOp[T]) valueExpr() drops.Expression {
+	return &opExpr{
+		parts:    []string{"", " " + string(o.op) + " ", ""},
+		operands: []drops.Expression{o.col, drops.Param{Value: o.delta}},
+	}
 }
 
 // Set is a typed plain assignment — the same thing (*Col[T]).Val
@@ -189,13 +194,10 @@ func (o *monotonicOp[T]) rebind(c *Column) ColumnValue {
 	cp.col = c
 	return &cp
 }
-func (o *monotonicOp[T]) writeValue(b *drops.Builder) {
-	b.WriteString(o.fn)
-	b.WriteByte('(')
-	o.col.WriteSQL(b)
-	b.WriteString(", ")
-	b.AddArg(o.val)
-	b.WriteByte(')')
+func (o *monotonicOp[T]) writeValue(b *drops.Builder) { b.Append(o.valueExpr()) }
+
+func (o *monotonicOp[T]) valueExpr() drops.Expression {
+	return funcExpr(o.fn, []drops.Expression{o.col, drops.Param{Value: o.val}})
 }
 
 // SetIfChanged emits "col = ?" only when the value differs from the
@@ -248,19 +250,18 @@ func (o *ifChangedOp[T]) rebind(c *Column) ColumnValue {
 	cp.col = c
 	return &cp
 }
-func (o *ifChangedOp[T]) writeValue(b *drops.Builder) {
-	// CASE WHEN NOT (col <=> ?) THEN ? ELSE col END. The value binds
-	// twice; MySQL's placeholders are positional, so there is no way
-	// to name one parameter in two places.
-	b.WriteString("CASE WHEN NOT (")
-	o.col.WriteSQL(b)
-	b.WriteString(" <=> ")
-	b.AddArg(o.val)
-	b.WriteString(") THEN ")
-	b.AddArg(o.val)
-	b.WriteString(" ELSE ")
-	o.col.WriteSQL(b)
-	b.WriteString(" END")
+func (o *ifChangedOp[T]) writeValue(b *drops.Builder) { b.Append(o.valueExpr()) }
+
+// valueExpr renders CASE WHEN NOT (col <=> ?) THEN ? ELSE col END. The
+// value binds twice; MySQL's placeholders are positional, so there is
+// no way to name one parameter in two places.
+func (o *ifChangedOp[T]) valueExpr() drops.Expression {
+	return &opExpr{
+		parts: []string{"CASE WHEN NOT (", " <=> ", ") THEN ", " ELSE ", " END"},
+		operands: []drops.Expression{
+			o.col, drops.Param{Value: o.val}, drops.Param{Value: o.val}, o.col,
+		},
+	}
 }
 
 // SetExpr assigns an arbitrary expression to a column inside a Patch —

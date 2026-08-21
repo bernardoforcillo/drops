@@ -74,17 +74,17 @@ func OctetLength(e any) drops.Expression { return funcCall("length", []any{e}) }
 // in PostgreSQL. count may be nil to omit the FOR clause and take the
 // rest of the string.
 func Substring(e, from, count any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("substring(")
-		writeOperand(b, e)
-		b.WriteString(" FROM ")
-		writeOperand(b, from)
-		if count != nil {
-			b.WriteString(" FOR ")
-			writeOperand(b, count)
-		}
-		b.WriteByte(')')
-	})
+	var o opBuilder
+	o.text("substring(")
+	o.value(e)
+	o.text(" FROM ")
+	o.value(from)
+	if count != nil {
+		o.text(" FOR ")
+		o.value(count)
+	}
+	o.text(")")
+	return o.done()
 }
 
 // Left / Right take a prefix or suffix of n characters. No pg
@@ -109,15 +109,10 @@ func RTrim(e any) drops.Expression { return funcCall("rtrim", []any{e}) }
 // "BOTH", "LEADING" or "TRAILING" — the only way to trim something
 // other than spaces on both servers.
 func TrimChars(where string, chars, e any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("trim(")
-		b.WriteString(where)
-		b.WriteByte(' ')
-		writeOperand(b, chars)
-		b.WriteString(" FROM ")
-		writeOperand(b, e)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"trim(" + where + " ", " FROM ", ")"},
+		operands: []drops.Expression{operandExpr(chars), operandExpr(e)},
+	}
 }
 
 // LPad / RPad pad e to n characters with pad.
@@ -174,13 +169,10 @@ func RegexpLike(e, pattern any) drops.Expression { return binOp(e, "REGEXP", pat
 // index of substring, or 0. Same spelling and same answer as
 // PostgreSQL's.
 func Position(substring, str any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("position(")
-		writeOperand(b, substring)
-		b.WriteString(" IN ")
-		writeOperand(b, str)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"position(", " IN ", ")"},
+		operands: []drops.Expression{operandExpr(substring), operandExpr(str)},
+	}
 }
 
 // StrPos keeps PostgreSQL's strpos(<string>, <substring>) argument
@@ -237,13 +229,10 @@ func FromBase64(e any) drops.Expression { return funcCall("from_base64", []any{e
 // anything.
 func Collate(e any, collation string) drops.Expression {
 	mustCollation(collation)
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, e)
-		b.WriteString(" COLLATE ")
-		b.WriteString(collation)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " COLLATE " + collation + ")"},
+		operands: []drops.Expression{operandExpr(e)},
+	}
 }
 
 // mustCollation rejects anything that is not shaped like a collation

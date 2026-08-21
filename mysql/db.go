@@ -175,8 +175,20 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 }
 
 // ExecExpr renders e and executes it — the usual way to run DDL.
+//
+// It renders e FOR ctx, which for a DDL helper is the same bytes it
+// always was: there is nothing inside a CREATE TABLE to resolve. What
+// changes is everything else a caller can hand it. A statement builder
+// passed here used to be rendered by its WriteSQL, so
+// db.ExecExpr(ctx, db.Delete(scoped)) sent a DELETE with no tenant
+// predicate and refused nothing on a ctx with no tenant — the one
+// executor on *DB that took a ctx and then threw it away. A statement
+// written inside an expression is reached by the same walk.
 func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, error) {
-	sql, args := render(e)
+	sql, args, err := renderForCtx(ctx, e)
+	if err != nil {
+		return nil, err
+	}
 	return db.Exec(ctx, sql, args...)
 }
 

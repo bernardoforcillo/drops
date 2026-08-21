@@ -30,7 +30,9 @@ import "github.com/bernardoforcillo/drops"
 // taking its arguments already flattened into a slice. It is the same
 // call [Func] makes; the slice form is what the helpers in this
 // package need, since they build their argument lists.
-func funcCall(name string, args []any) drops.Expression { return Func(name, args...) }
+func funcCall(name string, args []any) drops.Expression {
+	return funcExpr(name, operandExprs(args))
+}
 
 // CountDistinct renders count(DISTINCT <e>).
 func CountDistinct(e drops.Expression) drops.Expression { return distinctAgg("count", e) }
@@ -41,12 +43,7 @@ func AvgDistinct(e drops.Expression) drops.Expression { return distinctAgg("avg"
 
 // distinctAgg renders <name>(DISTINCT <e>).
 func distinctAgg(name string, e drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(name)
-		b.WriteString("(DISTINCT ")
-		b.Append(e)
-		b.WriteByte(')')
-	})
+	return &opExpr{parts: []string{name + "(DISTINCT ", ")"}, operands: []drops.Expression{e}}
 }
 
 // CountIf renders count(CASE WHEN <pred> THEN 1 END) — the conditional
@@ -56,11 +53,10 @@ func distinctAgg(name string, e drops.Expression) drops.Expression {
 // NULL, and count() does not count NULLs. Writing "ELSE 0" instead
 // would count every row.
 func CountIf(pred drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("count(CASE WHEN ")
-		b.Append(pred)
-		b.WriteString(" THEN 1 END)")
-	})
+	return &opExpr{
+		parts:    []string{"count(CASE WHEN ", " THEN 1 END)"},
+		operands: []drops.Expression{pred},
+	}
 }
 
 // SumIf renders sum(CASE WHEN <pred> THEN <e> END) — pg's
@@ -71,13 +67,10 @@ func CountIf(pred drops.Expression) drops.Expression {
 // where no row matches sums to NULL, exactly as PostgreSQL's FILTER
 // does, rather than to 0.
 func SumIf(pred drops.Expression, e any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("sum(CASE WHEN ")
-		b.Append(pred)
-		b.WriteString(" THEN ")
-		writeOperand(b, e)
-		b.WriteString(" END)")
-	})
+	return &opExpr{
+		parts:    []string{"sum(CASE WHEN ", " THEN ", " END)"},
+		operands: []drops.Expression{pred, operandExpr(e)},
+	}
 }
 
 // GroupConcat renders group_concat(<e> SEPARATOR '<sep>') — MySQL's
@@ -103,33 +96,32 @@ func SumIf(pred drops.Expression, e any) drops.Expression {
 // neither the literal separator nor the truncation is a detail a
 // reader should have to discover.
 func GroupConcat(e any, sep string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("group_concat(")
-		writeOperand(b, e)
-		writeSeparator(b, sep)
-		b.WriteByte(')')
-	})
+	var o opBuilder
+	o.text("group_concat(")
+	o.value(e)
+	o.text(separatorClause(sep) + ")")
+	return o.done()
 }
 
 // GroupConcatDistinct is [GroupConcat] over the distinct values, in
 // the order given.
 func GroupConcatDistinct(e any, order []drops.Expression, sep string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("group_concat(DISTINCT ")
-		writeOperand(b, e)
-		if len(order) > 0 {
-			b.WriteString(" ORDER BY ")
-			b.AppendList(", ", order)
-		}
-		writeSeparator(b, sep)
-		b.WriteByte(')')
-	})
+	var o opBuilder
+	o.text("group_concat(DISTINCT ")
+	o.value(e)
+	if len(order) > 0 {
+		o.text(" ORDER BY ")
+		o.list(order)
+	}
+	o.text(separatorClause(sep) + ")")
+	return o.done()
 }
 
-func writeSeparator(b *drops.Builder, sep string) {
-	b.WriteString(" SEPARATOR '")
-	b.WriteString(quoteLiteral(sep))
-	b.WriteString("'")
+// separatorClause renders " SEPARATOR '<sep>'". The separator is text
+// in the statement rather than an operand because the grammar demands a
+// literal there — see [GroupConcat].
+func separatorClause(sep string) string {
+	return " SEPARATOR '" + quoteLiteral(sep) + "'"
 }
 
 // BoolAnd reports whether every row satisfies e, as min(<e>) — see the
@@ -160,13 +152,7 @@ func IfNull(a, b any) drops.Expression { return funcCall("ifnull", []any{a, b}) 
 
 // As renames an arbitrary expression: "<expr> AS <alias>". The method
 // form on a column is (*Column).As.
-func As(e drops.Expression, alias string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(e)
-		b.WriteString(" AS ")
-		b.WriteIdent(alias)
-	})
-}
+func As(e drops.Expression, alias string) drops.Expression { return aliasExpr(e, alias) }
 
 // Cast renders CAST(<e> AS <typ>) with typ written verbatim, so it
 // must be one of the types MySQL's CAST accepts — SIGNED, UNSIGNED,
@@ -177,11 +163,8 @@ func As(e drops.Expression, alias string) drops.Expression {
 // CAST(x AS SIGNED) is what was meant. JSON belongs to that list on
 // MySQL 8 and not on MariaDB — see json.go.
 func Cast(e any, typ string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CAST(")
-		writeOperand(b, e)
-		b.WriteString(" AS ")
-		b.WriteString(typ)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"CAST(", " AS " + typ + ")"},
+		operands: []drops.Expression{operandExpr(e)},
+	}
 }

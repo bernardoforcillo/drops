@@ -107,8 +107,37 @@
 // outbox, the event store, the idempotency store, keyset pagination,
 // the typed error surface, and the expression library above. The
 // remaining cross-cutting packages that pg and sqlite have grown —
-// saga, audit, tenancy — are not ported yet, and this doc will say so
-// until they are.
+// saga and audit — are not ported yet, and this doc will say so until
+// they are.
+//
+// # Multi-tenancy
+//
+// A table can declare who owns its rows, and drops carries that
+// declaration into every statement it composes:
+//
+//	Posts.ContextFilter(mysql.TenantFilter(PostTenantID)).
+//	    ScopeWritesByTenant(PostTenantID)
+//
+//	ctx = mysql.WithTenant(ctx, currentTenant)
+//
+// The predicate is resolved by the EXECUTORS rather than by the
+// renderer, so one declaration covers a root query, a joined table, a
+// CTE body, a subquery operand, an UPDATE and a DELETE — everything
+// that goes through All / One / Rows / Exec. It fails closed: a ctx
+// with no tenant is [ErrTenantMissing] and no statement at all. The
+// cost is that [SelectBuilder.ToSQL] no longer shows the whole
+// statement; ToSQLCtx is the ctx-aware twin, and the one to log and to
+// assert on. [Table.ContextFilter], [TenantFilter] and
+// [Entity.ScopeByTenant] carry the reasoning, and tenant.go lists what
+// the predicates do not reach.
+//
+// Two of the answers are this dialect's own. A join places the
+// predicate by kind — INNER in the WHERE clause, LEFT in the ON clause,
+// and a RIGHT JOIN inverts both sides — see
+// [SelectBuilder.RightJoin]. And ON DUPLICATE KEY UPDATE, which names
+// no conflict target and takes no WHERE clause, is gated inside its
+// assignments so a collision with another tenant's row rewrites
+// nothing: see [InsertBuilder.ToSQLCtx].
 //
 // There are no relations here. The declaration API existed and nothing
 // consumed it: mysql has no eager loader, so a HasMany compiled, ran,

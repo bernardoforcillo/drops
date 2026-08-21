@@ -121,33 +121,32 @@ func DateTrunc(field string, ts any) drops.Expression {
 	case "week":
 		// Back up to Monday first, then flatten the time. WEEKDAY() is
 		// 0 on a Monday, which is the number of days to subtract.
-		monday := funcCall("date_sub", []any{ts, drops.ExprFunc(func(b *drops.Builder) {
-			b.WriteString("INTERVAL ")
-			funcCall("weekday", []any{ts}).WriteSQL(b)
-			b.WriteString(" DAY")
-		})})
+		monday := funcCall("date_sub", []any{ts, &opExpr{
+			parts:    []string{"INTERVAL ", " DAY"},
+			operands: []drops.Expression{funcCall("weekday", []any{ts})},
+		}})
 		return castDatetime(funcCall("date_format", []any{monday, "%Y-%m-%d 00:00:00"}))
 	case "quarter":
 		// January 1st of the year, advanced by whole quarters.
 		firstOfYear := funcCall("makedate", []any{funcCall("year", []any{ts}), 1})
-		start := drops.ExprFunc(func(b *drops.Builder) {
-			b.WriteByte('(')
-			firstOfYear.WriteSQL(b)
-			b.WriteString(" + INTERVAL ")
-			funcCall("quarter", []any{ts}).WriteSQL(b)
-			b.WriteString("-1 QUARTER)")
-		})
+		start := &opExpr{
+			parts:    []string{"(", " + INTERVAL ", "-1 QUARTER)"},
+			operands: []drops.Expression{firstOfYear, funcCall("quarter", []any{ts})},
+		}
 		return castDatetime(funcCall("date_format", []any{start, "%Y-%m-%d 00:00:00"}))
 	}
 	panic(fmt.Sprintf("drops/mysql: DateTrunc field %q is not one of second, minute, hour, day, week, month, quarter, year", field))
 }
 
+// castDatetime wraps e in CAST(… AS DATETIME(6)), holding e.
+//
+// It holds it for the reason every node in this package does: ts is a
+// caller's operand, so DateTrunc("day", <select>) writes a statement
+// inside this cast, and a closure here would put it out of the
+// resolver's reach — the whole expression would render its subquery
+// through WriteSQL, unscoped, on any ctx at all.
 func castDatetime(e drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CAST(")
-		e.WriteSQL(b)
-		b.WriteString(" AS DATETIME(6))")
-	})
+	return &opExpr{parts: []string{"CAST(", " AS DATETIME(6))"}, operands: []drops.Expression{e}}
 }
 
 // Extract renders extract(<field> FROM <ts>).
@@ -162,13 +161,10 @@ func castDatetime(e drops.Expression) drops.Expression {
 // EXTRACT(WEEK FROM …) is also not pg's ISO week: MySQL defaults to
 // mode 0, Sunday-based, with a week 0 at the start of the year.
 func Extract(field string, ts any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("extract(")
-		b.WriteString(field)
-		b.WriteString(" FROM ")
-		writeOperand(b, ts)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"extract(" + field + " FROM ", ")"},
+		operands: []drops.Expression{operandExpr(ts)},
+	}
 }
 
 // DayOfWeek renders dayofweek(<ts>), which numbers Sunday 1 through
@@ -213,12 +209,10 @@ func Interval(n any, unit string) drops.Expression {
 	if u == "" || strings.ContainsAny(u, " \t\n\r'`\"();") {
 		panic(fmt.Sprintf("drops/mysql: %q is not an interval unit", unit))
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("INTERVAL ")
-		writeOperand(b, n)
-		b.WriteByte(' ')
-		b.WriteString(u)
-	})
+	return &opExpr{
+		parts:    []string{"INTERVAL ", " " + u},
+		operands: []drops.Expression{operandExpr(n)},
+	}
 }
 
 // Second / Minute / Hour / Day / Week / Month / Year build interval
@@ -256,15 +250,10 @@ func TimestampDiff(unit string, from, to any) drops.Expression {
 	if u == "" || strings.ContainsAny(u, " \t\n\r'`\"();") {
 		panic(fmt.Sprintf("drops/mysql: %q is not an interval unit", unit))
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("timestampdiff(")
-		b.WriteString(u)
-		b.WriteString(", ")
-		writeOperand(b, from)
-		b.WriteString(", ")
-		writeOperand(b, to)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"timestampdiff(" + u + ", ", ", ", ")"},
+		operands: []drops.Expression{operandExpr(from), operandExpr(to)},
+	}
 }
 
 // DateFormat renders date_format(<ts>, <pattern>) using MySQL's %-code

@@ -359,25 +359,25 @@ func JSONTable(doc any, rowPath string, alias string, cols ...JSONColumn) drops.
 	for _, c := range cols {
 		mustJSONPath(c.path)
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("JSON_TABLE(")
-		writeOperand(b, doc)
-		b.WriteString(", ")
-		b.WriteString("'" + quoteLiteral(rowPath) + "'")
-		b.WriteString(" COLUMNS (")
-		for i, c := range cols {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteIdent(c.name)
-			b.WriteByte(' ')
-			b.WriteString(c.typ)
-			b.WriteString(" PATH ")
-			b.WriteString("'" + quoteLiteral(c.path) + "'")
+	// Only the document is an operand — a caller can hand that one a
+	// scalar subquery, and it is walked like any other operand. The
+	// COLUMNS list is text: every part of it is an identifier or a JSON
+	// path this function has already validated, and none of it is a
+	// place a statement can be written.
+	var o opBuilder
+	o.text("JSON_TABLE(")
+	o.value(doc)
+	o.text(", '" + quoteLiteral(rowPath) + "' COLUMNS (")
+	for i, c := range cols {
+		if i > 0 {
+			o.text(", ")
 		}
-		b.WriteString(")) AS ")
-		b.WriteIdent(alias)
-	})
+		o.text(quoteIdent(c.name) + " " + c.typ + " PATH '" + quoteLiteral(c.path) + "'")
+	}
+	o.text("))")
+	node := o.done()
+	node.alias = alias
+	return node
 }
 
 // mustJSONPath rejects anything that is not shaped like a JSON path.

@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"reflect"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -195,13 +196,82 @@ func (g allGuard) Predicate(ctx context.Context) (drops.Expression, error) {
 }
 
 // AuthorizeWith installs g on the entity. Pass nil to clear.
+//
+// The guard is registered as a [Table.ContextFilter], so it is applied
+// by whichever executor runs the statement rather than by the Entity
+// methods — which is what puts it on an eager-loaded relation edge, on
+// a subquery over the guarded table and on a bare db.Select().From(t),
+// none of which has an Entity to ask.
+//
+// One entity registers at most one guard filter, under a key naming its
+// row type (see rowScopeFilterKey), and registering under a key that is
+// already taken REPLACES what is there. So two entities over one table
+// compose or collide depending on their row types, and the rule is
+// worth knowing before it decides something:
+//
+//   - Entity[Invoice] and Entity[InvoiceWrite] over "invoices" hold two
+//     keys, so both guards apply and the rows are visible only to a
+//     subject both of them admit.
+//   - Two Entity[Invoice] values over "invoices" — the ordinary shape
+//     where a read path and a write path each build their own — hold
+//     one key, and the second AuthorizeWith silently replaces the
+//     first's guard.
+//
+// The second is not the conservative outcome, and calling it one would
+// be worse than the behaviour: a reader who believed the two guards
+// were AND-ed would read a narrowing that is not there. The key cannot
+// be made finer without making it too fine — an entity built inside a
+// request handler is a shape this method documents as supported, and
+// keying on anything per-value would stack one guard per request onto a
+// shared table, growing the WHERE clause without bound. Two guards that
+// must both hold go into one AuthorizeWith with AllOf, which says so at
+// the call site.
 func (e *Entity[T]) AuthorizeWith(g Guard) *Entity[T] {
 	e.guard = g
+	// Registered even for a nil g: the closure reads e.guard when it
+	// runs, so clearing a guard clears the predicate, and re-registering
+	// under the same key keeps an entity rebuilt per request from
+	// stacking one filter per construction.
+	e.table.setContextFilter(rowScopeFilterKey(e.rowType, "guard"), e.guardPredicate)
 	return e
+}
+
+// rowScopeFilterKey names the context filter an entity registers on its
+// table for kind ("tenant" or "guard").
+//
+// The row type is in the key so that two entities over one table with
+// different row types each keep their own filter, while the same entity
+// declared twice — or rebuilt inside a request handler, which is a
+// documented shape — replaces its own rather than stacking a copy per
+// call. What the key cannot do is separate two entities of the *same*
+// row type: registering replaces, and [Entity.AuthorizeWith] says what
+// that costs.
+//
+// The type is spelled with its full import path rather than through
+// reflect.Type.String, which prints the short package name. Two Invoice
+// types from two packages both ending in "billing" are
+// "billing.Invoice" to String, so they would share one key and one of
+// the two guards would vanish — a row-visibility filter lost to a
+// package-name collision, which is not a failure anybody would think to
+// look for. A type with no name — an anonymous struct, which is legal
+// as an entity's row type in a test — has no path either, so those fall
+// back to String.
+func rowScopeFilterKey(rowType reflect.Type, kind string) string {
+	if rowType == nil {
+		return kind + ":"
+	}
+	if rowType.Name() == "" || rowType.PkgPath() == "" {
+		return kind + ":" + rowType.String()
+	}
+	return kind + ":" + rowType.PkgPath() + "." + rowType.Name()
 }
 
 // guardPredicate resolves the active guard's predicate, or (nil, nil)
 // when no guard is installed.
+//
+// It is registered on the table as a context filter by AuthorizeWith
+// and called by the executors; the Entity methods no longer inject it
+// themselves.
 func (e *Entity[T]) guardPredicate(ctx context.Context) (drops.Expression, error) {
 	if e.guard == nil {
 		return nil, nil

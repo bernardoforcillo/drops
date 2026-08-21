@@ -193,10 +193,28 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 	return rows, err
 }
 
-// ExecExpr renders e with the SQLite dialect and runs it. Convenience
-// for DDL helpers like CreateTable.
+// ExecExpr renders e for ctx with the SQLite dialect and runs it.
+// Convenience for DDL helpers like CreateTable, and the one executor
+// that takes an arbitrary expression rather than a builder.
+//
+// It renders for the ctx, not blind, and the reason is that this is an
+// EXECUTOR: everything else in the package that sends a statement
+// resolves the context filters of the tables it names first, and a
+// method that took a ctx and threw it away would be the way around all
+// of them. db.ExecExpr(ctx, db.Delete(Posts).Where(...)) is an
+// ordinary spelling, and rendered blind it sent a DELETE against a
+// tenant-scoped table with no tenant predicate and no refusal.
+//
+// Three cases, and renderForCtx says which is which: a statement is
+// asked for its ctx form; an expression with a statement inside it is
+// walked to that statement; anything genuinely opaque — a DDL helper, a
+// [drops.Raw] — has nothing to resolve and renders byte for byte as it
+// always did.
 func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, error) {
-	sql, args := drops.StringWithDialect(Dialect, e)
+	sql, args, err := renderForCtx(ctx, e)
+	if err != nil {
+		return nil, err
+	}
 	return db.Exec(ctx, sql, args...)
 }
 

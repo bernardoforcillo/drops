@@ -84,23 +84,21 @@ func (p *PageBuilder[T]) Limit(n int) *PageBuilder[T] {
 	return p
 }
 
-// All runs the query and returns the page. Honours the entity's tenant
-// scope when one is configured.
+// All runs the query and returns the page.
+//
+// The tenant scope and the authorization guard are applied by the
+// executor, from the filters the table carries — see
+// [Table.ContextFilter]. This method used to inject the tenant
+// predicate and not the guard, which is the failure mode a per-call-site
+// scope always has: it covers the sites somebody listed, and a page over
+// a guarded entity read rows the subject was not entitled to.
 func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	if len(p.orderBys) == 0 {
 		return nil, errors.New("drops/sqlite: Page requires OrderBy(...)")
 	}
-	tenantPred, err := p.e.tenantPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	sel := p.db.Select(p.e.selectCols()...).From(p.e.table)
 	for _, w := range p.wheres {
 		sel.Where(w)
-	}
-	if tenantPred != nil {
-		sel.Where(tenantPred)
 	}
 	if p.after != "" {
 		guard, err := cursorGuard(p.orderBys, p.after)

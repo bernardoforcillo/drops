@@ -21,6 +21,25 @@ type exprBinding struct {
 func (e *exprBinding) column() *Column             { return e.col }
 func (e *exprBinding) writeValue(b *drops.Builder) { e.expr.WriteSQL(b) }
 
+// boundExpr and withBoundExpr implement exprBound, which is how the
+// resolver reaches the statements a hook's assignment may hold. A hook
+// is registered on the table and reaches every write against it, and
+// what it binds is an arbitrary expression — so it is an operand
+// position a *SelectBuilder can be handed to, and one no call site
+// shows.
+//
+// withBoundExpr copies rather than assigning through the pointer: a
+// hook is free to hand back a binding it holds on to, and a resolved
+// body written into that binding would pin one request's tenant into
+// every later statement the hook contributes to.
+func (e *exprBinding) boundExpr() drops.Expression { return e.expr }
+
+func (e *exprBinding) withBoundExpr(x drops.Expression) ColumnValue {
+	cp := *e
+	cp.expr = x
+	return &cp
+}
+
 // ----------------------------------------------------------------------
 // INSERT hook
 // ----------------------------------------------------------------------

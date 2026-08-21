@@ -140,13 +140,7 @@ func (c *Col[T]) Lte(v T) drops.Expression { return cmp(c.Column, "<=", v) }
 
 // EqCol compares two columns.
 func (c *Col[T]) EqCol(other ColRef) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		c.Column.WriteSQL(b)
-		b.WriteString(" = ")
-		other.col().WriteSQL(b)
-		b.WriteByte(')')
-	})
+	return binOp(c.Column, "=", other.col())
 }
 
 // IsNull / IsNotNull.
@@ -154,23 +148,33 @@ func (c *Col[T]) IsNull() drops.Expression    { return nullCheck(c.Column, true)
 func (c *Col[T]) IsNotNull() drops.Expression { return nullCheck(c.Column, false) }
 
 // In renders (col IN (?, ?, ...)). Empty renders "(0)" (never matches).
+//
+// Every value is BOUND, never rendered as an expression, which is the
+// rule the whole typed column form follows and the reason it needs
+// saying: T can be instantiated as an interface type, so a *Col[any]
+// would otherwise render whatever an Expression-valued argument writes
+// instead of binding it — a change of meaning decided by the type
+// parameter rather than by the call. The package-level [In] is the one
+// that takes an operand, and it holds it.
 func (c *Col[T]) In(values ...T) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		if len(values) == 0 {
-			b.WriteString("(0)")
-			return
-		}
-		b.WriteByte('(')
-		c.Column.WriteSQL(b)
-		b.WriteString(" IN (")
-		for i, v := range values {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.AddArg(v)
-		}
-		b.WriteString("))")
-	})
+	if len(values) == 0 {
+		return drops.Raw("(0)")
+	}
+	// One part before the column, one opening the list, one comma per
+	// further value, and the two closing parentheses.
+	parts := make([]string, len(values)+2)
+	parts[0] = "("
+	parts[1] = " IN ("
+	for i := 2; i <= len(values); i++ {
+		parts[i] = ", "
+	}
+	parts[len(values)+1] = "))"
+	operands := make([]drops.Expression, 0, len(values)+1)
+	operands = append(operands, c.Column)
+	for _, v := range values {
+		operands = append(operands, drops.Param{Value: v})
+	}
+	return &opExpr{parts: parts, operands: operands}
 }
 
 // Asc / Desc produce ORDER BY terms.
@@ -182,63 +186,58 @@ func (c *Column) Asc() drops.Expression  { return orderTerm(c, " ASC") }
 func (c *Column) Desc() drops.Expression { return orderTerm(c, " DESC") }
 
 func orderTerm(c *Column, dir string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(dir)
-	})
+	return &opExpr{parts: []string{"", dir}, operands: []drops.Expression{c}}
 }
 
 // As aliases a column in a SELECT projection.
 func (c *Column) As(alias string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		c.WriteSQL(b)
-		b.WriteString(" AS ")
-		b.WriteIdent(alias)
-	})
+	return aliasExpr(c, alias)
 }
 
 // Val binds a typed value for INSERT/UPDATE.
 func (c *Col[T]) Val(v T) ColumnValue { return columnValue{col: c.Column, val: v} }
 
+// cmp renders "(<col> <op> ?)". The value is always BOUND — never
+// rendered as an expression — because this is the typed column form and
+// its argument is a Go value of the column's own type. The untyped
+// package-level operators in op.go are the ones that take an operand,
+// and they hold it.
 func cmp(c *Column, op string, v any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		c.WriteSQL(b)
-		b.WriteByte(' ')
-		b.WriteString(op)
-		b.WriteByte(' ')
-		b.AddArg(v)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " " + op + " ", ")"},
+		operands: []drops.Expression{c, drops.Param{Value: v}},
+	}
 }
 
 func nullCheck(c *Column, isNull bool) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		c.WriteSQL(b)
-		if isNull {
-			b.WriteString(" IS NULL)")
-		} else {
-			b.WriteString(" IS NOT NULL)")
-		}
-	})
+	tail := " IS NOT NULL)"
+	if isNull {
+		tail = " IS NULL)"
+	}
+	return &opExpr{parts: []string{"(", tail}, operands: []drops.Expression{c}}
 }
 
 // And / Or combine predicates.
+//
+// Each operand is held rather than closed over, so a conjunct that is a
+// statement — And(Exists(sub), guard) — keeps its own scoping, and each
+// is bracketed when leaving it bare would let it reassociate its
+// neighbours: And(drops.Raw("a OR b"), guard) rendered
+// "(a OR b AND guard)", which is "(a OR (b AND guard))" and leaves the
+// guard binding nothing. See bracketConjunct.
+//
+// A single predicate is not bracketed, because there is nothing beside
+// it to reassociate, and the enclosing parentheses these render anyway
+// are the wrapper the caller sees. That keeps And(p) and Or(p)
+// rendering exactly the bytes they always did.
 func And(preds ...drops.Expression) drops.Expression { return boolChain(" AND ", preds) }
 func Or(preds ...drops.Expression) drops.Expression  { return boolChain(" OR ", preds) }
 
 func boolChain(sep string, preds []drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		for i, p := range preds {
-			if i > 0 {
-				b.WriteString(sep)
-			}
-			b.Append(p)
-		}
-		b.WriteByte(')')
-	})
+	if len(preds) > 1 {
+		preds = bracketConjuncts(preds)
+	}
+	return listOp("(", sep, ")", preds)
 }
 
 // ColumnValue is a column bound to a value for INSERT/UPDATE.
@@ -271,3 +270,14 @@ type exprValue struct {
 
 func (v exprValue) column() *Column             { return v.col }
 func (v exprValue) writeValue(b *drops.Builder) { b.Append(v.expr) }
+
+// boundExpr and withBoundExpr implement exprBound, so the statements
+// inside an [UpdateBuilder.SetExpr] assignment are resolved for the
+// executing ctx. The assigned value is the operand that decides what
+// gets written rather than which rows do; see resolveSets.
+func (v exprValue) boundExpr() drops.Expression { return v.expr }
+
+func (v exprValue) withBoundExpr(x drops.Expression) ColumnValue {
+	v.expr = x
+	return v
+}

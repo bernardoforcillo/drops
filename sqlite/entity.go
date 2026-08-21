@@ -19,6 +19,10 @@ import (
 // primary key.
 type Entity[T any] struct {
 	table *Table
+	// rowType is T with its pointers stripped. It names the row this
+	// entity maps, and is what keys the context filters the entity
+	// registers on the shared table — see rowScopeFilterKey.
+	rowType reflect.Type
 	// pk / pkField describe the primary key when it is a single
 	// column and are nil for a composite one; pks / pkFields are
 	// always populated, in declaration order.
@@ -46,7 +50,8 @@ type entityColField struct {
 
 // hasRowScope reports whether anything restricts which rows an
 // operation on this entity may touch: a tenant axis or an
-// authorisation guard declared through the entity.
+// authorisation guard declared through the entity, or any context
+// filter the TABLE declares.
 //
 // The invariant the answer guards is the strong one: the PK cache never
 // *holds* a scoped row, not merely "a scoped Get does not read it".
@@ -70,14 +75,23 @@ type entityColField struct {
 // unrestricted", answered no and put a guarded entity back on the
 // cached path.
 //
-// What is missing from the list, and is the difference from drops/pg:
-// this dialect has no table-level context filter, so an axis declared
-// on the Table rather than through the Entity is not a shape that
-// exists here. When sqlite gains one, it belongs in this predicate —
-// pg's equivalent asks e.table.hasContextFilters() as its third term
-// precisely because a table can be scoped with no Entity involved.
+// The third term is the one the list used to be missing, and it is the
+// reason this comment named it before it existed: a table can be scoped
+// with no Entity involved at all —
+// Posts.ContextFilter(sqlite.TenantFilter(col)), or a second entity
+// over the same table that declared the axis — and the PK cache is
+// attached per entity. Without it, an entity holding no axis of its own
+// went on filling a primary-key-keyed namespace with rows whose
+// visibility the table restricts, and every one of them was a row
+// waiting to be handed to the next caller who asked for that id.
+//
+// The first two terms are kept rather than folded into the third. They
+// answer a question about this entity's configuration where the third
+// answers one about the table's, and an entity whose guard is declared
+// but whose filter registration happens to be replaced by another
+// entity of the same row type must still be treated as scoped.
 func (e *Entity[T]) hasRowScope() bool {
-	return e.tenantCol != nil || e.guard != nil
+	return e.tenantCol != nil || e.guard != nil || e.table.hasContextFilters()
 }
 
 // NewEntity builds the entity, panicking on misconfiguration (schemas
@@ -132,7 +146,10 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	if err := checkDrift(rt, t, colFields, cfg); err != nil {
 		panic(err.Error())
 	}
-	return &Entity[T]{table: t, pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields}
+	return &Entity[T]{
+		table: t, rowType: rt,
+		pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields,
+	}
 }
 
 // EntityOption configures [NewEntity].
@@ -269,41 +286,32 @@ func (e *Entity[T]) selectCols() []drops.Expression {
 }
 
 // Get fetches the row whose primary key equals id, returning ErrNoRows
-// if absent. Applies the tenant scope and the authorization guard when
-// configured.
+// if absent.
+//
+// The tenant scope and the authorization guard are not applied here.
+// They are registered on the table as context filters (see
+// [Entity.ScopeByTenant] and [Entity.AuthorizeWith]) and applied by the
+// executor this statement runs through, which is what puts them on
+// every other path too — a relation edge, a subquery, a bare
+// db.Select — instead of only on the methods somebody remembered.
 //
 // When a cache is attached via WithCache, Get serves hits from the
 // cache and dedupes concurrent cache misses via single-flight so a
 // thundering herd resolves to one DB query. An entity whose rows are
-// scoped — by a tenant axis or a guard — skips that path entirely: the
-// cache is keyed by primary key alone, so answering from it would hand
-// one caller a row another caller cached, without a statement ever
-// being sent. See hasRowScope.
+// scoped — by a tenant axis, a guard, or anything the table itself
+// declares — skips that path entirely: the cache is keyed by primary
+// key alone, so answering from it would hand one caller a row another
+// caller cached, without a statement ever being sent. See hasRowScope.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	var out T
 	pred, err := e.pkPredicate(key)
 	if err != nil {
 		return out, err
 	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return out, err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return out, err
-	}
 	if e.cache != nil && !e.hasRowScope() {
 		return e.getCached(db, ctx, key, pred)
 	}
-	sel := db.Select(e.selectCols()...).From(e.table).Where(pred)
-	if tenantPred != nil {
-		sel.Where(tenantPred)
-	}
-	if guardPred != nil {
-		sel.Where(guardPred)
-	}
-	err = sel.One(ctx, &out)
+	err = db.Select(e.selectCols()...).From(e.table).Where(pred).One(ctx, &out)
 	return out, err
 }
 
@@ -394,7 +402,15 @@ func (e *Entity[T]) insertReturningKey(db *DB, ctx context.Context, ins *InsertB
 		ins.Returning(e.pks[i])
 		dests = append(dests, rv.FieldByIndex(e.pkFields[i]).Addr().Interface())
 	}
-	sqlText, args := ins.ToSQL()
+	// ToSQLCtx, not ToSQL: this is an executor, and the statement it
+	// sends has to be the one the ctx names — stamped with the tenant,
+	// or refused when the ctx carries none. Rendering it blind here
+	// would have made Entity.Create the one INSERT path in the package
+	// that wrote a row belonging to nobody.
+	sqlText, args, err := ins.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := db.Query(ctx, sqlText, args...)
 	if err != nil {
 		return err
@@ -507,15 +523,8 @@ func rowsMatchColumns(rows [][]ColumnValue, cols []*Column) bool {
 // same transaction (when audited), and refreshes the PK cache — or, for
 // a scoped entity, clears it. See hasRowScope.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
+	var err error
 	rv := reflect.ValueOf(r).Elem()
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return err
-	}
 	sets := e.bindings(rv, true)
 	pkVals := e.pkValuesOf(r)
 	pred, err := e.pkPredicate(pkVals)
@@ -523,14 +532,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		return err
 	}
 	do := func(tx *DB) error {
-		upd := tx.Update(e.table).Set(sets...).Where(pred)
-		if tenantPred != nil {
-			upd.Where(tenantPred)
-		}
-		if guardPred != nil {
-			upd.Where(guardPred)
-		}
-		if _, err := upd.Exec(ctx); err != nil {
+		if _, err := tx.Update(e.table).Set(sets...).Where(pred).Exec(ctx); err != nil {
 			return err
 		}
 		return e.recordAudit(tx, ctx, "update", r, auditKey(pkVals))
@@ -558,24 +560,9 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var res drops.Result
 	do := func(tx *DB) error {
-		del := tx.Delete(e.table).Where(pred)
-		if tenantPred != nil {
-			del.Where(tenantPred)
-		}
-		if guardPred != nil {
-			del.Where(guardPred)
-		}
-		r, derr := del.Exec(ctx)
+		r, derr := tx.Delete(e.table).Where(pred).Exec(ctx)
 		if derr != nil {
 			return derr
 		}
@@ -620,42 +607,59 @@ func (e *Entity[T]) bindings(rv reflect.Value, skipPK bool) []ColumnValue {
 
 // Query begins a fluent, entity-typed query. When the entity is
 // tenant-scoped the caller must pass a tenant-carrying ctx to All/One
-// (via WithTenant); the tenant predicate is applied at execution time.
+// (via WithTenant); the tenant predicate is applied at execution time,
+// by the executor, from the filter the axis registered on the table.
 func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 	return &EntityQuery[T]{e: e, sb: db.Select(e.selectCols()...).From(e.table)}
 }
 
 // EntityQuery is a typed wrapper over SelectBuilder that returns []T / T.
+//
+// It used to AND the tenant predicate and the guard onto q.sb the first
+// time it executed, under a scopesApplied flag. Two things were wrong
+// with that and both are fixed by letting the executor do it. The
+// predicates reached this path and no other, so a query built any other
+// way went unscoped. And appending to the builder MUTATED it, so the
+// flag existed to stop the second execution carrying the predicate
+// twice — which meant a query value reused across requests answered the
+// second request with the first request's tenant, permanently. The
+// executor resolves onto a per-execution copy instead, so a reused
+// EntityQuery is scoped afresh every time and there is no flag to keep
+// in step.
 type EntityQuery[T any] struct {
-	e             *Entity[T]
-	sb            *SelectBuilder
-	scopesApplied bool
+	e  *Entity[T]
+	sb *SelectBuilder
+	// unscoped records [EntityQuery.Unscoped], which means something
+	// narrower here than it does on the raw builder — see there, and
+	// see stmt for how the narrower meaning is composed.
+	unscoped bool
 }
 
-// applyScopes AND-s the ctx tenant predicate and authorization guard onto
-// the query the first time it runs. Returns ErrTenantMissing /
-// ErrSubjectMissing when a scope/guard is configured but ctx lacks the
-// needed value.
-func (q *EntityQuery[T]) applyScopes(ctx context.Context) error {
-	if q.scopesApplied {
-		return nil
+// stmt returns the SELECT to run for ctx.
+//
+// With no Unscoped it is the builder itself, and the executor does
+// everything. With Unscoped it is a per-execution COPY that opts the
+// statement out of the table's automatic predicates and then AND-s the
+// context filters back in, resolved for this ctx.
+//
+// The copy is not an optimisation. Appending the resolved predicates to
+// q.sb would leave them there: the second execution of a reused query
+// would carry the tenant twice, and a query value held across requests
+// would answer the second request with the first request's tenant.
+// That is the same accretion the old applyScopes flag existed to paper
+// over, and copying is what removes the need for a flag.
+func (q *EntityQuery[T]) stmt(ctx context.Context) (*SelectBuilder, error) {
+	if !q.unscoped {
+		return q.sb, nil
 	}
-	tenantPred, err := q.e.tenantPredicate(ctx)
+	scope, err := q.e.table.resolveContextFilters(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if tenantPred != nil {
-		q.sb.Where(tenantPred)
-	}
-	guardPred, err := q.e.guardPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	if guardPred != nil {
-		q.sb.Where(guardPred)
-	}
-	q.scopesApplied = true
-	return nil
+	cp := *q.sb
+	cp.unscoped = true
+	cp.wheres = append(append([]drops.Expression(nil), q.sb.wheres...), scope...)
+	return &cp, nil
 }
 
 // Where AND-s predicates onto the query.
@@ -670,12 +674,35 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 	return q
 }
 
-// Limit / Offset bound the result window.
-// Unscoped opts out of the table's DefaultFilter predicates for this
-// query. Without it a soft-deleted row is unreachable through the
-// entity at all, which makes an audit or a restore flow impossible to
-// write.
-func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+// Unscoped opts out of the table's DEFAULT filters for this query —
+// the declaration-time ones, a soft-delete guard above all. Without it
+// a soft-deleted row is unreachable through the entity at all, which
+// makes an audit or a restore flow impossible to write.
+//
+// It does NOT drop the table's context filters: the tenant axis and the
+// authorization guard survive it. That is a deliberate difference from
+// [SelectBuilder.Unscoped], which is statement-wide, and from
+// drops/pg's entity query, which is statement-wide too. The two lists
+// are not the same kind of thing — a default filter is a default scope,
+// a context filter is a row-visibility boundary — and the failures of
+// conflating them are not symmetric. Widening a default scope when the
+// caller asked to widen it costs nothing. Dropping the boundary hands
+// this request every tenant's rows, or every subject's, and it does so
+// on the one method a caller reaches for while thinking about
+// soft-deleted rows rather than about tenancy.
+//
+// pg makes the other trade, and its reason is real: a caller who says
+// Unscoped and gets ErrTenantMissing has learned nothing about the row
+// they were after. The reason it lands differently here is that this
+// dialect ALREADY behaved this way — the entity injected its guard
+// whether or not the query said Unscoped — and a port that silently
+// widened every existing Unscoped() call to span tenants would be a
+// scoping regression shipped under the banner of scoping work.
+//
+// A query that genuinely has to span tenants is written on the raw
+// builder, db.Select().From(t).Unscoped(), where a reviewer reading the
+// call sees the whole of what was given up.
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.unscoped = true; return q }
 
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
@@ -684,14 +711,15 @@ func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); retur
 // cache attached, the result is read through it under a key derived
 // from the rendered SQL and its arguments, matching drops/pg.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
-	if err := q.applyScopes(ctx); err != nil {
-		return nil, err
-	}
 	if q.e.cache != nil {
 		return q.allCached(ctx)
 	}
+	sel, err := q.stmt(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var out []T
-	if err := q.sb.All(ctx, &out); err != nil {
+	if err := sel.All(ctx, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -701,14 +729,15 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 // same way as All when the entity has a cache attached.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	var out T
-	if err := q.applyScopes(ctx); err != nil {
-		return out, err
-	}
 	q.sb.Limit(1)
 	if q.e.cache != nil {
 		return q.oneCached(ctx)
 	}
-	err := q.sb.One(ctx, &out)
+	sel, err := q.stmt(ctx)
+	if err != nil {
+		return out, err
+	}
+	err = sel.One(ctx, &out)
 	return out, err
 }
 
@@ -716,8 +745,27 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // cache. Both go through the single-flight group so a cold key under
 // concurrent load issues one query rather than one per caller — the
 // stampede protection the PK path already had.
+//
+// The key is built from ToSQLCtx and not from ToSQL, and that is a
+// tenant boundary rather than a detail. The query namespace is safe for
+// a scoped entity only because the tenant is bound into the statement
+// as an argument and hashed into the key — see queryKey, which is
+// written around exactly that fact. Since the axis moved onto the table
+// the tenant is added by the RESOLVER, so ToSQL renders the statement
+// without it: two tenants asking one question would produce one key and
+// one of them would be served the other's rows, silently, on the first
+// request after the second tenant's cache warmed. Resolving here also
+// means a ctx that cannot name a tenant is refused before the cache is
+// consulted, rather than after it answers.
 func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
-	sql, args := q.sb.ToSQL()
+	sel, err := q.stmt(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sql, args, err := sel.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	key := queryKey(q.e.table.Name(), sql, args)
 	var out []T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
@@ -729,7 +777,7 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 			return hits, nil
 		}
 		var rs []T
-		if qErr := q.sb.All(ctx, &rs); qErr != nil {
+		if qErr := sel.All(ctx, &rs); qErr != nil {
 			return rs, qErr
 		}
 		_ = q.e.cache.writeKey(ctx, key, rs)
@@ -742,9 +790,16 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 }
 
 func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
-	sql, args := q.sb.ToSQL()
-	key := queryKey(q.e.table.Name(), sql, args) + ":one"
 	var out T
+	sel, err := q.stmt(ctx)
+	if err != nil {
+		return out, err
+	}
+	sql, args, err := sel.ToSQLCtx(ctx)
+	if err != nil {
+		return out, err
+	}
+	key := queryKey(q.e.table.Name(), sql, args) + ":one"
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
 		return out, nil
 	}
@@ -753,7 +808,7 @@ func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
 		if hit, rErr := q.e.cache.readPK(ctx, key, &t); rErr == nil && hit {
 			return t, nil
 		}
-		if qErr := q.sb.One(ctx, &t); qErr != nil {
+		if qErr := sel.One(ctx, &t); qErr != nil {
 			return t, qErr
 		}
 		_ = q.e.cache.writeKey(ctx, key, t)

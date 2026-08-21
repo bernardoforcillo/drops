@@ -11,12 +11,12 @@ import "github.com/bernardoforcillo/drops"
 //	sqlite.Over(sqlite.RowNumber(),
 //	    sqlite.WindowSpec().PartitionBy(UserID).OrderBy(PostCreatedAt.Desc()))
 func Over(fn drops.Expression, win *Window) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(fn)
-		b.WriteString(" OVER (")
-		win.writeBody(b)
-		b.WriteByte(')')
-	})
+	var o opBuilder
+	o.operand(fn)
+	o.text(" OVER (")
+	win.build(&o)
+	o.text(")")
+	return o.done()
 }
 
 // Window describes the contents of an OVER (...) clause.
@@ -45,47 +45,47 @@ func (w *Window) OrderBy(exprs ...drops.Expression) *Window {
 // "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING".
 func (w *Window) Frame(spec string) *Window { w.frame = spec; return w }
 
-func (w *Window) writeBody(b *drops.Builder) {
+// build appends the window spec's body to o.
+//
+// The partition and order lists are held as operands rather than
+// rendered inside a closure, because a window key is an operand
+// position a caller can hand a statement to:
+// row_number() OVER (PARTITION BY (SELECT … FROM posts)) is a shape
+// that renders, and while it lived in a drops.ExprFunc the statement in
+// it carried none of the posts table's context filters. See opExpr.
+func (w *Window) build(o *opBuilder) {
 	first := true
 	if len(w.partition) > 0 {
-		b.WriteString("PARTITION BY ")
-		b.AppendList(", ", w.partition)
+		o.text("PARTITION BY ")
+		o.list(w.partition)
 		first = false
 	}
 	if len(w.order) > 0 {
 		if !first {
-			b.WriteByte(' ')
+			o.text(" ")
 		}
-		b.WriteString("ORDER BY ")
-		b.AppendList(", ", w.order)
+		o.text("ORDER BY ")
+		o.list(w.order)
 		first = false
 	}
 	if w.frame != "" {
 		if !first {
-			b.WriteByte(' ')
+			o.text(" ")
 		}
-		b.WriteString(w.frame)
+		o.text(w.frame)
 	}
 }
 
 // Window functions ----------------------------------------------------
 
-func RowNumber() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("row_number()") })
-}
-func Rank() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("rank()") })
-}
-func DenseRank() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("dense_rank()") })
-}
-func PercentRank() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("percent_rank()") })
-}
-func CumeDist() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("cume_dist()") })
-}
-func Ntile(n any) drops.Expression { return funcCall("ntile", []any{n}) }
+// These take no operand at all, so there is nothing for a walk to
+// reach: they are fixed text and stay fixed text.
+func RowNumber() drops.Expression   { return drops.Raw("row_number()") }
+func Rank() drops.Expression        { return drops.Raw("rank()") }
+func DenseRank() drops.Expression   { return drops.Raw("dense_rank()") }
+func PercentRank() drops.Expression { return drops.Raw("percent_rank()") }
+func CumeDist() drops.Expression    { return drops.Raw("cume_dist()") }
+func Ntile(n any) drops.Expression  { return funcCall("ntile", []any{n}) }
 
 // Lag renders lag(expr [, offset [, default]]).
 func Lag(expr any, args ...any) drops.Expression {

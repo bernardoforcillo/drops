@@ -17,6 +17,15 @@ import (
 // Each requested relation costs exactly one extra batched query (an
 // IN (...) over the collected parent keys), so eager loading never
 // degrades into N+1.
+//
+// Every one of those queries is composed with this package's builder
+// and run through its executors, which is what carries each target
+// table's own automatic predicates onto the edge: a tenant axis
+// declared on the child table restricts the children, without the
+// loader knowing anything about tenants. That is the property the
+// entity-level scoping never had — the loader has no Entity to ask, so
+// a predicate the Entity methods injected filtered the parents and
+// loaded every tenant's children.
 type FindBuilder struct {
 	db    *DB
 	table *Table
@@ -316,10 +325,22 @@ func (f *FindBuilder) loadManyToMany(
 	rowKeyType := parentType.FieldByIndex(rowKeyField).Type
 	targetKeyType := childStructType.FieldByIndex(targetKeyField).Type
 
-	junctionSQL, junctionArgs := f.db.Select(rel.ThroughLocal, rel.ThroughForeign).
+	// ToSQLCtx, not ToSQL. This is the one query in the eager loader
+	// that renders its own SQL instead of going through an executor,
+	// because it scans two loose key columns rather than a row type —
+	// and rendering is where a table's context filters do NOT appear.
+	// A junction table is exactly the kind that carries them: a
+	// membership row is what says which tenant an association belongs
+	// to, so an unresolved junction read linked this tenant's parents
+	// to every tenant's children, and the target query that follows
+	// cannot notice because it is handed the keys as values.
+	junctionSQL, junctionArgs, err := f.db.Select(rel.ThroughLocal, rel.ThroughForeign).
 		From(rel.Through).
 		Where(inPredicate(rel.ThroughLocal, rowKeys)).
-		ToSQL()
+		ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	junctionRows, err := f.db.Query(ctx, junctionSQL, junctionArgs...)
 	if err != nil {
 		return err

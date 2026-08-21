@@ -20,7 +20,9 @@ import (
 //	//   "maxScore" = max("maxScore", ?)
 //	// WHERE ("id" = ?) AND ("tenantId" = ?)
 //
-// The op set honours the entity's tenant scope (see ScopeByTenant).
+// The op set honours the table's automatic predicates — the tenant axis
+// (see ScopeByTenant), an authorization guard, a soft-delete filter —
+// because it runs through UpdateBuilder.Exec like any other write.
 // Returns drops.Result so callers can read rows-affected to distinguish
 // "row missing" from "row updated" without a follow-up SELECT.
 
@@ -46,15 +48,12 @@ func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...Patc
 	if err != nil {
 		return nil, err
 	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	upd := db.Update(e.table).Set(ops...).Where(pred)
-	if tenantPred != nil {
-		upd.Where(tenantPred)
-	}
-	return upd.Exec(ctx)
+	// The tenant predicate and the authorization guard are the table's
+	// context filters and are applied by Exec. This method used to
+	// inject the tenant and not the guard, so a patch — a write, and
+	// the one write in the package that never reads the row first —
+	// reached rows a guarded entity would not have shown the caller.
+	return db.Update(e.table).Set(ops...).Where(pred).Exec(ctx)
 }
 
 // number is the constraint for numeric counter ops.

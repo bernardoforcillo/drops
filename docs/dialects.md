@@ -15,11 +15,24 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Migrations, diff, snapshot | ✅ | ✅ | — | ✅ | — |
 | Outbox, saga, event store | ✅ | ✅ | — | event store | — |
 | Tenant scoping | ✅ | ✅ | ✅ | ✅ (narrower) | — |
+| Server-side boundary under it | ✅ RLS, reads + writes | file per tenant | definer view, reads + writes, needs a grant drops cannot write | row policy, reads only, fails open by default | — |
 | Audit, authz, cache | ✅ | ✅ | — | — | — |
 | Vector search | ✅ pgvector | — | — | ✅ built-in | ✅ native |
 
 Where a cell is empty the feature is not there yet, not disabled. The
 package doc for each dialect says what it covers.
+
+The "server-side boundary" row is the one to read twice, because the
+row above it flattens a difference that decides how a multi-tenant
+deployment is built. Tenant scoping is an application-level predicate
+in all four dialects; what sits UNDER it is not the same thing four
+times. Only PostgreSQL's is a boundary drops can both declare and
+satisfy. On MySQL drops renders the DDL and the deployment has to
+withhold the base-table grant that makes it a boundary; on ClickHouse
+the policy covers reads only and exempts any principal it does not
+name; on SQLite there is no principal at all, so the triggers drops
+renders guard against mistakes and the boundary is one file per
+tenant. See "Tenant scoping" below.
 
 ## PostgreSQL
 

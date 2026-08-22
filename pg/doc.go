@@ -152,14 +152,52 @@
 //     materialised view evaluates its stored body on INSERT with no ctx
 //     anywhere near it.
 //
-// What none of the three has is the boundary this section opened by
-// naming. PostgreSQL row-level security has no equivalent in SQLite
-// (no roles, no policies, and a process that can open the file reads
-// every byte), in MySQL (whose nearest equivalent is a definer-rights
-// view, a schema object drops does not manage), or in ClickHouse. In
-// those three dialects the predicates are the whole of what there is,
-// which makes each package's own "Where the automatic scoping stops"
-// list load-bearing rather than a footnote.
+// What none of the three has is PostgreSQL row-level security. This
+// paragraph used to go on to say they therefore had nothing at all
+// underneath the predicates, and that was false — flatly for
+// ClickHouse, misleadingly for MySQL, and by omission for SQLite. The
+// three are not equal, and the differences decide what a deployment on
+// each has to build for itself:
+//
+//   - ClickHouse HAS a server-side row filter: CREATE ROW POLICY …
+//     USING <cond> TO <role>, which drops declares as [RowPolicy] in
+//     drops/clickhouse. It covers SELECT and nothing else — FOR INSERT
+//     is a syntax error, so no policy constrains what a write leaves
+//     behind — and it fails OPEN by default, because
+//     users_without_row_policies_can_read_rows defaults to true and a
+//     principal with no policy of its own therefore reads every row.
+//     It is a read floor for the principals a deployment remembered to
+//     name, not a boundary the way RLS is.
+//   - MySQL has no row-level security, but it has a real boundary of a
+//     different shape: a definer-rights view filtered to one tenant,
+//     carrying WITH CASCADED CHECK OPTION, reached by an account that
+//     holds privileges on the VIEW AND NOT ON THE BASE TABLE. That
+//     holds against whatever SQL the application sends, because the
+//     privilege system enforces it rather than a predicate, and unlike
+//     a ClickHouse policy it covers WRITES. drops renders the DDL as
+//     [TenantView] in drops/mysql — but the boundary is the ABSENCE of
+//     a grant on the base table, an absence is not a statement, and no
+//     library can render one. So on MySQL it is a documented deployment
+//     pattern, not a library feature, and it costs one account per
+//     tenant, which a pooled connection shared across tenants cannot
+//     pay.
+//   - SQLite has no principal to bind a row to at all — no roles, no
+//     grants, and a process that can open the file reads every byte.
+//     What it does have is triggers, which are in the SCHEMA and so
+//     reach statements drops never built: drops/sqlite renders them as
+//     [TenantGuard]. That is a guard against MISTAKES — the raw
+//     statement, the backfill script, the foreign key pointing at
+//     another tenant's row — and not against an adversary, who can
+//     simply DROP TRIGGER. The only real boundary this dialect has is
+//     one database FILE per tenant, enforced by the filesystem, and
+//     that is a deployment decision drops does not own.
+//
+// So the ranking is ClickHouse and MySQL ahead of SQLite on what the
+// server can be made to enforce, MySQL ahead of ClickHouse on write
+// coverage, and neither reaching what RLS gives this package. Each of
+// the three packages' own "Where the automatic scoping stops" list
+// stays load-bearing rather than a footnote, because on all three the
+// predicates are still what covers the common path.
 //
 // Everything drops builds, drops walks. A statement written anywhere
 // inside a statement drops composed — a CTE body, a subquery operand in

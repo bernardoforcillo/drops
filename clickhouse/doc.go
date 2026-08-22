@@ -77,9 +77,10 @@
 // the thing the server has.
 //
 // The half that does not come across is writes. A ClickHouse row
-// policy filters SELECT and only SELECT: there is no WITH CHECK and
-// FOR INSERT is a syntax error, so a principal that can write can
-// write any tenant id it likes. On the READ side the predicates have a
+// policy filters SELECT and only SELECT: FOR INSERT is a syntax error,
+// and the WITH CHECK token the parser tolerates has nowhere to store a
+// condition, so a principal that can write can write any tenant id it
+// likes. On the READ side the predicates have a
 // floor under them if the deployment declares one; on the WRITE side
 // they are the whole of what there is. rowpolicy.go says what that
 // costs, what drops verified against a running server and what it did

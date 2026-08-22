@@ -69,10 +69,20 @@ import (
 // the dialect you are using: clickhouse in particular has no UPDATE,
 // no DELETE, no upsert and no relations for an axis to reach into.
 //
-// What does NOT port is the boundary. PostgreSQL row-level security is
-// the isolation boundary these predicates sit on top of, and the other
-// three dialects have no equivalent to sit on. There the predicates are
-// the whole of what there is.
+// What does NOT port is row-level security. PostgreSQL RLS is the
+// isolation boundary these predicates sit on top of, and no other
+// dialect here has it. What this sentence used to add — that the other
+// three therefore have nothing to sit on, and the predicates are the
+// whole of what there is — was false, and it is worth knowing exactly
+// how, because the three are not equal: ClickHouse has CREATE ROW
+// POLICY, which drops declares as clickhouse.RowPolicy, covering reads
+// only and failing open for any principal no policy names; MySQL has
+// the definer-rights view, which drops renders as mysql.TenantView and
+// which covers reads AND writes but is made a boundary by a grant drops
+// cannot write; and SQLite has no principal to bind a row to, so its
+// sqlite.TenantGuard triggers are a guard against mistakes rather than
+// a boundary, and one file per tenant is the only real one. The package
+// doc's "Where the automatic scoping stops" gives each in full.
 
 // ==== THE TENANT POLICIES — NORMATIVE ====
 //

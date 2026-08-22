@@ -431,11 +431,17 @@ func namesAxis(c, axis *Column) bool {
 //
 // Panics if col has no matching struct field — fail loudly at startup
 // rather than at the first query.
+//
+// col is matched by Column.key, so a handle taken off a table alias
+// names the same axis as the declared one. What is stored is the
+// entity's own handle rather than the one passed in: the predicate has
+// to qualify with the table this entity queries, and an alias handle
+// would qualify with an alias no such query names.
 func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 	c := col.col()
 	for _, cf := range e.colFields {
 		if cf.col.key() == c.key() {
-			e.tenantCol = c
+			e.tenantCol = cf.col
 			e.tenantField = cf.field
 			// The filter closes over the entity, not over the column,
 			// so there is one source of truth: whatever tenantPredicate
@@ -447,7 +453,7 @@ func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 			// [Table.ScopeWritesByTenant] and [InsertBuilder.ToSQLCtx].
 			// Declared on the table rather than kept on the entity
 			// because db.Insert(e.Table()) has no entity to ask.
-			e.table.setTenantAxis(c)
+			e.table.setTenantAxis(cf.col)
 			return e
 		}
 	}

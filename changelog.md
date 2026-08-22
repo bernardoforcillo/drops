@@ -179,6 +179,21 @@ once a 1.0 is cut.
   whose tenant does not round-trip through its transport as the
   column's exact type. `clickhouse` was the only dialect that had
   noticed, and its `sameTenant` is now the answer in all four.
+- **`Patch` could hand the row to another tenant** (`drops/pg`,
+  `drops/sqlite`, `drops/mysql`). Its op list comes from the caller,
+  and nothing stopped an op from naming the tenant column:
+  `Patch(db, ctx, 7, pg.Set(TenantID, 999))` rendered `UPDATE
+  "patch_axis_rows" SET "tenantId" = $1 WHERE ("patch_axis_rows"."id"
+  = $2) AND ("patch_axis_rows"."tenantId" = $3)` bound to `999, 7,
+  77` — the WHERE clause a review would check was correct, and the SET
+  clause gave the row away. `pg.Inc(TenantID, 1)` moved it one tenant
+  along. `Patch` is the one write in the package that never reads the
+  row first, so nothing downstream notices; and an op list is exactly
+  what a handler builds out of the fields a request named. It now
+  refuses any op on the axis with `ErrTenantMismatch`, including one
+  that assigns the ctx tenant's own value: that is a no-op by
+  coincidence of the value, and a rule with an exception in it is one a
+  caller can be talked into satisfying. `clickhouse` has no `Patch`.
 - **`sqlite`'s `Update` accepted a row whose key was still zero**
   (`drops/sqlite`). It sent `WHERE "id" = 0`, matched nothing, and
   reported success — a caller left believing a write landed. It now

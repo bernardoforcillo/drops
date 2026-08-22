@@ -258,6 +258,24 @@ func (e *Entity[T]) tenantWriteAxis() (*Column, []int, bool) {
 	return nil, nil, false
 }
 
+// tenantAxisColumn returns the entity's tenant axis, whoever declared
+// it — [Entity.ScopeByTenant] or the table itself.
+//
+// Unlike tenantWriteAxis it does not ask for a struct field bound to
+// the column: a patch never touches the struct, and an entity that
+// maps no field to its tenant column is still writing into a scoped
+// table. Requiring the field here would make the axis check skip
+// exactly the entities that cannot stamp themselves.
+func (e *Entity[T]) tenantAxisColumn() (*Column, bool) {
+	if e.tenantCol != nil {
+		return e.tenantCol, true
+	}
+	if c := e.table.tenantAxis(); c != nil {
+		return c, true
+	}
+	return nil, false
+}
+
 // stampTenant ensures r's tenant field matches ctx — assigns a zero
 // value, rejects a mismatching one.
 func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {

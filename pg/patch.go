@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -61,6 +62,9 @@ type PatchOp interface {
 //
 // Returns the result so callers can detect "no row matched"
 // without an additional SELECT.
+//
+// An op naming the tenant column is [ErrTenantMismatch]: the axis is
+// what addresses the row, never something a patch assigns.
 func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (drops.Result, error) {
 	return e.PatchKey(db, ctx, []any{id}, ops...)
 }
@@ -74,6 +78,27 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...PatchOp) (drops.Result, error) {
 	if len(ops) == 0 {
 		return nil, errors.New("drops/pg: Patch requires at least one operation")
+	}
+	// The tenant column is an axis, never an assignment. An op naming
+	// it renders SET "tenantId" = ? beside a WHERE clause that still
+	// addresses the ctx tenant — one statement handing the row to
+	// somebody else, reported as one row affected, and this is the one
+	// write in the package that never reads the row first, so nothing
+	// downstream notices. Create and Update refuse that instruction
+	// when it arrives on a struct; this is the same rule where an op
+	// list can express it, which is where a handler building ops out
+	// of the fields a request named will put it.
+	//
+	// An op assigning the ctx tenant's own value is refused too. It is
+	// a no-op only by coincidence of the value, and a rule with an
+	// exception in it is one a caller can be talked into satisfying.
+	if axis, ok := e.tenantAxisColumn(); ok {
+		for _, op := range ops {
+			if op.column().key() == axis.key() {
+				return nil, fmt.Errorf("%w: %s is an axis, not an assignment",
+					ErrTenantMismatch, tenantAxisName(axis))
+			}
+		}
 	}
 	pred, err := e.pkPredicate(key)
 	if err != nil {

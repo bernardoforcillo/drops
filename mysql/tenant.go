@@ -75,6 +75,19 @@ import (
 //     fold is the worse failure rather than the safer one: a match
 //     tells the INSERT the axis is bound already, so what a wrong
 //     guess drops is the stamp — see identKey in ident.go;
+//   - a tenant value the axis column's collation folds onto another
+//     tenant's. sameTenant compares the ctx tenant with a bound value
+//     in Go; the predicate hands both sides to the server, which
+//     compares them under the column's collation — and MySQL's default
+//     collation for character columns is case-insensitive
+//     (utf8mb4_0900_ai_ci in 8.0, utf8mb4_general_ci before it), so on
+//     an axis column that took the default, "acme" and "ACME" are two
+//     tenants to drops and one to the server. That is the documented
+//     behaviour of those collations rather than something measured
+//     here: no MySQL was reachable to run it. The same shape IS
+//     measured, against PostgreSQL and against SQLite, in
+//     integration/tenantvaluefold_test.go. A _bin or _cs collation on
+//     the axis column is the caller's to declare;
 //   - a scoped table INNER- or LEFT-joined BEFORE a RIGHT JOIN keeps its
 //     guard in the WHERE clause, and the RIGHT JOIN NULL-extends the left
 //     side — so the guard is false for exactly the rows the RIGHT JOIN

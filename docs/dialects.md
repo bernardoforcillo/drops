@@ -269,18 +269,26 @@ them.
 
 The four lists are not one list repeated, and reading one is not
 reading them all. `pg`'s is written against `pg`'s own surface and
-shares no entry's wording with the other three: ten entries, covering
-among others the FULL JOIN refusal, the `DeleteHook` rewrite path,
-what `ToSQL` renders without a ctx, and how far `Unscoped` reaches.
-The other three share a spine of six — a raw statement, a `drops.Raw`
-or `ExprFunc` body, a view body, a statement that said `Unscoped()`,
-an INSERT into a table with a read filter and no write column, and the
-RIGHT JOIN placement gap — and depart from it where the dialect does.
-`mysql` carries two more: its hand-written outbox, event-store and
-idempotency SQL, and the identifier fold it cannot settle without a
-server. `sqlite` carries the RIGHT JOIN entry to record a gap the
-dialect cannot have, so that adding a join kind is known to bring it.
-Read the list for the dialect you are writing against.
+shares no entry's wording with the other three: eleven entries,
+covering among others the FULL JOIN refusal, the `DeleteHook` rewrite
+path, what `ToSQL` renders without a ctx, how far `Unscoped` reaches,
+and what the axis column's collation and type do to two tenant values
+Go calls different. The other three share a spine of six — a raw
+statement, a `drops.Raw` or `ExprFunc` body, a view body, a statement
+that said `Unscoped()`, an INSERT into a table with a read filter and
+no write column, and the RIGHT JOIN placement gap — and depart from it
+where the dialect does. `mysql` carries three more: its hand-written
+outbox, event-store and idempotency SQL, the identifier fold it cannot
+settle without a server, and the tenant value its default
+case-insensitive collation folds onto another tenant's. `sqlite`
+carries the RIGHT JOIN entry to record a gap the dialect cannot have,
+so that adding a join kind is known to bring it, and one entry of its
+own: a `COLLATE NOCASE` axis column is two tenants to drops and one to
+the server. `clickhouse` carries no entry of that kind: it has no
+per-column collation for `=`, its `String` comparison being binary,
+and no ClickHouse was reachable to probe what its drivers do with a
+tenant value of the wrong Go type. Read the list for the dialect you
+are writing against.
 
 ## Porting between them
 

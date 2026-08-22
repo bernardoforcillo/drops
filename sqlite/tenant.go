@@ -72,6 +72,16 @@ import (
 //   - an INSERT into a table that declared a read filter and no write
 //     column — see [Table.ScopeWritesByTenant] for why drops will not
 //     guess the column;
+//   - a tenant value the axis column's collation folds onto another
+//     tenant's. sameTenant compares the ctx tenant with a bound value
+//     in Go; the predicate hands both sides to SQLite, which compares
+//     them under the column's collation. On a column declared COLLATE
+//     NOCASE the tenants "acme" and "ACME" are two to drops and one to
+//     the server, so each reads and writes the other's rows with no
+//     refusal anywhere — shown in-process, needing no container, in
+//     integration/tenantvaluefold_test.go. drops does not read the
+//     schema's collations, so a binary collation on the axis column is
+//     the caller's to declare;
 //   - the RIGHT JOIN placement gap the other three dialects carry
 //     cannot be written here: this package exposes INNER and LEFT JOIN
 //     and nothing else (see joinKind). The entry is kept so that adding

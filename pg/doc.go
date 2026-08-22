@@ -242,6 +242,30 @@
 //     this section describes, and it belongs in a round that can verify
 //     it in its own right.
 //
+//   - What "the same tenant" MEANS is Go's question for the guard and
+//     the SERVER's for the predicate, and the two can disagree.
+//     sameTenant compares the ctx tenant with a bound value by Go
+//     equality and a lossless round trip, and tenant.go states it as
+//     the only definition; the predicate it renders — "tenantId" = $1
+//     — makes no such comparison. It hands both sides to the server,
+//     which reads the parameter as the column's type and compares
+//     under the column's collation. On a nondeterministic collation
+//     (COLLATE ... deterministic = false, the ICU case- or
+//     accent-insensitive kind) tenant "ACME" reads and writes tenant
+//     "acme"'s rows: two tenants to drops, one to the server, in both
+//     directions and silently. On a bigint axis a ctx tenant of "01"
+//     addresses tenant 1 and stamps rows into it — the pairing
+//     section 1 of tenant.go calls a type confusion and refuses
+//     outright when what it is comparing is a BINDING. drops does not
+//     read the catalogue and cannot see a column's collation, so an
+//     axis on a deterministic collation, and a tenant carried in one
+//     Go type, are the caller's to arrange. Both halves are
+//     demonstrated against PostgreSQL 16 in
+//     integration/tenantvaluefold_test.go, and written down rather
+//     than fixed for the reason the join entry above gives: refusing a
+//     ctx tenant by the axis column's declared type is a change to the
+//     mechanism this section describes.
+//
 //   - Eager-load refusal is not atomic. A Find issues the parent query
 //     and then one query per edge, so a refusal on a later edge surfaces
 //     after earlier statements have already reached the server. Nothing

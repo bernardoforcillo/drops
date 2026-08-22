@@ -9,7 +9,12 @@ import (
 	"github.com/bernardoforcillo/drops/clickhouse"
 )
 
-// What a real server said, and what it did not.
+// What an engine said, and what it did not.
+//
+// No ClickHouse SERVER has ever been reachable from this project, and
+// nothing here should be read as if one had been. What was reachable
+// is an embedded engine, and the difference is named wherever it
+// matters.
 //
 // The rendering asserted below was checked against a real ClickHouse
 // 26.7.2.1 query parser — the engine embedded in the chdb python
@@ -27,7 +32,7 @@ import (
 //     system.row_policies carries only select_filter, and the token
 //     appears nowhere in ClickHouse's documentation.
 //
-// One semantic claim was executed rather than parsed, using the
+// Two semantic claims were executed rather than parsed, using the
 // users.xml <filter> form of the same row-policy machinery (SQL-created
 // policies cannot be exercised that way because clickhouse-local
 // exposes no writeable access storage and rejects CREATE ROW POLICY
@@ -35,16 +40,23 @@ import (
 // table, SELECT returned two rows, an INSERT of a fourth row belonging
 // to another tenant succeeded with no error, and system.parts then
 // reported four physical rows against a SELECT that still returned
-// two. That is the fact the doc comments in rowpolicy.go rest on.
+// two. And the fail-open default: with the filter declared for a
+// SECOND account instead, the account chdb connects as — which no
+// policy names — read all three rows, through a policy carrying the
+// filter 1 that the engine wrote for it. Those are the two facts the
+// doc comments in rowpolicy.go rest on rather than quote.
 //
-// Everything else about ClickHouse row policies in those doc comments —
-// the two access_control_improvements defaults, how permissive and
-// restrictive policies combine, what happens on a distributed table —
-// rests on ClickHouse's own documentation and changelog, not on a
-// server this test suite reached. The tests below assert rendering.
+// Everything else about ClickHouse row policies in those doc comments
+// — the two access_control_improvements defaults and whether turning
+// them off does what it says, how permissive and restrictive policies
+// combine, what a policy with no TO clause applies to, what happens on
+// a distributed table — rests on ClickHouse's own documentation and
+// changelog. The file comment on rowpolicy.go sorts every claim into
+// measured, documented, or neither, and is meant to be exhaustive. The
+// tests below assert rendering.
 //
-// Both probes are checked in, at testdata/rowpolicy_probe.py, so the
-// next person to change this file can re-run them against a newer
+// All three probes are checked in, at testdata/rowpolicy_probe.py, so
+// the next person to change this file can re-run them against a newer
 // engine rather than trusting this comment. Nothing in `go test` runs
 // it: it needs chdb from PyPI, and the root module has no external
 // dependencies to spend on a verification harness.
@@ -303,6 +315,19 @@ func TestRowPolicyIncompleteDeclarations(t *testing.T) {
 			policy: clickhouse.NewRowPolicy("p").On(rpDocs).UsingEq(rpTenant, struct{}{}).ToAll(),
 			want:   clickhouse.ErrRowPolicyUnsupportedLiteral,
 		},
+		{
+			// To with an empty list is the shape a roles slice read
+			// from configuration takes on the day the configuration is
+			// wrong. It renders a policy with no TO clause, and what
+			// such a policy applies to is the one thing about this
+			// mechanism drops has never been able to establish — see
+			// the last list in the file comment. Asking for a set of
+			// principals and naming none of them is a declaration
+			// mistake, so it is refused rather than rendered.
+			name:   "TO names nobody",
+			policy: clickhouse.NewRowPolicy("p").On(rpDocs).Using("1").To(),
+			want:   clickhouse.ErrRowPolicyRolesRequired,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -326,11 +351,30 @@ func TestIncompleteRowPolicyRendersUnrunnableSQL(t *testing.T) {
 	for _, p := range []*clickhouse.RowPolicy{
 		clickhouse.NewRowPolicy("p").Using("1").ToAll(),
 		clickhouse.NewRowPolicy("p").On(rpDocs).ToAll(),
+		clickhouse.NewRowPolicy("p").On(rpDocs).Using("1").To(),
 	} {
 		sql := policySQL(clickhouse.CreateRowPolicy(p))
 		if !strings.Contains(sql, "/* drops/clickhouse:") {
 			t.Errorf("expected a loud marker in: %s", sql)
 		}
+	}
+}
+
+// Omitting TO entirely is not the same mistake and is not refused.
+// The grammar makes the clause optional, drops renders what it is
+// told, and a caller who never asked for a principal set has not
+// handed drops an empty one. What the rendered policy then applies to
+// is an open question the doc comment on [RowPolicy.To] hands back to
+// the reader rather than answering.
+func TestARowPolicyWithNoToClauseStillRenders(t *testing.T) {
+	p := clickhouse.NewRowPolicy("p").On(rpDocs).Using("1")
+	if err := p.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+	got := policySQL(clickhouse.CreateRowPolicy(p))
+	want := `CREATE ROW POLICY "p" ON "analytics"."docs" FOR SELECT USING (1)`
+	if got != want {
+		t.Errorf("\n got: %s\nwant: %s", got, want)
 	}
 }
 

@@ -294,7 +294,9 @@ That is not the same as the predicates being the whole of what there
 is, which is what this paragraph used to say. Each of the three has
 something, and the three are not alike. `clickhouse` has `CREATE ROW
 POLICY`, which filters reads for a user or role and has no `WITH CHECK`
-half, so writes have no floor at all (`clickhouse/rowpolicy.go`).
+half, so writes have no floor at all — and which fails *open*, so a
+principal no policy names reads every tenant's rows unless the server's
+`access_control_improvements` says otherwise (`clickhouse/rowpolicy.go`).
 `mysql` has a definer-rights view with `WITH CASCADED CHECK OPTION`
 reached by an account holding nothing on the base table, which covers
 reads and writes both, and whose boundary is the *absence* of a grant —

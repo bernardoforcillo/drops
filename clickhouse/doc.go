@@ -80,12 +80,14 @@
 // policy filters SELECT and only SELECT: FOR INSERT is a syntax error,
 // and the WITH CHECK token the parser tolerates has nowhere to store a
 // condition, so a principal that can write can write any tenant id it
-// likes. On the READ side the predicates have a
-// floor under them if the deployment declares one; on the WRITE side
-// they are the whole of what there is. rowpolicy.go says what that
-// costs, what drops verified against a running server and what it did
-// not, and why there is no runtime identity surface here to match
-// drops/pg's. Either way tenant.go's list of where the predicates stop
+// likes. On the READ side the predicates have a floor under them if
+// the deployment declares one, and only for the principals that
+// policy applies to; on the WRITE side they are the whole of what
+// there is. rowpolicy.go says what that costs, splits every claim it
+// makes into what was measured on the embedded engine, what was read
+// out of ClickHouse's documentation and what is neither — no
+// ClickHouse SERVER has been reachable from this project — and says
+// why there is no runtime identity surface here to match drops/pg's. Either way tenant.go's list of where the predicates stop
 // is load-bearing rather than a footnote.
 //
 // What this dialect's version of the feature does NOT have, because the

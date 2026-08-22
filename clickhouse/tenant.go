@@ -79,11 +79,13 @@ import (
 // FOR INSERT does not parse, and while the parser tolerates a WITH
 // CHECK token there is no column in system.row_policies to store the
 // condition in, so nothing server-side constrains what a write may
-// leave behind. On the write
-// side these predicates ARE the whole of it, and on the read side they
-// are a floor only where the deployment declared a policy. So the list
-// below is not a footnote, it is what is left when the predicates do
-// not reach:
+// leave behind. On the write side these predicates ARE the whole of
+// it. On the read side they have a floor only where the deployment
+// declared a policy AND the reading principal is one that policy
+// applies to — a principal no policy matches reads every tenant's
+// rows by default, silently, which is [RowPolicy]'s first paragraph
+// and the reason it is the first. So the list below is not a
+// footnote, it is what is left when the predicates do not reach:
 //
 //   - a raw statement, through [DB.Exec] or [DB.Query], carries what
 //     the caller wrote and nothing else;

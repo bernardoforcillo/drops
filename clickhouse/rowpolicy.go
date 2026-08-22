@@ -41,7 +41,7 @@ import (
 // nowhere in ClickHouse's documentation, so this package does not
 // emit one.
 //
-// The consequence, checked against a running engine rather than
+// The consequence, executed on the embedded engine rather than
 // inferred: under a policy of tenant = 'acme', a SELECT of a
 // three-row table returned the two acme rows, an INSERT of a fourth
 // row belonging to another tenant succeeded with no error, and
@@ -112,25 +112,121 @@ import (
 //
 // # What rests on rendering alone
 //
-// Every statement this file emits was parsed by a real ClickHouse
-// 26.7.2.1 (via EXPLAIN AST on the embedded engine), and the read /
-// write asymmetry above was executed. NOT verified here, and taken
-// from ClickHouse's documentation and changelog: how permissive and
-// restrictive policies combine, how policies behave on Distributed
-// tables and under FINAL, and the two server defaults below — which
-// are the sharpest edge in the whole mechanism and belong in front of
-// anyone who declares a policy:
+// This section is meant to be exhaustive. Every claim this file makes
+// belongs to one of the three lists below, and one belonging to none
+// of them is a defect in the file — which has happened twice.
 //
-//   - users_without_row_policies_can_read_rows defaults to TRUE. If a
-//     policy exists for user A and none for user B, B reads EVERY
-//     row. Adding a principal — a migration account, a BI connector,
-//     a new service — silently exempts it.
-//   - throw_on_unmatched_row_policies, which turns that case into an
-//     error, arrived in 26.2 and defaults to FALSE.
+// Start with the limit that shapes all three: no CREATE ROW POLICY
+// this package emits has ever been EXECUTED. The engine reachable
+// from here is clickhouse-local, embedded (chdb 4.3.0, ClickHouse
+// 26.7.2.1), and it exposes exactly one access storage — the
+// read-only users_xml directory — so storing a policy answers code
+// 514, ACCESS_STORAGE_FOR_INSERTION_NOT_FOUND. Measured, including
+// against configurations naming a local_directory and a memory
+// storage: system.user_directories still lists users_xml alone. Row
+// policy BEHAVIOUR below was therefore measured through policies
+// declared in users.xml, which is the same access entity written a
+// different way and the only one this engine will hold.
 //
-// A ClickHouse row policy therefore fails OPEN unless the deployment
-// says otherwise. A drops-emitted policy does not change that, and no
-// doc comment here should be read as if it did.
+// MEASURED here, on that engine:
+//
+//   - every statement this file emits parses, via EXPLAIN AST —
+//     including both ON CLUSTER placements, which differ between
+//     CREATE and DROP.
+//   - FOR INSERT is a syntax error: "Expected one of: ALL, SELECT,
+//     end of query". So is drops/pg's clause order, TO before USING:
+//     "Expected one of: token, Comma, USING, WITH CHECK, end of
+//     query".
+//   - the parser accepts a WITH CHECK token, and accepts a policy
+//     with no USING clause at all — which is why
+//     [ErrRowPolicyConditionRequired] is checked in drops rather than
+//     left to the server.
+//   - system.row_policies has exactly one filter column,
+//     select_filter. There is nowhere for a WITH CHECK condition to
+//     be stored.
+//   - the read / write asymmetry: under a policy of tenant = 'acme',
+//     a SELECT of a three-row table returned the two acme rows, an
+//     INSERT of a fourth row belonging to another tenant succeeded
+//     with no error, and system.parts then reported four physical
+//     rows against a SELECT that still returned two.
+//   - the fail-open default at work: with a policy defined for one
+//     account only, the server synthesised a policy carrying the
+//     filter 1 for the other account, and that account read every row
+//     of the table. See [RowPolicy], where it belongs.
+//   - neither setting named below is a session setting. SET answers
+//     "Unknown setting" to both, and neither appears in
+//     system.settings or system.server_settings.
+//   - the REMEDY for the fail-open default was NOT measured. Setting
+//     users_without_row_policies_can_read_rows to false had no effect
+//     on this engine — tried under <access_control_improvements> and
+//     at the config root, in the server config and in the users
+//     config, with the synthesised filter-1 policy still present
+//     every time. clickhouse-local appears not to read the section at
+//     all, which is of a piece with it ignoring every user_directories
+//     entry. The fix below is documentation. The failure above is
+//     measurement.
+//
+// READ OUT OF ClickHouse's own documentation — the docs repository at
+// commit 8903628 (2026-08-03). Its sql-reference and server-settings
+// pages are in that checkout only as translations, the English
+// originals being fetched from the ClickHouse repository at build
+// time; setting names, defaults and code blocks are untranslated in
+// all four languages, and those are what is quoted here.
+//
+//   - row policies as an access-control entity — CREATE ROW POLICY,
+//     system.row_policies, SHOW POLICIES — arrived in v20.1.2.4
+//     (2020-01-22), listed there under Experimental Feature.
+//   - "Row policies makes sense only if you have readonly access. If
+//     you can modify table or copy partitions between tables, it
+//     defeats the restrictions of row policies."
+//     (guides/sre/user-management/index.md.)
+//   - how permissive and restrictive policies combine, as a formula,
+//     and that database-level policies combine with table-level ones
+//     the same way. (CREATE ROW POLICY; quoted at
+//     [RowPolicy.Restrictive].)
+//   - TO ALL means every ClickHouse user including the current one,
+//     and ALL EXCEPT removes names from that set. (CREATE ROW
+//     POLICY.)
+//   - one policy per tenant principal, with the application
+//     connecting AS that principal: CREATE ROW POLICY user_filter_1
+//     ON default.events USING tenant_id=1 TO user_1.
+//     (cloud/guides/best_practices/multitenancy.md.)
+//   - both settings below live under <access_control_improvements> in
+//     the server configuration, which is where the documented example
+//     puts them.
+//     (operations/server-configuration-parameters/settings.md.)
+//   - users_without_row_policies_can_read_rows has documented default
+//     true, and its description is about PERMISSIVE policies: whether
+//     "users without permissive row policies" can still read rows
+//     with a SELECT, with the worked case of two users, a policy for
+//     A only, B seeing all rows on true and no rows on false.
+//   - throw_on_unmatched_row_policies has documented default false,
+//     and "which, when enabled, throws an exception if a user queries
+//     a table that has row policies but none of them apply to that
+//     user" arrived in 26.2 (2026-02-26, PR #95014). A server older
+//     than that does not have the setting.
+//   - "WITH CHECK" appears nowhere in that checkout: zero hits across
+//     every language.
+//
+// NEITHER measured here nor stated by that documentation. These are
+// open questions, and nothing in this package answers them:
+//
+//   - what a policy with NO TO clause applies to. drops renders one;
+//     [RowPolicy.To] says to name a principal rather than lean on the
+//     omission.
+//   - whether a RESTRICTIVE policy narrows anything when it is the
+//     only policy on a table. [RowPolicy.Restrictive] sets out the
+//     two documented sentences that point opposite ways.
+//   - how a policy behaves on a Distributed table, and on which side
+//     of the hop it is evaluated.
+//   - policies under FINAL. The setting governing it is
+//     apply_row_policy_after_final, whose own description says 0 is
+//     the default while system.settings reports its default as 1 on
+//     26.7.2.1 — measured, and not reconciled here.
+//
+// A ClickHouse row policy fails OPEN unless the deployment says
+// otherwise. That is the first thing [RowPolicy] says, and nothing in
+// this file should be read as drops having changed it.
 
 // Errors a [RowPolicy] can carry. Each names a declaration that would
 // otherwise render as a statement the server accepts and drops cannot
@@ -145,6 +241,15 @@ var (
 	// is why this is checked here: the statement would succeed and
 	// install an access rule whose effect drops cannot describe.
 	ErrRowPolicyConditionRequired = errors.New("drops/clickhouse: row policy has no USING condition; call Using or UsingEq")
+
+	// ErrRowPolicyRolesRequired means To was called and named nobody —
+	// the shape a roles slice read from configuration takes on the day
+	// the configuration is wrong. It would render a policy with no TO
+	// clause, and what such a policy applies to is the one thing about
+	// this mechanism drops has never established. Omitting To
+	// altogether is not this and is not refused; asking for a set of
+	// principals and naming none of them is.
+	ErrRowPolicyRolesRequired = errors.New("drops/clickhouse: row policy TO clause names no principal; pass a role to To, or use ToAll / ToAllExcept")
 
 	// ErrRowPolicyUnsupportedLiteral means UsingEq was handed a value
 	// with no unambiguous ClickHouse literal form. Nothing here
@@ -161,6 +266,60 @@ var (
 // and no WithCheck, because ClickHouse has no command to point them
 // at. See the file comment for what that costs and why the type is
 // not called Policy.
+//
+// # It covers the principals it names, and nobody else, in silence
+//
+// Read this before declaring one. It is not a footnote about the
+// mechanism; it is the failure a policy sitting in a repository
+// invites six months after it was written.
+//
+// A ClickHouse row policy FAILS OPEN by default. A principal that no
+// policy on the table applies to reads every tenant's rows, and
+// nothing says so: no error, no warning, no empty result to notice,
+// no line in a log. Measured on 26.7.2.1 — with a row policy defined
+// for one account only, the server SYNTHESISED a policy carrying the
+// filter 1 for the other account, plainly visible in
+// system.row_policies, and that account read the whole table.
+//
+// So the shape that leaks is not a wrong policy. It is a correct
+// policy and a new account: a BI connector, a migration user, an
+// analytics job, a support tool, added by someone who never opened
+// this file, filtered by nothing. Every tenant's rows, through a
+// connector, for as long as nobody looks.
+//
+// Two ClickHouse settings decide it. Both live under
+// <access_control_improvements> in the server's configuration FILE,
+// and neither is reachable from a client: measured, SET answers
+// "Unknown setting" to each and neither appears in system.settings or
+// system.server_settings, so no session and no drops migration can
+// turn either on. This is a change somebody makes on the server.
+//
+//   - users_without_row_policies_can_read_rows is the one that
+//     matters, and its documented default is TRUE. At false, a
+//     principal with no permissive policy reads NOTHING instead of
+//     everything. Available on every version that has row policies.
+//   - throw_on_unmatched_row_policies turns the same case into an
+//     exception rather than silence. Documented default FALSE, and it
+//     arrived in 26.2 (2026-02-26): a server older than that does not
+//     have the setting, and setting it there does nothing.
+//
+// Which is to say, on the server:
+//
+//	<access_control_improvements>
+//	    <users_without_row_policies_can_read_rows>false</users_without_row_policies_can_read_rows>
+//	    <throw_on_unmatched_row_policies>true</throw_on_unmatched_row_policies>
+//	</access_control_improvements>
+//
+// Both defaults and the fix are ClickHouse's documentation. The
+// fail-open BEHAVIOUR is measured; the fix is not, because no engine
+// reachable from this project honours the section — see the file
+// comment. Verify it on your own server before believing it holds.
+//
+// What a schema declaration can do without touching the server is
+// [RowPolicy.ToAllExcept]: TO ALL EXCEPT the accounts meant to see
+// everything covers the principals nobody has thought of yet, where a
+// policy naming each tenant role leaves the next account somebody
+// adds unfiltered. Prefer it. It is the only half of this drops owns.
 //
 // A zero RowPolicy is not usable; start from [NewRowPolicy]. The
 // builder methods return the receiver so a declaration reads as one
@@ -245,11 +404,25 @@ func (p *RowPolicy) OnCluster(cluster string) *RowPolicy {
 // for one principal OR together; restrictive ones AND with the
 // result, so a restrictive policy can only ever narrow.
 //
-// One ClickHouse behaviour to know before relying on it, from its
-// documentation rather than from a server this package reached: a
-// table whose only policies are restrictive leaves every row visible,
-// because there is no permissive term for them to narrow. A
-// restrictive-only declaration is therefore not a boundary on its own.
+// Do not ship a table whose ONLY policy is restrictive — not because
+// the outcome is known to be bad, but because it is not known at all,
+// and the two documented sentences bearing on it point opposite ways.
+// The CREATE ROW POLICY page gives the formula
+//
+//	row_is_visible = (one or more of the permissive policies' conditions are non-zero) AND
+//	                 (all of the restrictive policies's conditions are non-zero)
+//
+// under which a restrictive-only table shows NO rows at all: there is
+// no permissive term to satisfy. The description of
+// users_without_row_policies_can_read_rows, which defaults to true,
+// is about principals "without permissive row policies" — under which
+// such a principal is handed a permissive term of 1 and the
+// restrictive one narrows it normally, the opposite outcome. Which
+// rule reaches a principal holding a restrictive policy and no
+// permissive one is stated nowhere, and drops cannot settle it: no
+// policy this package emits has ever been stored, for the reason the
+// file comment gives. Declare a permissive policy alongside and the
+// question does not arise.
 func (p *RowPolicy) Restrictive() *RowPolicy { p.restrictive = true; return p }
 
 // Using sets the USING condition verbatim.
@@ -285,19 +458,44 @@ func (p *RowPolicy) Using(expr string) *RowPolicy { p.using = expr; return p }
 func (p *RowPolicy) UsingEq(c ColRef, value any) *RowPolicy {
 	lit, err := rowPolicyLiteral(value)
 	if err != nil {
-		p.err = err
+		p.fail(err)
 		return p
 	}
 	p.using = quoteIdent(c.col().Name()) + " = " + lit
 	return p
 }
 
+// fail records the first error. The first is kept because it is the
+// one a reader can act on: a later complaint is usually a consequence.
+func (p *RowPolicy) fail(err error) {
+	if p.err == nil {
+		p.err = err
+	}
+}
+
 // To scopes the policy to the named roles or users.
 //
-// A policy with no TO clause at all is legal ClickHouse and applies
-// to nobody, which is why it is not the way to say "everyone" —
-// [RowPolicy.ToAll] is.
+// Name somebody. [RowPolicy.ToAll] is how a policy says "everyone",
+// and [RowPolicy.ToAllExcept] is the form that still covers the
+// account nobody has thought of yet — see [RowPolicy] for why that
+// account is the failure to design against. Calling To and naming
+// nobody is [ErrRowPolicyRolesRequired].
+//
+// Omitting the clause entirely is a different thing and drops renders
+// it: ClickHouse's grammar makes TO optional. What such a policy
+// applies to, this package does not know. ClickHouse's documentation
+// does not say, and it cannot be measured here — the embedded engine
+// exposes no writable access storage, so CREATE ROW POLICY answers
+// code 514 and no policy drops emits has ever been stored. This doc
+// comment used to assert that a policy with no TO clause applies to
+// nobody. It was never checked, it is not checked now, and the
+// question sits in the last list of the file comment with the other
+// open ones. Do not build a boundary on the omission.
 func (p *RowPolicy) To(roles ...string) *RowPolicy {
+	if len(roles) == 0 {
+		p.fail(ErrRowPolicyRolesRequired)
+		return p
+	}
 	for _, r := range roles {
 		mustIdent("role", r)
 	}

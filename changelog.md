@@ -151,6 +151,38 @@ once a 1.0 is cut.
   and the pinned guard, which has no immutability trigger and repairs
   in place. All of it measured in-process in
   `integration/sqlite_tenantguard_test.go`.
+- **`clickhouse.RowPolicy` says what it rests on, exhaustively, and
+  says the fail-open default where a user meets it.** A ClickHouse row
+  policy fails OPEN: a principal that no policy on the table applies
+  to reads every tenant's rows, silently. That was one sentence in a
+  package-level paragraph; it is now the first section of the doc
+  comment on `RowPolicy` itself, with the two settings that decide it
+  (`users_without_row_policies_can_read_rows`, documented default
+  true; `throw_on_unmatched_row_policies`, documented default false
+  and only from 26.2), the `<access_control_improvements>` block they
+  go in, and the measured fact that neither is reachable with `SET` —
+  it is a change somebody makes on the server, not in a migration. The
+  behaviour itself is now measured rather than quoted: declare a
+  policy for one account in `users.xml` and the engine synthesises a
+  policy carrying the filter `1` for the other, which reads the whole
+  table.
+
+  The file comment's verification section is now three exhaustive
+  lists — measured here, read out of ClickHouse's documentation, or
+  NEITHER — and two claims moved into the third. `To`'s assertion that
+  a policy with no `TO` clause "applies to nobody" was never checked
+  and is not checkable here, so it is now an open question the doc
+  hands back to the reader; and `Restrictive`'s claim that a
+  restrictive-only table leaves every row visible was attributed to
+  documentation that says the opposite in one place and something
+  compatible in another, so it is now the disagreement it is. Calling
+  `To` with no roles at all — what a config-driven roles slice does on
+  a bad day — is `ErrRowPolicyRolesRequired` rather than a silently
+  rendered `TO`-less policy. `testdata/rowpolicy_probe.py` gained the
+  fail-open probe and four attempts at the remedy, all of which
+  clickhouse-local ignores, which is why the remedy is documented and
+  labelled as such. No ClickHouse server has been reachable from this
+  project, and `clickhouse/doc.go` no longer says one was.
 - **`pg.DB.InTxAs` and `pg.Session`** — drops could WRITE a row-level
   security policy (`Table.EnableRLS`, `NewPolicy`, `Table.AddPolicy`)
   and could not SATISFY one: nothing in the package made a pooled

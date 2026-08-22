@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Re-verify what rowpolicy.go claims, against a real ClickHouse.
+"""Re-verify what rowpolicy.go claims, against a real ClickHouse engine.
 
 Nothing in the Go test suite runs this. It exists so the next person to
 touch clickhouse/rowpolicy.go can re-check the facts its doc comments
@@ -14,10 +14,10 @@ real ClickHouse engine in-process — chdb 4.3.0 carries ClickHouse
 26.7.2.1 — driven in clickhouse-local mode.
 
     pip3 install chdb
-    python3 rowpolicy_probe.py                # both checks
+    python3 rowpolicy_probe.py                # every check
     go run ./... | python3 rowpolicy_probe.py --parse   # parse stdin
 
-Two things it checks, and one it cannot.
+Three things it checks, and the ones it cannot.
 
 1. PARSE. Every statement drops emits is fed to EXPLAIN AST, which
    parses and stops. A pass proves the grammar accepts the string and
@@ -34,13 +34,32 @@ Two things it checks, and one it cannot.
    enforcement path — it shows up in system.row_policies like any
    other — so what it settles is the semantics, not the DDL.
 
+3. FAILOPEN. What a principal NO policy applies to reads. users.xml
+   takes as many users as it is given, so the unmatched principal this
+   was once thought unobservable on clickhouse-local is observable
+   after all: declare a filter for one account and query as the other.
+   The engine synthesises a policy carrying the filter 1 for the
+   unmatched account and it reads the whole table. That is the sharpest
+   edge in the mechanism and it is measured here, not quoted.
+
+   The REMEDY is the half that stays unmeasured. Setting
+   users_without_row_policies_can_read_rows to false changes nothing on
+   this engine, under <access_control_improvements> or at the config
+   root, in the server config or the users config — all four are tried
+   below and all four are expected to make no difference, which is why
+   the check reports rather than fails. clickhouse-local ignores the
+   section, of a piece with it ignoring every user_directories entry
+   (system.user_directories lists users_xml and nothing else however
+   the config is written, which is also why a SQL CREATE ROW POLICY
+   cannot be stored here at all).
+
 What it cannot check, and what therefore rests on ClickHouse's own
-documentation wherever rowpolicy.go cites it: the two
-access_control_improvements defaults (clickhouse-local has one user, so
-there is no unmatched principal to observe), custom-settings-based
-predicates (clickhouse-local ignores custom_settings_prefixes from a
-config file), how permissive and restrictive policies combine, and
-anything distributed.
+documentation wherever rowpolicy.go cites it: whether turning either
+access_control_improvements setting off does what it says,
+custom-settings-based predicates (clickhouse-local ignores
+custom_settings_prefixes from a config file), how permissive and
+restrictive policies combine, what a policy with no TO clause applies
+to, and anything distributed.
 """
 
 import os
@@ -71,6 +90,46 @@ CONFIG_XML = """<clickhouse>
   <user_directories><users_xml><path>{users}</path></users_xml></user_directories>
 </clickhouse>
 """
+
+# Two accounts, a filter on one of them. `default` is the account chdb
+# connects as and the one no policy names.
+FAILOPEN_USERS_XML = """<clickhouse>{extra}
+  <profiles><default></default></profiles>
+  <users>
+    <default>
+      <password></password>
+      <networks><ip>::/0</ip></networks>
+      <profile>default</profile>
+      <quota>default</quota>
+      <access_management>1</access_management>
+    </default>
+    <tenantreader>
+      <password></password>
+      <networks><ip>::/0</ip></networks>
+      <profile>default</profile>
+      <quota>default</quota>
+      <databases>
+        <t><docs><filter>tenant = 'acme'</filter></docs></t>
+      </databases>
+    </tenantreader>
+  </users>
+  <quotas><default></default></quotas>
+</clickhouse>
+"""
+
+FAILOPEN_CONFIG_XML = """<clickhouse>{extra}
+  <user_directories><users_xml><path>{users}</path></users_xml></user_directories>
+</clickhouse>
+"""
+
+# The setting that is supposed to close the hole, written the four ways
+# it could plausibly be read: nested and bare, in each of the two files.
+ACI_OFF = ("\n  <access_control_improvements>"
+           "\n    <users_without_row_policies_can_read_rows>false"
+           "</users_without_row_policies_can_read_rows>"
+           "\n  </access_control_improvements>")
+BARE_OFF = ("\n  <users_without_row_policies_can_read_rows>false"
+            "</users_without_row_policies_can_read_rows>")
 
 # The shapes rowpolicy.go emits, plus the two it must never emit.
 PARSE_CASES = [
@@ -180,6 +239,71 @@ def check_enforce():
     return failures
 
 
+def failopen_once(users_extra, config_extra, label):
+    """Read t.docs as the account no policy names. Returns (rows, filters)."""
+    from chdb import session
+
+    cfg = tempfile.mkdtemp(prefix="chprobe-fo-cfg-")
+    users = os.path.join(cfg, "users.xml")
+    config = os.path.join(cfg, "config.xml")
+    with open(users, "w") as fh:
+        fh.write(FAILOPEN_USERS_XML.format(extra=users_extra))
+    with open(config, "w") as fh:
+        fh.write(FAILOPEN_CONFIG_XML.format(extra=config_extra, users=users))
+
+    path = tempfile.mkdtemp(prefix="chprobe-fo-")
+    sess = session.Session(f"{path}?config-file={config}")
+
+    def q(sql):
+        return str(sess.query(sql, "CSV")).strip()
+
+    q("CREATE DATABASE IF NOT EXISTS t")
+    q("CREATE TABLE t.docs (id UInt32, tenant String, body String) "
+      "ENGINE=MergeTree ORDER BY id")
+    q("INSERT INTO t.docs VALUES (1,'acme','a1'),(2,'acme','a2'),(3,'globex','g1')")
+    filters = q("SELECT name, select_filter FROM system.row_policies ORDER BY name")
+    rows = q("SELECT count() FROM t.docs")
+    dirs = q("SELECT name FROM system.user_directories")
+    sess.close()
+    shutil.rmtree(path, ignore_errors=True)
+    shutil.rmtree(cfg, ignore_errors=True)
+    print(f"  {label}: reads {rows} of 3 rows; user_directories={dirs}")
+    print(f"       policies: {filters}")
+    return rows, filters
+
+
+def check_failopen():
+    """A principal no policy applies to reads every row, silently."""
+    failures = 0
+    rows, filters = failopen_once("", "", "default (nothing set)")
+    if rows != "3":
+        failures += 1
+        print("  FAIL the unmatched account did NOT read every row — rowpolicy.go's "
+              "fail-open paragraph needs rewriting against this engine")
+    elif "1" not in filters:
+        failures += 1
+        print("  FAIL every row was read but no synthesised filter-1 policy is "
+              "visible; the mechanism is not what rowpolicy.go describes")
+    else:
+        print("  ok   the unmatched account read every row, through a policy the "
+              "server wrote for it")
+
+    # The remedy, four ways. None of these is expected to change the
+    # answer on clickhouse-local; a run where one DOES is a finding, and
+    # rowpolicy.go should stop calling the fix unmeasured.
+    for label, users_extra, config_extra in [
+        ("config <access_control_improvements>", "", ACI_OFF),
+        ("config root", "", BARE_OFF),
+        ("users <access_control_improvements>", ACI_OFF, ""),
+        ("users root", BARE_OFF, ""),
+    ]:
+        rows, _ = failopen_once(users_extra, config_extra, f"off via {label}")
+        if rows != "3":
+            print(f"  NOTE  {label} CLOSED the hole on this engine. rowpolicy.go "
+                  "records the fix as documentation only; make it a measurement.")
+    return failures
+
+
 def main():
     if "--parse" in sys.argv and not sys.stdin.isatty():
         stmts = [line.strip() for line in sys.stdin if line.strip()]
@@ -188,6 +312,8 @@ def main():
     failures = check_parse()
     print("ENFORCE")
     failures += check_enforce()
+    print("FAILOPEN")
+    failures += check_failopen()
     print("failures:", failures)
     sys.exit(1 if failures else 0)
 

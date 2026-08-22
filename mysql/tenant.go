@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -66,6 +65,16 @@ import (
 //     guess the column;
 //   - the outbox, the event store and the idempotency store, which
 //     issue their own hand-written SQL against their own tables;
+//   - a column whose name differs from the tenant axis only by a
+//     NON-ASCII case pair. MySQL folds a column name's case, and folds
+//     ASCII in every configuration and on every platform; whether it
+//     also reads "tenantid" and "tenantİd" as one column is its
+//     identifier collation's answer, and no MySQL was reachable to
+//     settle it. So identKey folds the ASCII and stops, and every axis
+//     check here reads such a pair as two columns. Guessing the wider
+//     fold is the worse failure rather than the safer one: a match
+//     tells the INSERT the axis is bound already, so what a wrong
+//     guess drops is the stamp — see identKey in ident.go;
 //   - a scoped table INNER- or LEFT-joined BEFORE a RIGHT JOIN keeps its
 //     guard in the WHERE clause, and the RIGHT JOIN NULL-extends the left
 //     side — so the guard is false for exactly the rows the RIGHT JOIN
@@ -322,17 +331,38 @@ import (
 // unique within a table, so no column of the table itself can collide.
 //
 // "The same name" is the SERVER's question rather than Go's, so each
-// dialect answers it in its own identKey. sqlite and mysql resolve a
-// column name case-insensitively however it is quoted, so a handle
-// spelled TENANTID renders as the axis there, and matching on the
-// bytes was the same defect one shift key further in — the guard
-// answering no for a handle the renderer answers yes for. Those two
-// fold case. pg and clickhouse compare a quoted identifier byte for
-// byte, and drops quotes every identifier it writes, so there the two
-// spellings are two columns: a differently-cased handle names a
-// column the table does not have, the server refuses the statement,
-// and folding here would instead refuse a schema that legitimately
-// declares both.
+// dialect answers it in its own ident.go, in identKey. It lives
+// beside the quoting helpers and not here because it is the one thing
+// in these rules that differs by dialect, and moving it out is what
+// leaves the rules themselves byte-identical in four packages.
+//
+// The answer is one-directional: identKey never reads two names as
+// one column unless the server does. A key too NARROW is the defect
+// above one shift key further in — the guard answering no for a
+// handle the renderer answers yes for. A key too WIDE is not the
+// spurious refusal it looks like: the INSERT stamp reads a match as
+// the axis being bound already and appends nothing, so a statement
+// naming some ordinary column goes out with the tenant column absent
+// from it and the row lands under whatever the schema defaults to,
+// which is section 1's "belonged to nobody" reached from here. Both
+// are silent, so neither is guessed at.
+//
+// sqlite and mysql resolve a column name case-insensitively however
+// it is quoted, so a handle spelled TENANTID renders as the axis
+// there and matching on the bytes was that narrow key. Those two
+// fold, and they fold ASCII and stop. SQLite's own comparison is
+// ASCII and nothing more; MySQL folds ASCII in every configuration,
+// while what it does with a NON-ASCII case pair is its identifier
+// collation's answer and no MySQL was reachable to settle it. A pair
+// they therefore read as two columns where the server may read one is
+// written into that dialect's "Where the automatic scoping stops"
+// list, rather than covered by a fold nobody verified.
+//
+// pg and clickhouse compare a quoted identifier byte for byte, and
+// drops quotes every identifier it writes, so there the two spellings
+// are two columns: a differently-cased handle names a column the
+// table does not have, the server refuses the statement, and folding
+// here would instead refuse a schema that legitimately declares both.
 //
 // A hook is asked the same question. The bound set that makes
 // "user-supplied values win" true is keyed by the name a column
@@ -516,36 +546,6 @@ func namesAxis(c, axis *Column) bool {
 	}
 	return identKey(c.Name()) == identKey(axis.Name())
 }
-
-// identKey returns the form in which two rendered column names are one
-// column to the server that reads the statement.
-//
-// MySQL resolves a column name case-insensitively whatever the
-// server's lower_case_table_names setting says — that setting is about
-// TABLE and database names — and backticking one does not change it.
-// So `TENANTID` and `tenantId` are one column: an INSERT may name it
-// under either spelling, and a SET list assigns the same column
-// whichever it writes. The fold is what the renderer means here, and a
-// comparison on the bytes was [namesAxis]'s original defect one step
-// further in: a guard that asks "is this the axis?" answering no for a
-// handle the server answers yes for, which is how a codegen'd
-// OtherTable.TENANTID walked past the stamping and the ON DUPLICATE
-// KEY UPDATE gate with nothing but a shift key between it and the
-// refusal.
-//
-// The fold is strings.ToLower rather than a rule reproducing the
-// server's collation, and it is deliberately the wider of the two: it
-// folds every case pair Unicode has, so where the two answers differ
-// this refuses a statement the server would have accepted. That is the
-// direction to be wrong in — the wider answer refuses, the narrower
-// one binds.
-//
-// PostgreSQL and ClickHouse compare a quoted identifier byte for byte
-// and drops quotes every identifier it writes, so their identKey is
-// the name itself. Asking the question in all four packages is what
-// stops one dialect's answer from being carried into another by a
-// reader who only saw the comparison.
-func identKey(name string) string { return strings.ToLower(name) }
 
 // ScopeByTenant marks col as the entity's tenant axis. Every subsequent
 // Get / Query / Update / Delete reads the tenant from ctx (via

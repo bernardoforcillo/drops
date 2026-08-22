@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -150,6 +151,130 @@ func TestUpdateHookSeesACaseVariantBinding(t *testing.T) {
 		t.Errorf("rendered SQL:\n got = %v\nwant = %v", sql, want)
 	}
 	if wantArgs := []any{scopeTenant, int64(7), scopeTenant}; !reflect.DeepEqual(args, wantArgs) {
+		t.Errorf("bound arguments:\n got = %#v\nwant = %#v", args, wantArgs)
+	}
+}
+
+// The fold has a second edge, and it is the one that binds rather than
+// refuses.
+//
+// SQLite's case-insensitive matching of identifiers is ASCII ONLY —
+// sqlite3StrICmp folds A-Z onto a-z through a 256-entry table and
+// leaves every other byte alone. Go's strings.ToLower is Unicode-wide,
+// so it folds pairs SQLite does not: U+0130 LATIN CAPITAL LETTER I
+// WITH DOT ABOVE onto "i", and U+212A KELVIN SIGN onto "k". A table
+// may declare "tenantid" and "tenantİd" side by side and SQLite
+// creates two columns; the integration suite asks a real SQLite and it
+// says so.
+//
+// Under the wider fold the guard read the second as the axis, and what
+// that costs is not a refusal. stampTenantColumn reads a match as the
+// axis being bound already and appends no stamp, so an INSERT naming
+// the ordinary column rendered with the tenant column absent from it
+// and the row landed carrying whatever the schema defaults to. That is
+// section 1's own failure mode reached through section 4: a row that
+// belongs to nobody, invisible to every later request, and reported as
+// written. On the UPDATE side it is the refusal it looks like — an
+// ordinary assignment to an ordinary column, rejected as a transfer.
+//
+// So the fold has to be the server's fold rather than a wider one that
+// happens to be in the standard library. These cases pin the two
+// families where the answers differ.
+
+// overFoldSchema declares a table whose write axis is axisName and
+// which also carries otherName — a column strings.ToLower maps onto
+// the axis and SQLite does not.
+func overFoldSchema(axisName, otherName string) (tbl *sqlite.Table, id *sqlite.Col[int64], tenant, other *sqlite.Col[string]) {
+	t := sqlite.NewTable("posts")
+	idCol := sqlite.Add(t, sqlite.BigInt("id").PrimaryKey())
+	tenantCol := sqlite.Add(t, sqlite.Text(axisName).NotNull())
+	otherCol := sqlite.Add(t, sqlite.Text(otherName))
+	t.ContextFilter(sqlite.TenantFilter(tenantCol)).ScopeWritesByTenant(tenantCol)
+	return t, idCol, tenantCol, otherCol
+}
+
+const (
+	// dottedI is U+0130; strings.ToLower maps it onto "i".
+	dottedIAxis  = "tenantid"
+	dottedIOther = "tenantİd"
+	// kelvin is U+212A; strings.ToLower maps it onto "k".
+	kelvinAxis  = "tenantkey"
+	kelvinOther = "tenantKey"
+)
+
+func TestInsertStampsWhenAColumnOnlyUnicodeFoldsOntoTheAxis(t *testing.T) {
+	const tenant = "acme"
+	tests := []struct {
+		name     string
+		axis     string
+		other    string
+		bound    string
+		wantSQL  string
+		wantArgs []any
+	}{
+		{
+			// Before the fix this rendered
+			// INSERT INTO "posts" ("tenantİd") VALUES (?) with args
+			// ["acme"] — the axis "tenantid" nowhere in the statement.
+			name:     "U+0130 differs from i to SQLite and not to strings.ToLower",
+			axis:     dottedIAxis,
+			other:    dottedIOther,
+			bound:    tenant,
+			wantSQL:  `INSERT INTO "posts" ("tenantİd", "tenantid") VALUES (?, ?)`,
+			wantArgs: []any{tenant, tenant},
+		},
+		{
+			// The same family, and with a value that is NOT the ctx
+			// tenant: before the fix an ordinary column holding an
+			// ordinary string was refused as another tenant's axis
+			// value.
+			name:     "U+212A differs from k to SQLite and not to strings.ToLower",
+			axis:     kelvinAxis,
+			other:    kelvinOther,
+			bound:    "celsius",
+			wantSQL:  `INSERT INTO "posts" ("tenantKey", "tenantkey") VALUES (?, ?)`,
+			wantArgs: []any{"celsius", tenant},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			posts, _, _, other := overFoldSchema(tt.axis, tt.other)
+			db := sqlite.New(dropstest.New())
+			ctx := sqlite.WithTenant(context.Background(), tenant)
+
+			sql, args, err := db.Insert(posts).Values(other.Val(tt.bound)).ToSQLCtx(ctx)
+			if err != nil {
+				t.Fatalf("ToSQLCtx: %v", err)
+			}
+			if sql != tt.wantSQL {
+				t.Errorf("rendered SQL:\n got = %v\nwant = %v", sql, tt.wantSQL)
+			}
+			if !reflect.DeepEqual(args, tt.wantArgs) {
+				t.Errorf("bound arguments:\n got = %#v\nwant = %#v", args, tt.wantArgs)
+			}
+		})
+	}
+}
+
+// The UPDATE half: assigning a column that only Unicode-folds onto the
+// axis is an ordinary assignment, and the axis predicate still lands.
+func TestUpdateAssignsAColumnThatOnlyUnicodeFoldsOntoTheAxis(t *testing.T) {
+	const tenant = "acme"
+	posts, id, _, other := overFoldSchema(dottedIAxis, dottedIOther)
+	db := sqlite.New(dropstest.New())
+	ctx := sqlite.WithTenant(context.Background(), tenant)
+
+	sql, args, err := db.Update(posts).Set(other.Val("x")).
+		Where(sqlite.Eq(id, int64(7))).ToSQLCtx(ctx)
+	if err != nil {
+		t.Fatalf("ToSQLCtx: %v", err)
+	}
+	want := `UPDATE "posts" SET "tenantİd" = ? ` +
+		`WHERE ("posts"."id" = ?) AND ("posts"."tenantid" = ?)`
+	if sql != want {
+		t.Errorf("rendered SQL:\n got = %v\nwant = %v", sql, want)
+	}
+	if wantArgs := []any{"x", int64(7), tenant}; !reflect.DeepEqual(args, wantArgs) {
 		t.Errorf("bound arguments:\n got = %#v\nwant = %#v", args, wantArgs)
 	}
 }

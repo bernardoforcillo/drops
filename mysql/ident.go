@@ -56,3 +56,61 @@ func quoteIdents(names []string) []string {
 	}
 	return out
 }
+
+// identKey returns the form in which two rendered column names are one
+// column to the server that reads the statement. [namesAxis] asks its
+// question through it, which is where "the same name" stops being Go's
+// question and becomes the server's.
+//
+// The invariant is one-directional: identKey never reports two names
+// as one column unless the server does. Both ways of being wrong are
+// silent, and neither is a refusal.
+//
+// A key too NARROW is the defect the function was extracted to fix —
+// the guard answering "not the axis" for a handle the renderer answers
+// yes for, so the statement goes out carrying it. A key too WIDE costs
+// more than the spurious refusal it looks like: stampTenantColumn
+// reads a match as the axis being bound already and appends no stamp,
+// so an INSERT naming some ordinary column renders with the tenant
+// column absent from it and the row lands under whatever the schema
+// defaults to — section 1's "belonged to nobody" reached through
+// section 4.
+//
+// MySQL resolves a column name case-insensitively on every platform
+// and in every configuration: lower_case_table_names governs TABLE
+// names, and column names are folded whatever it is set to. So a
+// handle spelled TENANTID renders as the axis here too, and the byte
+// comparison had the same shift-key bypass sqlite's did.
+//
+// The fold is ASCII, which is the part every configuration agrees on.
+// What MySQL does with a NON-ASCII case pair is its identifier
+// collation's answer rather than Unicode's — utf8mb3_general_ci gives
+// U+0130 the weight of "I", the utf8mb4_0900_ai_ci of a newer server
+// folds a wider set again, and neither of them is strings.ToLower —
+// and this package has no MySQL to ask. It does not guess: an ASCII
+// fold is never wider than the server's, which is the invariant above,
+// and the pairs it therefore reads as two columns where the server may
+// read one are written down in the "Where the automatic scoping stops"
+// list in tenant.go rather than covered by a fold nobody verified.
+//
+// pg and clickhouse compare a quoted identifier byte for byte and
+// their identKey returns the name itself. Asking the question in all
+// four packages is what stops one dialect's answer from being carried
+// into another by a reader who only saw the comparison.
+func identKey(name string) string {
+	var b []byte
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c < 'A' || c > 'Z' {
+			continue
+		}
+		if b == nil {
+			b = []byte(name)
+		}
+		b[i] = c + ('a' - 'A')
+	}
+	if b == nil {
+		return name
+	}
+	return string(b)
+}

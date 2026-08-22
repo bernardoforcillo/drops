@@ -284,6 +284,38 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **The axis guard folded identifier case wider than the server does**
+  (`drops/sqlite`, `drops/mysql`). Matching a bound column handle
+  against the tenant axis is a question about what the SERVER resolves,
+  and the two dialects whose servers fold a column name's case answered
+  it with `strings.ToLower`. That is Unicode-wide; SQLite's own
+  comparison is ASCII and stops there, so a table declaring `tenantid`
+  and `tenantİd` — two columns SQLite creates without complaint — had
+  the second read as the axis.
+
+  What that cost was not the spurious refusal it looks like. The INSERT
+  stamp reads a match as the axis being bound already and appends
+  nothing, so `INSERT INTO "fold_rows" ("title", "tenantİd")` went out
+  with the tenant column absent from the statement and the row landed
+  under whatever the schema defaults to — a row belonging to nobody,
+  invisible to every later request and reported as written. On a `NOT
+  NULL` axis it is a constraint failure on a column the caller never
+  named, which is how the integration suite catches it against a real
+  SQLite.
+
+  The fold now folds ASCII and stops, under one invariant stated in all
+  four packages: `identKey` never reads two names as one column unless
+  the server does. `pg` and `clickhouse` compare a quoted identifier
+  byte for byte and fold nothing, unchanged. `mysql` folds ASCII, which
+  every MySQL agrees on; what its identifier collation does with a
+  non-ASCII case pair is unverified here for want of a server, and is
+  written into that package's "where the automatic scoping stops" list
+  rather than guessed at. `identKey` moved out of `tenant.go` and in
+  beside the quoting helpers in `ident.go`, which leaves the tenancy
+  rules byte-identical across the four; a fuzz target per dialect pins
+  the fold against a model of the server's rule, and
+  `tenantpolicy_test.go` fails if a dialect declares it anywhere else.
+
 - **`ScopeByTenant` stored the handle it was passed rather than the
   entity's own** (`drops/sqlite`, `drops/clickhouse`). `ScopeByTenant`
   takes a `ColRef`, so a handle taken off `Table.As` enters legally —

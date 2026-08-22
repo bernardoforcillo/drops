@@ -135,3 +135,62 @@ func FuzzSQLiteMustIdentMatchesWhatQuotingCanRender(f *testing.F) {
 		}
 	})
 }
+
+// SQLite's identifier comparison is sqlite3StrICmp: it folds A-Z onto
+// a-z through a 256-entry table and leaves every other byte alone.
+// [identKey] has to be that map and not a wider one, so the rule is
+// written out here and the fuzz asks whether identKey is it.
+//
+// A wider fold is not the harmless over-approximation it looks like.
+// The axis guard reads a match as the tenant column being bound
+// already and appends no stamp, so folding a pair the server calls two
+// columns produced an INSERT with the axis absent from it — verified
+// against a real SQLite in the integration suite, where it comes back
+// as a NOT NULL failure on a column the caller never named.
+func asciiFoldModel(name string) string {
+	out := []byte(name)
+	for i, c := range out {
+		if c >= 'A' && c <= 'Z' {
+			out[i] = c + ('a' - 'A')
+		}
+	}
+	return string(out)
+}
+
+func FuzzSQLiteIdentKeyFoldsExactlyWhatSQLiteFolds(f *testing.F) {
+	for _, s := range nastyNames {
+		f.Add(s)
+	}
+	// The pairs the two answers disagree about: U+0130 and U+212A are
+	// case pairs to Unicode and ordinary bytes to SQLite.
+	f.Add("TENANTID")
+	f.Add("tenantİd")
+	f.Add("tenantKey")
+	f.Fuzz(func(t *testing.T, name string) {
+		key := identKey(name)
+		if want := asciiFoldModel(name); key != want {
+			t.Fatalf("identKey(%q) = %q, the server's own fold gives %q", name, key, want)
+		}
+		// Matching happens more than once per statement and on both
+		// sides of the comparison, so the key has to be a fixed point:
+		// a fold that moved again would answer differently depending
+		// on how many times it had been asked.
+		if again := identKey(key); again != key {
+			t.Fatalf("identKey(%q) = %q, folding that again gives %q", name, key, again)
+		}
+		// Folding bytes rather than runes is what keeps every
+		// multi-byte sequence intact, and the byte count is how that
+		// shows: no lead or continuation byte falls in A-Z.
+		if len(key) != len(name) {
+			t.Fatalf("identKey(%q) is %d bytes, the name is %d", name, len(key), len(name))
+		}
+		// And a name that could be rendered still can be. The fold is
+		// asked about names that reached a column declaration, so it
+		// must not turn one into something quoting cannot carry.
+		if validateIdent("column", name) == nil {
+			if err := validateIdent("column", key); err != nil {
+				t.Fatalf("identKey(%q) = %q is no longer renderable: %v", name, key, err)
+			}
+		}
+	})
+}

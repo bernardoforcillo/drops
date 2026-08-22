@@ -161,3 +161,24 @@ func FuzzClickHouseMustIdentMatchesWhatQuotingCanRender(f *testing.F) {
 		}
 	})
 }
+
+// ClickHouse compares a quoted identifier byte for byte, and drops quotes
+// every identifier it writes, so [identKey] is the name itself. That
+// is worth fuzzing precisely because it is nothing: the two dialects
+// that DO fold reach the same guard through the same [namesAxis], and
+// a fold copied across from one of them would read a schema's
+// deliberately distinct "tenantId" and "TenantId" as one column — at
+// which point the INSERT stamp is suppressed for a column the server
+// never resolved.
+func FuzzClickHouseIdentKeyFoldsNothing(f *testing.F) {
+	for _, s := range nastyNames {
+		f.Add(s)
+	}
+	f.Add("TENANTID")
+	f.Add("tenantİd")
+	f.Fuzz(func(t *testing.T, name string) {
+		if key := identKey(name); key != name {
+			t.Fatalf("identKey(%q) = %q; ClickHouse resolves neither onto the other", name, key)
+		}
+	})
+}

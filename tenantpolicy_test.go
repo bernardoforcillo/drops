@@ -384,6 +384,32 @@ func TestTenantPolicyBlockSurfaceClaimsHold(t *testing.T) {
 				"the stamp-before-validators rule is about", dir)
 		}
 	}
+	// "each dialect answers it in its own ident.go, in identKey". The
+	// fold is the one rule in section 4 whose answer differs by
+	// dialect, and it sits beside the quoting helpers so that the
+	// tenancy rules around the block — sameTenant, namesAxis,
+	// columnPath, isNilTenant, TenantFrom — stay byte-identical in
+	// four packages. A dialect that moves the fold back into tenant.go
+	// makes them diverge again by a function; one that declares it
+	// twice has a fold whose answer depends on which declaration the
+	// reader found; one that loses it leaves namesAxis comparing bytes
+	// where its server compares columns, which is the defect section 4
+	// is written about.
+	for _, dir := range dirs {
+		files := filesDeclaringFunc(t, dir, "identKey")
+		switch {
+		case len(files) == 0:
+			t.Errorf("%s declares no identKey: the policy block says each dialect answers "+
+				"\"the same name\" for its own server, and namesAxis has nothing to ask", dir)
+		case len(files) > 1:
+			t.Errorf("%s declares identKey in %d files (%v): the fold has no single answer",
+				dir, len(files), files)
+		case filepath.Base(files[0]) != "ident.go":
+			t.Errorf("%s declares identKey in %s: the policy block says it lives in ident.go, "+
+				"beside the quoting helpers and out of the rules that stay byte-identical",
+				dir, filepath.Base(files[0]))
+		}
+	}
 	// "RelConfig.Unscoped is pg's alone."
 	for _, dir := range dirs {
 		if dir == "pg" {
@@ -423,6 +449,35 @@ func pkgHasFunc(t *testing.T, dir, recv, method string) bool {
 		}
 	}
 	return false
+}
+
+// filesDeclaringFunc returns the non-test files in dir that declare a
+// top-level function called name, sorted. Plural on purpose: two
+// declarations of one rule is a finding rather than an impossibility,
+// since build tags can put a second one behind a constraint this
+// parse does not evaluate.
+func filesDeclaringFunc(t *testing.T, dir, name string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", dir, err)
+	}
+	var out []string
+	for _, p := range pkgs {
+		for file, f := range p.Files {
+			for _, d := range f.Decls {
+				fd, ok := d.(*ast.FuncDecl)
+				if ok && fd.Recv == nil && fd.Name.Name == name {
+					out = append(out, file)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // receiverTypeName reduces a receiver expression to the bare type

@@ -89,3 +89,89 @@ func TestForeignTenantHandleCannotWriteARowToAnotherTenant(t *testing.T) {
 		t.Fatalf("row landed as %+v, want one row {y acme}", landed)
 	}
 }
+
+// The fold has a second edge, and only a server can settle where it
+// falls.
+//
+// SQLite matches identifiers case-insensitively for ASCII and stops
+// there — sqlite3StrICmp folds A-Z onto a-z through a 256-entry table
+// and leaves every other byte alone. Go's strings.ToLower is
+// Unicode-wide, so the guard that folded with it read a pair SQLite
+// calls two columns as one. This test creates that table and asks:
+// CREATE TABLE with both spellings succeeds, which is the whole
+// premise, and no unit test can assert it.
+//
+// What the over-fold cost was not a refusal. stampTenantColumn reads a
+// match as the axis being bound already and appends no stamp, so
+// INSERT INTO "fold_rows" ("title", "tenantİd") VALUES (?, ?) went out
+// with "tenantId" — the actual axis — absent from the statement, and
+// the row landed carrying the column's default. Against a NOT NULL
+// axis that is a constraint failure; against a nullable one it is
+// section 1's own failure mode, a row belonging to nobody, invisible
+// to every later request and reported as written.
+type foldRow struct {
+	ID       int64  `drop:"id"`
+	Title    string `drop:"title"`
+	TenantID string `drop:"tenantId"`
+	Dotted   string `drop:"tenantİd"`
+}
+
+func TestUnicodeFoldedColumnIsNotTheAxisSQLiteResolves(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	tbl := sqlite.NewTable("fold_rows")
+	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey().AutoIncrement())
+	title := sqlite.Add(tbl, sqlite.Text("title").NotNull())
+	tenant := sqlite.Add(tbl, sqlite.Text("tenantId").NotNull())
+	// U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE. strings.ToLower
+	// maps it onto "i", so this name folds onto "tenantid" the way
+	// "tenantId" does. SQLite does not fold it, and the CREATE TABLE
+	// below is where that stops being an assertion about a doc comment.
+	dotted := sqlite.Add(tbl, sqlite.Text("tenantİd").NotNull())
+	sqlite.NewEntity[foldRow](tbl).ScopeByTenant(tenant)
+	exec(t, db, sqlite.CreateTable(tbl))
+
+	acme := sqlite.WithTenant(ctx, "acme")
+
+	// The INSERT that used to render without its axis. It names the
+	// ordinary column and nothing else; the stamp has to be appended
+	// for the statement to satisfy the NOT NULL on "tenantId" at all.
+	if _, err := db.Insert(tbl).
+		Values(title.Val("x"), dotted.Val("acme")).Exec(acme); err != nil {
+		t.Fatalf("INSERT naming a column that only Unicode-folds onto the axis: %v", err)
+	}
+
+	var landed []foldRow
+	if err := db.Select(title, tenant, dotted).From(tbl).All(acme, &landed); err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	if len(landed) != 1 {
+		t.Fatalf("landed %d row(s), want 1: %+v", len(landed), landed)
+	}
+	if landed[0].TenantID != "acme" {
+		t.Errorf("the axis holds %q, want the ctx tenant %q", landed[0].TenantID, "acme")
+	}
+	if landed[0].Dotted != "acme" {
+		t.Errorf("the ordinary column holds %q, want what the caller bound", landed[0].Dotted)
+	}
+
+	// And the two columns really are two, on the way back out: a value
+	// written to one is not readable from the other.
+	if _, err := db.Insert(tbl).
+		Values(title.Val("y"), dotted.Val("celsius")).Exec(acme); err != nil {
+		t.Fatalf("INSERT binding an ordinary value to the folded column: %v", err)
+	}
+	var both []foldRow
+	if err := db.Select(title, tenant, dotted).From(tbl).All(acme, &both); err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	if len(both) != 2 {
+		t.Fatalf("landed %d row(s), want 2: %+v", len(both), both)
+	}
+	for _, r := range both {
+		if r.TenantID != "acme" {
+			t.Errorf("row %+v is not the ctx tenant's", r)
+		}
+	}
+}

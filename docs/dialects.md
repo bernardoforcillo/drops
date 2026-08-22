@@ -259,11 +259,28 @@ differences are named inside the shared text — `clickhouse` models
 neither `UPDATE` nor `DELETE`, `RelConfig.Unscoped` is `pg`'s alone —
 so the same words are true in four packages.
 
-What the mechanism does *not* reach is listed per dialect in each
-package's `tenant.go`, under "Where the automatic scoping stops". It is
-not a footnote — in three of the four dialects the predicates are the
-whole of what there is — and the entries are the same entries in the
-same order, so a reviewer who has read one has read them all.
+What the mechanism does *not* reach is listed per dialect, under
+"Where the automatic scoping stops" — in `tenant.go` for `sqlite`,
+`mysql` and `clickhouse`, and in `doc.go` for `pg`, where it continues
+the package overview that opened the subject. It is not a footnote: in
+three of the four the predicates are the whole of what there is,
+because none of those three has row-level security to put underneath
+them.
+
+The four lists are not one list repeated, and reading one is not
+reading them all. `pg`'s is written against `pg`'s own surface and
+shares no entry's wording with the other three: ten entries, covering
+among others the FULL JOIN refusal, the `DeleteHook` rewrite path,
+what `ToSQL` renders without a ctx, and how far `Unscoped` reaches.
+The other three share a spine of six — a raw statement, a `drops.Raw`
+or `ExprFunc` body, a view body, a statement that said `Unscoped()`,
+an INSERT into a table with a read filter and no write column, and the
+RIGHT JOIN placement gap — and depart from it where the dialect does.
+`mysql` carries two more: its hand-written outbox, event-store and
+idempotency SQL, and the identifier fold it cannot settle without a
+server. `sqlite` carries the RIGHT JOIN entry to record a gap the
+dialect cannot have, so that adding a join kind is known to bring it.
+Read the list for the dialect you are writing against.
 
 ## Porting between them
 

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -73,11 +72,12 @@ import (
 //   - an INSERT into a table that declared a read filter and no write
 //     column — see [Table.ScopeWritesByTenant] for why drops will not
 //     guess the column;
-//   - the RIGHT JOIN placement gap the other three dialects carry cannot
-//     be written here: this package exposes INNER and LEFT JOIN and
-//     nothing else (see joinKind). The entry is kept so the four lists
-//     say the same things in the same order, and so that adding a join
-//     kind is known to bring the gap with it.
+//   - the RIGHT JOIN placement gap the other three dialects carry
+//     cannot be written here: this package exposes INNER and LEFT JOIN
+//     and nothing else (see joinKind). The entry is kept so that adding
+//     a join kind is known to bring the gap with it. It is not kept to
+//     keep the four lists in step — they are not in step, and
+//     docs/dialects.md says where they differ.
 //
 // A reviewer who has not read that list will read a raw fragment or a
 // view body as scoped when it is not.
@@ -321,17 +321,38 @@ import (
 // unique within a table, so no column of the table itself can collide.
 //
 // "The same name" is the SERVER's question rather than Go's, so each
-// dialect answers it in its own identKey. sqlite and mysql resolve a
-// column name case-insensitively however it is quoted, so a handle
-// spelled TENANTID renders as the axis there, and matching on the
-// bytes was the same defect one shift key further in — the guard
-// answering no for a handle the renderer answers yes for. Those two
-// fold case. pg and clickhouse compare a quoted identifier byte for
-// byte, and drops quotes every identifier it writes, so there the two
-// spellings are two columns: a differently-cased handle names a
-// column the table does not have, the server refuses the statement,
-// and folding here would instead refuse a schema that legitimately
-// declares both.
+// dialect answers it in its own ident.go, in identKey. It lives
+// beside the quoting helpers and not here because it is the one thing
+// in these rules that differs by dialect, and moving it out is what
+// leaves the rules themselves byte-identical in four packages.
+//
+// The answer is one-directional: identKey never reads two names as
+// one column unless the server does. A key too NARROW is the defect
+// above one shift key further in — the guard answering no for a
+// handle the renderer answers yes for. A key too WIDE is not the
+// spurious refusal it looks like: the INSERT stamp reads a match as
+// the axis being bound already and appends nothing, so a statement
+// naming some ordinary column goes out with the tenant column absent
+// from it and the row lands under whatever the schema defaults to,
+// which is section 1's "belonged to nobody" reached from here. Both
+// are silent, so neither is guessed at.
+//
+// sqlite and mysql resolve a column name case-insensitively however
+// it is quoted, so a handle spelled TENANTID renders as the axis
+// there and matching on the bytes was that narrow key. Those two
+// fold, and they fold ASCII and stop. SQLite's own comparison is
+// ASCII and nothing more; MySQL folds ASCII in every configuration,
+// while what it does with a NON-ASCII case pair is its identifier
+// collation's answer and no MySQL was reachable to settle it. A pair
+// they therefore read as two columns where the server may read one is
+// written into that dialect's "Where the automatic scoping stops"
+// list, rather than covered by a fold nobody verified.
+//
+// pg and clickhouse compare a quoted identifier byte for byte, and
+// drops quotes every identifier it writes, so there the two spellings
+// are two columns: a differently-cased handle names a column the
+// table does not have, the server refuses the statement, and folding
+// here would instead refuse a schema that legitimately declares both.
 //
 // A hook is asked the same question. The bound set that makes
 // "user-supplied values win" true is keyed by the name a column
@@ -516,34 +537,6 @@ func namesAxis(c, axis *Column) bool {
 	}
 	return identKey(c.Name()) == identKey(axis.Name())
 }
-
-// identKey returns the form in which two rendered column names are one
-// column to the server that reads the statement.
-//
-// SQLite resolves a column name case-insensitively, quoted or not:
-// "TENANTID" and "tenantId" are one column, an INSERT may name it
-// under either spelling, and an UPDATE's SET list assigns the same
-// column whichever it writes. So the fold is what the renderer means
-// here, and a comparison on the bytes was [namesAxis]'s original
-// defect one step further in — a guard that asks "is this the axis?"
-// answering no for a handle the server answers yes for, which is how a
-// codegen'd OtherTable.TENANTID walked past the stamping and the
-// upsert gate with nothing but a shift key between it and the
-// refusal.
-//
-// The fold is deliberately wider than SQLite's own, which is ASCII
-// only: strings.ToLower folds every case pair Unicode has. The two
-// answers differ only for a table declaring two columns whose names
-// differ by a non-ASCII case pair alone, where this refuses a
-// statement the server would have accepted. That is the direction to
-// be wrong in — the wider answer refuses, the narrower one binds.
-//
-// PostgreSQL and ClickHouse compare a quoted identifier byte for byte
-// and drops quotes every identifier it writes, so their identKey is
-// the name itself. Asking the question in all four packages is what
-// stops one dialect's answer from being carried into another by a
-// reader who only saw the comparison.
-func identKey(name string) string { return strings.ToLower(name) }
 
 // ScopeByTenant marks col as the entity's tenant axis. Every subsequent
 // Get / Query / Update / Delete reads the tenant from ctx (via

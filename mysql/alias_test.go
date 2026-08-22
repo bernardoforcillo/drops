@@ -101,17 +101,52 @@ func TestAliasInsertStillDefaultsAGenuinelyMissingColumn(t *testing.T) {
 }
 
 // Two tables that happen to share a column name are not the same
-// column, so identity is the declared column and never the name.
-func TestInsertDoesNotAlignAStrangerTableSColumn(t *testing.T) {
+// column to Go, and this test used to assert that alignment agreed:
+// a stranger table's `id` fell to DEFAULT and the value the caller
+// bound was dropped.
+//
+// That is the discard this phase closed. The INSERT column list writes
+// the bare name, so a stranger's `id` IS this statement's `id` to the
+// server — see the rendered-name rule in tenant.go's policy block —
+// and dropping its binding wrote a row the caller never asked for. The
+// assertion is inverted rather than deleted: what still must not align
+// is a name the column list does not carry, and that half is asserted
+// below.
+func TestInsertAlignsAStrangerTableSColumnByItsRenderedName(t *testing.T) {
 	tbl, id, name, _ := aliasTable()
 	_, otherID, _, _ := aliasTable()
 	db := mysql.New(&fakeDriver{})
-	got, _ := db.Insert(tbl).
+	got, args := db.Insert(tbl).
 		Row(id.Val(1), name.Val("a")).
 		Row(mysql.Bind(otherID, int64(2))).
 		ToSQL()
-	if !strings.Contains(got, "(DEFAULT, DEFAULT)") {
-		t.Errorf("a column of another table must not align: %s", got)
+	want := "INSERT INTO `users` (`id`, `name`) VALUES (?, ?), (?, DEFAULT)"
+	if got != want {
+		t.Errorf("rendered SQL:\n got = %v\nwant = %v", got, want)
+	}
+	if len(args) != 3 || args[2] != int64(2) {
+		t.Errorf("the stranger handle's value was dropped: args = %v", args)
+	}
+}
+
+// And a column of another table whose NAME this list does not carry
+// still has nowhere to go: it is not the same column to the server
+// either, and the row's other columns default.
+func TestInsertDoesNotAlignAColumnTheListDoesNotName(t *testing.T) {
+	tbl, id, name, _ := aliasTable()
+	other := mysql.NewTable("audits")
+	nickname := mysql.Add(other, mysql.Varchar("nickname", 255))
+	db := mysql.New(&fakeDriver{})
+	got, args := db.Insert(tbl).
+		Row(id.Val(1), name.Val("a")).
+		Row(mysql.Bind(nickname, "nick")).
+		ToSQL()
+	want := "INSERT INTO `users` (`id`, `name`) VALUES (?, ?), (DEFAULT, DEFAULT)"
+	if got != want {
+		t.Errorf("rendered SQL:\n got = %v\nwant = %v", got, want)
+	}
+	if len(args) != 2 {
+		t.Errorf("a column the list does not name must bind nothing: args = %v", args)
 	}
 }
 

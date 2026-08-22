@@ -154,23 +154,65 @@ func (v valuesRef) WriteSQL(b *drops.Builder) {
 //
 // The column list is fixed by the first Row and the bindings come from
 // whichever handles the caller held, so the two sides are matched on
-// Column.key rather than on the pointer: a value bound through an
-// alias names the same column as the declared handle. Matching by
-// pointer instead drops it, and drops it silently — the column falls
-// to the DEFAULT fill, which is well-formed SQL that writes the wrong
+// the name a column RENDERS as — [identKey]'s question, the one
+// [namesAxis] asks — and not on [Column.key] or on the pointer. This
+// is the write path that decides which bindings are rendered at all,
+// so a binding this index fails to recognise is not compared with
+// anything and not refused: it is DISCARDED, and the column falls to
+// the DEFAULT fill, which is well-formed SQL that writes the wrong
 // row.
+//
+// Every spelling of "the same column" reaches here. An alias copy
+// keeps the declared name, so a value bound through an alias lands in
+// its column's slot exactly as it did under the key index: key
+// equality implies name equality, and nothing that matched before
+// stops matching. What the key index missed is a handle for the
+// same-named column of ANOTHER table object — and on this dialect a
+// handle spelled in another case, since MySQL folds a column name in
+// every configuration. A later row of a batch that named the tenant
+// axis either way had its binding dropped, and then: scoped, the stamp
+// filled the gap from ctx and a row the caller had assigned to tenant
+// 999 went out as tenant 77 with no refusal; unscoped, nothing filled
+// it and the row belonged to nobody, reported as written.
+//
+// A row may name one rendered column more often than cols does — two
+// handles for it, one slot — and then the LAST binding wins, as the
+// map this index replaced did for one handle bound twice. A row that
+// contradicts itself is not resolved by whichever spelling came first.
+//
+// A binding whose rendered name is not in cols at all is dropped, as it
+// was before. That residue is the column list's rather than this
+// index's: the list is fixed by the first Row, so there is no slot to
+// render such a value in, and the table's own handle for the same
+// column is dropped in the same place.
 func alignRow(cols []*Column, values []ColumnValue) []drops.Expression {
-	byCol := make(map[*Column]ColumnValue, len(values))
+	slots := make(map[string]int, len(cols))
+	for _, c := range cols {
+		slots[identKey(c.Name())]++
+	}
+	bound := make(map[string][]ColumnValue, len(values))
 	for _, v := range values {
-		byCol[v.column().key()] = v
+		k := identKey(v.column().Name())
+		n, ok := slots[k]
+		if !ok {
+			continue
+		}
+		q := append(bound[k], v)
+		if len(q) > n {
+			q = q[len(q)-n:]
+		}
+		bound[k] = q
 	}
 	out := make([]drops.Expression, len(cols))
 	for i, c := range cols {
-		v, ok := byCol[c.key()]
-		if !ok {
+		k := identKey(c.Name())
+		q := bound[k]
+		if len(q) == 0 {
 			out[i] = sqlDefault{}
 			continue
 		}
+		v := q[0]
+		bound[k] = q[1:]
 		// The binding's own expression, not a closure over its
 		// writeValue: a value bound as a subquery is a statement, and a
 		// statement inside a closure is one the resolver cannot reach.

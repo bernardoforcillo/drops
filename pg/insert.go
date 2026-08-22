@@ -104,11 +104,37 @@ func columnsOf(values []ColumnValue) []*Column {
 // alignRow returns the row's bindings aligned with cols. Missing
 // columns are filled with a DEFAULT binding.
 //
-// The index is keyed by Column.key: a row bound through an alias while
-// the column list was fixed by a row bound through the base handles
-// would otherwise match nothing and render as a row of DEFAULTs — a
-// well-formed INSERT of the wrong data, and on a nullable column a
-// silent one.
+// The index is keyed by the name a column RENDERS as — [identKey]'s
+// question, the one [namesAxis] asks — and not by [Column.key]. This
+// is the write path that decides which bindings are rendered at all,
+// so a binding this index fails to recognise is not compared with
+// anything and not refused: it is DISCARDED, and the column falls to
+// the DEFAULT fill. That is a well-formed INSERT of data the caller
+// did not write, and on a nullable column a silent one.
+//
+// Both spellings of "the same column" reach here. An alias copy keeps
+// the declared name, so the case this function was written for — a row
+// bound through an alias while the column list was fixed by the base
+// handles — matches exactly as it did: key equality implies name
+// equality, and nothing that matched before stops matching. What the
+// key index missed is a handle for the same-named column of ANOTHER
+// table object, which the column list renders identically. A later row
+// of a batch that named the tenant axis that way had its binding
+// dropped, and then: scoped, the stamp filled the gap from ctx and a
+// row the caller had assigned to tenant 9 went out as tenant 3 with no
+// refusal; unscoped, nothing filled it and the row belonged to nobody,
+// reported as written.
+//
+// A row may name one rendered column more often than cols does — two
+// handles for it, one slot — and then the LAST binding wins, as the
+// map this index replaced did for one handle bound twice. A row that
+// contradicts itself is not resolved by whichever spelling came first.
+//
+// A binding whose rendered name is not in cols at all is dropped, as it
+// was before. That residue is the column list's rather than this
+// index's: the list is fixed by the first Row, so there is no slot to
+// render such a value in, and the table's own handle for the same
+// column is dropped in the same place.
 //
 // The gaps are filled with a binding rather than with a bare expression
 // so that a row stays a list of [ColumnValue] all the way to the
@@ -116,17 +142,31 @@ func columnsOf(values []ColumnValue) []*Column {
 // hiding in it and stamp the tenant column by index — an aligned row
 // whose entries were opaque writer closures could do neither.
 func alignRow(cols []*Column, values []ColumnValue) []ColumnValue {
-	idx := make(map[*Column]ColumnValue, len(values))
+	slots := make(map[string]int, len(cols))
+	for _, c := range cols {
+		slots[identKey(c.Name())]++
+	}
+	bound := make(map[string][]ColumnValue, len(values))
 	for _, v := range values {
-		idx[v.column().key()] = v
+		k := identKey(v.column().Name())
+		n, ok := slots[k]
+		if !ok {
+			continue
+		}
+		q := append(bound[k], v)
+		if len(q) > n {
+			q = q[len(q)-n:]
+		}
+		bound[k] = q
 	}
 	out := make([]ColumnValue, len(cols))
 	for j, c := range cols {
-		if v, ok := idx[c.key()]; ok {
-			out[j] = v
-		} else {
-			out[j] = defaultBinding(c)
+		k := identKey(c.Name())
+		if q := bound[k]; len(q) > 0 {
+			out[j], bound[k] = q[0], q[1:]
+			continue
 		}
+		out[j] = defaultBinding(c)
 	}
 	return out
 }

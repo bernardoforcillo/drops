@@ -118,18 +118,65 @@ func columnsOf(values []ColumnValue) []*Column {
 // alignRow aligns the row's values with the chosen column order;
 // missing columns default to NULL (CH uses NULL as the "no value"
 // marker — there's no DEFAULT keyword inside VALUES the way PG has).
+//
+// The index is keyed by the name a column RENDERS as — [identKey]'s
+// question, the one [namesAxis] asks — and not by [Column.key]. This
+// is the write path that decides which bindings are rendered at all,
+// so a binding this index fails to recognise is DISCARDED, and with
+// NULL as the filler the row is written with the column empty.
+//
+// On the tenant axis that emptiness is a row belonging to nobody, and
+// it did not need Unscoped to get there: stampTenantColumn reads the
+// RAW row, so it found a binding made through another table's handle
+// for the same rendered column, compared it with the ctx tenant,
+// passed it and appended no stamp of its own — and this function then
+// dropped the binding the check had just approved, rendering NULL in
+// its place. The check and the renderer were asking two different
+// questions and the renderer's was the one that reached the server.
+//
+// An alias copy keeps the declared name, so a value bound through an
+// alias lands in its column's slot exactly as it did under the key
+// index: key equality implies name equality, and nothing that matched
+// before stops matching.
+//
+// A row may name one rendered column more often than cols does — two
+// handles for it, one slot — and then the LAST binding wins, as the
+// map this index replaced did for one handle bound twice. A row that
+// contradicts itself is not resolved by whichever spelling came first.
+//
+// A binding whose rendered name is not in cols at all is dropped, as it
+// was before. That residue is the column list's rather than this
+// index's: the list comes from row zero or from
+// [InsertBuilder.Columns], so there is no slot to render such a value
+// in, and the table's own handle for the same column is dropped in the
+// same place.
 func alignRow(cols []*Column, values []ColumnValue) []drops.Expression {
-	idx := map[*Column]ColumnValue{}
+	slots := make(map[string]int, len(cols))
+	for _, c := range cols {
+		slots[identKey(c.Name())]++
+	}
+	bound := make(map[string][]ColumnValue, len(values))
 	for _, v := range values {
-		idx[v.column().key()] = v
+		k := identKey(v.column().Name())
+		n, ok := slots[k]
+		if !ok {
+			continue
+		}
+		q := append(bound[k], v)
+		if len(q) > n {
+			q = q[len(q)-n:]
+		}
+		bound[k] = q
 	}
 	out := make([]drops.Expression, len(cols))
 	for j, c := range cols {
-		if v, ok := idx[c.key()]; ok {
-			out[j] = bindingExpr(v)
-		} else {
+		k := identKey(c.Name())
+		q := bound[k]
+		if len(q) == 0 {
 			out[j] = drops.Raw("NULL")
+			continue
 		}
+		out[j], bound[k] = bindingExpr(q[0]), q[1:]
 	}
 	return out
 }

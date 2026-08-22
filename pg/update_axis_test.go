@@ -304,3 +304,37 @@ func TestUpdateTreatsACaseVariantNameAsAnotherColumn(t *testing.T) {
 		t.Errorf("bound arguments:\n got = %#v\nwant = %#v", args, wantArgs)
 	}
 }
+
+// A PII-flagged tenant column binds its value wrapped in a redaction
+// marker, which is a logging concern and not a tenancy one — so the
+// check compares what the driver will receive rather than the wrapper
+// a formatter sees. Asking the wrapper would refuse every restatement
+// on such a column, Entity.Update's included.
+func TestUpdateComparesTheValueBehindThePIIMarker(t *testing.T) {
+	tbl := pg.NewTable("secrets")
+	id := pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	tenant := pg.Add(tbl, pg.BigInt("tenantId").NotNull().AsPII())
+	tbl.ContextFilter(pg.TenantFilter(tenant)).ScopeWritesByTenant(tenant)
+	db := pg.New(dropstest.New())
+
+	sql, args, err := db.Update(tbl).Set(tenant.Val(3)).
+		Where(pg.Eq(id, int64(7))).ToSQLCtx(tenantCtx(int64(3)))
+	if err != nil {
+		t.Fatalf("ToSQLCtx: %v", err)
+	}
+	want := `UPDATE "secrets" SET "tenantId" = $1 ` +
+		`WHERE ("secrets"."id" = $2) AND ("secrets"."tenantId" = $3)`
+	if sql != want {
+		t.Errorf("rendered SQL:\n got = %v\nwant = %v", sql, want)
+	}
+	if len(args) != 3 {
+		t.Fatalf("bound %d arguments, want 3: %#v", len(args), args)
+	}
+
+	// And the refusal still fires through the marker.
+	_, _, err = db.Update(tbl).Set(tenant.Val(999)).
+		Where(pg.Eq(id, int64(7))).ToSQLCtx(tenantCtx(int64(3)))
+	if !errors.Is(err, pg.ErrTenantMismatch) {
+		t.Fatalf("ToSQLCtx = %v, want %v", err, pg.ErrTenantMismatch)
+	}
+}

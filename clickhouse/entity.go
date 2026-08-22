@@ -167,16 +167,24 @@ func (e *Entity[T]) runValidators(r *T) error {
 // so r is not refreshed — any DEFAULT-driven values (timestamps,
 // UUIDs) stay zero on the Go side.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) (drops.Result, error) {
-	if err := e.runValidators(r); err != nil {
-		return nil, err
-	}
 	// The tenant is stamped onto the STRUCT, before the bindings are
 	// collected, so the caller's own value comes back carrying the
 	// tenant it was written under — and a row that already names a
 	// different tenant is refused rather than silently rewritten. The
 	// builder stamps the binding as well (see InsertBuilder.resolveCtx);
 	// doing it here too is what makes r agree with the row.
+	//
+	// It runs BEFORE the validators, which is section 2 of the policy
+	// block and used to be the other way round here: a validator saw
+	// the tenant field as the caller left it, which on the ordinary
+	// path — a struct decoded from a request body — is zero. So a
+	// validator that checked the row's tenant checked nothing, and one
+	// that required the field to be set rejected every legitimate
+	// Create.
 	if err := e.stampTenant(ctx, r); err != nil {
+		return nil, err
+	}
+	if err := e.runValidators(r); err != nil {
 		return nil, err
 	}
 	v := reflect.ValueOf(r).Elem()
@@ -197,15 +205,18 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
-		if err := e.runValidators(&rs[i]); err != nil {
-			return nil, err
-		}
 		// Every row, before any SQL is built. A batch is the normal
 		// size of a write here, so a stamp applied to some rows and not
 		// others is the outcome worth ruling out: half a million rows
 		// land owned and the rest owned by nobody, in one statement
 		// reported as a success.
+		//
+		// And before this row's validators, for the reason [Entity.Create]
+		// spells out: a validator reads the row as it will be written.
 		if err := e.stampTenant(ctx, &rs[i]); err != nil {
+			return nil, err
+		}
+		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
 	}

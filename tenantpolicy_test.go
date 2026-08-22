@@ -347,6 +347,24 @@ func TestTenantPolicyBlockSurfaceClaimsHold(t *testing.T) {
 			}
 		}
 	}
+	// "only pg and clickhouse register validators. sqlite and mysql
+	// have no Entity.Validate". That sentence is what makes the
+	// stamp-before-validators rule above true in four packages rather
+	// than in one, so it is asked of every dialect found and not of a
+	// list: a fifth that grows Validate has to be given the ordering
+	// and has to be counted here.
+	validators := map[string]bool{"pg": true, "clickhouse": true}
+	for _, dir := range dirs {
+		has := entityHasMethod(t, dir, "Validate")
+		switch {
+		case has && !validators[dir]:
+			t.Errorf("%s grew Entity.Validate: the policy block says only pg and clickhouse "+
+				"register validators, and the stamp-before-validators rule now has to hold here too", dir)
+		case !has && validators[dir]:
+			t.Errorf("%s lost Entity.Validate: the policy block counts it among the dialects "+
+				"the stamp-before-validators rule is about", dir)
+		}
+	}
 	// "RelConfig.Unscoped is pg's alone."
 	for _, dir := range dirs {
 		if dir == "pg" {

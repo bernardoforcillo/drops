@@ -162,14 +162,15 @@ import (
 // a row to another tenant.
 //
 // Create stamps the axis from ctx onto a zero field and refuses a
-// field naming another tenant. Update does the same, and its stamp
-// runs before the validators so a validator reads the row as it will
-// be written rather than as the caller happened to build it. A struct
-// whose tenant field is zero — one built from a form, or from a
-// decoded request body — is stamped rather than allowed to write that
-// zero over a row and hand it to no tenant at all; a struct carrying
-// somebody else's tenant is [ErrTenantMismatch] rather than a
-// transfer of ownership.
+// field naming another tenant. Update does the same. Both stamp
+// BEFORE the validators run, so a validator reads the row as it will
+// be written rather than as the caller happened to build it — handed
+// the row as built, a validator that checks the tenant is checking a
+// field the statement is about to replace. A struct whose tenant
+// field is zero — one built from a form, or from a decoded request
+// body — is stamped rather than allowed to write that zero over a row
+// and hand it to no tenant at all; a struct carrying somebody else's
+// tenant is [ErrTenantMismatch] rather than a transfer of ownership.
 //
 // Patch refuses ANY op naming the axis, including an op assigning the
 // ctx tenant's own value. That op is a no-op only by coincidence of
@@ -196,6 +197,11 @@ import (
 // not transactional, which this package does not model — so that
 // dialect has no Update and no Patch, and the write half of the axis
 // is stamping and refusal alone. The other three carry all of it.
+//
+// Validators are the mirror image: only pg and clickhouse register
+// them. sqlite and mysql have no Entity.Validate, so the ordering rule
+// above is about those two, and in the other two there is nothing for
+// a stamp to run before.
 //
 // --- 3. WHAT UNSCOPED MEANS AT EACH LEVEL ---
 //
@@ -350,9 +356,9 @@ func isNilTenant(v any) bool {
 //
 // The producers wrap it with the table and column that refused, because
 // that is the only diagnostic a caller gets: nothing exported asks a
-// *Table which filters it carries, so in a schema where four tables are
-// scoped an unwrapped sentence would say the same thing whichever one
-// of them stopped the query. Match it with errors.Is.
+// *Table which CONTEXT filters it carries, so in a schema where four
+// tables are scoped an unwrapped sentence would say the same thing
+// whichever one of them stopped the query. Match it with errors.Is.
 var ErrTenantMissing = errors.New("drops/sqlite: table is tenant-scoped but ctx has no tenant")
 
 // ErrTenantMismatch is returned when a row or a binding carries a

@@ -76,7 +76,12 @@ func AllowAnyUnmappedColumn() EntityOption {
 // values for the entity's primary key.
 var ErrKeyArity = errors.New("drops/mysql: wrong number of primary-key values")
 
-// ErrPKNotSet is returned by Update when the key fields are all zero.
+// ErrPKNotSet is returned by Update when r's primary-key field is the
+// zero value. The alternative is a statement whose WHERE addresses id
+// = 0: it matches nothing, reports success, and leaves the caller
+// believing a write landed. Save never returns it — a zero key is how
+// Save tells a row that has never been written from one that has, and
+// it routes that row to Create.
 var ErrPKNotSet = errors.New("drops/mysql: primary key field is the zero value")
 
 // NewEntity builds the entity, panicking on misconfiguration —
@@ -205,6 +210,9 @@ func (e *Entity[T]) pkValuesOf(r *T) []any {
 	return out
 }
 
+// pkIsZero reports whether every key field is the zero value — the
+// test Save uses to decide between insert and update, and the one
+// Update uses to refuse a row that addresses no row at all.
 func (e *Entity[T]) pkIsZero(r *T) bool {
 	v := reflect.ValueOf(r).Elem()
 	for _, idx := range e.pkFields {
@@ -386,7 +394,11 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 }
 
 // Update writes every non-key column of r to the row its key
-// addresses.
+// addresses. ErrPKNotSet is returned if r's PK is the zero value.
+//
+// The tenant column is an axis, never an assignment: Create stamps it,
+// Update stamps it, both refuse a mismatch, and neither ever takes the
+// value from the struct as an instruction.
 //
 // On a tenant-scoped entity the tenant column is one of those non-key
 // columns, so the row's own tenant is stamped from ctx before the

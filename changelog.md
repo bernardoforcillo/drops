@@ -137,6 +137,55 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **The tenant stamp converted the ctx tenant without asking what the
+  conversion did to it, and wrote one tenant into a statement that
+  addressed another** (`drops/pg`, `drops/sqlite`, `drops/mysql`,
+  `drops/clickhouse`). `stampTenant` filled a zero tenant field from
+  ctx on `ConvertibleTo` alone, without the string guard `sameTenant` —
+  four lines below it in the same file — exists to carry. Go converts
+  an integer to a string as a rune, so a ctx tenant of `65` and a TEXT
+  tenant column produced `UPDATE "str_rows" SET "tenantId" = ?,
+  "title" = ? WHERE ("str_rows"."id" = ?) AND ("str_rows"."tenantId" =
+  ?)` bound to `"A", "x", 7, 65`: the row is ASSIGNED to tenant `"A"`
+  by a statement that ADDRESSES tenant `65`, which hands it to whoever
+  owns `"A"`. `Create` escaped it only because the INSERT is stamped a
+  second time from the binding side, which does use `sameTenant`;
+  `Update` has no second stamp, so it reached the wire. The stamp now
+  converts and then asks `sameTenant` whether what came out names the
+  tenant that went in, so the string case and the truncating numeric
+  case are both refused — with the axis named, since that is the only
+  diagnostic the caller gets. A column whose type disagrees with the
+  ctx tenant's is the schema reporting a type confusion, so this
+  refuses rather than reaching for `strconv`, which would accept it
+  silently.
+- **`sameTenant` converted in one direction, so a truncating pair
+  compared equal** (`drops/pg`, `drops/sqlite`, `drops/mysql`,
+  `drops/clickhouse`). `pg` converted the ctx tenant into the bound
+  value's type and the other three converted the bound value into the
+  ctx tenant's — identical doc comments over mirrored bodies, and
+  neither direction was right. `int64(1<<32|77)` and `int32(77)`
+  convert onto each other's type and match in whichever direction
+  throws the high bits away, so each dialect accepted the pair the
+  other refused and the statement went out carrying a value the ctx
+  never named. The comparison is now a round trip — convert, compare,
+  convert back, compare again — in all four, in the same words, and
+  `pg`'s copy has moved next to `stampTenant` so the four files can be
+  diffed against each other.
+- **The tenant a row already carried was compared with
+  `reflect.DeepEqual`, so the refusal fired on a match** (`drops/pg`,
+  `drops/sqlite`, `drops/mysql`). `DeepEqual` is a type comparison as
+  much as a value one: `int64(77)` on the column and `int(77)` on ctx
+  were `ErrTenantMismatch`, which made `Update` unusable for any caller
+  whose tenant does not round-trip through its transport as the
+  column's exact type. `clickhouse` was the only dialect that had
+  noticed, and its `sameTenant` is now the answer in all four.
+- **`sqlite`'s `Update` accepted a row whose key was still zero**
+  (`drops/sqlite`). It sent `WHERE "id" = 0`, matched nothing, and
+  reported success — a caller left believing a write landed. It now
+  returns the new `ErrPKNotSet`, the sentinel `pg` and `mysql` already
+  had, and the three doc comments say the same thing: `Save` never
+  returns it, because a zero key is how `Save` recognises a row that
+  has never been written and routes it to `Create`.
 - **`WithTracer` produced no spans inside a transaction** (`drops/pg`).
   `Begin` and `InTx` built the transaction-bound `*DB` as
   `&DB{drv: tx, hook: db.hook}` — twice, in two places — which carried

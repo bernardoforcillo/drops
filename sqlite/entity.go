@@ -221,6 +221,14 @@ func (e *Entity[T]) PKs() []*Column {
 // values for the entity's primary key.
 var ErrKeyArity = errors.New("drops/sqlite: wrong number of primary-key values")
 
+// ErrPKNotSet is returned by Update when r's primary-key field is the
+// zero value. The alternative is a statement whose WHERE addresses id
+// = 0: it matches nothing, reports success, and leaves the caller
+// believing a write landed. Save never returns it — a zero key is how
+// Save tells a row that has never been written from one that has, and
+// it routes that row to Create.
+var ErrPKNotSet = errors.New("drops/sqlite: primary key field is the zero value")
+
 // pkPredicate addresses one row by key. A count mismatch is an error
 // rather than a partial match: half a composite key would silently
 // address every row sharing that column.
@@ -251,6 +259,19 @@ func (e *Entity[T]) pkValuesOf(r *T) []any {
 		out[i] = v.FieldByIndex(idx).Interface()
 	}
 	return out
+}
+
+// pkIsZero reports whether every key field is the zero value — the
+// test Save uses to decide between insert and update, and the one
+// Update uses to refuse a row that addresses no row at all.
+func (e *Entity[T]) pkIsZero(r *T) bool {
+	v := reflect.ValueOf(r).Elem()
+	for _, idx := range e.pkFields {
+		if !v.FieldByIndex(idx).IsZero() {
+			return false
+		}
+	}
+	return true
 }
 
 // isKeyColumn reports whether c is part of the primary key.
@@ -521,7 +542,8 @@ func rowsMatchColumns(rows [][]ColumnValue, cols []*Column) bool {
 // Update writes every non-PK column of r, matched by primary key. Applies
 // the tenant scope and authorization guard, records an audit row in the
 // same transaction (when audited), and refreshes the PK cache — or, for
-// a scoped entity, clears it. See hasRowScope.
+// a scoped entity, clears it. See hasRowScope. ErrPKNotSet is returned
+// if r's PK is the zero value.
 //
 // The tenant column is an axis, never an assignment: Create stamps it,
 // Update stamps it, both refuse a mismatch, and neither ever takes the
@@ -538,6 +560,9 @@ func rowsMatchColumns(rows [][]ColumnValue, cols []*Column) bool {
 // question, and the table's context filter answers it: the WHERE
 // clause carries the ctx tenant like every other statement's.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
+	if e.pkIsZero(r) {
+		return ErrPKNotSet
+	}
 	if err := e.stampTenant(ctx, r); err != nil {
 		return err
 	}

@@ -260,9 +260,8 @@ func (e *Entity[T]) tenantWriteAxis() (*Column, []int, bool) {
 	return nil, nil, false
 }
 
-// stampTenant ensures r's tenant field matches ctx. Called by
-// Create, CreateMany, UpsertMany and CopyFrom — corrects a zero value,
-// rejects a mismatching one.
+// stampTenant ensures r's tenant field matches ctx — assigns a zero
+// value, rejects a mismatching one.
 func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
 	col, field, ok := e.tenantWriteAxis()
 	if !ok {
@@ -277,21 +276,88 @@ func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
 		// Assign — set via reflection. Fields must be settable.
 		ctxTenant := reflect.ValueOf(t)
 		if !ctxTenant.Type().AssignableTo(fv.Type()) {
-			// Try a numeric / string conversion when types differ
-			// but are convertible — keeps the API flexible for
-			// int64 PKs paired with a tenant value sourced as int.
-			if ctxTenant.Type().ConvertibleTo(fv.Type()) {
-				ctxTenant = ctxTenant.Convert(fv.Type())
-			} else {
-				return ErrTenantMismatch
+			// A tenant sourced as an int and a column typed int64
+			// are the same tenant, so the conversion is worth
+			// making — but only when what comes out names the
+			// tenant that went in, which is [sameTenant]'s
+			// question and not ConvertibleTo's. Converting on
+			// ConvertibleTo alone stamped a ctx tenant of 65 into
+			// a text column as the rune "A" while the WHERE
+			// clause still addressed 65: one statement assigning
+			// one tenant and addressing another, which hands the
+			// row to whoever owns "A".
+			//
+			// A column whose type disagrees with the ctx tenant's
+			// is the schema saying these are not the same kind of
+			// tenant, so this refuses rather than reaching for
+			// strconv: a conversion invented here would silently
+			// accept the type confusion the schema is reporting,
+			// and the caller would never learn that the tenant it
+			// thinks it wrote under is not the one on the row.
+			if !ctxTenant.Type().ConvertibleTo(fv.Type()) {
+				return fmt.Errorf("%w: %s cannot hold the ctx tenant",
+					ErrTenantMismatch, tenantAxisName(col))
 			}
+			conv := ctxTenant.Convert(fv.Type())
+			if !sameTenant(conv.Interface(), t) {
+				return fmt.Errorf("%w: %s cannot hold the ctx tenant",
+					ErrTenantMismatch, tenantAxisName(col))
+			}
+			ctxTenant = conv
 		}
 		fv.Set(ctxTenant)
 		return nil
 	}
-	// r already has a tenant — must match ctx.
-	if !reflect.DeepEqual(fv.Interface(), t) {
-		return ErrTenantMismatch
+	// r already carries a tenant, and it must be this one. Compared
+	// with [sameTenant] rather than reflect.DeepEqual, which is a
+	// type comparison as much as a value one: int64(77) on the
+	// column and int(77) on ctx were a mismatch, so the refusal
+	// fired on a match and Update was unusable for every caller
+	// whose tenant does not round-trip through its transport as the
+	// column's exact type.
+	if !sameTenant(fv.Interface(), t) {
+		return fmt.Errorf("%w: %s carries another tenant's value",
+			ErrTenantMismatch, tenantAxisName(col))
 	}
 	return nil
+}
+
+// sameTenant reports whether a bound tenant value and the ctx tenant
+// name the same tenant.
+//
+// The conversion mirrors [Entity.stampTenant]: a tenant sourced as an
+// int and a column typed int64 are the same tenant, and refusing that
+// pairing would reject the very rows the entity methods stamp. The
+// string guard is not decoration — Go converts an integer to a string
+// as a rune, so without it tenant 65 and tenant "A" would compare
+// equal, and a numeric tenant would be accepted as the owner of a text
+// tenant column's row.
+//
+// The comparison is a round trip — convert, compare, convert back,
+// compare again — because a one-way conversion calls a truncating pair
+// equal. int64(1<<32|77) and int32(77) convert onto each other's type
+// and match in whichever direction throws the high bits away, so a
+// check that converts only one way accepts the pair and the statement
+// goes out carrying a value the ctx never named. Only a conversion
+// that loses nothing in either direction names the same tenant.
+func sameTenant(bound, want any) bool {
+	if reflect.DeepEqual(bound, want) {
+		return true
+	}
+	bv, wv := reflect.ValueOf(bound), reflect.ValueOf(want)
+	if !bv.IsValid() || !wv.IsValid() {
+		return false
+	}
+	bt, wt := bv.Type(), wv.Type()
+	if (bt.Kind() == reflect.String) != (wt.Kind() == reflect.String) {
+		return false
+	}
+	if !bt.ConvertibleTo(wt) || !wt.ConvertibleTo(bt) {
+		return false
+	}
+	conv := bv.Convert(wt)
+	if !reflect.DeepEqual(conv.Interface(), want) {
+		return false
+	}
+	return reflect.DeepEqual(conv.Convert(bt).Interface(), bound)
 }

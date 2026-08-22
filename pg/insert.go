@@ -3,7 +3,6 @@ package pg
 import (
 	"context"
 	"fmt"
-	"reflect"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -700,34 +699,6 @@ func unwrapPIIArg(v any) any {
 		return p.Value
 	}
 	return v
-}
-
-// sameTenant reports whether a bound tenant value and the ctx tenant
-// name the same tenant.
-//
-// The conversion mirrors [Entity.stampTenant]: a tenant sourced as an
-// int and a column typed int64 are the same tenant, and refusing that
-// pairing would reject the very rows the entity methods stamp. The
-// string guard is not decoration — Go converts an integer to a string
-// as a rune, so without it tenant 65 and tenant "A" would compare
-// equal, and a numeric tenant would be accepted as the owner of a text
-// tenant column's row.
-func sameTenant(bound, want any) bool {
-	if reflect.DeepEqual(bound, want) {
-		return true
-	}
-	bv, wv := reflect.ValueOf(bound), reflect.ValueOf(want)
-	if !bv.IsValid() || !wv.IsValid() {
-		return false
-	}
-	bt, wt := bv.Type(), wv.Type()
-	if (bt.Kind() == reflect.String) != (wt.Kind() == reflect.String) {
-		return false
-	}
-	if !wt.ConvertibleTo(bt) {
-		return false
-	}
-	return reflect.DeepEqual(bound, wv.Convert(bt).Interface())
 }
 
 // scopeConflict returns the conflict branch an INSERT into a

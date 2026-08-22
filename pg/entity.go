@@ -462,7 +462,8 @@ func (e *Entity[T]) pkValuesOf(r *T) []any {
 }
 
 // pkIsZero reports whether every key field is the zero value — the
-// test Save uses to decide between insert and update.
+// test Save uses to decide between insert and update, and the one
+// Update uses to refuse a row that addresses no row at all.
 func (e *Entity[T]) pkIsZero(r *T) bool {
 	v := reflect.ValueOf(r).Elem()
 	for _, idx := range e.pkFields {
@@ -501,8 +502,12 @@ func colNames(cols []*Column) []string {
 // CRUD operations
 // ----------------------------------------------------------------------
 
-// ErrPKNotSet is returned by Update / Save when r's primary-key
-// field is the zero value but the operation requires it to be set.
+// ErrPKNotSet is returned by Update when r's primary-key field is the
+// zero value. The alternative is a statement whose WHERE addresses id
+// = 0: it matches nothing, reports success, and leaves the caller
+// believing a write landed. Save never returns it — a zero key is how
+// Save tells a row that has never been written from one that has, and
+// it routes that row to Create.
 var ErrPKNotSet = errors.New("drops/pg: primary key field is the zero value")
 
 // ErrStaleObject is returned by Update on an entity whose table

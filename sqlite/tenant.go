@@ -58,8 +58,8 @@ import (
 // policy is, and SQLite has no equivalent of PostgreSQL row-level
 // security to put underneath them: there are no roles, no policies, and
 // a process that can open the file can read every byte in it. So the
-// list below is not a footnote, it is the whole of what is left when
-// the predicates do not reach:
+// list below is not a footnote — it is where a statement leaves the
+// scoping behind:
 //
 //   - a raw statement, through [DB.Exec] or [DB.Query], carries what
 //     the caller wrote and nothing else;
@@ -91,6 +91,34 @@ import (
 //
 // A reviewer who has not read that list will read a raw fragment or a
 // view body as scoped when it is not.
+//
+// # What is underneath them, and what is not
+//
+// That list used to be the whole of what was left, and saying so was
+// this file describing an absence it had not looked for. There is no
+// row-level security here and there never will be, but SQLite has
+// TRIGGERS, and a trigger is inside the database: it runs for every
+// statement that reaches the table, through whatever connection, in
+// whatever process, including every entry in the list above. See
+// [TenantGuard], which renders them from this same axis and refuses a
+// write that would leave a row with no tenant, move one between
+// tenants, or point a foreign key at another tenant's row.
+//
+// It is a guard and not a boundary, and the word that separates them is
+// "principal". pg's policies bind rows to a role, clickhouse's to a
+// user, mysql's definer-rights view to an account. SQLite has none to
+// bind to, so whoever can write the file can DROP TRIGGER. A tenant
+// guard holds against MISTAKES — the raw statement, the backfill
+// script, the foreign key that names the wrong row — which is what
+// actually leaks; it does not hold against an adversary.
+//
+// The boundary this dialect does have is architectural: one database
+// FILE per tenant, enforced by the filesystem rather than by anything
+// inside the database. tenantguard.go states what that costs — N
+// migrations, cross-tenant queries that stop being queries, per-tenant
+// connection management, and a routing decision that becomes the
+// boundary itself — and [TenantGuard.PinnedTo] is the half of it drops
+// can put in the schema.
 
 // ==== THE TENANT POLICIES — NORMATIVE ====
 //

@@ -8,12 +8,23 @@ import (
 
 // CreateTable returns a CREATE TABLE statement for t.
 //
-// Unlike PostgreSQL, SQLite cannot add constraints after the fact
-// (there is no ALTER TABLE ADD CONSTRAINT), so EVERY constraint —
-// composite primary key, UNIQUE, CHECK and single- or multi-column
+// Unlike PostgreSQL, SQLite's ALTER TABLE adds no composite primary
+// key, no UNIQUE and no foreign key after the fact, so EVERY constraint
+// — composite primary key, UNIQUE, CHECK and single- or multi-column
 // foreign key — is emitted inline inside the CREATE TABLE body. This is
 // the deliberate dialect difference from drops/pg, whose migration
 // generator emits those as separate ALTER statements.
+//
+// This comment used to say the flat "there is no ALTER TABLE ADD
+// CONSTRAINT", and that is not quite true: the NAMED CHECK form of it
+// is accepted, appended to the stored schema text, enforced, and still
+// enforced after the file is reopened — measured in
+// integration/sqlite_tenantguard_test.go, along with the UNIQUE and
+// FOREIGN KEY forms being syntax errors. drops does not emit it, since
+// it is outside the ALTER TABLE grammar SQLite documents and a
+// generator has no business relying on that. It is recorded here so
+// that the comment does not send a reader to rebuild a table they did
+// not have to.
 func CreateTable(t *Table) drops.Expression { return createTable(t, false) }
 
 // CreateTableIfNotExists is the IF NOT EXISTS variant.

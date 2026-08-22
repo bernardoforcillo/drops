@@ -554,3 +554,74 @@ func TestAGuardNamingAMissingParentRefusesEveryWrite(t *testing.T) {
 		t.Fatalf("refused for some other reason: %v", err)
 	}
 }
+
+// Why a trigger and not a CHECK, part two — and a correction to what
+// sqlite/ddl.go said about ALTER TABLE.
+//
+// The usual reason for emitting every constraint inside CREATE TABLE is
+// that SQLite's ALTER TABLE cannot add one, so a CHECK on an existing
+// table means the twelve-step rebuild. That is true of UNIQUE and of
+// FOREIGN KEY, and it is NOT true of a named CHECK: the statement is
+// accepted, appended to the stored schema text, enforced immediately,
+// still enforced after the file is reopened, and integrity_check is
+// happy about it.
+//
+// The form is outside the ALTER TABLE grammar SQLite documents, which
+// is why drops measures it here and does not emit it. It is recorded
+// because a comment saying the statement does not exist would send a
+// reader to rebuild a table they did not have to.
+func TestAlterTableAddsANamedCheckAndNothingElse(t *testing.T) {
+	db, sqlDB, dsn := openSQLiteFile(t)
+	ctx := context.Background()
+
+	if _, err := db.Exec(ctx,
+		`CREATE TABLE "gd_alter" ("id" INTEGER PRIMARY KEY, "tenantId" TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(ctx,
+		`ALTER TABLE "gd_alter" ADD CONSTRAINT "gd_alter_ck" CHECK ("tenantId" IS NOT NULL)`); err != nil {
+		t.Fatalf("ADD CONSTRAINT ... CHECK was refused; sqlite/ddl.go's note that this "+
+			"form is accepted is what must change: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO "gd_alter" VALUES (1, NULL)`); err == nil {
+		t.Fatalf("the added CHECK was stored and not enforced")
+	}
+
+	// It adds no column, whatever the ADD COLUMN grammar would suggest.
+	var cols int64
+	scalar(t, db, `SELECT count(*) FROM pragma_table_info('gd_alter')`, &cols)
+	if cols != 2 {
+		t.Fatalf("table has %d columns, want 2: ADD CONSTRAINT added one", cols)
+	}
+
+	// And it survives the file being closed and reopened.
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.ExecContext(ctx, `INSERT INTO "gd_alter" VALUES (2, NULL)`); err == nil {
+		t.Fatalf("the CHECK was not enforced after reopening the file")
+	}
+	var integrity string
+	if err := reopened.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		t.Fatalf("integrity_check: %v", err)
+	}
+	if integrity != "ok" {
+		t.Fatalf("integrity_check = %q", integrity)
+	}
+
+	// The other two constraint kinds are syntax errors, so the inline
+	// rule CREATE TABLE follows is still the rule.
+	for _, stmt := range []string{
+		`ALTER TABLE "gd_alter" ADD CONSTRAINT "gd_alter_u" UNIQUE ("tenantId")`,
+		`ALTER TABLE "gd_alter" ADD CONSTRAINT "gd_alter_fk" FOREIGN KEY ("tenantId") REFERENCES "gd_alter" ("id")`,
+	} {
+		if _, err := reopened.ExecContext(ctx, stmt); err == nil {
+			t.Fatalf("SQLite accepted %q; ddl.go says it does not", stmt)
+		}
+	}
+}

@@ -82,11 +82,54 @@ once a 1.0 is cut.
   layer that code sits behind. So declare RLS on every table holding
   tenant rows — `Table.EnableRLS` and `Table.AddPolicy` emit it into
   the migration — and establish the request's identity with
-  `DB.InTxAs`, above. `drops/sqlite`, `drops/mysql` and
-  `drops/clickhouse` have nothing equivalent to sit on: there the
-  predicates are the whole of what there is, which is what makes each
-  package's list of where they stop load-bearing rather than a
-  footnote. `pg/doc.go` carries the argument in full.
+  `DB.InTxAs`, above. `pg/doc.go` carries the argument in full.
+
+  This bullet used to end by saying the other three dialects had
+  "nothing equivalent to sit on", so that there the predicates were the
+  whole of what there is. That was an absence nobody had looked for,
+  and each of the three turned out to have something — different in
+  kind, and none of them PostgreSQL's. ClickHouse has `CREATE ROW
+  POLICY`, a READ boundary bound to a user or role, with no `WITH
+  CHECK` half, so a principal that can write can write any tenant id it
+  likes (`clickhouse/rowpolicy.go`). MySQL has a definer-rights view
+  with `WITH CASCADED CHECK OPTION` over an account holding no
+  privilege on the base table, which covers reads and writes both and
+  whose boundary is the ABSENCE of a grant — something drops can render
+  the DDL beside and cannot establish (`mysql/tenantview.go`). SQLite
+  has no principal of any kind, and therefore no boundary inside the
+  database at all: what it has is triggers, which run for the
+  statements the predicates cannot reach and hold against mistakes
+  rather than against an adversary (`sqlite/tenantguard.go`); its
+  boundary is one database file per tenant. Each package's list of
+  where the predicates stop stays load-bearing either way.
+- **`sqlite.TenantGuard`** — the write guard this dialect turned out to
+  have. SQLite has no roles, no policies and no row-level security, and
+  the package doc read as though that made the application predicates
+  the whole of what there is. It does not: SQLite has triggers, and a
+  trigger is inside the database, so it runs for every statement that
+  reaches the table through whatever connection in whatever process —
+  a raw `DB.Exec`, a `drops.Raw` fragment, a hand-run migration, the
+  `sqlite3` shell — which is exactly the set the predicates cannot
+  reach. `TenantGuardFor(table)` derives the guard from the axis the
+  table already declares and renders `CREATE TRIGGER` statements
+  refusing three writes a correctly-scoped statement can still make:
+  an axis left NULL, an axis that changes, and an axis disagreeing
+  with the row a foreign key names. The third has no predicate form at
+  all — a post stamped `acme` whose author belongs to `globex` is
+  correct at every step and still reads one tenant's data through
+  another's row. `PinnedTo(value)` fixes the axis to one literal, which
+  is the half of a file-per-tenant deployment the schema can enforce.
+  A guard and not a boundary, deliberately: SQLite has no principal to
+  bind rows to, so whoever can write the file can `DROP TRIGGER`.
+  `sqlite/tenantguard.go` records what a `CHECK` cannot express, why
+  the pinned value is a literal, what one file per tenant costs, and
+  why there is no request-scoped form — the only per-connection state
+  SQLite has is the TEMP schema, a persistent trigger is refused for
+  naming it, and the temp trigger that does work fails OPEN on every
+  pooled connection but the one that installed it. Every claim is
+  measured in-process against a real engine in
+  `integration/sqlite_tenantguard_test.go`, including the negative
+  ones.
 - **`pg.DB.InTxAs` and `pg.Session`** — drops could WRITE a row-level
   security policy (`Table.EnableRLS`, `NewPolicy`, `Table.AddPolicy`)
   and could not SATISFY one: nothing in the package made a pooled

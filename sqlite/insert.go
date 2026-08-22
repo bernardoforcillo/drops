@@ -94,9 +94,19 @@ func (i *InsertBuilder) Returning(cols ...ColRef) *InsertBuilder {
 // whole table, not per tenant, so the row it collides with may well
 // belong to somebody else. Tenant A guessing an id therefore destroys
 // tenant B's row and takes ownership of the key, silently, reported as
-// one row affected. The delete also fires that row's ON DELETE
-// triggers and cascades, so the damage is not confined to the one
+// one row affected. The row's foreign-key ON DELETE CASCADE actions run
+// for that implicit delete, so the damage is not confined to the one
 // table.
+//
+// Its DELETE TRIGGERS do not, and that is worse rather than better.
+// SQLite fires them for a REPLACE's implicit delete only when
+// PRAGMA recursive_triggers is on, and it is off by default — measured
+// in integration/sqlite_tenantguard_test.go, where a BEFORE DELETE
+// trigger that refuses everything watches the other tenant's row be
+// destroyed and reports nothing, and then refuses the same statement
+// once the pragma is on. So a [TenantGuard], which is what holds this
+// dialect's axis against SQL drops did not build, does not reach here:
+// this refusal is the only thing in front of it.
 //
 // PostgreSQL's dialect answers the equivalent shape — ON CONFLICT DO
 // UPDATE — by keeping the statement and gating the branch: it drops the

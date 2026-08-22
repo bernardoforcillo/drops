@@ -210,7 +210,17 @@ What differs is surface, and it differs where the SQL does:
 - **SQLite** has the whole mechanism minus what the dialect lacks: no
   `RIGHT` or `FULL JOIN`, so the join-placement shapes cannot arise.
   There is no row-level security to sit underneath — no roles, no
-  policies, and a process that can open the file reads every byte.
+  policies, and a process that can open the file reads every byte. What
+  it does have is triggers, which are inside the database and so run
+  for the statements the predicates cannot reach: `TenantGuard` renders
+  them from the same axis and refuses a write that leaves a row with no
+  tenant, moves one between tenants, or points a foreign key at another
+  tenant's row. That is a guard against mistakes, not a boundary
+  against a principal, because there is no principal here to bind rows
+  to — anyone who can write the file can `DROP TRIGGER`. The boundary
+  this dialect has is architectural: one database file per tenant, and
+  `sqlite/tenantguard.go` says what that costs and which half of it
+  `PinnedTo` can put in the schema.
 - **MySQL** has the whole mechanism, including the aliased `UPDATE` and
   `DELETE` that must name their alias twice and the upsert whose
   `ON DUPLICATE KEY UPDATE` has no conflict target and no `WHERE`

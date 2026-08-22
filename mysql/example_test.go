@@ -75,3 +75,34 @@ func ExampleDeleteBuilder_Limit() {
 	// Output:
 	// DELETE FROM `posts` WHERE (`posts`.`views` < ?) ORDER BY `posts`.`id` ASC LIMIT ?
 }
+
+// A tenant view is the DDL an operator applies to give one tenant an
+// account that cannot reach the other tenants' rows — including
+// through a statement drops never saw.
+//
+// What makes it a boundary is the part that is NOT here: the account
+// granted the view must hold nothing on `docs` itself. drops renders
+// these two statements and stops; see tenantview.go for why executing
+// them would be reporting a boundary it had not established.
+func ExampleCreateTenantView() {
+	docs := mysql.NewDatabaseTable("shop", "docs")
+	mysql.Add(docs, mysql.BigSerial("id").PrimaryKey())
+	tenant := mysql.Add(docs, mysql.Varchar("tenantId", 64).NotNull())
+	mysql.Add(docs, mysql.Text("body"))
+
+	view := mysql.NewTenantView("v_docs_acme").
+		On(docs).
+		Axis(tenant).
+		ForTenant("acme").
+		DefinedBy(mysql.Acct("app", "localhost"))
+
+	create, _ := drops.StringWithDialect(mysql.Dialect, mysql.CreateTenantView(view))
+	grant, _ := drops.StringWithDialect(mysql.Dialect, mysql.GrantTenantView(
+		view, mysql.Acct("acme", "%"),
+		mysql.PrivSelect, mysql.PrivInsert, mysql.PrivUpdate, mysql.PrivDelete))
+	fmt.Println(create)
+	fmt.Println(grant)
+	// Output:
+	// CREATE DEFINER = `app`@`localhost` SQL SECURITY DEFINER VIEW `shop`.`v_docs_acme` AS SELECT `id`, `tenantId`, `body` FROM `shop`.`docs` WHERE `tenantId` = 'acme' WITH CASCADED CHECK OPTION
+	// GRANT SELECT, INSERT, UPDATE, DELETE ON `shop`.`v_docs_acme` TO `acme`@`%`
+}

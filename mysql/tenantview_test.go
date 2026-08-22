@@ -2,6 +2,7 @@ package mysql_test
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -321,5 +322,50 @@ func TestTenantViewFollowsTheTableIntoTheDefaultDatabase(t *testing.T) {
 		"AS SELECT `tenantId` FROM `docs` WHERE `tenantId` = 'acme' WITH CASCADED CHECK OPTION"
 	if got != want {
 		t.Errorf("SQL = %s\nwant  %s", got, want)
+	}
+}
+
+// TestTenantViewShipsNoExecutionAndNoRevoke pins two decisions that are
+// arguments rather than code, and that a later round could undo without
+// any other test noticing.
+//
+// Both are documented at length in tenantview.go. A test is here
+// because a doc comment does not fail:
+//
+//   - nothing in this file executes. The view and the grant are not
+//     the boundary — the absence of a base-table grant is — so a
+//     drops call that ran them would report success for something it
+//     had not established and could not check.
+//   - nothing in this file emits a REVOKE. It would read like drops
+//     taking the base table away, and it is the wrong shape twice:
+//     REVOKE answers ERROR 1147 when there is no grant to remove,
+//     which is the state a correct deployment is already in, and the
+//     REVOKE IF EXISTS that tolerates that was measured as MySQL-only
+//     — MariaDB 10.11.14 answers ERROR 1064 to it.
+func TestTenantViewShipsNoExecutionAndNoRevoke(t *testing.T) {
+	src, err := os.ReadFile("tenantview.go")
+	if err != nil {
+		t.Fatalf("read tenantview.go: %v", err)
+	}
+	text := string(src)
+
+	// Only the doc comments may say the word; no rendered statement may.
+	for _, line := range strings.Split(text, "\n") {
+		code := strings.TrimSpace(line)
+		if strings.HasPrefix(code, "//") {
+			continue
+		}
+		if strings.Contains(code, "REVOKE") {
+			t.Errorf("tenantview.go renders a REVOKE:\n\t%s\n"+
+				"REVOKE fails with 1147 where a correct deployment already is, and "+
+				"REVOKE IF EXISTS does not exist in MariaDB", code)
+		}
+		for _, run := range []string{"ExecExpr(", "db.Exec(", "*DB)"} {
+			if strings.Contains(code, run) {
+				t.Errorf("tenantview.go reaches for execution (%s):\n\t%s\n"+
+					"this file renders DDL and stops; the boundary is a grant state "+
+					"drops cannot establish or verify", run, code)
+			}
+		}
 	}
 }

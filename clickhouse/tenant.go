@@ -387,9 +387,17 @@ import (
 // Which comparisons exist is not left to whoever reads four packages
 // carefully. A census at the root enumerates every comparison by
 // handle identity in every dialect and fails until each one carries a
-// recorded answer to the question this section asks. Three rounds of
-// this phase found the same defect the same way, by it biting; the
-// enumeration is what stops the fourth.
+// recorded answer to the question this section asks. A second check
+// derives the other half of that question rather than taking it on
+// trust: it reads each dialect for the places a column name is written
+// with no qualifier, follows what feeds them back through assignment,
+// return, range and argument, and fails on every comparison by
+// identity it arrives at that is not exempted with the mechanism that
+// makes it safe. An exemption naming a comparison the derivation no
+// longer reaches fails it too. So which comparisons owe an answer is
+// derived from the source rather than read off it by whoever looked.
+// Three rounds of this phase found the same defect the same way, by it
+// biting; the enumeration is what stops the fourth.
 //
 // "The same name" is the SERVER's question rather than Go's, so each
 // dialect answers it in its own ident.go, in identKey. It lives
@@ -452,10 +460,24 @@ import (
 //
 // Dialect surface: clickhouse has no Patch, so there the earlier
 // refusal has no op list to apply to and the rendered-name rule is the
-// whole of it. The alignment above is pg's, mysql's and clickhouse's:
-// sqlite renders each row's bindings in the order they were bound and
-// has nothing to align, so there the guards are the whole of the write
-// path.
+// whole of it. The alignment above — a row placed against a column
+// list an earlier row fixed — is pg's, mysql's and clickhouse's;
+// sqlite's raw builder renders each row's bindings in the order they
+// were bound and places nothing against anything.
+//
+// That does not leave sqlite with nothing to align, and saying it did
+// was this section stating the rendered-name rule's intent ahead of
+// its coverage once more. sqlite's entity batch widens every row to
+// the union of the columns the batch binds, which is an alignment
+// against a column list by another name, and it asks the identity
+// question. What makes that safe is the reach rather than the rule:
+// every binding it indexes was built by this package from the entity's
+// own colFields, sqlite has no Entity.CreateCols for a caller to name
+// a column through, and a widening drops no binding when it matches
+// none — the discard above is what the identity question costs, and
+// there is none here. Where a caller's handle can arrive, the
+// alignment asks the rendered-name question; where it cannot, the
+// reason is written down and checked rather than assumed.
 // ==== END OF THE TENANT POLICIES ====
 
 type tenantCtxKey int

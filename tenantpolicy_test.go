@@ -522,6 +522,31 @@ func TestTenantPolicyBlockSurfaceClaimsHold(t *testing.T) {
 				"a row against a column list the first row fixed", dir)
 		}
 	}
+	// "sqlite's entity batch widens every row to the union of the
+	// columns the batch binds, which is an alignment against a column
+	// list by another name, and it asks the identity question." That
+	// sentence replaced the claim that sqlite had nothing to align,
+	// which was this section describing the rendered-name rule's
+	// INTENT ahead of its COVERAGE — the same way it was wrong about
+	// alignRow for three rounds. It is sqlite's alone: a dialect that
+	// grows a widening owes the paragraph its own reach argument, and
+	// sqlite losing it leaves the paragraph describing a step that is
+	// not there. What the widening renders is pinned in
+	// sqlite/entityalign_test.go, and the reach half — no caller
+	// handle can arrive — is the exemption in
+	// TestNoColumnKeyComparisonOnARenderedNamePath.
+	widens := map[string]bool{"sqlite": true}
+	for _, dir := range dirs {
+		has := entityHasMethod(t, dir, "alignBindings")
+		switch {
+		case has && !widens[dir]:
+			t.Errorf("%s grew Entity.alignBindings: the policy block says the widening is sqlite's, and "+
+				"what can reach this one has to be answered for here too", dir)
+		case !has && widens[dir]:
+			t.Errorf("%s lost Entity.alignBindings: the policy block names it as the alignment this "+
+				"dialect does have, and says why it may keep asking the identity question", dir)
+		}
+	}
 	// "each dialect answers it in its own ident.go, in identKey". The
 	// fold is the one rule in section 4 whose answer differs by
 	// dialect, and it sits beside the quoting helpers so that the

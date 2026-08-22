@@ -30,6 +30,13 @@
 // and [Entity.ScopeByTenant] carry the reasoning, and tenant.go lists
 // what the predicates do not reach.
 //
+// tenant.go also carries the block delimited THE TENANT POLICIES —
+// NORMATIVE: what counts as the same tenant, what may assign the axis,
+// and what Unscoped means at each level. It is byte-identical in all
+// four dialects and a root-level test fails when one of them drifts, so
+// it is the reference rather than this package's own account of the
+// rules.
+//
 // It is the same mechanism drops/pg, drops/mysql and drops/clickhouse
 // carry — normalise the dialect name and diff sqlite/resolve.go against
 // any of theirs and the same file comes back. What differs here is

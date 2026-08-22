@@ -51,6 +51,13 @@
 // statement at all. See tenant.go for the whole of it, including the
 // list of places the predicates do not reach.
 //
+// tenant.go also carries the block delimited THE TENANT POLICIES —
+// NORMATIVE: what counts as the same tenant, what may assign the axis,
+// and what Unscoped means at each level. It is byte-identical in all
+// four dialects and a root-level test fails when one of them drifts, so
+// it is the reference rather than this package's own account of the
+// rules.
+//
 // One consequence changes an existing habit: since a table's context
 // filters are resolved against a ctx, [SelectBuilder.ToSQL] no longer
 // necessarily shows the whole statement. [SelectBuilder.ToSQLCtx] does,

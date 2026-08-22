@@ -113,6 +113,13 @@
 // result that reads like "no such row"; and the predicate is in the
 // statement, where a query plan and a reviewer can both see it.
 //
+// tenant.go carries the block delimited THE TENANT POLICIES —
+// NORMATIVE: what counts as the same tenant, what may assign the axis,
+// and what Unscoped means at each level. It is byte-identical in all
+// four dialects and a root-level test fails when one of them drifts, so
+// it is the reference rather than this package's own account of the
+// rules.
+//
 // # Where the automatic scoping stops
 //
 // This section describes package pg, and the three ports now carry the

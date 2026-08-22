@@ -97,10 +97,10 @@ func (t *Table) Alias() string    { return t.alias }
 // package-level variables before it runs init, so an alias declared
 // beside its table is taken before any init or constructor that
 // declares the scoping — and while the lists were copied, that alias
-// was unscoped for ever. It rendered DELETE `u` FROM `users` AS `u` with no predicate at all,
-// on a ctx carrying no tenant, without refusing; and it lost a
-// soft-delete guard registered after it was taken, so it read rows the
-// application had deleted.
+// was unscoped for ever. It rendered DELETE `u` FROM `users` AS `u`
+// with no predicate at all, on a ctx carrying no tenant, without
+// refusing; and it lost a soft-delete guard registered after it was
+// taken, so it read rows the application had deleted.
 //
 // BOTH filter lists are shared, on the same terms, because the argument
 // does not distinguish them: a [Table.DefaultFilter] registered after
@@ -110,9 +110,10 @@ func (t *Table) Alias() string    { return t.alias }
 // The predicates cannot be rewritten, being closures over the handles
 // they were given, so they are rendered inside a relation rename
 // instead: see resolveFilterExprs. Without it an aliased query against
-// a scoped table could not run at all — `users`.`deletedAt` against FROM `users` AS `u` is MySQL 1054, not a widened result — which made the one
-// table shape that must never lose its tenant axis the one shape that
-// could not be queried under an alias.
+// a scoped table could not run at all — `users`.`deletedAt` against
+// FROM `users` AS `u` is MySQL 1054, not a widened result — which made
+// the one table shape that must never lose its tenant axis the one
+// shape that could not be queried under an alias.
 //
 // The consequence in the other direction is that registering on an
 // alias registers on the table, and so on every other alias of it,

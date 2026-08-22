@@ -223,7 +223,30 @@ authority, and **defaults-only** on an entity query, which drops the
 declaration-time filters (a soft-delete guard) and keeps the tenant
 axis and the authorization guard. A query that genuinely has to span
 tenants is written on the raw builder, where a reviewer reads the whole
-of what was given up.
+of what was given up. On an **INSERT** it additionally means the ctx
+tenant is neither stamped nor required and the dialect's upsert branch
+is left as written — the escape hatch a migration or a backfill needs.
+
+At every level it stops at the edge of the statement it was said on. A
+CTE body, a subquery operand, a subquery bound as an INSERT value is a
+statement of its own and keeps its own scoping, and an inner statement
+with no tenant to name still refuses. That is also how one part of a
+query is unscoped and no other. The wide misreading is the dangerous
+one: a caller who expects `Unscoped` on the INSERT to widen the
+subquery bound as its value will write a row computed from one
+tenant's data while believing it spans them all.
+
+The rules are written down once rather than per dialect. Each package's
+`tenant.go` carries a block delimited `THE TENANT POLICIES —
+NORMATIVE`, byte-identical in all four and pinned by a root-level test
+that fails when one drifts by a word, by whitespace, or by reordering.
+It states what counts as the same tenant (a round-trip conversion, so a
+truncating pair cannot compare equal), what may assign the axis
+(`Create` and `Update` stamp and refuse a mismatch; `Patch` refuses any
+op naming it), and what `Unscoped` means at each level. Dialect
+differences are named inside the shared text — `clickhouse` models
+neither `UPDATE` nor `DELETE`, `RelConfig.Unscoped` is `pg`'s alone —
+so the same words are true in four packages.
 
 What the mechanism does *not* reach is listed per dialect in each
 package's `tenant.go`, under "Where the automatic scoping stops". It is

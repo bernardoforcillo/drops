@@ -171,6 +171,16 @@ variadic, so the composite form is `PatchKey` with the key as a slice:
 MembershipEntity.PatchKey(db, ctx, []any{orgID, userID}, pg.Set(MemberRole, "admin"))
 ```
 
+An op naming the entity's tenant column is `ErrTenantMismatch`, in
+`pg`, `sqlite` and `mysql` alike — `clickhouse` has no `Patch`. The
+tenant column is what *addresses* a row, not something a patch assigns,
+and `Patch` is the one write in the package that never reads the row
+first, so nothing downstream would notice: `Set(TenantID, 999)` beside
+a `WHERE` clause that still carries the ctx tenant is one statement
+handing the row away, reported as one row affected. The refusal covers
+an op assigning the ctx tenant's own value too, since that is a no-op
+only by coincidence of the value.
+
 ## Relations
 
 Declare them once, against the table:
@@ -334,10 +344,23 @@ upsert and no relations for an axis to reach into. See
 [dialects.md](dialects.md#tenant-scoping) for the per-dialect table,
 and each package's `tenant.go` for what the scoping does not reach.
 
-One rule worth carrying to the call site, because it is the same in all
-four: `Unscoped` on an **entity query** drops the declaration-time
-default filters — a soft-delete guard — and *keeps* the tenant axis and
-the authorization guard. `Unscoped` on a **raw builder** is
-statement-wide and drops both. A query that genuinely has to span
-tenants is written on the raw builder, where a reviewer reads the whole
-of what was given up.
+The rules themselves are written down once. Each dialect's `tenant.go`
+carries a block delimited `THE TENANT POLICIES — NORMATIVE` that is
+byte-identical in all four, and a root-level test fails when one of
+them drifts by a word. It states what counts as the same tenant, what
+may assign the axis, and what `Unscoped` gives up at each level, and it
+names the dialect differences inside the shared text so one set of
+words is true in four packages. Read it there rather than here: this
+page summarises, that block is the reference.
+
+Three of its rules are worth carrying to the call site, because they
+are the same in all four. `Unscoped` on an **entity query** drops the
+declaration-time default filters — a soft-delete guard — and *keeps*
+the tenant axis and the authorization guard. `Unscoped` on a **raw
+builder** is statement-wide and drops both; a query that genuinely has
+to span tenants is written there, where a reviewer reads the whole of
+what was given up. And at every level `Unscoped` stops at the edge of
+the statement it was said on: a CTE body, a subquery operand, a
+subquery bound as an INSERT value is a statement of its own and keeps
+its own scoping, which is also how one part of a query is unscoped and
+no other.

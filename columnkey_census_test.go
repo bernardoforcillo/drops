@@ -126,15 +126,18 @@ var columnKeySites = map[string]keyComparison{
 	"clickhouse/insert.go:columnsOf":               {keyFailsClosed, "a stranger becomes a SECOND entry in the column list, and stampTenantColumn checks every occurrence of the axis before the duplicate reaches the server"},
 
 	// --- sqlite ---
-	"sqlite/table.go:As":                  {keyOwnHandles, "wires an alias copy's origin"},
-	"sqlite/table.go:ScopeWritesByTenant": {keyFailsClosed, "a handle this table does not own panics at declaration time"},
-	"sqlite/table.go:setTenantAxis":       {keyOwnHandles, "normalises an alias copy onto the declared column before storing it"},
-	"sqlite/tenant.go:ScopeByTenant":      {keyFailsClosed, "a handle with no matching struct field panics at declaration time"},
-	"sqlite/tenant.go:tenantWriteAxis":    {keyOwnHandles, "matches the table's own axis handle against the entity's own colFields"},
-	"sqlite/entity.go:isKeyColumn":        {keyOwnHandles, "compares the entity's own colFields against its own primary-key handles"},
-	"sqlite/entity.go:alignBindings":      {keyOwnHandles, "widens an entity batch whose every binding this package built from the entity's own colFields"},
-	"sqlite/patch.go:ownsColumn":          {keyFailsClosed, "name lookup first, then key, so a same-name stranger is refused as ErrForeignColumn"},
-	"sqlite/page.go:encodeCursor":         {keyFailsClosed, "an ordering handle with no matching struct field is refused; a cursor is built from struct fields"},
+	"sqlite/table.go:As":                    {keyOwnHandles, "wires an alias copy's origin"},
+	"sqlite/table.go:ScopeWritesByTenant":   {keyFailsClosed, "a handle this table does not own panics at declaration time"},
+	"sqlite/table.go:setTenantAxis":         {keyOwnHandles, "normalises an alias copy onto the declared column before storing it"},
+	"sqlite/tenant.go:ScopeByTenant":        {keyFailsClosed, "a handle with no matching struct field panics at declaration time"},
+	"sqlite/tenant.go:tenantWriteAxis":      {keyOwnHandles, "matches the table's own axis handle against the entity's own colFields"},
+	"sqlite/entity.go:isKeyColumn":          {keyOwnHandles, "compares the entity's own colFields against its own primary-key handles"},
+	"sqlite/entity.go:alignBindings":        {keyOwnHandles, "widens an entity batch whose every binding this package built from the entity's own colFields"},
+	"sqlite/patch.go:ownsColumn":            {keyFailsClosed, "name lookup first, then key, so a same-name stranger is refused as ErrForeignColumn"},
+	"sqlite/page.go:encodeCursor":           {keyFailsClosed, "an ordering handle with no matching struct field is refused; a cursor is built from struct fields"},
+	"sqlite/tenantguard.go:Axis":            {keyFailsClosed, "normalises an alias copy onto its origin; a handle the guarded table does not own is refused by validate as ErrTenantGuardAxisNotInTable, and no trigger renders until it passes"},
+	"sqlite/tenantguard.go:MatchingParent":  {keyFailsClosed, "same normalisation for the three handles of a parent link; validate refuses a local key the guarded table does not own, and a parent key and axis that are not one table, as ErrTenantGuardParentNotInTable"},
+	"sqlite/tenantguard.go:tableOwnsColumn": {keyFailsClosed, "the refusal itself: every handle a trigger body names must be one of the declared columns of the table that body names, so the bare name in NEW.<col> and in the parent subquery is always one that table has"},
 }
 
 // censusKeyComparisons returns every "dir/file.go:function" in dir

@@ -122,6 +122,13 @@ var keyPathExemptions = map[string]string{
 		"by this package from the entity's own colFields — CreateMany takes rows of T, not handles, and " +
 		"sqlite has no CreateCols for a caller to name a column through. It widens rather than selects, " +
 		"so no binding is dropped either",
+	"sqlite/tenantguard.go:Axis": "normalises an alias copy onto its origin at declaration time; the " +
+		"trigger's WHEN does render a bare NEW.<col>, but a handle the guarded table does not own is " +
+		"refused by validate as ErrTenantGuardAxisNotInTable and no DDL renders until it passes",
+	"sqlite/tenantguard.go:MatchingParent": "the same normalisation for a parent link, refused the same " +
+		"way: validate requires the local key to be a column of the guarded table and the parent key and " +
+		"parent axis to belong to one table, so every bare name in the subquery names the table the " +
+		"subquery selects FROM",
 }
 
 // TestNoColumnKeyComparisonOnARenderedNamePath is the rule, enforced.

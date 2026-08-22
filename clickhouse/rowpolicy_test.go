@@ -42,6 +42,12 @@ import (
 // restrictive policies combine, what happens on a distributed table —
 // rests on ClickHouse's own documentation and changelog, not on a
 // server this test suite reached. The tests below assert rendering.
+//
+// Both probes are checked in, at testdata/rowpolicy_probe.py, so the
+// next person to change this file can re-run them against a newer
+// engine rather than trusting this comment. Nothing in `go test` runs
+// it: it needs chdb from PyPI, and the root module has no external
+// dependencies to spend on a verification harness.
 
 var (
 	rpDocs     = clickhouse.NewDatabaseTable("analytics", "docs")

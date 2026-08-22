@@ -284,6 +284,48 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **A binding that named a column by the name it renders was dropped
+  from the row rather than written** (`drops/pg`, `drops/mysql`,
+  `drops/clickhouse`). `alignRow` is what decides which of a row's
+  bindings are rendered at all, and it indexed the row by column
+  identity while the INSERT column list writes the bare name. So a
+  later row of a batch naming the tenant axis through another table's
+  handle — the codegen'd `<Table>Cols.TenantID` that is one character
+  away in any file — matched nothing and was DISCARDED: not compared
+  with the ctx tenant, not refused, not written. `pg` and `mysql`
+  filled the gap with `DEFAULT` and the stamp then landed on top of it,
+  so a batch whose second row assigned tenant `9` went out under the
+  ctx tenant `3` with no refusal at all:
+  `INSERT INTO "sprockets" ("tenantId", "name") VALUES ($1, $2), ($3, $4)`
+  bound to `3, a, 3, b`. Said `Unscoped()`, nothing stamped and the row
+  landed on the column's default — a row belonging to nobody, reported
+  as written. `clickhouse` needed no `Unscoped` for that: its stamp
+  reads the RAW row, so it found the binding, compared it, passed it
+  and appended nothing, and `alignRow` then dropped the binding the
+  check had just approved and rendered `NULL`. The alignment now
+  indexes by the rendered name through `identKey`, which is the
+  question the axis guards already ask; identity implies name equality,
+  so the aliased-handle case it was written for is unchanged, and a row
+  naming one rendered column more often than the fixed column list does
+  keeps the last binding, as the map it replaced did. `sqlite` renders
+  each row's bindings in the order they were bound and has no alignment
+  step. The entry below closed every guard that ASKS whether a handle
+  is the axis; this closes the one thing that decided whether the
+  binding reached a guard at all.
+- **The same defect was being found three rounds running by it biting**
+  (`drops`). A root-level census now enumerates every comparison by
+  column identity in every dialect — derived from `WithTenant`, like
+  the policy block's own drift test — and fails until each site carries
+  a recorded answer to the question that generated all of them: does
+  the statement this feeds render the column as a bare name, and can a
+  caller's handle reach it? An unanswered site fails with the question;
+  a recorded site that no longer exists fails too, so the record cannot
+  rot into a list of places that used to matter. Section 4 of the
+  normative policy block now describes the COVERAGE of the
+  rendered-name rule rather than its intent: which guards ask it, that
+  the alignment asks it too, the one guard that still compares by
+  identity and why it fails closed, and that the column list keeps two
+  handles rendering one name as two entries.
 - **The axis guard folded identifier case wider than the server does**
   (`drops/sqlite`, `drops/mysql`). Matching a bound column handle
   against the tenant axis is a question about what the SERVER resolves,

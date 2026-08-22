@@ -499,6 +499,29 @@ func TestTenantPolicyBlockSurfaceClaimsHold(t *testing.T) {
 				"the stamp-before-validators rule is about", dir)
 		}
 	}
+	// "The alignment above is pg's, mysql's and clickhouse's: sqlite
+	// renders each row's bindings in the order they were bound and has
+	// nothing to align". That sentence is section 4 describing its own
+	// COVERAGE, which is the half the block was wrong about for three
+	// rounds — it stated the rendered-name rule as an intent while a
+	// write path still matched by handle identity. A dialect that
+	// grows an alignment step owes it the rendered-name index, and one
+	// that loses it leaves the paragraph describing a path that is not
+	// there. The set is recorded and the dialects are derived, so a
+	// fifth is asked rather than exempted.
+	aligns := map[string]bool{"pg": true, "mysql": true, "clickhouse": true}
+	for _, dir := range dirs {
+		has := len(filesDeclaringFunc(t, dir, "alignRow")) > 0
+		switch {
+		case has && !aligns[dir]:
+			t.Errorf("%s grew alignRow: the policy block says the alignment is pg's, mysql's and "+
+				"clickhouse's, and the binding it decides to render has to be found by rendered "+
+				"name here too", dir)
+		case !has && aligns[dir]:
+			t.Errorf("%s lost alignRow: the policy block counts it among the dialects that align "+
+				"a row against a column list the first row fixed", dir)
+		}
+	}
 	// "each dialect answers it in its own ident.go, in identKey". The
 	// fold is the one rule in section 4 whose answer differs by
 	// dialect, and it sits beside the quoting helpers so that the
@@ -524,6 +547,26 @@ func TestTenantPolicyBlockSurfaceClaimsHold(t *testing.T) {
 				"beside the quoting helpers and out of the rules that stay byte-identical",
 				dir, filepath.Base(files[0]))
 		}
+	}
+	// "Entity.CreateCols — pg's alone — asks by identity whether the
+	// columns it was handed name the axis". Section 4 names the one
+	// guard that still compares that way and says why it fails closed:
+	// the table-name refusal above it and the struct field a stranger
+	// does not have. A dialect that grows CreateCols inherits neither
+	// sentence, and the paragraph would be describing a method the
+	// reader's package has for reasons that are not its own.
+	for _, dir := range dirs {
+		if dir == "pg" {
+			continue
+		}
+		if entityHasMethod(t, dir, "CreateCols") {
+			t.Errorf("%s grew Entity.CreateCols: the policy block says it is pg's alone, and the "+
+				"identity comparison it describes now has to fail closed here too", dir)
+		}
+	}
+	if !entityHasMethod(t, "pg", "CreateCols") {
+		t.Error("pg lost Entity.CreateCols: the policy block names it as the one axis guard still " +
+			"comparing by handle identity")
 	}
 	// "RelConfig.Unscoped is pg's alone."
 	for _, dir := range dirs {

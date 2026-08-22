@@ -197,7 +197,9 @@ import (
 // The raw builders answer the same question, because a table's
 // promise cannot turn on which spelling of "write a row" the caller
 // reached for. db.Insert stamps the axis onto every row that leaves
-// it out and compares a binding that names it. db.Update may only
+// it out and compares a binding that names it, where naming it is
+// section 4's rendered-name question and not a matter of which handle
+// the caller happened to hold. db.Update may only
 // RESTATE it: an assignment binding the tenant the ctx already
 // carries renders, and anything else naming the axis is refused —
 // another tenant's value, and equally an expression whose result only
@@ -324,11 +326,54 @@ import (
 // kept the assignment it exists to drop, and a patch assigned the axis
 // under a WHERE clause still addressing the ctx tenant.
 //
-// So the write paths match the axis by rendered column name, and check
-// EVERY occurrence rather than stopping at the first. Name equality is
-// the weaker test and the right one here: identity implies it, so
-// nothing that matched before stops matching, and column names are
-// unique within a table, so no column of the table itself can collide.
+// So the guards that ask whether a handle is the axis match it by
+// rendered column name, and check EVERY occurrence rather than
+// stopping at the first: the INSERT stamp, the upsert or replace
+// branch, the UPDATE SET check, Patch's refusal, the widening of a
+// column list that does not name the axis yet, and the sorting key of
+// an engine that folds rows together where the dialect has one. Name
+// equality is the weaker test and the right one here: identity implies
+// it, so nothing that matched before stops matching, and column names
+// are unique within a table, so no column of the table itself can
+// collide.
+//
+// The guards are not the whole of a write path. Something decides,
+// before any of them runs, which of a row's bindings are rendered at
+// all — and where that is an alignment against a column list fixed
+// ahead of the row, it asked the identity question too. A binding
+// that named the axis by the name it renders was therefore not
+// matched, and was DISCARDED rather than checked: the column fell to
+// whatever the dialect fills a gap with — DEFAULT, or NULL where
+// there is no DEFAULT keyword inside VALUES — and the guard saw a gap
+// where the caller had written a value and stamped over it. Said
+// Unscoped, nothing stamped and the row belonged to nobody, reported
+// as written — section 1's failure mode reached from here. So the
+// alignment asks the same rendered-name question, and asks it for
+// every column rather than for the axis alone: what a guard checked
+// is then what the server is sent.
+//
+// One guard on a statement is still by handle identity, and it is
+// named here rather than changed because it fails closed. (The
+// setters that declare the axis compare that way too; what they do
+// about it is further down.) Entity.CreateCols — pg's alone — asks by
+// identity whether the columns it was handed name the axis, having
+// already refused a handle whose table is not the entity's, and a
+// same-table handle spelled another way has no struct field to take a
+// value from, so nothing that renders as the axis reaches that
+// question.
+//
+// The column list keeps two handles that render one name as two
+// entries rather than one, in every dialect and however it is built.
+// That is not a hole either: the axis check reads BOTH occurrences, so
+// a disagreement is refused here, and what is left when they agree is
+// a duplicate column, which the server refuses.
+//
+// Which comparisons exist is not left to whoever reads four packages
+// carefully. A census at the root enumerates every comparison by
+// handle identity in every dialect and fails until each one carries a
+// recorded answer to the question this section asks. Three rounds of
+// this phase found the same defect the same way, by it biting; the
+// enumeration is what stops the fourth.
 //
 // "The same name" is the SERVER's question rather than Go's, so each
 // dialect answers it in its own ident.go, in identKey. It lives
@@ -391,7 +436,10 @@ import (
 //
 // Dialect surface: clickhouse has no Patch, so there the earlier
 // refusal has no op list to apply to and the rendered-name rule is the
-// whole of it.
+// whole of it. The alignment above is pg's, mysql's and clickhouse's:
+// sqlite renders each row's bindings in the order they were bound and
+// has nothing to align, so there the guards are the whole of the write
+// path.
 // ==== END OF THE TENANT POLICIES ====
 
 type tenantCtxKey int

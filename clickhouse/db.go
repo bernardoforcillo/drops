@@ -207,11 +207,20 @@ func (db *DB) emit(ctx context.Context, e drops.QueryEvent) {
 	drops.CallHook(db.hook, ctx, e)
 }
 
-// ToSQL renders an Expression with the ClickHouse placeholder style.
-// Use it when you need to inspect generated SQL outside of the
-// builders (logging, snapshotting, tests).
+// ToSQL renders an Expression as ClickHouse SQL. Use it when you need
+// to inspect generated SQL outside of the builders (logging,
+// snapshotting, tests).
+//
+// It installs the whole [Dialect], not just [Placeholder]. The
+// placeholder style is the same either way, but identifier quoting is
+// not: a Builder with no Dialect falls back to drops.StdQuoteIdent,
+// which doubles the quote and leaves backslashes alone. ClickHouse's
+// lexer reads backslash escapes inside a double-quoted token, so that
+// fallback renders a different name than the one asked for — "a\b"
+// arrives as an 'a' followed by a backspace — and every later
+// reference to the object fails to resolve.
 func ToSQL(e drops.Expression) (sql string, args []any) {
-	b := drops.NewBuilder(Placeholder)
+	b := drops.NewBuilder(drops.WithDialect(Dialect))
 	b.Append(e)
 	return b.SQL()
 }

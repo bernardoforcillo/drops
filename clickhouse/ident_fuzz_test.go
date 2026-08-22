@@ -182,3 +182,57 @@ func FuzzClickHouseIdentKeyFoldsNothing(f *testing.F) {
 		}
 	})
 }
+
+// Every path that renders a statement has to reach the same answer as
+// quoteIdent, because ClickHouse's lexer honours backslash escapes
+// inside a double-quoted token. Doubling the quote and leaving the
+// backslash alone — what drops.StdQuoteIdent does, and what a Builder
+// falls back to when no Dialect is installed — silently renames the
+// object: on ClickHouse 26.7.2.1, CREATE TABLE e ("a\\b" UInt8) yields
+// a column whose name is the three bytes 61 5C 62, while the naive
+// "a\b" yields the two bytes 61 08 — an 'a' followed by a backspace.
+// The column the statement asked for is not the column that exists,
+// and every later reference to it fails to resolve.
+//
+// FuzzClickHouseQuoteIdent already pins the two quoting *functions*
+// together, but it builds its Builder with the Dialect installed, so
+// it cannot see a render path that forgets to install it. This is that
+// test: it exercises the three exported ToSQL entry points instead.
+func TestRenderPathsQuoteIdentifiersTheClickHouseWay(t *testing.T) {
+	const nasty = `a\b`
+	want := quoteIdent(nasty)
+	naive := drops.StdQuoteIdent(nasty)
+	if want == naive {
+		t.Fatalf("fixture is not discriminating: quoteIdent and StdQuoteIdent agree on %q", nasty)
+	}
+
+	tbl := NewTable(nasty)
+	col := Add(tbl, UInt8(nasty))
+	tbl.Engine(MergeTree()).OrderBy(col)
+
+	paths := map[string]func() string{
+		"ToSQL": func() string {
+			sql, _ := ToSQL(CreateTable(tbl))
+			return sql
+		},
+		"SelectBuilder.ToSQL": func() string {
+			sql, _ := New(nil).Select(col).From(tbl).ToSQL()
+			return sql
+		},
+		"InsertBuilder.ToSQL": func() string {
+			sql, _ := New(nil).Insert(tbl).Row(col.Val(1)).ToSQL()
+			return sql
+		},
+	}
+	for name, render := range paths {
+		t.Run(name, func(t *testing.T) {
+			sql := render()
+			if !strings.Contains(sql, want) {
+				t.Errorf("%s did not quote %q the ClickHouse way\n  want substring: %s\n  got: %s", name, nasty, want, sql)
+			}
+			if strings.Contains(sql, naive) {
+				t.Errorf("%s rendered the un-escaped form %s, which names a different object:\n  %s", name, naive, sql)
+			}
+		})
+	}
+}

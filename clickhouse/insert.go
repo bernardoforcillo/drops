@@ -255,15 +255,19 @@ func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]ColumnValue) {
 	return cols, rows
 }
 
-// ToSQL renders the statement.
+// ToSQL renders the statement as ClickHouse SQL.
 //
 // It renders what the builder knows without a context, which on a table
 // that carries a tenant axis is not the statement that would be sent:
 // the stamped tenant column is resolved against a ctx. Use
 // [InsertBuilder.ToSQLCtx] for the statement a given ctx would send;
 // that is the one to assert on in a test, and the one to log.
+//
+// It installs the whole [Dialect] rather than [Placeholder] alone, so
+// identifiers are quoted the way the DDL helpers quote them — see
+// [ToSQL] for what the difference costs.
 func (i *InsertBuilder) ToSQL() (sql string, args []any) {
-	b := drops.NewBuilder(Placeholder)
+	b := drops.NewBuilder(drops.WithDialect(Dialect))
 	i.WriteSQL(b)
 	return b.SQL()
 }

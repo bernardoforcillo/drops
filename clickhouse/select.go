@@ -565,7 +565,7 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 	}
 }
 
-// ToSQL renders the statement using the ClickHouse placeholder style.
+// ToSQL renders the statement as ClickHouse SQL.
 //
 // It renders what the builder knows without a context, which since
 // [Table.ContextFilter] shipped is no longer necessarily the whole
@@ -576,8 +576,12 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 // ToSQL remains the right call where there is no request to speak of
 // and never will be: rendering a materialised view's body, or embedding
 // the SELECT in a statement some other executor will run.
+//
+// It installs the whole [Dialect] rather than [Placeholder] alone, so
+// identifiers are quoted the way the DDL helpers quote them — see
+// [ToSQL] for what the difference costs.
 func (s *SelectBuilder) ToSQL() (sql string, args []any) {
-	b := drops.NewBuilder(Placeholder)
+	b := drops.NewBuilder(drops.WithDialect(Dialect))
 	s.WriteSQL(b)
 	return b.SQL()
 }

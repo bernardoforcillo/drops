@@ -297,7 +297,9 @@ var (
 //   - users_without_row_policies_can_read_rows is the one that
 //     matters, and its documented default is TRUE. At false, a
 //     principal with no permissive policy reads NOTHING instead of
-//     everything. Available on every version that has row policies.
+//     everything. Which versions carry the setting is not something
+//     this project has established — check it against the server you
+//     are about to change.
 //   - throw_on_unmatched_row_policies turns the same case into an
 //     exception rather than silence. Documented default FALSE, and it
 //     arrived in 26.2 (2026-02-26): a server older than that does not

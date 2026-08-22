@@ -99,6 +99,14 @@ func (u *UpdateBuilder) Returning(cols ...drops.Expression) *UpdateBuilder {
 // statement does not read another tenant's rows, it writes them. Prefer
 // restating the scope you meant — Unscoped().Where(...) — over dropping
 // it wholesale.
+//
+// It additionally means the SET list may assign the tenant axis, which
+// a scoped UPDATE may not — see checkAxisAssignment. The two halves
+// give way together, and that is what keeps this one flag: a statement
+// stops being confined to the ctx tenant's rows in the same breath as
+// it stops being confined to its value, so the write that moves a row
+// between tenants is spelled here rather than in hand-written SQL, and
+// says so where a reviewer reads it.
 func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
 	u.unscoped = true
 	return u

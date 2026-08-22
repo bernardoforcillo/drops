@@ -176,6 +176,29 @@ import (
 // the field would skip precisely the entities that cannot stamp
 // themselves.
 //
+// The raw builders answer the same question, because a table's
+// promise cannot turn on which spelling of "write a row" the caller
+// reached for. db.Insert stamps the axis onto every row that leaves
+// it out and compares a binding that names it. db.Update may only
+// RESTATE it: an assignment binding the tenant the ctx already
+// carries renders, and anything else naming the axis is refused —
+// another tenant's value, and equally an expression whose result only
+// the server knows, a transfer written as arithmetic being still a
+// transfer. That is asked of an UPDATE hook's assignment as much as
+// of the caller's own, a hook being registered on the table and
+// reaching every UPDATE against it. Unscoped is the opt-out for both
+// builders, and what saying it gives up is section 3's subject.
+//
+// Restating is permitted where Patch refuses even that, and the
+// asymmetry is deliberate rather than a drift. Update writes every
+// mapped column of the row, the axis among them, having stamped it
+// from ctx one call earlier, so the value it assigns is the ctx
+// tenant's by construction: the rule the raw builder enforces is the
+// one the entity path obeys, rather than one the entity path is
+// exempt from. A patch op list never passes through a stamp — it is
+// built out of the fields a request named — so nothing in it is ever
+// the stamp's own output, and the stricter rule costs it nothing.
+//
 // Which row is addressed is a separate question from what is written
 // to it, and the table's context filter answers it: the WHERE clause
 // carries the ctx tenant like every other statement's. Both halves
@@ -247,6 +270,16 @@ import (
 // site, where a reviewer reads it, which is the whole difference
 // between this and a package-level switch nobody sees in review.
 //
+// On an UPDATE, Unscoped additionally means the SET list may assign
+// the axis. Both halves of the statement give way together, which is
+// what keeps it one flag: the WHERE clause stops being confined to
+// the ctx tenant's rows in the same breath as the SET list stops
+// being confined to its value, so the statement that moves a row
+// between tenants — a migration, a merge of two accounts, an admin
+// tool — is writable here and says so where a reviewer reads it.
+// clickhouse models no UPDATE for this to be about; section 2 says
+// why.
+//
 // Dialect surface: the relation-level opt-out, RelConfig.Unscoped, is
 // pg's alone. It unscopes one eager-loaded edge and leaves the rest of
 // the query scoped. sqlite loads relations but exposes no per-relation
@@ -278,6 +311,38 @@ import (
 // the weaker test and the right one here: identity implies it, so
 // nothing that matched before stops matching, and column names are
 // unique within a table, so no column of the table itself can collide.
+//
+// "The same name" is the SERVER's question rather than Go's, so each
+// dialect answers it in its own identKey. sqlite and mysql resolve a
+// column name case-insensitively however it is quoted, so a handle
+// spelled TENANTID renders as the axis there, and matching on the
+// bytes was the same defect one shift key further in — the guard
+// answering no for a handle the renderer answers yes for. Those two
+// fold case. pg and clickhouse compare a quoted identifier byte for
+// byte, and drops quotes every identifier it writes, so there the two
+// spellings are two columns: a differently-cased handle names a
+// column the table does not have, the server refuses the statement,
+// and folding here would instead refuse a schema that legitimately
+// declares both.
+//
+// A hook is asked the same question. The bound set that makes
+// "user-supplied values win" true is keyed by the name a column
+// renders as, so a hook holding another handle for a column the
+// caller already bound sees that binding rather than adding a second
+// one. What a second one costs is the server's to decide — a
+// duplicate column or a duplicate assignment is an error in one
+// dialect and last-wins in another — and the axis can be the column
+// it is about.
+//
+// The axis handle itself is one of the table's own columns, and a
+// handle that is not is refused where it is declared.
+// Table.ScopeWritesByTenant used to take whatever it was given, and
+// what it is given reaches the INSERT column list and every axis
+// check the package makes — so a handle from another table could name
+// a column this table does not have, leaving the stamp to render a
+// name the server refuses and a refusal about the axis to contradict
+// itself. ScopeByTenant already panicked for a column with no
+// matching struct field; both setters fail that way now.
 //
 // Where a statement can refuse earlier, it does: an op naming a column
 // of another table is refused as exactly that, whatever the column is,

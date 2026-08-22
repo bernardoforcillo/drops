@@ -332,6 +332,25 @@ func TestTenantPolicyBlockSurfaceClaimsHold(t *testing.T) {
 				"and that sentence is now false in every tenant.go file", method, method)
 		}
 	}
+	// The same sentence is a claim about the RAW builder too, and
+	// section 2's rule for it — "db.Update may only RESTATE the axis"
+	// — is about a method clickhouse does not have. A dialect that
+	// grows DB.Update owes that rule an implementation, and one that
+	// loses it makes the section-3 paragraph about Unscoped and the
+	// SET list describe nothing.
+	if pkgHasFunc(t, "clickhouse", "DB", "Update") {
+		t.Error("clickhouse grew DB.Update: the policy block says this dialect models no UPDATE, " +
+			"and the raw builder's axis rule now has to hold here too")
+	}
+	for _, dir := range dirs {
+		if dir == "clickhouse" {
+			continue
+		}
+		if !pkgHasFunc(t, dir, "DB", "Update") {
+			t.Errorf("%s lost DB.Update: the policy block states what a raw UPDATE "+
+				"may assign to the axis in every dialect that has one", dir)
+		}
+	}
 	// The ones that do carry the write half must actually carry it, or
 	// the block's "the other three carry all of it" is false. The set
 	// is derived, so a fifth dialect is asked the same question rather

@@ -71,6 +71,14 @@ func (u *UpdateBuilder) Where(preds ...drops.Expression) *UpdateBuilder {
 // half-scoped write is the worse of the two answers. An UPDATE that
 // legitimately has to reach outside the ctx tenant says so here, and
 // then says which rows it means with an explicit predicate.
+//
+// It additionally means the SET list may assign the tenant axis, which
+// a scoped UPDATE may not — see checkAxisAssignment. The two halves
+// give way together, and that is what keeps this one flag: a statement
+// stops being confined to the ctx tenant's rows in the same breath as
+// it stops being confined to its value, so the write that moves a row
+// between tenants is spelled here rather than in hand-written SQL, and
+// says so where a reviewer reads it.
 func (u *UpdateBuilder) Unscoped() *UpdateBuilder {
 	u.unscoped = true
 	return u

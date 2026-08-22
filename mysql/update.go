@@ -80,6 +80,14 @@ func (u *UpdateBuilder) Limit(n int64) *UpdateBuilder { u.limit = &n; return u }
 // UPDATE that legitimately writes across tenants says so at the call
 // site; see [SelectBuilder.Unscoped] for why it is both lists or
 // neither.
+//
+// It additionally means the SET list may assign the tenant axis, which
+// a scoped UPDATE may not — see checkAxisAssignment. The two halves
+// give way together, and that is what keeps this one flag: a statement
+// stops being confined to the ctx tenant's rows in the same breath as
+// it stops being confined to its value, so the write that moves a row
+// between tenants is spelled here rather than in hand-written SQL, and
+// says so where a reviewer reads it.
 func (u *UpdateBuilder) Unscoped() *UpdateBuilder { u.unscoped = true; return u }
 
 // ErrNoAssignments is returned when an UPDATE has nothing to set.

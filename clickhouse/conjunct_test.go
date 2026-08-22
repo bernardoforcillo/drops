@@ -227,6 +227,14 @@ func TestNoExpressionConstructorSwallowsItsOperands(t *testing.T) {
 		// andWith assembles an ON clause at render time out of pieces
 		// the resolver has already been through.
 		"conjunct.go": "andWith composes already-resolved predicates",
+		// Access-control DDL. A row policy's USING condition is stored
+		// TEXT — a string this package quotes and the SERVER evaluates
+		// on every later SELECT — never a drops.Expression, so there is
+		// no operand tree for the resolver to walk and no ctx a
+		// CREATE ROW POLICY could be resolved for. See rowpolicy.go for
+		// why the condition cannot be an expression: it outlives the
+		// statement that installed it.
+		"rowpolicy.go": "access-control DDL holds a stored condition string, not an operand",
 	}
 
 	entries, err := os.ReadDir(".")

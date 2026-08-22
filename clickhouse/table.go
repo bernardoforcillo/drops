@@ -21,6 +21,15 @@ type Table struct {
 	ttl        string
 	settings   []string // "key = value" raw pairs
 
+	// rowPolicies are the server-side row policies declared beside the
+	// table. They are NOT part of its schema — nothing carries them
+	// into DDL the table itself emits, and see rowpolicy.go for why an
+	// access entity does not belong in a schema snapshot either. The
+	// table holds them so a declaration can sit next to the columns it
+	// is about, and Table.RowPolicies walks them when a migration
+	// emits the DDL.
+	rowPolicies []*RowPolicy
+
 	// scope carries every automatic predicate and lifecycle hook the
 	// table declares. It is a pointer, and an alias taken off this
 	// table SHARES it rather than copying it — see tableScope, and see
@@ -134,6 +143,13 @@ func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
 	// cp.scope is the same pointer, on purpose: see tableScope.
+	// cp.rowPolicies is dropped, equally on purpose: a policy is a
+	// declaration-time DDL object naming the relation it was declared
+	// against, and an alias is a query-time handle. Carrying the slice
+	// would hand the copy policies that name the original relation,
+	// and appending to either would write through the shared backing
+	// array into the other.
+	cp.rowPolicies = nil
 	cp.alias = alias
 	cp.columns = make([]*Column, len(t.columns))
 	cp.byName = make(map[string]*Column, len(t.byName))

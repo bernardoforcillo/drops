@@ -160,3 +160,33 @@ func sameArgs(got, want []any) bool {
 	}
 	return true
 }
+
+// The axis handle itself arrives from Table.ScopeWritesByTenant, which
+// takes whatever it is given. A schema that declared the write axis
+// with another table's handle — the same one-character mistake, made
+// one level up — left the axis check comparing its own column against
+// a stranger and matching nothing, so the op it exists to refuse went
+// through. It is asked by rendered name now, so the declaration
+// mistake costs a confusing error message and not a row.
+func TestPatchRefusesTheAxisEvenWhenTheAxisWasDeclaredForeign(t *testing.T) {
+	tbl := mysql.NewTable("misdeclared_rows")
+	mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
+	tenant := mysql.Add(tbl, mysql.BigInt("tenantId").NotNull())
+	mysql.Add(tbl, mysql.BigInt("likes").NotNull().Default("0"))
+	ent := mysql.NewEntity[patchAxisRow](tbl)
+
+	other := mysql.NewTable("misdeclared_source")
+	mysql.Add(other, mysql.BigInt("id").PrimaryKey())
+	foreign := mysql.Add(other, mysql.BigInt("tenantId").NotNull())
+	tbl.ContextFilter(mysql.TenantFilter(tenant)).ScopeWritesByTenant(foreign)
+
+	drv := dropstest.New()
+	db := mysql.New(drv)
+	_, err := ent.Patch(db, typeCtx(int64(77)), int64(7), mysql.Set(tenant, int64(999)))
+	if !errors.Is(err, mysql.ErrTenantMismatch) {
+		t.Errorf("Patch = %v, want ErrTenantMismatch", err)
+	}
+	if got := drv.Statements(); len(got) != 0 {
+		t.Errorf("a refused Patch still sent %d statement(s): %v", len(got), got)
+	}
+}

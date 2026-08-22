@@ -212,8 +212,12 @@ once a 1.0 is cut.
   handle's own table as well as the entity's, since `"tenantId"` alone
   reads as the right column. An alias handle for one of the table's own
   columns is unaffected: aliasing is a query-scope rename of the same
-  column. `tenantAxisName` is `columnPath` in all four dialects, which
-  is what it always rendered.
+  column. The axis check the guard protects now asks the same
+  rendered-name question, so a schema that declared its write axis with
+  another table's handle — the same mistake one level up, through
+  `Table.ScopeWritesByTenant`, which takes whatever it is given — no
+  longer leaves that check matching nothing. `tenantAxisName` is
+  `columnPath` in all four dialects, which is what it always rendered.
 - **Three doc statements that were false where they were written.**
   `drops/sqlite`'s `resolveSets` pointed at `exprValue`, which in that
   package is the concrete struct in `column.go` rather than the

@@ -109,7 +109,15 @@ func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...Patc
 	// exception in it is one a caller can be talked into satisfying.
 	if axis, ok := e.tenantAxisColumn(); ok {
 		for _, op := range ops {
-			if op.column().key() == axis.key() {
+			// Asked with [namesAxis] rather than by column identity,
+			// for the reason the loop above exists: identity is not
+			// what the SET list renders. Every op has already been
+			// proved to be one of this table's own columns, where the
+			// two agree — but the axis handle itself arrives from
+			// [Table.ScopeWritesByTenant], which takes whatever it is
+			// given, and a schema that declared it with another table's
+			// handle would leave this check matching nothing at all.
+			if namesAxis(op.column(), axis) {
 				return nil, fmt.Errorf("%w: %s is an axis, not an assignment",
 					ErrTenantMismatch, columnPath(axis))
 			}

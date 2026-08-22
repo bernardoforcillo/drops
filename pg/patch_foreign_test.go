@@ -143,3 +143,33 @@ func TestPatchAcceptsAnAliasHandleForItsOwnColumn(t *testing.T) {
 		t.Errorf("args:\n got = %#v\nwant = %#v", st.Args, wantArgs)
 	}
 }
+
+// The axis handle itself arrives from Table.ScopeWritesByTenant, which
+// takes whatever it is given. A schema that declared the write axis
+// with another table's handle — the same one-character mistake, made
+// one level up — left the axis check comparing its own column against
+// a stranger and matching nothing, so the op it exists to refuse went
+// through. It is asked by rendered name now, so the declaration
+// mistake costs a confusing error message and not a row.
+func TestPatchRefusesTheAxisEvenWhenTheAxisWasDeclaredForeign(t *testing.T) {
+	tbl := pg.NewTable("misdeclared_rows")
+	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
+	tenant := pg.Add(tbl, pg.BigInt("tenantId").NotNull())
+	pg.Add(tbl, pg.BigInt("likes").NotNull().Default("0"))
+	ent := pg.NewEntity[patchAxisRow](tbl)
+
+	other := pg.NewTable("misdeclared_source")
+	pg.Add(other, pg.BigInt("id").PrimaryKey())
+	foreign := pg.Add(other, pg.BigInt("tenantId").NotNull())
+	tbl.ContextFilter(pg.TenantFilter(tenant)).ScopeWritesByTenant(foreign)
+
+	drv := dropstest.New()
+	db := pg.New(drv)
+	_, err := ent.Patch(db, tenantCtx(int64(77)), int64(7), pg.Set(tenant, int64(999)))
+	if !errors.Is(err, pg.ErrTenantMismatch) {
+		t.Errorf("Patch = %v, want ErrTenantMismatch", err)
+	}
+	if got := drv.Statements(); len(got) != 0 {
+		t.Errorf("a refused Patch still sent %d statement(s): %v", len(got), got)
+	}
+}

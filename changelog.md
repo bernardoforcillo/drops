@@ -126,6 +126,34 @@ once a 1.0 is cut.
 - Smaller additions: `pg.SmallSerial`, `sqlite.Column.Asc/Desc/As`,
   `clickhouse.Bind`, `clickhouse.Table.OrderByColumns`,
   `(*Col[T]).Managed` on pg/sqlite/clickhouse.
+- **The tenant policies, written once and pinned** (`drops/pg`,
+  `drops/sqlite`, `drops/mysql`, `drops/clickhouse`). Every divergence
+  this phase turned up was a policy question no file owned: each
+  dialect answered it where its code needed an answer, and the
+  disagreements were found by reading four files side by side rather
+  than by anything that could fail. Each `tenant.go` now carries a
+  block delimited `THE TENANT POLICIES — NORMATIVE`, byte-identical in
+  all four, stating what counts as the same tenant (the round-trip
+  conversion, so a truncating pair cannot compare equal), what may
+  assign the axis (`Create` and `Update` stamp and refuse a mismatch,
+  `Patch` refuses any op naming it) and what `Unscoped` means at each
+  level. Dialect differences are named inside the shared text —
+  `clickhouse` models neither `UPDATE` nor `DELETE`, `RelConfig.Unscoped`
+  is `pg`'s alone — so one set of words is true in four packages. A
+  root-level test compares the extracted bytes, so a block that drifts
+  by a word, by whitespace or by reordering fails; a second asserts the
+  surface claims, since a dialect growing what the block says it lacks
+  would make the shared text false in four places at once.
+- **`InsertBuilder.Unscoped` says where it stops** (`drops/mysql`,
+  `drops/clickhouse`). The statement builder's `Unscoped` and the
+  entity query's were unified a round ago; the insert builder's was the
+  level left with four wordings, and the two that omitted the nesting
+  rule were the two whose boundary a reviewer had to assert rather than
+  read. All four now say the same thing in the same words, varying only
+  where the dialect's conflict branch does, and `mysql` and
+  `clickhouse` assert the rule on rendered SQL and args: a subquery
+  bound as an INSERT value keeps its own tenant predicate, and an inner
+  statement with no tenant to name still refuses the whole INSERT.
 
 ### Changed
 - **`NewEntity` now rejects a column bound to no struct field**
@@ -137,6 +165,17 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **Three doc statements that were false where they were written.**
+  `drops/sqlite`'s `resolveSets` pointed at `exprValue`, which in that
+  package is the concrete struct in `column.go` rather than the
+  interface the walk dispatches on — `exprBound`, as `mysql` and
+  `clickhouse` already said — so the link named a real but wrong
+  symbol. `drops/clickhouse`'s alias documentation described the leak
+  it prevents as a "DELETE-shaped mutation", in the one dialect that
+  models no DELETE; it is a SELECT now. And `drops/clickhouse`'s
+  `SelectBuilder.Unscoped` was missing the paragraph explaining why it
+  clears the context filters too, which it does, exactly as the other
+  three do.
 - **The tenant stamp converted the ctx tenant without asking what the
   conversion did to it, and wrote one tenant into a statement that
   addressed another** (`drops/pg`, `drops/sqlite`, `drops/mysql`,

@@ -103,6 +103,22 @@ import (
 //
 // --- 1. WHAT COUNTS AS THE SAME TENANT ---
 //
+// A ctx carries a tenant when the value on it is not nil. WithTenant
+// takes an `any`, so a nil of some type — a (*string)(nil) read out of
+// a request struct — arrives inside an interface that is not itself
+// nil, and a check for the interface being nil reports a tenant that
+// is not there. Stamped onto a row, it wrote NULL, which no tenant
+// predicate matches: the row belonged to nobody, was invisible to
+// every later request including the one that wrote it, and was
+// reported as written. A nil of any type is no tenant, and every path
+// that needs one refuses with [ErrTenantMissing] rather than binding
+// it.
+//
+// A zero that is not a nil — an empty string, a zero int — IS a
+// tenant. The schema can store it and it addresses the same rows on
+// the way back out, which is the whole difference: it is
+// self-consistent where a NULL is not.
+//
 // A tenant value bound to a column and the tenant carried on ctx name
 // the same tenant when they are equal, or when they convert onto each
 // other's type losing nothing in EITHER direction.
@@ -278,9 +294,38 @@ func WithTenant(ctx context.Context, tenant any) context.Context {
 }
 
 // TenantFrom returns the tenant on ctx (ok=false when absent).
+//
+// A nil tenant is an absent one. WithTenant takes an `any`, so a nil of
+// some type — a (*string)(nil) read out of a request struct, a nil map
+// from a header lookup — arrives inside an interface that is not itself
+// nil, and asking whether the interface is nil answered that the ctx
+// carries a tenant. It carries none: what reached the statement was
+// NULL, which no tenant predicate matches. See section 1 of the
+// normative policy block above for why that is refused rather than
+// bound.
 func TenantFrom(ctx context.Context) (any, bool) {
 	v := ctx.Value(tenantKey)
-	return v, v != nil
+	if v == nil || isNilTenant(v) {
+		return nil, false
+	}
+	return v, true
+}
+
+// isNilTenant reports whether v is a nil held inside a non-nil
+// interface, which is the one shape a comparison against nil cannot
+// see.
+//
+// The kinds listed are every kind that HAS a nil. A zero of any other
+// kind — an empty string, a zero int — is a value the schema can store
+// and address rows by, so it is a tenant like any other and is not
+// this function's business.
+func isNilTenant(v any) bool {
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+		reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // ErrTenantMissing is returned when a statement reads or writes a table

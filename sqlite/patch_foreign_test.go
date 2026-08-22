@@ -145,31 +145,62 @@ func TestPatchAcceptsAnAliasHandleForItsOwnColumn(t *testing.T) {
 }
 
 // The axis handle itself arrives from Table.ScopeWritesByTenant, which
-// takes whatever it is given. A schema that declared the write axis
-// with another table's handle — the same one-character mistake, made
-// one level up — left the axis check comparing its own column against
-// a stranger and matching nothing, so the op it exists to refuse went
-// through. It is asked by rendered name now, so the declaration
-// mistake costs a confusing error message and not a row.
-func TestPatchRefusesTheAxisEvenWhenTheAxisWasDeclaredForeign(t *testing.T) {
+// used to take whatever it was given. A schema that declared the write
+// axis with another table's handle — the same one-character mistake,
+// made one level up — left the axis check comparing its own column
+// against a stranger and matching nothing, so the op it exists to
+// refuse went through; asking by rendered name made the check hold,
+// but the declaration still named a column this table does not have
+// and every message about it read as a contradiction.
+//
+// So the mistake is refused where it is made. A handle the table does
+// not own is a panic at declaration time, which is where the other
+// axis setter already puts it — Entity.ScopeByTenant panics for a
+// column with no matching struct field — and after it the stored axis
+// is one of the table's own columns by construction.
+//
+// This test used to assert that a Patch against such a table was
+// refused with ErrTenantMismatch and sent no statement. That schema no
+// longer exists to build, and the assertion it made is now a property
+// of the declaration rather than of the request: what follows pins the
+// panic, and the by-rendered-name axis check is still pinned by the
+// tests above, which reach it through the OP's handle.
+func TestScopeWritesByTenantRefusesAHandleTheTableDoesNotOwn(t *testing.T) {
 	tbl := sqlite.NewTable("misdeclared_rows")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
 	tenant := sqlite.Add(tbl, sqlite.BigInt("tenantId").NotNull())
 	sqlite.Add(tbl, sqlite.BigInt("likes").NotNull().Default("0"))
-	ent := sqlite.NewEntity[patchAxisRow](tbl)
 
 	other := sqlite.NewTable("misdeclared_source")
 	sqlite.Add(other, sqlite.BigInt("id").PrimaryKey())
 	foreign := sqlite.Add(other, sqlite.BigInt("tenantId").NotNull())
-	tbl.ContextFilter(sqlite.TenantFilter(tenant)).ScopeWritesByTenant(foreign)
 
-	drv := dropstest.New()
-	db := sqlite.New(drv)
-	_, err := ent.Patch(db, typeCtx(int64(77)), int64(7), sqlite.Set(tenant, int64(999)))
-	if !errors.Is(err, sqlite.ErrTenantMismatch) {
-		t.Errorf("Patch = %v, want ErrTenantMismatch", err)
-	}
-	if got := drv.Statements(); len(got) != 0 {
-		t.Errorf("a refused Patch still sent %d statement(s): %v", len(got), got)
-	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("a write axis declared with another table's handle was accepted")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic value = %#v, want a string naming the mistake", r)
+		}
+		for _, want := range []string{"ScopeWritesByTenant", "misdeclared_source.tenantId", "misdeclared_rows"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("panic message %q does not name %q", msg, want)
+			}
+		}
+	}()
+	tbl.ContextFilter(sqlite.TenantFilter(tenant)).ScopeWritesByTenant(foreign)
+}
+
+// The table's own handle is accepted, and so is an alias copy of it:
+// ownership is asked by Column.key, which collapses an alias onto the
+// column it was declared as.
+func TestScopeWritesByTenantAcceptsAnAliasCopyOfItsOwnColumn(t *testing.T) {
+	tbl := sqlite.NewTable("aliased_rows")
+	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
+	tenant := sqlite.Add(tbl, sqlite.BigInt("tenantId").NotNull())
+	alias := tbl.As("a")
+
+	tbl.ContextFilter(sqlite.TenantFilter(tenant)).ScopeWritesByTenant(alias.Col("tenantId"))
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -440,12 +441,44 @@ func columnPath(c *Column) string {
 // name, so nothing that matched before stops matching. Within one
 // table names are unique, so a column of the entity's own table that
 // is not the axis cannot collide with it here.
+//
+// "The same name" is [identKey]'s question rather than a byte
+// comparison, because which spellings the server resolves to one
+// column is a property of the dialect and not of Go.
 func namesAxis(c, axis *Column) bool {
 	if c == nil || axis == nil {
 		return false
 	}
-	return c.Name() == axis.Name()
+	return identKey(c.Name()) == identKey(axis.Name())
 }
+
+// identKey returns the form in which two rendered column names are one
+// column to the server that reads the statement.
+//
+// SQLite resolves a column name case-insensitively, quoted or not:
+// "TENANTID" and "tenantId" are one column, an INSERT may name it
+// under either spelling, and an UPDATE's SET list assigns the same
+// column whichever it writes. So the fold is what the renderer means
+// here, and a comparison on the bytes was [namesAxis]'s original
+// defect one step further in — a guard that asks "is this the axis?"
+// answering no for a handle the server answers yes for, which is how a
+// codegen'd OtherTable.TENANTID walked past the stamping and the
+// upsert gate with nothing but a shift key between it and the
+// refusal.
+//
+// The fold is deliberately wider than SQLite's own, which is ASCII
+// only: strings.ToLower folds every case pair Unicode has. The two
+// answers differ only for a table declaring two columns whose names
+// differ by a non-ASCII case pair alone, where this refuses a
+// statement the server would have accepted. That is the direction to
+// be wrong in — the wider answer refuses, the narrower one binds.
+//
+// PostgreSQL and ClickHouse compare a quoted identifier byte for byte
+// and drops quotes every identifier it writes, so their identKey is
+// the name itself. Asking the question in all four packages is what
+// stops one dialect's answer from being carried into another by a
+// reader who only saw the comparison.
+func identKey(name string) string { return strings.ToLower(name) }
 
 // ScopeByTenant marks col as the entity's tenant axis. Every subsequent
 // Get / Query / Update / Delete reads the tenant from ctx (via

@@ -173,12 +173,36 @@ func (t *Table) ContextFilter(fn ContextFilterFunc) *Table {
 // this table needs a tenant on its ctx, including one built straight
 // from db.Insert(). A statement that legitimately writes outside the
 // ctx tenant says so with [InsertBuilder.Unscoped].
+// The handle has to be one of this table's own columns, and a handle
+// this table does not own is a panic at declaration time rather than a
+// statement at request time. It takes whatever it is given, and what
+// it is given ends up in the INSERT column list and in every axis
+// check the package makes — so a codegen'd OtherTable.TenantID passed
+// here named a column the table does not have: the INSERT stamped a
+// column the server then refused, and the refusal reached the caller
+// as a query error about a name they never typed. [ErrTenantNotInSortingKey]
+// could report the same declaration as "its sorting key is (tenantId,
+// id), which does not include other.tenantId" — a sentence that
+// contradicts itself.
+//
+// Ownership is asked by [Column.key], so a handle taken off a table
+// alias names the same axis as the declared one; what is STORED is
+// this table's own handle rather than the one passed in, for the
+// reason [Entity.ScopeByTenant] stores its own: an alias handle
+// qualifies with an alias an INSERT into this table has no name for.
 func (t *Table) ScopeWritesByTenant(col ColRef) *Table {
 	if col == nil {
 		return t
 	}
-	t.setTenantAxis(col.col())
-	return t
+	c := col.col()
+	for _, own := range t.columns {
+		if own.key() == c.key() {
+			t.setTenantAxis(own)
+			return t
+		}
+	}
+	panic("drops/clickhouse: ScopeWritesByTenant column " + columnPath(c) +
+		" is not a column of " + t.Name())
 }
 
 // setTenantAxis records the table's tenant column. Called by

@@ -301,9 +301,9 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 // columns are appended after the user-bound ones and apply to every
 // row uniformly.
 func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]ColumnValue) {
-	ctx := &InsertHookCtx{bound: make(map[*Column]bool, len(i.cols))}
+	ctx := &InsertHookCtx{bound: make(map[string]bool, len(i.cols))}
 	for _, c := range i.cols {
-		ctx.bound[c.key()] = true
+		ctx.bound[boundKey(c)] = true
 	}
 	for _, h := range i.table.insertHookList() {
 		h.BeforeInsert(ctx)

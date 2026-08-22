@@ -184,9 +184,9 @@ func (i *InsertBuilder) applyInsertHooks() [][]ColumnValue {
 	if len(i.rows) == 0 {
 		return i.rows
 	}
-	hctx := &InsertHookCtx{bound: make(map[*Column]bool, len(i.rows[0]))}
+	hctx := &InsertHookCtx{bound: make(map[string]bool, len(i.rows[0]))}
 	for _, cv := range i.rows[0] {
-		hctx.bound[cv.column().key()] = true
+		hctx.bound[boundKey(cv.column())] = true
 	}
 	for _, h := range i.table.insertHookList() {
 		h.BeforeInsert(hctx)

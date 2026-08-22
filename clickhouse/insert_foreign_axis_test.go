@@ -2,6 +2,7 @@ package clickhouse_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/bernardoforcillo/drops/clickhouse"
@@ -91,4 +92,63 @@ func TestInsertReadsAForeignHandleAsTheAxisItRenders(t *testing.T) {
 			t.Fatalf("ToSQLCtx = %v, want ErrTenantMismatch", err)
 		}
 	})
+}
+
+// The axis handle itself arrives from Table.ScopeWritesByTenant, which
+// used to take whatever it was given — so a schema could name a column
+// this table does not have, and every message about it read as a
+// contradiction. It is refused where the mistake is made, which is
+// where the other axis setter already puts it: Entity.ScopeByTenant
+// panics for a column with no matching struct field.
+func TestScopeWritesByTenantRefusesAHandleTheTableDoesNotOwn(t *testing.T) {
+	tbl := clickhouse.NewTable("misdeclared_hits")
+	clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	clickhouse.Add(tbl, clickhouse.String("tenantId"))
+
+	other := clickhouse.NewTable("misdeclared_source")
+	foreign := clickhouse.Add(other, clickhouse.String("tenantId"))
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("a write axis declared with another table's handle was accepted")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic value = %#v, want a string naming the mistake", r)
+		}
+		for _, want := range []string{"ScopeWritesByTenant", "misdeclared_source.tenantId", "misdeclared_hits"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("panic message %q does not name %q", msg, want)
+			}
+		}
+	}()
+	tbl.ScopeWritesByTenant(foreign)
+}
+
+// ClickHouse identifiers are case-sensitive, quoted or not, so a
+// handle spelled "TENANTID" names a column this table does not have
+// rather than the axis. drops renders it and the server answers
+// UNKNOWN_IDENTIFIER — the fail-loud answer, and the reason this
+// dialect's identKey does not fold case where sqlite's and mysql's do.
+//
+// No ClickHouse server was reachable while this was written; the
+// assertion is on what drops renders.
+func TestInsertTreatsACaseVariantNameAsAnotherColumn(t *testing.T) {
+	tbl := clickhouse.NewTable("cased_hits")
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	ten := clickhouse.Add(tbl, clickhouse.String("tenantId"))
+	tbl.ScopeWritesByTenant(ten)
+
+	other := clickhouse.NewTable("elsewhere")
+	odd := clickhouse.Add(other, clickhouse.String("TENANTID"))
+
+	db := clickhouse.New(nil)
+	sql, args, err := db.Insert(tbl).Row(id.Val(1), odd.Val("globex")).
+		ToSQLCtx(tenantCtx("acme"))
+	if err != nil {
+		t.Fatalf("ToSQLCtx: %v", err)
+	}
+	checkSQL(t, sql, `INSERT INTO "cased_hits" ("id", "TENANTID", "tenantId") VALUES (?, ?, ?)`)
+	checkArgs(t, args, uint64(1), "globex", "acme")
 }

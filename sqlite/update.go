@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/bernardoforcillo/drops"
 )
@@ -127,9 +128,9 @@ func (u *UpdateBuilder) autoWheres() []drops.Expression {
 // applyUpdateHooks runs every UpdateHook on the table and returns the
 // (possibly extended) SET list.
 func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
-	hctx := &UpdateHookCtx{bound: make(map[*Column]bool, len(u.sets))}
+	hctx := &UpdateHookCtx{bound: make(map[string]bool, len(u.sets))}
 	for _, s := range u.sets {
-		hctx.bound[s.column().key()] = true
+		hctx.bound[boundKey(s.column())] = true
 	}
 	for _, h := range u.table.updateHookList() {
 		h.BeforeUpdate(hctx)
@@ -140,6 +141,98 @@ func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
 	out := append([]ColumnValue(nil), u.sets...)
 	out = append(out, hctx.add...)
 	return out
+}
+
+// checkAxisAssignment refuses an UPDATE whose SET list assigns the
+// tenant axis to anything but the tenant the ctx already names.
+//
+// This is the raw builder's half of section 2 of the normative policy
+// block in tenant.go — "the tenant column is an axis, never an
+// assignment" — and it was the half that did not exist. Every other
+// write path had it: Create and Update stamp the axis from ctx and
+// refuse a struct naming another tenant, Patch refuses an op naming
+// the axis at all, the INSERT stamps every row and the upsert branch
+// drops the assignment. The builder the readme shows alongside them
+// rendered
+//
+//	UPDATE "posts" SET "tenantId" = ? WHERE "id" = ? AND "tenantId" = ?
+//	args: [999 7 77]
+//
+// which is word for word the shape the policy block describes: the
+// WHERE clause is correctly confined to the caller's own rows, the SET
+// list gives one of them away, and the half a review checks is the
+// correct one. It needs no foreign handle and no unusual import —
+// db.Update(tbl).Set(TenantCol.Val(999)), the table's own handle and
+// the obvious spelling. In this dialect the predicates are the whole
+// of the boundary, so nothing underneath refuses it either.
+//
+// What is refused, and what is not:
+//
+//   - An assignment binding the tenant the ctx already carries is a
+//     restatement of where the row already is, and renders. That is
+//     not an exception carved out for a caller who asks nicely:
+//     [Entity.Update] writes every mapped column of the row, the axis
+//     among them, having stamped it from ctx one call earlier — so the
+//     rule the raw builder enforces is the one the entity path obeys,
+//     rather than a rule the entity path is exempt from. The value is
+//     compared with [sameTenant], the definition section 1 gives.
+//   - Anything else naming the axis is [ErrTenantMismatch]: another
+//     tenant's value, and equally an expression this cannot read — a
+//     scalar subquery, "tenantId" + 1. What such an expression
+//     evaluates to is the server's answer and not one a check on the
+//     way out can have, and a transfer written as arithmetic is still
+//     a transfer.
+//   - A ctx with no tenant is [ErrTenantMissing]. On a table whose
+//     read scoping would refuse the statement anyway this is the same
+//     answer one clause earlier; on a table that named a write axis
+//     with [Table.ScopeWritesByTenant] and scopes its reads some other
+//     way, it is the only one.
+//
+// [UpdateBuilder.Unscoped] is the opt-out, and it is deliberate that
+// there is one. The raw builder is the documented escape hatch, and
+// the statements that legitimately move a row between tenants — a
+// migration, a merge of two accounts, an admin tool — have to be
+// writable in this package rather than in hand-written SQL beside it.
+// Unscoped already says "this statement's authority is not the ctx
+// tenant's" for the WHERE clause; saying it for the SET list too keeps
+// one flag meaning one thing, at the call site where a reviewer reads
+// it. That is [InsertBuilder.Unscoped]'s precedent, which likewise
+// turns off the stamping and the requirement together.
+//
+// Patch refuses the axis outright, including an op assigning the ctx
+// tenant's own value, and the difference from this is not a drift. A
+// patch op list is built out of the fields a request named and never
+// touches the row's struct, so nothing there is ever the stamp's own
+// output; a SET list is also what Entity.Update composes.
+//
+// It runs from resolveCtx, so it is the ctx paths — Exec and ToSQLCtx
+// — that refuse. [UpdateBuilder.ToSQL] renders without a ctx and has
+// no error to return, which is the same boundary the INSERT's stamping
+// has and the same one ToSQL already states about the context filters.
+func checkAxisAssignment(ctx context.Context, axis *Column, sets []ColumnValue) error {
+	if axis == nil {
+		return nil
+	}
+	for _, s := range sets {
+		if !namesAxis(s.column(), axis) {
+			continue
+		}
+		t, ok := TenantFrom(ctx)
+		if !ok {
+			return fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(axis))
+		}
+		bound, kind := classifyBinding(s)
+		if kind == bindingLiteral && sameTenant(bound, t) {
+			continue
+		}
+		if kind == bindingLiteral {
+			return fmt.Errorf("%w: %s is an axis, not an assignment: this UPDATE assigns another tenant's value",
+				ErrTenantMismatch, columnPath(axis))
+		}
+		return fmt.Errorf("%w: %s is an axis, not an assignment: this UPDATE assigns an expression drops cannot compare with the ctx tenant; drop the assignment, or say Unscoped",
+			ErrTenantMismatch, columnPath(axis))
+	}
+	return nil
 }
 
 // ToSQL renders the statement with SQLite placeholders.
@@ -203,6 +296,14 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	cp.sets = sets
 
 	if !u.unscoped {
+		// The SET list first, before any of the scoping is resolved: a
+		// statement that assigns the axis is refused whatever its WHERE
+		// clause would have carried, and the hooks above have already
+		// contributed theirs, so what is checked is the list the
+		// statement will render.
+		if err := checkAxisAssignment(ctx, u.table.tenantAxis(), cp.sets); err != nil {
+			return nil, err
+		}
 		defaults, err := resolveTableDefaults(ctx, u.table)
 		if err != nil {
 			return nil, err

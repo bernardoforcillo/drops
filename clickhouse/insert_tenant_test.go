@@ -292,6 +292,38 @@ func TestMergingEngineWithTheTenantInTheSortingKeyIsAccepted(t *testing.T) {
 	checkArgs(t, args, uint64(1), "acme")
 }
 
+// The sorting key is searched by the name it RENDERS, not by handle
+// identity, and this is the last comparison in the package that asked
+// the wrong one of those two questions.
+//
+// ORDER BY writes the bare column name, so a sorting key declared with
+// another table's handle for a column of this name IS the tenant
+// column to the engine that folds the parts. Compared by Column.key it
+// was a stranger, and the INSERT was refused with a sentence that
+// contradicted itself: "its sorting key is (tenantId, id), which does
+// not include folded5.tenantId". Nothing leaked — the answer was a
+// refusal either way — but the schema could not be written into at
+// all.
+func TestMergingEngineReadsAForeignSortingKeyHandleAsTheColumnItRenders(t *testing.T) {
+	db := clickhouse.New(nil)
+	tbl := clickhouse.NewTable("folded5")
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	ten := clickhouse.Add(tbl, clickhouse.String("tenantId"))
+
+	other := clickhouse.NewTable("elsewhere")
+	foreignTen := clickhouse.Add(other, clickhouse.String("tenantId"))
+
+	tbl.Engine(clickhouse.ReplacingMergeTree("")).OrderBy(foreignTen, id).
+		ScopeWritesByTenant(ten)
+
+	sql, args, err := db.Insert(tbl).Row(id.Val(1)).ToSQLCtx(tenantCtx("acme"))
+	if err != nil {
+		t.Fatalf("ToSQLCtx: %v", err)
+	}
+	checkSQL(t, sql, `INSERT INTO "folded5" ("id", "tenantId") VALUES (?, ?)`)
+	checkArgs(t, args, uint64(1), "acme")
+}
+
 // A merging engine with no sorting key at all folds every row of every
 // tenant into one, so it is the worst case rather than an exemption.
 func TestMergingEngineWithNoSortingKeyIsRefused(t *testing.T) {

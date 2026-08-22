@@ -433,12 +433,40 @@ func columnPath(c *Column) string {
 // name, so nothing that matched before stops matching. Within one
 // table names are unique, so a column of the entity's own table that
 // is not the axis cannot collide with it here.
+//
+// "The same name" is [identKey]'s question rather than a byte
+// comparison, because which spellings the server resolves to one
+// column is a property of the dialect and not of Go.
 func namesAxis(c, axis *Column) bool {
 	if c == nil || axis == nil {
 		return false
 	}
-	return c.Name() == axis.Name()
+	return identKey(c.Name()) == identKey(axis.Name())
 }
+
+// identKey returns the form in which two rendered column names are one
+// column to the server that reads the statement.
+//
+// Here it is the name itself. Every identifier drops writes goes out
+// quoted — see drops.Builder.WriteIdent — and PostgreSQL compares a
+// quoted identifier byte for byte, so "tenantId" and "TenantId" are
+// two columns and a handle spelled the second way names a column a
+// table declaring the first does not have. The statement is then
+// refused by the server as 42703, which is the fail-loud answer, and
+// folding case here would instead refuse a schema that legitimately
+// declares both.
+//
+// It exists as a named function, doing nothing, because the answer
+// differs by dialect and the difference is a leak. sqlite and mysql
+// resolve a quoted column name case-insensitively: there "TENANTID"
+// IS the axis to the server while an exact-bytes comparison calls the
+// two strangers, which is [namesAxis]'s original defect one step
+// further in — a guard that asks "is this the axis?" answering no for
+// a handle the renderer answers yes for. Their identKey folds case for
+// that reason. Asking the question in all four packages is what stops
+// one dialect's answer from being carried into another by a reader who
+// only saw the comparison.
+func identKey(name string) string { return name }
 
 // ScopeByTenant marks col as the entity's tenant axis. Every
 // subsequent Get / Query / Update / Delete reads the tenant from

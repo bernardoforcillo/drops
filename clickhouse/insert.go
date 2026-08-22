@@ -184,9 +184,9 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 // applyInsertHooks runs every InsertHook registered on the table and
 // returns the (possibly extended) column list and rows.
 func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]ColumnValue) {
-	ctx := &InsertHookCtx{bound: make(map[*Column]bool, len(i.cols))}
+	ctx := &InsertHookCtx{bound: make(map[string]bool, len(i.cols))}
 	for _, c := range i.cols {
-		ctx.bound[c.key()] = true
+		ctx.bound[boundKey(c)] = true
 	}
 	for _, h := range i.table.insertHookList() {
 		h.BeforeInsert(ctx)
@@ -452,12 +452,23 @@ var ErrTenantNotInSortingKey = errors.New("drops/clickhouse: a merging engine wo
 // a ReplacingMergeTree without a sorting key folds every row of every
 // tenant into one. The message says so rather than reporting an empty
 // list.
+//
+// The sorting key is searched with [namesAxis] rather than by
+// [Column.key], which is the last comparison in this package that
+// asked the wrong one of those two questions. ORDER BY renders the
+// bare column name, so a sorting key declared with another table's
+// handle for a column of this name IS the tenant column to the engine
+// that folds the parts — while key called the two strangers and the
+// refusal reported itself: "its sorting key is (tenantId, id), which
+// does not include zcm.tenantId". Nothing leaked through it, since the
+// answer was a refusal either way; what it cost was a schema that
+// could not be written into and a message that contradicted itself.
 func checkTenantSortingKey(t *Table, axis *Column) error {
 	if t == nil || axis == nil || !t.engineMergesBySortingKey() {
 		return nil
 	}
 	for _, c := range t.orderBy {
-		if c.col().key() == axis.key() {
+		if namesAxis(c.col(), axis) {
 			return nil
 		}
 	}

@@ -115,6 +115,8 @@ var columnKeySites = map[string]keyComparison{
 	"mysql/page.go:rebindSpec":                {keyOwnHandles, "moves a cursor key onto the entity's own handle; a stranger is left as it came and renders qualified"},
 	"mysql/cursor.go:rebindSpec":              {keyQualified, "same, plus the join test that decides whether the FROM table's handle may be substituted at all"},
 	"mysql/snapshot.go:AddIndex":              {keyOwnHandles, "compares two table objects while recording a schema snapshot"},
+	"mysql/tenantview.go:Axis":                {keyFailsClosed, "normalises an alias copy onto its origin; a handle the base table does not own is refused by validate as ErrTenantViewAxisNotInTable, and nothing renders until it passes"},
+	"mysql/tenantview.go:tableOwnsAxis":       {keyFailsClosed, "the refusal itself: the axis must be one of the base table's own declared columns, so the bare name in the view's WHERE is always one the FROM has"},
 
 	// --- clickhouse ---
 	"clickhouse/table.go:As":                       {keyOwnHandles, "wires an alias copy's origin"},

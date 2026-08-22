@@ -101,6 +101,9 @@ var keyPathExemptions = map[string]string{
 	"mysql/tenant.go:ScopeByTenant": "a handle with no matching struct field panics at declaration time",
 	"mysql/page.go:rebindSpec": "moves a cursor key onto the entity's own handle; a stranger is left as it " +
 		"came and renders qualified, which is different SQL the server can see",
+	"mysql/tenantview.go:Axis": "normalises an alias copy onto its origin at declaration time; the view's " +
+		"WHERE does render a bare name, but a handle the base table does not own is refused by validate " +
+		"as ErrTenantViewAxisNotInTable and no DDL renders until it passes",
 
 	// --- clickhouse ---
 	"clickhouse/table.go:As":                       "declaration time, the same wiring as pg's",

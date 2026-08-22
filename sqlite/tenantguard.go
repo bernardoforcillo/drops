@@ -195,6 +195,55 @@ import (
 // this reason ([ErrReplaceScoped]) — the guard is what remains when
 // the statement was not written through drops.
 //
+// A guard applied to a table that ALREADY holds violating rows is
+// accepted, and the rows stay. CREATE TRIGGER validates nothing: a
+// trigger fires on writes, and the rows already there were written
+// before it existed. Measured, along with everything below.
+//
+// That much is only untidy. What costs an outage is the next step,
+// and it is the reason this paragraph is long: under the unpinned
+// pair a violating row CANNOT BE REPAIRED IN PLACE. An UPDATE putting
+// the right tenant on the row is precisely the statement the
+// immutability guard exists to refuse, and it is refused — "tenantId
+// is immutable; this statement would move a row between tenants" —
+// including when the value being corrected is NULL, because NULL is
+// one of the two tenants the row is moving between. Fail-closed, and
+// the right direction, but the obvious repair is the one that does
+// not work.
+//
+// The ways out, in the order to reach for them:
+//
+//   - count first, and decide before applying anything.
+//     [TenantGuardViolations] renders that count as SQL, one query
+//     per guard condition a stored row can already violate.
+//   - DELETE the row and insert it again carrying the tenant it
+//     should have had. A guard installs no delete trigger, so the
+//     DELETE is accepted, and the INSERT goes in through the guard
+//     like any other write.
+//   - or drop the guard, repair, recreate — [DropTenantGuard], the
+//     UPDATE, [CreateTenantGuard] — with all of it inside ONE
+//     transaction, so the window in which the table is unguarded is a
+//     window nothing else gets to write in. SQLite takes DROP
+//     TRIGGER and CREATE TRIGGER inside a transaction like any other
+//     statement, and the guard is back and holding at COMMIT.
+//   - a row that violates only [TenantGuard.MatchingParent] settles
+//     from the other end: move the FOREIGN KEY to a parent in the
+//     same tenant. The axis never moves, so BEFORE UPDATE OF the axis
+//     never fires, and the agreement is restored in place.
+//   - under [TenantGuard.PinnedTo] none of this arises. A pin's
+//     condition is about the value a row lands on rather than about
+//     the move, so it renders no immutability trigger, and an UPDATE
+//     setting the axis to the pinned literal is accepted from another
+//     tenant's value and from NULL alike.
+//
+// The guards do not refuse installation over violating rows, and that
+// is a decision rather than an oversight: drops renders statements
+// and does not run them, and SQLite has no ALTER TABLE … VALIDATE and
+// no NOT VALID to defer the question to the engine. No statement this
+// package could emit would install the guard and report the rows in
+// one breath. So the count is handed back as a query, and whether to
+// apply anyway stays with the operator who can see the rows.
+//
 // A trigger body's names are not resolved when it is created. A guard
 // naming a parent table that does not exist is accepted by CREATE
 // TRIGGER and fails when it fires — with "no such table", refusing the
@@ -692,6 +741,88 @@ func dropTenantGuard(g *TenantGuard, ifExists bool) []drops.Expression {
 	return out
 }
 
+// TenantGuardCheck is one preflight query: the trigger whose
+// condition it mirrors, and a SELECT counting the rows already in the
+// table that condition would refuse.
+//
+// Trigger names the trigger rather than describing the violation
+// because the trigger name is what the refusal will be attributed to
+// later, in sqlite_master and in nothing else: an operator holding a
+// non-zero count wants to know which of a guard's several triggers is
+// about to start refusing writes.
+type TenantGuardCheck struct {
+	// Trigger is the name of the trigger this check precedes.
+	Trigger string
+	// Count is `SELECT count(*) FROM <table> WHERE <condition>`,
+	// returning one row of one column.
+	Count drops.Expression
+}
+
+// TenantGuardViolations renders the queries that answer "does this
+// table already hold rows the guard would refuse?".
+//
+// Run them BEFORE applying the guard. CREATE TRIGGER validates
+// nothing — a trigger fires on writes, and the rows already in the
+// table were written before it existed — so a guard applied over
+// violating rows is accepted and the rows stay, and the first anyone
+// hears of it is an UPDATE that cannot be made to work. The sharp
+// edges section of the file comment has the whole story and the
+// recovery recipe.
+//
+// One check per BEFORE INSERT trigger, in the order
+// [CreateTenantGuard] emits them. The BEFORE UPDATE triggers get
+// none, and that is not an omission: the unpinned pair's second
+// trigger refuses a TRANSITION, which needs two rows, and no query
+// over stored rows can count the transitions that have not happened
+// yet. A check claiming to would be reporting a guarantee nobody
+// measured.
+//
+// Why this is a query to run rather than a refusal in the installer:
+// drops renders statements, it does not execute them, and SQLite has
+// no ALTER TABLE … VALIDATE and no NOT VALID to defer the question to
+// the engine. There is no statement this package could emit that
+// would install the guard and report the rows in one breath. Handing
+// back the count as SQL is the honest shape — and it leaves the
+// decision, apply anyway or repair first, with the operator who can
+// see the rows.
+//
+// A guard whose declaration is broken yields ONE check that fails at
+// exec, rather than an empty slice: an empty slice reads as "nothing
+// to repair", which is the one answer a preflight must never give by
+// accident.
+func TenantGuardViolations(g *TenantGuard) []TenantGuardCheck {
+	if err := g.validate(); err != nil {
+		return []TenantGuardCheck{{
+			Count: drops.ExprFunc(func(b *drops.Builder) {
+				b.WriteString("SELECT count(*) FROM ")
+				b.WriteString("/* drops/sqlite: " + err.Error() + " */")
+			}),
+		}}
+	}
+	specs := g.triggerSpecs()
+	out := make([]TenantGuardCheck, 0, len(specs))
+	for _, s := range specs {
+		if s.update {
+			continue
+		}
+		spec := s
+		out = append(out, TenantGuardCheck{
+			Trigger: spec.name,
+			Count: drops.ExprFunc(func(b *drops.Builder) {
+				b.WriteString("SELECT count(*) FROM ")
+				// The table's own name rather than writeFrom, for the
+				// reason the CREATE uses it: an alias set on the table
+				// object would rename the very thing storedRow qualifies
+				// with.
+				b.WriteIdent(g.table.Name())
+				b.WriteString(" WHERE ")
+				spec.when(b, storedRow(g.table))
+			}),
+		})
+	}
+	return out
+}
+
 // triggerSpec is one rendered trigger: when it fires, on which
 // columns, the condition that refuses, and what the refusal says.
 type triggerSpec struct {
@@ -704,7 +835,14 @@ type triggerSpec struct {
 	// changing can break the agreement.
 	cols []*Column
 	// when renders the condition under which the write is refused.
-	when func(b *drops.Builder)
+	//
+	// It takes the qualifier a column of the guarded row is written
+	// with, because the same condition is asked in two places: NEW.
+	// inside the trigger body, and the guarded table's own name in the
+	// preflight query [TenantGuardViolations] renders. One function
+	// serves both, so a count of the rows a guard would refuse cannot
+	// drift away from the condition the guard actually applies.
+	when func(b *drops.Builder, row rowQualifier)
 	// message is the text RAISE(ABORT) carries, before literal
 	// quoting.
 	message string
@@ -750,8 +888,8 @@ func (g *TenantGuard) triggerSpecs() []triggerSpec {
 		// for every other tenant — so it replaces them.
 		lit, _ := tenantGuardLiteral(g.tenant)
 		msg := guardPath(axis) + " must be " + lit + " in this database"
-		when := func(b *drops.Builder) {
-			writeNewCol(b, axis)
+		when := func(b *drops.Builder, row rowQualifier) {
+			writeRowCol(b, row, axis)
 			b.WriteString(" IS NOT ")
 			b.WriteString(lit)
 		}
@@ -761,8 +899,8 @@ func (g *TenantGuard) triggerSpecs() []triggerSpec {
 	} else {
 		specs = append(specs, triggerSpec{
 			name: g.name + "_ins",
-			when: func(b *drops.Builder) {
-				writeNewCol(b, axis)
+			when: func(b *drops.Builder, row rowQualifier) {
+				writeRowCol(b, row, axis)
 				b.WriteString(" IS NULL")
 			},
 			message: guardPath(axis) + " is null; the row would belong to no tenant",
@@ -771,12 +909,12 @@ func (g *TenantGuard) triggerSpecs() []triggerSpec {
 			name:   g.name + "_upd",
 			update: true,
 			cols:   []*Column{axis},
-			when: func(b *drops.Builder) {
+			when: func(b *drops.Builder, row rowQualifier) {
 				// IS NOT rather than <>, because <> is NULL when either
 				// side is NULL and a NULL condition does not fire the
 				// trigger: an UPDATE moving a row from NULL to a tenant,
 				// or to NULL, would go unrefused.
-				writeNewCol(b, axis)
+				writeRowCol(b, row, axis)
 				b.WriteString(" IS NOT OLD.")
 				b.WriteIdent(axis.Name())
 			},
@@ -788,8 +926,8 @@ func (g *TenantGuard) triggerSpecs() []triggerSpec {
 		link := p
 		msg := guardPath(axis) + " disagrees with " + guardPath(link.parentAxis) +
 			" for the row " + guardPath(link.local) + " names"
-		when := func(b *drops.Builder) {
-			writeNewCol(b, axis)
+		when := func(b *drops.Builder, row rowQualifier) {
+			writeRowCol(b, row, axis)
 			b.WriteString(" IS NOT (SELECT ")
 			b.WriteIdent(link.parentAxis.Name())
 			b.WriteString(" FROM ")
@@ -801,7 +939,7 @@ func (g *TenantGuard) triggerSpecs() []triggerSpec {
 			// would not fire the trigger and would let a row with a null
 			// key past a guard that had not looked at it.
 			b.WriteString(" IS ")
-			writeNewCol(b, link.local)
+			writeRowCol(b, row, link.local)
 			b.WriteString(")")
 		}
 		specs = append(specs,
@@ -821,10 +959,34 @@ func (g *TenantGuard) triggerSpecs() []triggerSpec {
 	return specs
 }
 
-// writeNewCol renders NEW."col". The row reference is a keyword rather
-// than an identifier, so it is written unquoted and the column is not.
-func writeNewCol(b *drops.Builder, c *Column) {
-	b.WriteString("NEW.")
+// rowQualifier writes the prefix a column of the guarded row carries,
+// dot included.
+type rowQualifier func(b *drops.Builder)
+
+// newRow qualifies with NEW, the row a BEFORE trigger is about. The
+// row reference is a keyword rather than an identifier, so it is
+// written unquoted and the column is not.
+func newRow(b *drops.Builder) { b.WriteString("NEW.") }
+
+// storedRow qualifies with the guarded table's own name, for the same
+// condition asked of the rows already in the table.
+//
+// It qualifies where newRow would, rather than leaving the column
+// bare, because the parent-agreement condition puts a correlated
+// subquery around it: with the parent table in scope, a bare
+// "authorId" binds to the PARENT's column of that name if it has one,
+// and the check would compare a row against itself and report no
+// violations.
+func storedRow(t *Table) rowQualifier {
+	return func(b *drops.Builder) {
+		b.WriteIdent(t.Name())
+		b.WriteByte('.')
+	}
+}
+
+// writeRowCol renders <qualifier>"col".
+func writeRowCol(b *drops.Builder, row rowQualifier, c *Column) {
+	row(b)
 	b.WriteIdent(c.Name())
 }
 
@@ -857,7 +1019,7 @@ func writeCreateTenantGuard(b *drops.Builder, g *TenantGuard, s triggerSpec, ifN
 	// would name the alias in a context that has no query around it.
 	b.WriteIdent(g.table.Name())
 	b.WriteString(" FOR EACH ROW WHEN ")
-	s.when(b)
+	s.when(b, newRow)
 	// ABORT rather than ROLLBACK: the statement is undone and the
 	// caller's transaction is left alone. See the file comment.
 	b.WriteString(" BEGIN SELECT RAISE(ABORT, ")

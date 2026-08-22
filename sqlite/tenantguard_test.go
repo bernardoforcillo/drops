@@ -326,3 +326,116 @@ func TestTenantGuardAcceptsAnAxisTakenOffAnAlias(t *testing.T) {
 		t.Errorf("the alias reached the stored body: %s", got[0])
 	}
 }
+
+// renderChecks renders the preflight queries and reports the trigger
+// each one mirrors, so a case can assert both halves at once. A check
+// that bound an argument is a bug of the same shape as a trigger body
+// that did: the query is meant to be pasted into a shell by whoever is
+// deciding whether to apply the guard.
+func renderChecks(t *testing.T, checks []sqlite.TenantGuardCheck) ([]string, []string) {
+	t.Helper()
+	sqls := make([]string, 0, len(checks))
+	names := make([]string, 0, len(checks))
+	for _, c := range checks {
+		sql, args := drops.StringWithDialect(sqlite.Dialect, c.Count)
+		if len(args) != 0 {
+			t.Errorf("a preflight query bound %d args: %s %v", len(args), sql, args)
+		}
+		sqls = append(sqls, sql)
+		names = append(names, c.Trigger)
+	}
+	return sqls, names
+}
+
+// The preflight for the plain axis guard: the rows the INSERT trigger
+// would refuse are exactly the rows whose axis is already NULL.
+//
+// The condition is rendered by the same function that renders the
+// trigger's WHEN clause, which is the whole reason this is worth
+// having — a count that answered a DIFFERENT question from the guard
+// it precedes would be worse than no count at all.
+func TestTenantGuardViolationsCountsTheRowsTheGuardWouldRefuse(t *testing.T) {
+	posts, _, _ := guardTable("tg_pre")
+
+	got, names := renderChecks(t, sqlite.TenantGuardViolations(sqlite.TenantGuardFor(posts)))
+	checkStatements(t, got, []string{
+		`SELECT count(*) FROM "tg_pre" WHERE "tg_pre"."tenantId" IS NULL`,
+	})
+	checkStatements(t, names, []string{"tg_pre_tenantGuard_ins"})
+}
+
+// The immutability trigger has no preflight and must not render one:
+// it refuses a TRANSITION, and a transition needs two rows. A check
+// claiming to count the rows it would refuse would be counting
+// nothing, and reading zero from it would be reading a guarantee that
+// was never measured.
+func TestTenantGuardViolationsSkipsTheImmutabilityTrigger(t *testing.T) {
+	posts, _, _ := guardTable("tg_pre_upd")
+
+	_, names := renderChecks(t, sqlite.TenantGuardViolations(sqlite.TenantGuardFor(posts)))
+	for _, n := range names {
+		if strings.HasSuffix(n, "_upd") {
+			t.Errorf("a BEFORE UPDATE trigger got a preflight query: %s", n)
+		}
+	}
+}
+
+// A pinned guard counts every row that is not the file's tenant, NULL
+// included: IS NOT is true for both.
+func TestTenantGuardViolationsCountsAPinnedAxis(t *testing.T) {
+	posts, _, _ := guardTable("tg_pre_pin")
+
+	got, names := renderChecks(t, sqlite.TenantGuardViolations(
+		sqlite.TenantGuardFor(posts).PinnedTo("acme")))
+	checkStatements(t, got, []string{
+		`SELECT count(*) FROM "tg_pre_pin" WHERE "tg_pre_pin"."tenantId" IS NOT 'acme'`,
+	})
+	checkStatements(t, names, []string{"tg_pre_pin_tenantGuard_ins"})
+}
+
+// The parent-agreement preflight, and the reason the guarded row is
+// QUALIFIED rather than left bare the way NEW makes it inside a
+// trigger body: the correlated subquery has the parent table in scope,
+// so an unqualified "authorId" would bind to the parent's own column
+// of that name if it had one, and the check would silently compare a
+// row against itself.
+func TestTenantGuardViolationsQualifiesTheGuardedRow(t *testing.T) {
+	posts, _, author := guardTable("tg_pre_par")
+	users := sqlite.NewTable("tg_pre_par_users")
+	userID := sqlite.Add(users, sqlite.BigInt("id").PrimaryKey())
+	userTenant := sqlite.Add(users, sqlite.Text("tenantId").NotNull())
+	// The collision this qualification exists for: the parent table has
+	// a column of the same name as the guarded table's foreign key.
+	sqlite.Add(users, sqlite.BigInt("authorId"))
+
+	got, names := renderChecks(t, sqlite.TenantGuardViolations(
+		sqlite.TenantGuardFor(posts).MatchingParent(author, userID, userTenant)))
+	checkStatements(t, got, []string{
+		`SELECT count(*) FROM "tg_pre_par" WHERE "tg_pre_par"."tenantId" IS NULL`,
+		`SELECT count(*) FROM "tg_pre_par" WHERE "tg_pre_par"."tenantId" IS NOT ` +
+			`(SELECT "tenantId" FROM "tg_pre_par_users" WHERE "id" IS "tg_pre_par"."authorId")`,
+	})
+	checkStatements(t, names, []string{
+		"tg_pre_par_tenantGuard_ins",
+		"tg_pre_par_tenantGuard_authorId_ins",
+	})
+}
+
+// A broken declaration yields one query that FAILS, not an empty list.
+// An empty list reads as "nothing to repair", which is the one answer
+// a preflight must never give by accident.
+func TestTenantGuardViolationsBreaksOnABrokenDeclaration(t *testing.T) {
+	g := sqlite.NewTenantGuard("tg_pre_broken")
+
+	checks := sqlite.TenantGuardViolations(g)
+	if len(checks) != 1 {
+		t.Fatalf("a broken guard rendered %d checks, want 1", len(checks))
+	}
+	got, _ := renderChecks(t, checks)
+	if !strings.Contains(got[0], "/* drops/sqlite: ") {
+		t.Errorf("a refused declaration rendered a runnable query: %s", got[0])
+	}
+	if !errors.Is(g.Err(), sqlite.ErrTenantGuardTargetRequired) {
+		t.Errorf("Err() = %v, want ErrTenantGuardTargetRequired", g.Err())
+	}
+}

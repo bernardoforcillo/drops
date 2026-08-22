@@ -130,6 +130,27 @@ once a 1.0 is cut.
   measured in-process against a real engine in
   `integration/sqlite_tenantguard_test.go`, including the negative
   ones.
+- **`sqlite.TenantGuardViolations`** — the count a guard has never
+  reported. Applying a `TenantGuard` to a table that already holds
+  violating rows succeeds silently and leaves them, because `CREATE
+  TRIGGER` validates nothing; and under the unpinned pair those rows
+  then cannot be repaired IN PLACE, since an `UPDATE` putting the
+  right tenant on the row is the exact statement the immutability
+  guard refuses — NULL being one of the two tenants the row would move
+  between. `TenantGuardViolations(guard)` renders one
+  `SELECT count(*)` per condition a stored row can already violate,
+  built from the same function that renders the trigger's `WHEN`
+  clause, so the count and the guard cannot answer different
+  questions. The installer still does not refuse: drops renders
+  statements rather than running them, and SQLite has no
+  `ALTER TABLE … VALIDATE` and no `NOT VALID`, so no statement could
+  install the guard and report the rows in one breath. The sharp-edges
+  list in `sqlite/tenantguard.go` now carries the trap and the
+  recovery recipes — delete and re-insert; drop, repair and recreate
+  inside one transaction; repoint the foreign key instead of the axis;
+  and the pinned guard, which has no immutability trigger and repairs
+  in place. All of it measured in-process in
+  `integration/sqlite_tenantguard_test.go`.
 - **`pg.DB.InTxAs` and `pg.Session`** — drops could WRITE a row-level
   security policy (`Table.EnableRLS`, `NewPolicy`, `Table.AddPolicy`)
   and could not SATISFY one: nothing in the package made a pooled

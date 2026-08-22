@@ -781,3 +781,229 @@ func TestARebuildDropsTheGuardAndDiffReplaysIt(t *testing.T) {
 		t.Fatalf("the rebuild did not replay the guard: %v", sqlite.Diff(live, want))
 	}
 }
+
+// A guard applied over rows that already violate it is ACCEPTED, and
+// the rows stay.
+//
+// This is the trap the sharp-edges list in tenantguard.go names, and
+// it is asserted here rather than reasoned about because both halves
+// are surprising: CREATE TRIGGER validates nothing, and the obvious
+// repair afterwards — an UPDATE putting the right tenant on the row —
+// is the exact statement the immutability guard exists to refuse. A
+// table can therefore reach a state where a row is wrong and cannot be
+// made right in place.
+func TestAGuardOverPreexistingViolationsIsAcceptedAndTheRowsCannotBeRepairedInPlace(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	docs := sqlite.NewTable("gd_pre")
+	sqlite.Add(docs, sqlite.BigInt("id").PrimaryKey())
+	tenant := sqlite.Add(docs, sqlite.Text("tenantId"))
+	sqlite.Add(docs, sqlite.Text("body"))
+	docs.ScopeWritesByTenant(tenant)
+	exec(t, db, sqlite.CreateTable(docs))
+
+	for _, stmt := range []string{
+		`INSERT INTO "gd_pre" VALUES (1, 'acme', 'kept')`,
+		`INSERT INTO "gd_pre" VALUES (2, NULL, 'orphan')`,
+		`INSERT INTO "gd_pre" VALUES (3, NULL, 'orphan too')`,
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// The preflight, run where it is meant to be run: before the guard
+	// exists. Two rows, and the check names the trigger that will start
+	// refusing them.
+	checks := sqlite.TenantGuardViolations(sqlite.TenantGuardFor(docs))
+	if len(checks) != 1 {
+		t.Fatalf("rendered %d checks, want 1", len(checks))
+	}
+	if checks[0].Trigger != "gd_pre_tenantGuard_ins" {
+		t.Fatalf("check names %q, want the INSERT trigger", checks[0].Trigger)
+	}
+	text, args := drops.StringWithDialect(sqlite.Dialect, checks[0].Count)
+	if len(args) != 0 {
+		t.Fatalf("preflight bound args: %s %v", text, args)
+	}
+	var violating int64
+	scalar(t, db, text, &violating)
+	if violating != 2 {
+		t.Fatalf("preflight counted %d violating rows, want 2", violating)
+	}
+
+	// The guard goes on anyway, without complaint.
+	applyGuard(t, db, sqlite.CreateTenantGuard(sqlite.TenantGuardFor(docs)))
+
+	var left int64
+	scalar(t, db, `SELECT count(*) FROM "gd_pre" WHERE "tenantId" IS NULL`, &left)
+	if left != 2 {
+		t.Fatalf("%d violating rows survived the guard, want 2", left)
+	}
+
+	// And now they are stuck: correcting the axis is a move between
+	// tenants as far as the trigger can tell, NULL being one of them.
+	_, err := db.Exec(ctx, `UPDATE "gd_pre" SET "tenantId" = 'acme' WHERE "id" = 2`)
+	wantRefused(t, err, `"gd_pre"."tenantId" is immutable`)
+
+	// The first documented way out: the row can be DELETED, because a
+	// guard installs no delete trigger, and inserted again correctly.
+	if _, err := db.Exec(ctx, `DELETE FROM "gd_pre" WHERE "id" = 2`); err != nil {
+		t.Fatalf("deleting a violating row was refused: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO "gd_pre" VALUES (2, 'acme', 'orphan')`); err != nil {
+		t.Fatalf("re-inserting the repaired row was refused: %v", err)
+	}
+
+	scalar(t, db, text, &violating)
+	if violating != 1 {
+		t.Fatalf("preflight counts %d after one repair, want 1", violating)
+	}
+}
+
+// The second documented way out: drop the guard, repair, recreate,
+// inside ONE transaction — so the window in which the table is
+// unguarded is a window nothing else gets to write in.
+//
+// This runs against a file rather than ":memory:" because the claim is
+// about a transaction holding the database, and it asserts the guard
+// is back and holding afterwards: a recovery recipe that leaves the
+// table unguarded would be worse than the state it repaired.
+func TestDroppingAGuardRepairingAndRecreatingItInOneTransaction(t *testing.T) {
+	db, sqlDB, _ := openSQLiteFile(t)
+	ctx := context.Background()
+
+	docs := sqlite.NewTable("gd_repair")
+	sqlite.Add(docs, sqlite.BigInt("id").PrimaryKey())
+	tenant := sqlite.Add(docs, sqlite.Text("tenantId"))
+	docs.ScopeWritesByTenant(tenant)
+	exec(t, db, sqlite.CreateTable(docs))
+	if _, err := db.Exec(ctx, `INSERT INTO "gd_repair" VALUES (1, NULL), (2, NULL)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	guard := sqlite.TenantGuardFor(docs)
+	applyGuard(t, db, sqlite.CreateTenantGuard(guard))
+
+	tx, err := sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	inTx := func(e drops.Expression) {
+		t.Helper()
+		text, args := drops.StringWithDialect(sqlite.Dialect, e)
+		if _, err := tx.ExecContext(ctx, text, args...); err != nil {
+			t.Fatalf("%s: %v", text, err)
+		}
+	}
+	for _, e := range sqlite.DropTenantGuardIfExists(guard) {
+		inTx(e)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE "gd_repair" SET "tenantId" = 'acme' WHERE "tenantId" IS NULL`); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	for _, e := range sqlite.CreateTenantGuard(guard) {
+		inTx(e)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	var left int64
+	scalar(t, db, `SELECT count(*) FROM "gd_repair" WHERE "tenantId" IS NULL`, &left)
+	if left != 0 {
+		t.Fatalf("%d rows still violate the guard after the repair", left)
+	}
+	// The guard is back, and holding.
+	_, err = db.Exec(ctx, `INSERT INTO "gd_repair" VALUES (3, NULL)`)
+	wantRefused(t, err, `"gd_repair"."tenantId" is null`)
+}
+
+// Two violations that DO repair in place, and the reason each does.
+//
+// A pinned guard's condition is about the value a row lands on, not
+// about the move, so there is no immutability trigger to trip over. A
+// parent disagreement can be settled from the other end: moving the
+// foreign key to a parent in the same tenant satisfies the guard, and
+// a SET list that does not name the axis never reaches the
+// immutability trigger at all.
+func TestTheViolationsThatCanBeRepairedInPlace(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	pinned := sqlite.NewTable("gd_pin_repair")
+	sqlite.Add(pinned, sqlite.BigInt("id").PrimaryKey())
+	pinnedTenant := sqlite.Add(pinned, sqlite.Text("tenantId"))
+	pinned.ScopeWritesByTenant(pinnedTenant)
+	exec(t, db, sqlite.CreateTable(pinned))
+	if _, err := db.Exec(ctx, `INSERT INTO "gd_pin_repair" VALUES (1, 'globex'), (2, NULL)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	pin := sqlite.TenantGuardFor(pinned).PinnedTo("acme")
+	pinChecks := sqlite.TenantGuardViolations(pin)
+	pinText, _ := drops.StringWithDialect(sqlite.Dialect, pinChecks[0].Count)
+	var violating int64
+	scalar(t, db, pinText, &violating)
+	if violating != 2 {
+		t.Fatalf("preflight counted %d rows a pin would refuse, want 2", violating)
+	}
+	applyGuard(t, db, sqlite.CreateTenantGuard(pin))
+
+	// Another tenant's value, and NULL, both correct in place.
+	if _, err := db.Exec(ctx, `UPDATE "gd_pin_repair" SET "tenantId" = 'acme'`); err != nil {
+		t.Fatalf("repairing under a pinned guard was refused: %v", err)
+	}
+	scalar(t, db, pinText, &violating)
+	if violating != 0 {
+		t.Fatalf("%d rows still violate the pin after the repair", violating)
+	}
+
+	users := sqlite.NewTable("gd_par_users")
+	userID := sqlite.Add(users, sqlite.BigInt("id").PrimaryKey())
+	userTenant := sqlite.Add(users, sqlite.Text("tenantId"))
+	users.ScopeWritesByTenant(userTenant)
+	exec(t, db, sqlite.CreateTable(users))
+
+	posts := sqlite.NewTable("gd_par_posts")
+	sqlite.Add(posts, sqlite.BigInt("id").PrimaryKey())
+	postTenant := sqlite.Add(posts, sqlite.Text("tenantId"))
+	author := sqlite.Add(posts, sqlite.BigInt("authorId"))
+	posts.ScopeWritesByTenant(postTenant)
+	exec(t, db, sqlite.CreateTable(posts))
+
+	for _, stmt := range []string{
+		`INSERT INTO "gd_par_users" VALUES (1, 'acme'), (2, 'globex')`,
+		`INSERT INTO "gd_par_posts" VALUES (10, 'acme', 1)`,
+		`INSERT INTO "gd_par_posts" VALUES (11, 'acme', 2)`,
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	linked := sqlite.TenantGuardFor(posts).MatchingParent(author, userID, userTenant)
+	parentCheck := sqlite.TenantGuardViolations(linked)
+	if len(parentCheck) != 2 {
+		t.Fatalf("rendered %d checks for a guard with a parent link, want 2", len(parentCheck))
+	}
+	parentText, _ := drops.StringWithDialect(sqlite.Dialect, parentCheck[1].Count)
+	scalar(t, db, parentText, &violating)
+	if violating != 1 {
+		t.Fatalf("preflight counted %d disagreeing rows, want 1", violating)
+	}
+	applyGuard(t, db, sqlite.CreateTenantGuard(linked))
+
+	// The axis cannot move, but the foreign key can.
+	_, err := db.Exec(ctx, `UPDATE "gd_par_posts" SET "tenantId" = 'globex' WHERE "id" = 11`)
+	wantRefused(t, err, `"gd_par_posts"."tenantId"`)
+	if _, err := db.Exec(ctx, `UPDATE "gd_par_posts" SET "authorId" = 1 WHERE "id" = 11`); err != nil {
+		t.Fatalf("repointing the foreign key at a parent in the same tenant was refused: %v", err)
+	}
+	scalar(t, db, parentText, &violating)
+	if violating != 0 {
+		t.Fatalf("%d rows still disagree with their parent after the repair", violating)
+	}
+}

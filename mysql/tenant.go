@@ -46,10 +46,29 @@ import (
 // # Where the automatic scoping stops
 //
 // These predicates are not an isolation boundary the way a server-side
-// policy is. MySQL has no row-level security to put underneath them —
-// its nearest equivalent is a definer-rights view, which is a schema
-// object drops does not manage — so the list below is not a footnote,
-// it is the whole of what is left when the predicates do not reach:
+// policy is. MySQL has no row-level security to put underneath them,
+// and this paragraph used to name a definer-rights view once, as "a
+// schema object drops does not manage", and stop — which left the
+// reader believing the predicates were all MySQL had.
+//
+// They are not. A view owned by an account that can read the base
+// table, filtered to one tenant, carrying WITH CASCADED CHECK OPTION,
+// reached by an account that holds privileges on THE VIEW AND NOT ON
+// THE TABLE, is a boundary in the sense this phase has used the word:
+// it holds whatever SQL the application sends, because the privilege
+// system enforces it and not a predicate. It even covers WRITES, which
+// the ClickHouse row policies drops declares do not. [TenantView]
+// renders that DDL; tenantview.go says what it protects, how it fails,
+// and what it costs — one account per tenant, which a pooled
+// connection shared across tenants cannot pay.
+//
+// What drops CANNOT do is establish it. The boundary is the absence of
+// a grant on the base table, an absence is not a statement, and no
+// library can render "and nothing else in this server grants this
+// account that table". So it stays a documented deployment pattern
+// rather than a library feature, and the list below is what is left
+// when the predicates do not reach — a footnote only for a deployment
+// that declared those views and can prove the grants:
 //
 //   - a raw statement, through [DB.Exec] or [DB.Query], carries what
 //     the caller wrote and nothing else;
@@ -66,15 +85,24 @@ import (
 //   - the outbox, the event store and the idempotency store, which
 //     issue their own hand-written SQL against their own tables;
 //   - a column whose name differs from the tenant axis only by a
-//     NON-ASCII case pair. MySQL folds a column name's case, and folds
-//     ASCII in every configuration and on every platform; whether it
-//     also reads "tenantid" and "tenantİd" as one column is its
-//     identifier collation's answer, and no MySQL was reachable to
-//     settle it. So identKey folds the ASCII and stops, and every axis
-//     check here reads such a pair as two columns. Guessing the wider
-//     fold is the worse failure rather than the safer one: a match
-//     tells the INSERT the axis is bound already, so what a wrong
-//     guess drops is the stamp — see identKey in ident.go;
+//     NON-ASCII case pair, in a configuration where the server folds
+//     one. MySQL folds a column name's case, and folds ASCII in every
+//     configuration and on every platform; whether it also reads
+//     "tenantid" and "tenantİd" as one column is its identifier
+//     collation's answer. That was recorded here as unsettled for
+//     want of a server. It has now been asked of two: MySQL 8.0.46 and
+//     MariaDB 10.11.14, both in their default configurations, read
+//     that pair as TWO columns — a table declaring both is created
+//     rather than refused as a duplicate, and selecting "tenantİd"
+//     from a table holding only "tenantid" is ERROR 1054. The ASCII
+//     fold identKey performs is therefore exactly the fold those two
+//     servers perform, not a conservative approximation of it, and on
+//     them this entry describes no gap at all. It stays in the list
+//     because the identifier collation is configurable and two
+//     defaults are not every configuration. Guessing a wider fold
+//     would remain the worse failure: a match tells the INSERT the
+//     axis is bound already, so what a wrong guess drops is the stamp
+//     — see identKey in ident.go;
 //   - a tenant value the axis column's collation folds onto another
 //     tenant's. sameTenant compares the ctx tenant with a bound value
 //     in Go; the predicate hands both sides to the server, which
@@ -82,10 +110,16 @@ import (
 //     collation for character columns is case-insensitive
 //     (utf8mb4_0900_ai_ci in 8.0, utf8mb4_general_ci before it), so on
 //     an axis column that took the default, "acme" and "ACME" are two
-//     tenants to drops and one to the server. That is the documented
-//     behaviour of those collations rather than something measured
-//     here: no MySQL was reachable to run it. The same shape IS
-//     measured, against PostgreSQL and against SQLite, in
+//     tenants to drops and one to the server. That was recorded here
+//     as documented behaviour rather than measurement, for want of a
+//     server. It has since been run: on MySQL 8.0.46 a VARCHAR taking
+//     the default collation (utf8mb4_0900_ai_ci) returned both the
+//     "acme" row and the "ACME" row for tenant = 'acme', and MariaDB
+//     10.11.14 did the same under ITS default, which is a different
+//     collation again (latin1_swedish_ci) — so the fold is not a
+//     property of one version's default but of every default either
+//     family ships. A _bin column returned one row on both. The same
+//     shape is measured against PostgreSQL and against SQLite in
 //     integration/tenantvaluefold_test.go. A _bin or _cs collation on
 //     the axis column is the caller's to declare;
 //   - a scoped table INNER- or LEFT-joined BEFORE a RIGHT JOIN keeps its
@@ -419,8 +453,15 @@ import (
 // fold, and they fold ASCII and stop. SQLite's own comparison is
 // ASCII and nothing more; MySQL folds ASCII in every configuration,
 // while what it does with a NON-ASCII case pair is its identifier
-// collation's answer and no MySQL was reachable to settle it. A pair
-// they therefore read as two columns where the server may read one is
+// collation's answer. That was unsettled here for want of a server.
+// Two have now been asked — MySQL 8.0.46 and MariaDB 10.11.14, both
+// in their default configurations — and both read such a pair as TWO
+// columns, which is what these packages already read it as: on those
+// servers the ASCII fold is the server's fold and not an
+// approximation of it. It still stops at ASCII, because the
+// identifier collation is settable and two defaults are not every
+// configuration, and a fold WIDER than the server's is the silent
+// one. A pair some other configuration might read as one column is
 // written into that dialect's "Where the automatic scoping stops"
 // list, rather than covered by a fold nobody verified.
 //

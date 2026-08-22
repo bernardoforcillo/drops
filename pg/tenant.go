@@ -388,8 +388,15 @@ import (
 // fold, and they fold ASCII and stop. SQLite's own comparison is
 // ASCII and nothing more; MySQL folds ASCII in every configuration,
 // while what it does with a NON-ASCII case pair is its identifier
-// collation's answer and no MySQL was reachable to settle it. A pair
-// they therefore read as two columns where the server may read one is
+// collation's answer. That was unsettled here for want of a server.
+// Two have now been asked — MySQL 8.0.46 and MariaDB 10.11.14, both
+// in their default configurations — and both read such a pair as TWO
+// columns, which is what these packages already read it as: on those
+// servers the ASCII fold is the server's fold and not an
+// approximation of it. It still stops at ASCII, because the
+// identifier collation is settable and two defaults are not every
+// configuration, and a fold WIDER than the server's is the silent
+// one. A pair some other configuration might read as one column is
 // written into that dialect's "Where the automatic scoping stops"
 // list, rather than covered by a fold nobody verified.
 //

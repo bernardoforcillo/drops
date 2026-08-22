@@ -349,7 +349,7 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 		// [InsertBuilder.Columns]), so a tenant bound on every row but
 		// absent from the list would be dropped by alignRow and the
 		// batch would land owned by nobody.
-		if !containsColumn(cols, axis) {
+		if !containsAxis(cols, axis) {
 			cp.cols = append(append([]*Column(nil), cols...), axis)
 		}
 	}
@@ -383,9 +383,19 @@ func (i *InsertBuilder) writeAxis() *Column {
 	return i.table.tenantAxis()
 }
 
-func containsColumn(cols []*Column, c *Column) bool {
-	for _, x := range cols {
-		if x.key() == c.key() {
+// containsAxis reports whether the column list already names the
+// tenant axis, so that widening it would render the column twice.
+//
+// It asks [namesAxis] rather than comparing [Column.key], for the
+// reason stampTenantColumn does: a handle for the same-named column of
+// another table object is not key-equal to the axis, so a list that
+// already named the tenant was read as not naming it and the axis was
+// appended beside it — INSERT INTO "hits" ("id", "tenantId",
+// "tenantId") VALUES (?, ?, NULL), one column written twice under one
+// name with the stamp landing on neither.
+func containsAxis(cols []*Column, axis *Column) bool {
+	for _, c := range cols {
+		if namesAxis(c, axis) {
 			return true
 		}
 	}
@@ -486,6 +496,21 @@ func joinNames(names []string) string {
 // Every row is widened, not only the first. This builder derives the
 // column list from row zero, so a stamp applied to one row and not the
 // rest would bind values under the wrong names.
+//
+// Within a row the bindings are searched with [namesAxis] and EVERY
+// match is checked, rather than the first one found by [Column.key].
+// Both halves close the same hole. A handle for the same-named column
+// of another table object is not key-equal to the axis, so the row was
+// read as not naming the tenant at all and the ctx stamp was appended
+// beside the caller's binding — INSERT INTO "zzi" ("title", "tenantId",
+// "tenantId") VALUES (?, ?, ?) with args {"x", "evil", "acme"}. What a
+// server does with that varies: PostgreSQL rejects it and SQLite keeps
+// the first occurrence, writing the row under a tenant the ctx never
+// named. Matching by rendered name finds the caller's binding in
+// place, so nothing is appended and the value is compared with the ctx
+// tenant like any other; scanning every match means a column bound
+// twice cannot smuggle the second binding past a check that stopped at
+// the first.
 func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) ([][]ColumnValue, error) {
 	t, ok := TenantFrom(ctx)
 	if !ok {
@@ -493,31 +518,31 @@ func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) 
 	}
 	out := make([][]ColumnValue, len(rows))
 	for r, row := range rows {
-		at := -1
-		for j, cv := range row {
-			if cv.column().key() == axis.key() {
-				at = j
-				break
+		found := false
+		for _, cv := range row {
+			if !namesAxis(cv.column(), axis) {
+				continue
+			}
+			found = true
+			bound, kind := classifyBinding(cv)
+			switch kind {
+			case bindingLiteral:
+				if !sameTenant(bound, t) {
+					return nil, fmt.Errorf("%w: %s is bound to another tenant's value",
+						ErrTenantMismatch, columnPath(axis))
+				}
+			default:
+				return nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
+					ErrTenantMismatch, columnPath(axis))
 			}
 		}
-		if at < 0 {
+		if !found {
 			next := make([]ColumnValue, 0, len(row)+1)
 			next = append(next, row...)
 			out[r] = append(next, Bind(axis, t))
 			continue
 		}
-		bound, kind := classifyBinding(row[at])
-		switch kind {
-		case bindingLiteral:
-			if !sameTenant(bound, t) {
-				return nil, fmt.Errorf("%w: %s is bound to another tenant's value",
-					ErrTenantMismatch, columnPath(axis))
-			}
-			out[r] = row
-		default:
-			return nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
-				ErrTenantMismatch, columnPath(axis))
-		}
+		out[r] = row
 	}
 	return out, nil
 }

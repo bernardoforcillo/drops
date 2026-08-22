@@ -165,6 +165,55 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **A column handle taken off another table rendered as this table's
+  tenant column and was not recognised as it** (`drops/pg`,
+  `drops/sqlite`, `drops/mysql`, `drops/clickhouse`). Eleven rounds of
+  the tenant-scoping phase asked whether the tenant VALUE was right and
+  none asked whether the HANDLE was ours. Every write-side check
+  located the axis by column identity — `Column.key`, or in `sqlite`
+  the pointer — which collapses alias copies onto the column they were
+  declared as and has nothing to say about a stranger; the renderer
+  writes the bare column name, so `OtherTableCols.TenantID` renders as
+  `"tenantId"` and the server applies it to the row the statement
+  addresses. In a codegen'd schema where every table exports its own
+  `<Table>Cols.TenantID` that is one character away in any file. Four
+  sites carried it. `Entity.Patch` let the op through, moving a row to
+  another tenant against a live PostgreSQL with no error:
+  `UPDATE "zzi" SET "tenantId" = $1 WHERE ("zzi"."id" = $2) AND
+  ("zzi"."tenantId" = $3)` bound to `evil, 7, acme` — the WHERE clause
+  a review checks is correct and the SET list is the leak. Stamping
+  read the row as naming no tenant and APPENDED the ctx stamp beside
+  the caller's binding, `INSERT INTO "zzi" ("title", "tenantId",
+  "tenantId") VALUES ($1, $2, $3)` bound to `x, evil, acme`; PostgreSQL
+  rejects a duplicate column but **SQLite accepts it and keeps the
+  first**, so a row written under ctx tenant `"acme"` was stored as
+  `"evil"` against a real server, verified end to end and now pinned by
+  a regression test that runs in-process through `modernc.org/sqlite`
+  with no DSN. `pg`'s `ON CONFLICT DO UPDATE` and `mysql`'s
+  `ON DUPLICATE KEY UPDATE` kept the axis assignment they exist to
+  drop, rendering it under a gate that had just confirmed the collided
+  row belonged to this tenant. And `clickhouse` widened its column list
+  with an axis the list already named. The write paths now match the
+  axis by the column name the statement RENDERS and check EVERY
+  occurrence rather than stopping at the first, which closes the bypass
+  and the duplicate column together, and stops a column bound twice
+  from being safe only by the server's choice of which duplicate to
+  keep. Section 4 of the normative tenant policy block states the rule
+  in all four dialects.
+- **`Entity.Patch` accepted an op naming a column of another table**
+  (`drops/pg`, `drops/sqlite`, `drops/mysql`). The general form of the
+  defect above, and the fix for it: an op whose column is not a column
+  of the entity's table is refused whatever the column holds, because
+  the statement it renders assigns a relation the query does not name.
+  New sentinel `ErrForeignColumn`, deliberately not `ErrTenantMismatch`
+  — a foreign handle is not a tenancy problem, and reporting it as one
+  would send the caller to their tenant plumbing instead of to the
+  import that handed them the wrong handle. The message names the
+  handle's own table as well as the entity's, since `"tenantId"` alone
+  reads as the right column. An alias handle for one of the table's own
+  columns is unaffected: aliasing is a query-scope rename of the same
+  column. `tenantAxisName` is `columnPath` in all four dialects, which
+  is what it always rendered.
 - **Three doc statements that were false where they were written.**
   `drops/sqlite`'s `resolveSets` pointed at `exprValue`, which in that
   package is the concrete struct in `column.go` rather than the

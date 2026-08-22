@@ -257,6 +257,40 @@ import (
 // to. In those three, the nesting rule above is the whole of how one
 // part of a query is unscoped and no other.
 //
+//
+// --- 4. WHICH HANDLE NAMES THE AXIS ---
+//
+// A column handle names the tenant axis when it RENDERS as the axis,
+// not when it IS the axis. Those two differ, and the difference is a
+// leak.
+//
+// A handle for the same column name taken off a DIFFERENT table object
+// renders as the bare column name — which is what the axis renders as
+// — and the server applies it to the row the statement addresses.
+// Handle identity says the two are unrelated: it collapses alias
+// copies onto the column they were declared as and has nothing to say
+// about a stranger. So a guard that asks "is this the axis?" by
+// identity answers no, and lets through the handle the renderer
+// answers yes for. An INSERT then stamped the ctx tenant BESIDE the
+// caller's binding instead of checking it, a dialect's upsert branch
+// kept the assignment it exists to drop, and a patch assigned the axis
+// under a WHERE clause still addressing the ctx tenant.
+//
+// So the write paths match the axis by rendered column name, and check
+// EVERY occurrence rather than stopping at the first. Name equality is
+// the weaker test and the right one here: identity implies it, so
+// nothing that matched before stops matching, and column names are
+// unique within a table, so no column of the table itself can collide.
+//
+// Where a statement can refuse earlier, it does: an op naming a column
+// of another table is refused as exactly that, whatever the column is,
+// because the statement it renders addresses a relation the query does
+// not name. Patch does this, and the axis case stops being reachable
+// rather than being caught.
+//
+// Dialect surface: clickhouse has no Patch, so there the earlier
+// refusal has no op list to apply to and the rendered-name rule is the
+// whole of it.
 // ==== END OF THE TENANT POLICIES ====
 
 type tenantCtxKey int
@@ -349,6 +383,34 @@ func columnPath(c *Column) string {
 		return t.Name() + "." + c.Name()
 	}
 	return c.Name()
+}
+
+// namesAxis reports whether a bound column handle will RENDER as the
+// tenant axis in the statement being built.
+//
+// The comparison is on the rendered column name rather than on
+// [Column.key], because those two questions have different answers for
+// a handle obtained from a different table object — and the renderer
+// asks the first one. An INSERT column list, an UPDATE SET target and
+// an upsert assignment all write the bare name, so a foreign
+// OtherTable.TenantID and this table's tenant column are one column as
+// far as the server is concerned while key calls them strangers. A
+// check that compares by key therefore reads such a handle as "not the
+// axis" and lets the statement bind it anyway: on an INSERT the ctx
+// stamp was then APPENDED ALONGSIDE it, and a server that accepts a
+// duplicate column and keeps the first — SQLite does — wrote the row
+// under a tenant the ctx never named.
+//
+// Name equality is the weaker of the two tests and that is the point:
+// key equality implies it, since an alias copy keeps the declared
+// name, so nothing that matched before stops matching. Within one
+// table names are unique, so a column of the entity's own table that
+// is not the axis cannot collide with it here.
+func namesAxis(c, axis *Column) bool {
+	if c == nil || axis == nil {
+		return false
+	}
+	return c.Name() == axis.Name()
 }
 
 // ScopeByTenant marks col as the entity's tenant axis. Every subsequent

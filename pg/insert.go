@@ -594,19 +594,33 @@ func (i *InsertBuilder) writeAxis() *Column {
 // alignRow fills a column no row bound with DEFAULT: in a multi-row
 // INSERT one row may name the tenant column and the next may leave it
 // out, and the gap is exactly the case stamping exists for.
+//
+// The column list is searched with [namesAxis] and EVERY match is
+// checked, rather than the first one found by [Column.key]. Both halves
+// close the same hole. A handle for the same-named column of another
+// table object is not key-equal to the axis, so the column list was
+// read as not naming the tenant at all and the ctx stamp was appended
+// beside the caller's binding — INSERT INTO "zzi" ("title", "tenantId",
+// "tenantId") VALUES ($1, $2, $3) with args {"x", "evil", "acme"}.
+// PostgreSQL rejects that (42701, column specified more than once) but
+// SQLite accepts it and keeps the first occurrence, so the same shape
+// wrote a row under "evil" while the ctx said "acme". Matching by
+// rendered name finds the caller's binding in place, so nothing is
+// appended and the value is compared with the ctx tenant like any
+// other; scanning every match means a column bound twice cannot smuggle
+// the second binding past a check that stopped at the first.
 func stampTenantColumn(ctx context.Context, axis *Column, cols []*Column, rows [][]ColumnValue) ([]*Column, [][]ColumnValue, error) {
 	t, ok := TenantFrom(ctx)
 	if !ok {
 		return nil, nil, fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(axis))
 	}
-	at := -1
+	var at []int
 	for j, c := range cols {
-		if c.key() == axis.key() {
-			at = j
-			break
+		if namesAxis(c, axis) {
+			at = append(at, j)
 		}
 	}
-	if at < 0 {
+	if len(at) == 0 {
 		out := make([][]ColumnValue, len(rows))
 		for r, row := range rows {
 			next := make([]ColumnValue, 0, len(row)+1)
@@ -617,21 +631,28 @@ func stampTenantColumn(ctx context.Context, axis *Column, cols []*Column, rows [
 	}
 	out, copied := rows, false
 	for r, row := range rows {
-		bound, kind := classifyBinding(row[at])
-		switch kind {
-		case bindingDefault:
-			if !copied {
-				out, copied = append([][]ColumnValue(nil), rows...), true
+		next, rowCopied := row, false
+		for _, j := range at {
+			bound, kind := classifyBinding(row[j])
+			switch kind {
+			case bindingDefault:
+				if !copied {
+					out, copied = append([][]ColumnValue(nil), rows...), true
+				}
+				if !rowCopied {
+					next, rowCopied = append([]ColumnValue(nil), row...), true
+				}
+				next[j] = insertBinding(axis, t)
+			case bindingLiteral:
+				if !sameTenant(bound, t) {
+					return nil, nil, fmt.Errorf("%w: %s is bound to another tenant's value", ErrTenantMismatch, columnPath(axis))
+				}
+			default:
+				return nil, nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped", ErrTenantMismatch, columnPath(axis))
 			}
-			next := append([]ColumnValue(nil), row...)
-			next[at] = insertBinding(axis, t)
+		}
+		if rowCopied {
 			out[r] = next
-		case bindingLiteral:
-			if !sameTenant(bound, t) {
-				return nil, nil, fmt.Errorf("%w: %s is bound to another tenant's value", ErrTenantMismatch, columnPath(axis))
-			}
-		default:
-			return nil, nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped", ErrTenantMismatch, columnPath(axis))
 		}
 	}
 	return cols, out, nil
@@ -712,6 +733,14 @@ func unwrapPIIArg(v any) any {
 // tenant-scoped table may run: without the assignment that would hand
 // the row to another tenant, and gated on the collided row belonging to
 // this one. See [InsertBuilder.resolveCtx] for the whole reasoning.
+//
+// Which assignment that is, is decided by [namesAxis] and not by
+// [Column.key], for the reason stampTenantColumn is: the SET list of a
+// DO UPDATE writes the bare column name, so an assignment built from
+// another table's handle for a column of the same name rendered
+// SET "tenantId" = $1 under a gate that had just confirmed the
+// collided row was this tenant's — the gate passing is what made the
+// transfer land.
 func scopeConflict(axis *Column, c *conflictClause) *conflictClause {
 	if c == nil || c.doNoth {
 		return c
@@ -719,7 +748,7 @@ func scopeConflict(axis *Column, c *conflictClause) *conflictClause {
 	cp := *c
 	cp.updates = make([]ColumnValue, 0, len(c.updates))
 	for _, u := range c.updates {
-		if u.column().key() == axis.key() {
+		if namesAxis(u.column(), axis) {
 			continue
 		}
 		cp.updates = append(cp.updates, u)

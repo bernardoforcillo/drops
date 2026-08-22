@@ -466,19 +466,34 @@ func (i *InsertBuilder) writeAxis() *Column {
 // this builder derives its column list from row zero, so a stamp
 // applied to one row and not the rest would bind values under the wrong
 // names.
+//
+// The column list is searched with [namesAxis] and EVERY match is
+// checked, rather than the first one found by [Column.key]. Both halves
+// close the same hole. A handle for the same-named column of another
+// table object is not key-equal to the axis, so the column list was
+// read as not naming the tenant at all and the ctx stamp was appended
+// beside the caller's binding — INSERT INTO `zzi` (`title`, `tenantId`,
+// `tenantId`) VALUES (?, ?, ?) with args {"x", "evil", "acme"}. MySQL
+// should reject that (ER_FIELD_SPECIFIED_TWICE) but SQLite, which sees
+// the same shape from its own dialect, accepts it and keeps the first
+// occurrence, writing a row under "evil" while the ctx said "acme".
+// Matching by rendered name finds the caller's binding in place, so
+// nothing is appended and the value is compared with the ctx tenant
+// like any other; scanning every match means a column bound twice
+// cannot smuggle the second binding past a check that stopped at the
+// first.
 func stampTenantColumn(ctx context.Context, axis *Column, cols []*Column, rows [][]drops.Expression) ([]*Column, [][]drops.Expression, error) {
 	t, ok := TenantFrom(ctx)
 	if !ok {
 		return nil, nil, fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(axis))
 	}
-	at := -1
+	var at []int
 	for j, c := range cols {
-		if c.key() == axis.key() {
-			at = j
-			break
+		if namesAxis(c, axis) {
+			at = append(at, j)
 		}
 	}
-	if at < 0 {
+	if len(at) == 0 {
 		out := make([][]drops.Expression, len(rows))
 		for r, row := range rows {
 			next := make([]drops.Expression, 0, len(row)+1)
@@ -489,23 +504,30 @@ func stampTenantColumn(ctx context.Context, axis *Column, cols []*Column, rows [
 	}
 	out, copied := rows, false
 	for r, row := range rows {
-		bound, kind := classifyBinding(row[at])
-		switch kind {
-		case bindingDefault:
-			if !copied {
-				out, copied = append([][]drops.Expression(nil), rows...), true
-			}
-			next := append([]drops.Expression(nil), row...)
-			next[at] = drops.Param{Value: t}
-			out[r] = next
-		case bindingLiteral:
-			if !sameTenant(bound, t) {
-				return nil, nil, fmt.Errorf("%w: %s is bound to another tenant's value",
+		next, rowCopied := row, false
+		for _, j := range at {
+			bound, kind := classifyBinding(row[j])
+			switch kind {
+			case bindingDefault:
+				if !copied {
+					out, copied = append([][]drops.Expression(nil), rows...), true
+				}
+				if !rowCopied {
+					next, rowCopied = append([]drops.Expression(nil), row...), true
+				}
+				next[j] = drops.Param{Value: t}
+			case bindingLiteral:
+				if !sameTenant(bound, t) {
+					return nil, nil, fmt.Errorf("%w: %s is bound to another tenant's value",
+						ErrTenantMismatch, columnPath(axis))
+				}
+			default:
+				return nil, nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
 					ErrTenantMismatch, columnPath(axis))
 			}
-		default:
-			return nil, nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
-				ErrTenantMismatch, columnPath(axis))
+		}
+		if rowCopied {
+			out[r] = next
 		}
 	}
 	return cols, out, nil
@@ -572,13 +594,22 @@ func onePlaceholder() string {
 // other one so that a collision with another tenant's row rewrites
 // nothing. See [InsertBuilder.ToSQLCtx] for why the gate has to live
 // inside the assignments in this dialect.
+//
+// Which assignment is the tenant's is decided by [namesAxis] and not by
+// [Column.key], for the reason stampTenantColumn is: the SET list of an
+// ON DUPLICATE KEY UPDATE writes the bare column name, so an assignment
+// built from another table's handle for a column of the same name
+// survived the drop and rendered
+// `tenantId` = IF(`tenantId` = VALUES(`tenantId`), ?, `tenantId`) —
+// a gate that passes for exactly the rows this tenant owns, wrapped
+// around the value that gives one of them away.
 func gateUpserts(axis *Column, upserts []ColumnValue) []ColumnValue {
 	if len(upserts) == 0 {
 		return upserts
 	}
 	out := make([]ColumnValue, 0, len(upserts))
 	for _, u := range upserts {
-		if u.column().key() == axis.key() {
+		if namesAxis(u.column(), axis) {
 			continue
 		}
 		out = append(out, tenantGatedValue{inner: u, axis: axis})

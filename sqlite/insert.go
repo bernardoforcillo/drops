@@ -385,6 +385,24 @@ func (i *InsertBuilder) writeAxis() *Column {
 // column list from row zero, so a stamp applied to one row and not the
 // rest would bind values under the wrong names — see
 // Entity.alignBindings for the same hazard from the other direction.
+//
+// Within a row the bindings are searched with [namesAxis] and EVERY
+// match is checked, rather than the first one found by handle identity.
+// Both halves close the same hole, and this is the dialect it was
+// verified in. A handle for the same-named column of another table
+// object is a different handle, so the row was read as not naming the
+// tenant at all and the ctx stamp was appended beside the caller's
+// binding — INSERT INTO "zzi" ("title", "tenantId", "tenantId")
+// VALUES (?, ?, ?) with args {"x", "evil", "acme"}. PostgreSQL rejects
+// a duplicate column; SQLite accepts it and keeps the FIRST
+// occurrence, so a row written under ctx tenant "acme" landed as
+// "evil" against a real server with no error. Matching by rendered
+// name finds the caller's binding in place, so nothing is appended and
+// the value is compared with the ctx tenant like any other; scanning
+// every match means a column bound twice cannot smuggle the second
+// binding past a check that stopped at the first — which is what made
+// binding this table's own handle twice safe only by SQLite's choice
+// of which duplicate to keep.
 func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) ([][]ColumnValue, error) {
 	t, ok := TenantFrom(ctx)
 	if !ok {
@@ -392,31 +410,31 @@ func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) 
 	}
 	out := make([][]ColumnValue, len(rows))
 	for r, row := range rows {
-		at := -1
-		for j, cv := range row {
-			if cv.column() == axis {
-				at = j
-				break
+		found := false
+		for _, cv := range row {
+			if !namesAxis(cv.column(), axis) {
+				continue
+			}
+			found = true
+			bound, kind := classifyBinding(cv)
+			switch kind {
+			case bindingLiteral:
+				if !sameTenant(bound, t) {
+					return nil, fmt.Errorf("%w: %s is bound to another tenant's value",
+						ErrTenantMismatch, columnPath(axis))
+				}
+			default:
+				return nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
+					ErrTenantMismatch, columnPath(axis))
 			}
 		}
-		if at < 0 {
+		if !found {
 			next := make([]ColumnValue, 0, len(row)+1)
 			next = append(next, row...)
 			out[r] = append(next, columnValue{col: axis, val: t})
 			continue
 		}
-		bound, kind := classifyBinding(row[at])
-		switch kind {
-		case bindingLiteral:
-			if !sameTenant(bound, t) {
-				return nil, fmt.Errorf("%w: %s is bound to another tenant's value",
-					ErrTenantMismatch, columnPath(axis))
-			}
-			out[r] = row
-		default:
-			return nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
-				ErrTenantMismatch, columnPath(axis))
-		}
+		out[r] = row
 	}
 	return out, nil
 }

@@ -131,10 +131,19 @@ import (
 // that loses nothing both ways names the same tenant.
 //
 // A string on one side and a non-string on the other is never the same
-// tenant, whatever the conversion reports. Go converts an integer to a
-// string as a rune, so without that guard a ctx tenant of 65 and a
-// TEXT tenant column holding "A" compare equal, and a numeric tenant
-// is accepted as the owner of a text column's row.
+// tenant, whatever the conversion reports.
+//
+// What that guard rules out is not the integer, which is what it was
+// described as being for through eleven rounds of this phase. Go
+// converts an integer to a string as a rune, but nothing converts a
+// string back to an integer, so the round trip above already refuses
+// 65 and "A" and the guard is never reached for that pair. What it
+// rules out is []byte and []rune: those convert onto a string and back
+// losing nothing, so without it []byte("acme") and "acme" are the same
+// tenant. They are the same CHARACTERS. A schema holding its tenant as
+// bytes on one table and as text on another is reporting a type
+// confusion, exactly as a numeric ctx tenant on a text column is, and
+// it is refused on the same grounds.
 //
 // Nothing here reaches for strconv. A column whose type disagrees with
 // the ctx tenant's is the schema reporting a type confusion, and
@@ -613,11 +622,17 @@ func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
 //
 // The conversion mirrors [Entity.stampTenant]: a tenant sourced as an
 // int and a column typed int64 are the same tenant, and refusing that
-// pairing would reject the very rows the entity methods stamp. The
-// string guard is not decoration — Go converts an integer to a string
-// as a rune, so without it tenant 65 and tenant "A" would compare
-// equal, and a numeric tenant would be accepted as the owner of a text
-// tenant column's row.
+// pairing would reject the very rows the entity methods stamp.
+//
+// The string guard is not decoration, and it is not what stops a
+// numeric tenant owning a text column's row — the round trip below
+// does that, because nothing converts a string back to an integer.
+// What the guard stops is []byte and []rune, which DO convert onto a
+// string and back losing nothing: without it a ctx tenant of
+// []byte("acme") is accepted as the owner of a row whose text tenant
+// column holds "acme". It asks the KIND rather than the type, so a
+// caller's own named string type still names the same tenant as the
+// string a column binds.
 //
 // The comparison is a round trip — convert, compare, convert back,
 // compare again — because a one-way conversion calls a truncating pair

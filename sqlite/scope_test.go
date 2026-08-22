@@ -289,6 +289,72 @@ func TestJoinedTableCarriesItsDefaultFilters(t *testing.T) {
 	}
 }
 
+// Unscoped on a statement builder is STATEMENT-WIDE: it drops the
+// DefaultFilter and ContextFilter lists of the FROM table and of every
+// joined table alike.
+//
+// Statement-wide rather than per table, because a caller who says
+// Unscoped is describing this query's authority. A flag that unscoped
+// the FROM table while a joined one kept its tenant axis answers with a
+// silently narrowed slice of the rows that were asked for, and nothing
+// in a result set says which rows are missing from it.
+//
+// The other three dialects each assert this and sqlite did not. Both
+// join kinds are asked, because they place a guard differently — the
+// INNER JOIN's goes in the WHERE clause and the LEFT JOIN's into the ON
+// clause, so a flag that cleared one list and not the other would show
+// in only one of them. The ctx carries no tenant at all, which is the
+// other half of what Unscoped means: not an error.
+func TestUnscopedIsStatementWideAcrossAJoin(t *testing.T) {
+	tests := []struct {
+		name string
+		join func(*sqlite.SelectBuilder, *sqlite.Table, drops.Expression) *sqlite.SelectBuilder
+		want string
+	}{
+		{
+			name: "INNER JOIN",
+			join: func(s *sqlite.SelectBuilder, t *sqlite.Table, on drops.Expression) *sqlite.SelectBuilder {
+				return s.Join(t, on)
+			},
+			want: `SELECT "scw_from"."id" FROM "scw_from" JOIN "scw_joined" ` +
+				`ON ("scw_from"."postId" = "scw_joined"."id")`,
+		},
+		{
+			name: "LEFT JOIN",
+			join: func(s *sqlite.SelectBuilder, t *sqlite.Table, on drops.Expression) *sqlite.SelectBuilder {
+				return s.LeftJoin(t, on)
+			},
+			want: `SELECT "scw_from"."id" FROM "scw_from" LEFT JOIN "scw_joined" ` +
+				`ON ("scw_from"."postId" = "scw_joined"."id")`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Both tables carry both kinds of automatic predicate, so
+			// a flag that dropped one kind or one table shows up as a
+			// clause the assertion does not name.
+			from := sqlite.NewTable("scw_from")
+			fromID := sqlite.Add(from, sqlite.BigInt("id").PrimaryKey())
+			sqlite.Add(from, sqlite.BigInt("postId"))
+			fromTen := sqlite.Add(from, sqlite.BigInt("tenantId").NotNull())
+			from.ContextFilter(sqlite.TenantFilter(fromTen))
+			sqlite.SoftDelete(from)
+
+			joined := sqlite.NewTable("scw_joined")
+			joinedID := sqlite.Add(joined, sqlite.BigInt("id").PrimaryKey())
+			joinedTen := sqlite.Add(joined, sqlite.BigInt("tenantId").NotNull())
+			joined.ContextFilter(sqlite.TenantFilter(joinedTen))
+			sqlite.SoftDelete(joined)
+
+			db := sqlite.New(nil)
+			sel := tt.join(db.Select(fromID).From(from), joined,
+				sqlite.Eq(from.Col("postId"), joinedID)).Unscoped()
+			sql, args := renderCtx(t, sel, context.Background())
+			checkSQL(t, sql, tt.want, args, nil)
+		})
+	}
+}
+
 // A CTE body is a statement of its own and is resolved as one.
 // WITH … AS (<statement over a scoped table>) is the shape a reporting
 // query is written in, and an unscoped body reaches every tenant's rows

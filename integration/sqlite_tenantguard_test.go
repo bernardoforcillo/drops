@@ -714,3 +714,70 @@ func TestACheckCannotExpressTheCrossRowOrCrossTableGuards(t *testing.T) {
 		t.Fatalf("refused for some other reason: %v", err)
 	}
 }
+
+// A rebuild takes the guard with it, and drops' own Diff puts it back.
+//
+// SQLite changes a column by the twelve-step rebuild — create the new
+// shape, copy, DROP the old table, rename — and DROP TABLE takes every
+// trigger on that table with it. So the guard's lifetime is tied to
+// the migration tooling, and this asserts both halves of that: the
+// engine forgets the trigger when the table goes, and a Diff taken
+// against the live database emits the CREATE TRIGGER again after the
+// rebuild it wrote.
+//
+// A rebuild done by hand, or by a tool that does not read the triggers
+// first, has no such half. That is the sentence in tenantguard.go this
+// pins.
+func TestARebuildDropsTheGuardAndDiffReplaysIt(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	docs := sqlite.NewTable("gd_rebuild")
+	sqlite.Add(docs, sqlite.BigInt("id").PrimaryKey())
+	tenant := sqlite.Add(docs, sqlite.Text("tenantId"))
+	sqlite.Add(docs, sqlite.Text("body"))
+	docs.ScopeWritesByTenant(tenant)
+	exec(t, db, sqlite.CreateTable(docs))
+	applyGuard(t, db, sqlite.CreateTenantGuard(sqlite.TenantGuardFor(docs)))
+
+	live, err := sqlite.Introspect(ctx, db)
+	if err != nil {
+		t.Fatalf("introspect: %v", err)
+	}
+	if _, ok := live.Tables["gd_rebuild"].Triggers["gd_rebuild_tenantGuard_ins"]; !ok {
+		t.Fatalf("introspection did not see the guard: %+v", live.Tables["gd_rebuild"].Triggers)
+	}
+
+	// The engine's half: dropping the table forgets the triggers.
+	if _, err := db.Exec(ctx, `DROP TABLE "gd_rebuild"`); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	var left int64
+	scalar(t, db, `SELECT count(*) FROM sqlite_master WHERE "type" = 'trigger'`, &left)
+	if left != 0 {
+		t.Fatalf("%d triggers survived DROP TABLE, want 0", left)
+	}
+
+	// The tooling's half: a Diff that changes the table's shape emits
+	// the rebuild AND the CREATE TRIGGER after it.
+	narrowed := sqlite.NewTable("gd_rebuild")
+	sqlite.Add(narrowed, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(narrowed, sqlite.Text("tenantId"))
+	want := sqlite.BuildSnapshot(sqlite.NewSchema(narrowed))
+
+	var rebuilt, replayed bool
+	for _, stmt := range sqlite.Diff(live, want) {
+		if strings.HasPrefix(stmt, "-- rebuild") {
+			rebuilt = true
+		}
+		if strings.Contains(stmt, `CREATE TRIGGER "gd_rebuild_tenantGuard_ins"`) {
+			replayed = true
+		}
+	}
+	if !rebuilt {
+		t.Fatalf("dropping a column did not produce a rebuild: %v", sqlite.Diff(live, want))
+	}
+	if !replayed {
+		t.Fatalf("the rebuild did not replay the guard: %v", sqlite.Diff(live, want))
+	}
+}

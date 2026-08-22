@@ -19,14 +19,15 @@ import (
 // application predicates were therefore the WHOLE of what there is on
 // this dialect.
 //
-// They are not. SQLite has triggers, and a trigger is inside the
-// database. It runs for every statement that reaches the table,
-// whoever wrote it, through whatever connection, in whatever process,
-// including SQL that drops did not build and never saw — a raw
+// They are not. SQLite has triggers, and a trigger is in the SCHEMA
+// rather than on the connection. It runs for every statement that
+// reaches the table, whoever wrote it, through whatever connection —
+// including SQL that drops did not build and never saw: a raw
 // [DB.Exec], a [drops.Raw] fragment, a hand-run migration, the
 // `sqlite3` shell. That is the exact set the predicates cannot reach,
 // and it is where every silent wrong-tenant write this phase found
-// actually happened.
+// actually happened. Measured against a second handle to the same
+// file, one that never loaded drops.
 //
 // # What this file declares
 //
@@ -111,9 +112,10 @@ import (
 //   - every migration runs N times, once per file, and a run that
 //     fails halfway leaves the fleet on two schema versions. drops
 //     helps here and this is the part it genuinely owns: [Migrator]
-//     tracks applied migrations per database, [Snapshot] and [Diff]
-//     derive the statements, and [Drift] reads a live file and reports
-//     where it stopped matching. Point them at each file in turn.
+//     tracks applied migrations per database, [BuildSnapshot] and
+//     [Diff] derive the statements, and [DetectDrift] compares a live
+//     file against the repository's schema and reports where it
+//     stopped matching. Point them at each file in turn.
 //   - a cross-tenant question — "how many documents does the whole
 //     fleet hold" — stops being a query. It becomes a loop over files,
 //     or ATTACH plus a hand-written UNION ALL naming each one, with

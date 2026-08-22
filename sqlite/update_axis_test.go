@@ -24,9 +24,10 @@ import (
 // the WHERE clause is correctly confined to the caller's own rows and
 // the SET list gives one of them away, so the half a review checks is
 // the correct half. It needs no foreign handle and no unusual import,
-// only the table's own column and the obvious spelling — and in this
-// dialect the predicates are the whole of the boundary, so nothing
-// underneath refuses it either.
+// only the table's own column and the obvious spelling. There is no
+// row-level security underneath to refuse it either; the most a schema
+// can have is the immutability trigger sqlite.TenantGuard renders, and
+// a table that has not declared one does not have it.
 
 // updateAxisSchema is axisSchema's table plus the id handle an UPDATE
 // addresses a row with.

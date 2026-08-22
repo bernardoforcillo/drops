@@ -47,9 +47,17 @@
 // What does NOT come across from drops/pg is the boundary underneath.
 // PostgreSQL row-level security is what those predicates sit on top of,
 // and SQLite has no equivalent: no roles, no policies, and a process
-// that can open the file reads every byte in it. Here the predicates
-// are the whole of what there is, which makes tenant.go's list of where
-// they stop load-bearing rather than a footnote.
+// that can open the file reads every byte in it. That is what makes
+// tenant.go's list of where the predicates stop load-bearing rather
+// than a footnote.
+//
+// It does not make the predicates the whole of what there is, which is
+// what this comment used to say. SQLite has triggers, they are inside
+// the database, and they run for the statements on that list;
+// tenantguard.go renders them from the same axis and states plainly why
+// that is a guard against mistakes rather than a boundary against a
+// principal. The boundary this dialect has is one database file per
+// tenant.
 package sqlite
 
 import "github.com/bernardoforcillo/drops"

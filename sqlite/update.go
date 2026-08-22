@@ -171,8 +171,10 @@ func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
 // list gives one of them away, and the half a review checks is the
 // correct one. It needs no foreign handle and no unusual import —
 // db.Update(tbl).Set(TenantCol.Val(999)), the table's own handle and
-// the obvious spelling. In this dialect the predicates are the whole
-// of the boundary, so nothing underneath refuses it either.
+// the obvious spelling. There is no row-level security here for it to
+// run into either — the most a schema can put underneath is a trigger
+// refusing the assignment, which is what [TenantGuard] renders and
+// which a table that has not declared one does not have.
 //
 // What is refused, and what is not:
 //

@@ -23,9 +23,12 @@ import (
 // This is the dialect where that lands. PostgreSQL rejects a duplicate
 // column; SQLite accepts it and keeps the FIRST occurrence, so a row
 // written under ctx tenant "acme" was stored as "evil" against a real
-// server, with no error, in the dialect whose own tenant.go says the
-// predicates are the whole boundary. The end-to-end proof lives in the
-// integration suite; these tests pin the statement that carried it.
+// server, with no error, in the dialect with no row-level security
+// underneath to catch it. The end-to-end proof lives in the integration
+// suite; these tests pin the statement that carried it. What a schema
+// CAN put underneath arrived later and would refuse this row on the
+// axis being wrong rather than on the duplicate: see sqlite.TenantGuard
+// and integration/sqlite_tenantguard_test.go.
 //
 // So the axis is matched by the name the statement RENDERS, and every
 // occurrence is checked rather than the first — which is also what

@@ -272,10 +272,25 @@ so the same words are true in four packages.
 What the mechanism does *not* reach is listed per dialect, under
 "Where the automatic scoping stops" — in `tenant.go` for `sqlite`,
 `mysql` and `clickhouse`, and in `doc.go` for `pg`, where it continues
-the package overview that opened the subject. It is not a footnote: in
-three of the four the predicates are the whole of what there is,
-because none of those three has row-level security to put underneath
-them.
+the package overview that opened the subject. It is not a footnote: none of the other
+three has row-level security to put underneath them, so what a
+statement leaves behind when it walks off that list is not caught the
+way `pg` catches it.
+
+That is not the same as the predicates being the whole of what there
+is, which is what this paragraph used to say. Each of the three has
+something, and the three are not alike. `clickhouse` has `CREATE ROW
+POLICY`, which filters reads for a user or role and has no `WITH CHECK`
+half, so writes have no floor at all (`clickhouse/rowpolicy.go`).
+`mysql` has a definer-rights view with `WITH CASCADED CHECK OPTION`
+reached by an account holding nothing on the base table, which covers
+reads and writes both, and whose boundary is the *absence* of a grant —
+so drops renders the DDL and cannot establish it
+(`mysql/tenantview.go`). `sqlite` has no principal of any kind, and so
+nothing inside the database that binds rows to one; what it has is
+triggers, which run for the statements on the list and hold against
+mistakes rather than against an adversary (`sqlite/tenantguard.go`).
+Its boundary is one database file per tenant.
 
 The four lists are not one list repeated, and reading one is not
 reading them all. `pg`'s is written against `pg`'s own surface and

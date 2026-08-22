@@ -23,9 +23,11 @@ import (
 // PostgreSQL answers 42701 and fails closed. SQLite ACCEPTS a
 // duplicate column and keeps the FIRST occurrence, so this is the
 // dialect where the row lands: written under ctx tenant "acme",
-// stored as "evil", no error — in the dialect whose own tenant.go says
-// the predicates are the whole boundary because there is no row-level
-// security underneath them.
+// stored as "evil", no error — in the dialect with no row-level
+// security underneath to catch it. The guard a schema can declare
+// instead arrived later and refuses a row on its axis rather than on
+// the duplicate; sqlite_tenantguard_test.go is where that is asked of
+// the same engine.
 //
 // A unit test can only assert the rendering. Which of two duplicate
 // columns a server keeps is the server's answer, so this asks the

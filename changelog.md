@@ -9,6 +9,84 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Tenant scoping: the axis is declared on the TABLE and resolved by
+  the EXECUTORS** (`drops/pg`, `drops/sqlite`, `drops/mysql`,
+  `drops/clickhouse`). The largest body of work in this release.
+  `Table.ContextFilter(TenantFilter(col))` and
+  `Table.ScopeWritesByTenant(col)` — or `Entity.ScopeByTenant(col)`,
+  which registers both — declare who owns a table's rows;
+  `WithTenant(ctx, tenant)` names the tenant for a request. From there
+  every statement drops composes carries the predicate, to any depth: a
+  root query, a joined table, a CTE body, a subquery operand, a
+  set-operation operand, an eager-loaded edge, the predicate another
+  table's filter answers with. An INSERT has no WHERE clause, so what
+  it takes instead is the stamp: the ctx tenant is written onto the row
+  and a row already naming a different tenant is `ErrTenantMismatch`.
+  A ctx with no tenant is `ErrTenantMissing` and no statement at all.
+  `Unscoped()` is the opt-out, at the call site where a reviewer reads
+  it.
+
+  "On the table" and "by the executors" are the two load-bearing
+  words, and both were learned by shipping the other thing. While the
+  predicate was injected by the `Entity` methods it reached the queries
+  those methods built and nothing else, so an eager-loaded relation —
+  whose child query the relation loader builds with no `Entity` in the
+  call — came back holding every tenant's rows, and
+  `db.Select().From(Posts)`, the spelling the readme shows first,
+  carried nothing at all on a ctx with no tenant without refusing.
+  While the predicate was added by the RENDERER it was invisible to the
+  query cache, which keyed its entries on the rendered SQL, so two
+  tenants asking one question shared one entry.
+
+- **The same mechanism in four dialects, diffable against each other.**
+  Normalise the dialect name and `pg/resolve.go`, `sqlite/resolve.go`,
+  `mysql/resolve.go` and `clickhouse/resolve.go` are one file, so a
+  future divergence in how a statement is walked shows up as a diff
+  rather than as a defect in one package. What differs between them is
+  surface and it differs where the SQL does: `mysql` has the aliased
+  UPDATE and DELETE that must name their alias twice and the upsert
+  with no conflict target; `sqlite` has no RIGHT or FULL JOIN, so the
+  join-placement shapes cannot arise there; `clickhouse` has no UPDATE,
+  no DELETE, no upsert, no relations, no cache and no set operations,
+  and its cross-tenant overwrite needs no statement at all, because a
+  merging engine folds rows sharing a sorting key in the background —
+  which is where its check went, as `ErrTenantNotInSortingKey`. Each
+  package's own "where the automatic scoping stops" list says what the
+  predicates do not reach in that dialect. Read the list for the
+  dialect you are on, not this one.
+
+- **The scoping is enforced by checks that read the package's own
+  source** (`drops/pg`). A hand-written list of "helpers that must
+  carry the tenant axis" went stale after every round, because it was
+  written from what somebody had looked at. The census checks in
+  `pg/scopefunc_test.go` and `pg/authzscope_internal_test.go` derive
+  theirs: every exported constructor that takes an operand and returns
+  an expression, every builder method that takes one, every predicate
+  producer. A helper added tomorrow fails the census until it is
+  exercised with a scoped subquery. `pg/scopecheckself_test.go` points
+  each check at a package built to slip past it, so the checks are
+  themselves checked, and `tenantpolicy_test.go` pins the normative
+  policy block across a DERIVED set of dialects rather than a list of
+  four paths.
+
+- **Where the boundary is, said plainly.** These predicates are not the
+  isolation boundary. PostgreSQL row-level security is, and this layer
+  is what makes the common path fast, legible and correct on top of it.
+  No amount of further work here changes that, for three reasons none
+  of which is a bug: `drops.Builder` is an exported escape hatch and
+  what is assembled on one is text drops never sees; the enforcement
+  checks are an AST walk over one package, which makes them a lint, and
+  a lint is advice to exactly the person it constrains; and `Unscoped`
+  exists and has to, because reading across tenants is a real
+  requirement and a layer the guarded code can switch off is not a
+  layer that code sits behind. So declare RLS on every table holding
+  tenant rows — `Table.EnableRLS` and `Table.AddPolicy` emit it into
+  the migration — and establish the request's identity with
+  `DB.InTxAs`, above. `drops/sqlite`, `drops/mysql` and
+  `drops/clickhouse` have nothing equivalent to sit on: there the
+  predicates are the whole of what there is, which is what makes each
+  package's list of where they stop load-bearing rather than a
+  footnote. `pg/doc.go` carries the argument in full.
 - **`pg.DB.InTxAs` and `pg.Session`** — drops could WRITE a row-level
   security policy (`Table.EnableRLS`, `NewPolicy`, `Table.AddPolicy`)
   and could not SATISFY one: nothing in the package made a pooled
@@ -156,6 +234,47 @@ once a 1.0 is cut.
   statement with no tenant to name still refuses the whole INSERT.
 
 ### Changed
+- **BREAKING: a table that declares a tenant axis refuses every
+  statement whose ctx carries no tenant** (`drops/pg`, `drops/sqlite`,
+  `drops/mysql`, `drops/clickhouse`). Including one built straight from
+  `db.Select()`, `db.Update()`, `db.Delete()` or `db.Insert()`, with no
+  `Entity` anywhere in the call, and including the child query of an
+  eager-loaded relation. The error is `ErrTenantMissing`, wrapped with
+  the table and column that refused, and nothing is sent. This is the
+  point of the feature and it is also the upgrade: code that queried a
+  now-scoped table on a ctx with no tenant used to get every tenant's
+  rows and now gets an error. A query that legitimately spans tenants
+  says `Unscoped()`, where a reviewer can see it.
+- **BREAKING: `ToSQL` no longer renders the whole statement for a
+  scoped table** (`drops/pg`, `drops/sqlite`, `drops/mysql`,
+  `drops/clickhouse`). Context filters are resolved against a ctx, and
+  `ToSQL` has none, so the tenant predicate and the authorization guard
+  are missing from what it returns. It is for inspection. `ToSQLCtx` is
+  the ctx-aware twin and is what a request would send — log that one,
+  and assert on that one in tests.
+- **BREAKING: `drops/sqlite`'s Entity-injected tenant predicate is
+  gone.** The axis is a table filter there like everywhere else. An
+  entity that relied on the injected version keeps working; a query
+  built without an entity, which used to carry nothing, is now scoped
+  and now refuses.
+- **A nil ctx tenant is no tenant** (`drops/pg`, `drops/sqlite`,
+  `drops/mysql`, `drops/clickhouse`). `WithTenant` takes an `any`, so a
+  `(*string)(nil)` read out of a request struct arrives inside an
+  interface that is not itself nil, and `TenantFrom` reported a tenant
+  that was not there. Every path that needs one now refuses with
+  `ErrTenantMissing` before a statement is rendered. A zero that is not
+  a nil — an empty string, a zero int — is still a tenant: the schema
+  can store it and it addresses the same rows on the way back out. See
+  the Fixed entry for what the old answer wrote.
+- **`Entity.Create` and `Entity.CreateMany` stamp the tenant before
+  running validators** (`drops/clickhouse`). They ran the validators
+  first, so every validator in that dialect saw the tenant field as the
+  caller left it — zero on the ordinary path. A validator that reads
+  the row's tenant now reads the value the statement will write, which
+  is what `drops/pg` has always done and what section 2 of the
+  normative policy block says. A validator that asserted the field was
+  EMPTY on the way in will now fail; that assertion was reading the
+  wrong side of the stamp.
 - **`NewEntity` now rejects a column bound to no struct field**
   (`drops/pg`, `drops/sqlite`, `drops/clickhouse`). It used to skip it
   silently, so a renamed field or a mistyped `drop:` tag removed the
@@ -165,6 +284,58 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **`ScopeByTenant` stored the handle it was passed rather than the
+  entity's own** (`drops/sqlite`, `drops/clickhouse`). `ScopeByTenant`
+  takes a `ColRef`, so a handle taken off `Table.As` enters legally —
+  and in a codegen'd schema, where the alias is how a query spells the
+  table, it is the handle in scope at the call site. The predicate is
+  rendered into statements that name the DECLARED relation, so the
+  stored alias handle qualified with an alias no such query has a FROM
+  entry for: `SELECT * FROM "zz_rows" WHERE ("u"."tenantId" = ?)`. The
+  server cannot resolve `"u"`, so this failed closed — but it failed at
+  the server, on a statement Go was happy with, and the same handle is
+  what the write side reads to stamp. `drops/pg` fixed this in
+  `29b48af` and `drops/mysql` matched; both now assert the whole
+  statement and its arguments for an entity scoped through an alias
+  handle, so the question is asked of four dialects rather than two.
+- **A typed nil on the ctx wrote a row belonging to nobody**
+  (`drops/pg`, `drops/sqlite`, `drops/mysql`, `drops/clickhouse`).
+  `TenantFrom` reported a tenant for any ctx value that was not the nil
+  interface, and a nil of some type is not that:
+  `Create(db, WithTenant(ctx, (*string)(nil)), &row)` returned no error
+  and inserted `tenantId = NULL`. That is the "hand it to no tenant at
+  all" outcome the write side exists to rule out — the row is invisible
+  to every later request including the one that wrote it, and the
+  insert is reported as a success. Reads on the same ctx bound NULL
+  into the predicate, where it matches nothing, so the pair orphaned
+  rows rather than leaking them. Now refused on both sides.
+- **Three more sentences about tenancy that were not true.** The
+  normative policy block said the axis stamp runs before the
+  validators, so that a validator reads the row as it will be WRITTEN;
+  `drops/clickhouse`, the only dialect other than `pg` with validators,
+  ran them the other way round — fixed above, and the block now names
+  the surface, since `sqlite` and `mysql` register no validators at
+  all. "Nothing exported asks a `*Table` which filters it carries" was
+  false in `sqlite` and `clickhouse`, which export
+  `Table.DefaultFilters`; the sentence was always about the CONTEXT
+  filters and now says so. And `drops/pg` documented
+  `ErrTenantMismatch` as returned by `Create`, while returning it from
+  `Update`, `CreateMany`, `UpsertMany`, `CopyFrom`, the INSERT
+  builder's axis check and `Patch`'s; it now says what the other three
+  already said.
+- **The string guard in `sameTenant` was documented as preventing
+  something the round trip already prevents** (`drops/pg`,
+  `drops/sqlite`, `drops/mysql`, `drops/clickhouse`). Four files and
+  the policy block said the guard is what stops a numeric tenant owning
+  a text column's row. It is not: nothing converts a string back to an
+  integer, so `65` and `"A"` are refused by the two-way conversion with
+  the guard removed. What the guard actually refuses is `[]byte` and
+  `[]rune`, which convert onto a string and back losing nothing —
+  without it a ctx tenant of `[]byte("acme")` owns a row whose text
+  tenant column holds `"acme"`. The behaviour is unchanged and correct;
+  the description is now the one the code has, and each dialect asserts
+  both halves, including that a caller's own named string type still
+  names the same tenant as the string a column binds.
 - **A column handle taken off another table rendered as this table's
   tenant column and was not recognised as it** (`drops/pg`,
   `drops/sqlite`, `drops/mysql`, `drops/clickhouse`). Eleven rounds of

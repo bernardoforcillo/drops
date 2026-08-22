@@ -180,6 +180,14 @@ joined table, a CTE body, a subquery operand, an eager-loaded edge, the
 predicate another table's filter answers with — and a ctx with no
 tenant is refused before anything is sent.
 
+A nil is no tenant. `WithTenant` takes an `any`, so a `(*string)(nil)`
+read out of a request struct arrives inside an interface that is not
+itself nil; it is refused exactly as an absent tenant is, rather than
+stamping `NULL` onto a row that then belongs to nobody. A zero that is
+not a nil — an empty string, a zero int — is a tenant like any other:
+the schema can store it and it addresses the same rows on the way back
+out.
+
 ```go
 Posts.ContextFilter(pg.TenantFilter(PostTenantID)).
     ScopeWritesByTenant(PostTenantID)
@@ -240,6 +248,9 @@ The rules are written down once rather than per dialect. Each package's
 `tenant.go` carries a block delimited `THE TENANT POLICIES —
 NORMATIVE`, byte-identical in all four and pinned by a root-level test
 that fails when one drifts by a word, by whitespace, or by reordering.
+The set of dialects it pins is derived from the source — every package
+declaring `WithTenant` — rather than listed, so a fifth dialect that
+carried no block would fail rather than pass unnoticed.
 It states what counts as the same tenant (a round-trip conversion, so a
 truncating pair cannot compare equal), what may assign the axis
 (`Create` and `Update` stamp and refuse a mismatch; `Patch` refuses any

@@ -308,6 +308,12 @@ reach further than the entity they are spelled on:
   refuses when the ctx carries none. Widen one statement with
   `Unscoped()`, one relation edge with `RelConfig.Unscoped()`.
 
+  The handle it is given is normalised to the entity's own: a column
+  taken off `Table.As` names the same axis as the declared one, and
+  what is stored is the declared handle, because the predicate has to
+  qualify with the table the entity queries rather than with an alias
+  no such query names.
+
   It is not the isolation boundary, and the `pg` package doc says so
   under "The predicates are not the boundary". PostgreSQL row-level
   security is the boundary; these predicates are the layer that makes
@@ -347,7 +353,8 @@ and each package's `tenant.go` for what the scoping does not reach.
 The rules themselves are written down once. Each dialect's `tenant.go`
 carries a block delimited `THE TENANT POLICIES — NORMATIVE` that is
 byte-identical in all four, and a root-level test fails when one of
-them drifts by a word. It states what counts as the same tenant, what
+them drifts by a word — over a set of dialects derived from the source
+rather than listed, so a fifth one carrying no block fails too. It states what counts as the same tenant, what
 may assign the axis, and what `Unscoped` gives up at each level, and it
 names the dialect differences inside the shared text so one set of
 words is true in four packages. Read it there rather than here: this

@@ -190,8 +190,13 @@ func TestCompositeUpsertConflictsOnBothColumns(t *testing.T) {
 
 func TestCompositePatchKey(t *testing.T) {
 	fd := &fakeDriver{}
-	_, role := membershipTable()
-	_, err := ckEntity(t).PatchKey(pg.New(fd), context.Background(),
+	// The entity and the op's handle come from ONE table object.
+	// membershipTable() builds a fresh one per call, and a handle off a
+	// second "memberships" is a handle for a table this entity does not
+	// query — which Patch now refuses as [pg.ErrForeignColumn], because
+	// it renders as this table's column while being no such thing.
+	tbl, role := membershipTable()
+	_, err := pg.NewEntity[membership](tbl).PatchKey(pg.New(fd), context.Background(),
 		[]any{int64(1), int64(2)},
 		pg.Set(role, "admin"),
 	)
@@ -205,8 +210,8 @@ func TestCompositePatchKey(t *testing.T) {
 }
 
 func TestPatchOnCompositeKeyRejectsSingleValue(t *testing.T) {
-	_, role := membershipTable()
-	_, err := ckEntity(t).Patch(pg.New(&fakeDriver{}), context.Background(), int64(1), pg.Set(role, "admin"))
+	tbl, role := membershipTable()
+	_, err := pg.NewEntity[membership](tbl).Patch(pg.New(&fakeDriver{}), context.Background(), int64(1), pg.Set(role, "admin"))
 	if !errors.Is(err, pg.ErrKeyArity) {
 		t.Errorf("err = %v want ErrKeyArity", err)
 	}

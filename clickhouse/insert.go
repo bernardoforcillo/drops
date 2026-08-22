@@ -456,7 +456,7 @@ func checkTenantSortingKey(t *Table, axis *Column) error {
 		where = "its sorting key is (" + joinNames(t.OrderByColumns()) + ")"
 	}
 	return fmt.Errorf("%w: %q uses %s and %s, which does not include %s; add the tenant column to ORDER BY, or say Unscoped",
-		ErrTenantNotInSortingKey, t.Name(), engineName(t.engine), where, tenantAxisName(axis))
+		ErrTenantNotInSortingKey, t.Name(), engineName(t.engine), where, columnPath(axis))
 }
 
 func joinNames(names []string) string {
@@ -489,7 +489,7 @@ func joinNames(names []string) string {
 func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) ([][]ColumnValue, error) {
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(axis))
+		return nil, fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(axis))
 	}
 	out := make([][]ColumnValue, len(rows))
 	for r, row := range rows {
@@ -511,12 +511,12 @@ func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) 
 		case bindingLiteral:
 			if !sameTenant(bound, t) {
 				return nil, fmt.Errorf("%w: %s is bound to another tenant's value",
-					ErrTenantMismatch, tenantAxisName(axis))
+					ErrTenantMismatch, columnPath(axis))
 			}
 			out[r] = row
 		default:
 			return nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
-				ErrTenantMismatch, tenantAxisName(axis))
+				ErrTenantMismatch, columnPath(axis))
 		}
 	}
 	return out, nil

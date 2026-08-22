@@ -329,7 +329,7 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 	if axis := i.writeAxis(); axis != nil {
 		if i.orReplace {
 			return nil, fmt.Errorf("%w: %q is tenant-scoped on %s; use OrIgnore, an UPDATE, or say Unscoped",
-				ErrReplaceScoped, i.table.Name(), tenantAxisName(axis))
+				ErrReplaceScoped, i.table.Name(), columnPath(axis))
 		}
 		var err error
 		// Stamping rebuilds every row, so an INSERT into a table with a
@@ -388,7 +388,7 @@ func (i *InsertBuilder) writeAxis() *Column {
 func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) ([][]ColumnValue, error) {
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(axis))
+		return nil, fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(axis))
 	}
 	out := make([][]ColumnValue, len(rows))
 	for r, row := range rows {
@@ -410,12 +410,12 @@ func stampTenantColumn(ctx context.Context, axis *Column, rows [][]ColumnValue) 
 		case bindingLiteral:
 			if !sameTenant(bound, t) {
 				return nil, fmt.Errorf("%w: %s is bound to another tenant's value",
-					ErrTenantMismatch, tenantAxisName(axis))
+					ErrTenantMismatch, columnPath(axis))
 			}
 			out[r] = row
 		default:
 			return nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
-				ErrTenantMismatch, tenantAxisName(axis))
+				ErrTenantMismatch, columnPath(axis))
 		}
 	}
 	return out, nil

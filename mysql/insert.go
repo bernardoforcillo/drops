@@ -469,7 +469,7 @@ func (i *InsertBuilder) writeAxis() *Column {
 func stampTenantColumn(ctx context.Context, axis *Column, cols []*Column, rows [][]drops.Expression) ([]*Column, [][]drops.Expression, error) {
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return nil, nil, fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(axis))
+		return nil, nil, fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(axis))
 	}
 	at := -1
 	for j, c := range cols {
@@ -501,11 +501,11 @@ func stampTenantColumn(ctx context.Context, axis *Column, cols []*Column, rows [
 		case bindingLiteral:
 			if !sameTenant(bound, t) {
 				return nil, nil, fmt.Errorf("%w: %s is bound to another tenant's value",
-					ErrTenantMismatch, tenantAxisName(axis))
+					ErrTenantMismatch, columnPath(axis))
 			}
 		default:
 			return nil, nil, fmt.Errorf("%w: %s is bound to an expression drops cannot compare with the ctx tenant; bind a value, leave the column out, or say Unscoped",
-				ErrTenantMismatch, tenantAxisName(axis))
+				ErrTenantMismatch, columnPath(axis))
 		}
 	}
 	return cols, out, nil

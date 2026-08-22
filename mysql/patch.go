@@ -64,12 +64,31 @@ import (
 // helper serve both.
 type PatchOp = ColumnValue
 
+// ErrForeignColumn is returned by [Entity.PatchKey] when an op names a
+// column that is not a column of the entity's table.
+//
+// It is deliberately not [ErrTenantMismatch] and does not wrap it. A
+// handle taken off another table object is a bug whatever the column
+// holds — the statement it renders assigns a relation the query does
+// not name — and reporting it as a tenant problem would send the
+// caller to their tenancy rather than to the import that handed them
+// the wrong handle. That the tenant axis is one of the things this
+// refusal protects is a consequence of the rule, not its definition.
+//
+// Match it with errors.Is. The message names the handle's own table as
+// well as the entity's, because "tenantId" alone reads as the right
+// column and which table it came from is the whole mistake.
+var ErrForeignColumn = errors.New("drops/mysql: patch op names a column of another table")
+
 // Patch issues an UPDATE applying ops to the row whose primary key
 // equals id. It returns the result, so a caller can tell "no such row"
 // from "row updated" without a second SELECT.
 //
 // An op naming the tenant column is [ErrTenantMismatch]: the axis is
-// what addresses the row, never something a patch assigns.
+// what addresses the row, never something a patch assigns. An op
+// naming a column of some OTHER table is [ErrForeignColumn], whatever
+// the column is — including the one that renders as this table's
+// tenant axis.
 func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (drops.Result, error) {
 	return e.PatchKey(db, ctx, []any{id}, ops...)
 }
@@ -83,6 +102,33 @@ func (e *Entity[T]) Patch(db *DB, ctx context.Context, id any, ops ...PatchOp) (
 func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...PatchOp) (drops.Result, error) {
 	if len(ops) == 0 {
 		return nil, errors.New("drops/mysql: Patch requires at least one operation")
+	}
+	// Every op has to name a column of the entity's own table, and this
+	// runs before the axis check below because it is what makes the
+	// axis check mean anything.
+	//
+	// The SET list renders the bare column name, so a handle for the
+	// same-named column of a DIFFERENT table object renders exactly
+	// like this table's own and the server writes the row this UPDATE
+	// addresses — while [Column.key], which collapses alias copies onto
+	// the column they were declared as, calls the two handles
+	// strangers. The axis check compares by key, so a foreign
+	// OtherTable.TenantID walked past it and rendered
+	// SET "tenantId" = ? beside a WHERE clause still addressing the
+	// ctx tenant: the transfer that check exists to refuse, one
+	// character away in any schema whose codegen gives every table its
+	// own <Table>Cols.TenantID.
+	//
+	// The rule is wider than the axis on purpose, because the mistake
+	// is. An op naming another table's column is a bug whatever the
+	// column holds — nothing in the statement names that relation — so
+	// it is refused as one, and the axis case stops being reachable as
+	// a side effect. See [ErrForeignColumn].
+	for _, op := range ops {
+		if !e.ownsColumn(op.column()) {
+			return nil, fmt.Errorf("%w: %s is not a column of %q",
+				ErrForeignColumn, columnPath(op.column()), e.table.Name())
+		}
 	}
 	// The tenant column is an axis, never an assignment. An op naming
 	// it renders SET "tenantId" = ? beside a WHERE clause that still
@@ -101,7 +147,7 @@ func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...Patc
 		for _, op := range ops {
 			if op.column().key() == axis.key() {
 				return nil, fmt.Errorf("%w: %s is an axis, not an assignment",
-					ErrTenantMismatch, tenantAxisName(axis))
+					ErrTenantMismatch, columnPath(axis))
 			}
 		}
 	}
@@ -111,6 +157,25 @@ func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...Patc
 	}
 	upd := db.Update(e.table).Set(ops...).Where(pred)
 	return upd.Exec(ctx)
+}
+
+// ownsColumn reports whether c is one of the entity's table's own
+// columns.
+//
+// The lookup goes through the table's name index and only then
+// compares [Column.key], so an alias handle for one of the table's
+// columns answers yes — an alias is a query-scope rename of the same
+// column — while another table's column of the same name answers no.
+// Asking key alone cannot tell those two apart: to key, a foreign
+// handle is simply unequal to everything, which is indistinguishable
+// from "not the column I asked about" and is how a handle that renders
+// as the tenant axis came to be read as unrelated to it.
+func (e *Entity[T]) ownsColumn(c *Column) bool {
+	if c == nil {
+		return false
+	}
+	own := e.table.Col(c.Name())
+	return own != nil && own.key() == c.key()
 }
 
 // ----------------------------------------------------------------------

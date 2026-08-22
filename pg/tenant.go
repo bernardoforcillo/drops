@@ -288,7 +288,7 @@ var ErrTenantMismatch = errors.New("drops/pg: row tenant disagrees with ctx tena
 // that wrapping is the whole diagnostic.
 func TenantFilter(col ColRef) ContextFilterFunc {
 	c := col.col()
-	where := tenantAxisName(c)
+	where := columnPath(c)
 	return func(ctx context.Context) (drops.Expression, error) {
 		t, ok := TenantFrom(ctx)
 		if !ok {
@@ -298,11 +298,17 @@ func TenantFilter(col ColRef) ContextFilterFunc {
 	}
 }
 
-// tenantAxisName renders a tenant column as "table.column" for an error
-// message, or as the bare column name for a handle that has not been
-// added to a table — which is a declaration mistake, and one this
-// message should describe rather than panic over.
-func tenantAxisName(c *Column) string {
+// columnPath renders a column as "table.column" for an error message,
+// or as the bare column name for a handle that has not been added to a
+// table — which is a declaration mistake, and one this message should
+// describe rather than panic over.
+//
+// The table it names is the one the HANDLE was declared on rather than
+// the one the statement runs against, and that is what makes it worth
+// having beyond the tenant errors: a refusal reading "posts.tenantId"
+// under a statement about "users" says which mistake was made, where
+// the bare "tenantId" would read as the right column.
+func columnPath(c *Column) string {
 	if c == nil {
 		return "?"
 	}
@@ -378,7 +384,7 @@ func (e *Entity[T]) tenantPredicate(ctx context.Context) (drops.Expression, erro
 	}
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(e.tenantCol))
+		return nil, fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(e.tenantCol))
 	}
 	return Eq(e.tenantCol, t), nil
 }
@@ -438,7 +444,7 @@ func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
 	}
 	t, ok := TenantFrom(ctx)
 	if !ok {
-		return fmt.Errorf("%w: %s", ErrTenantMissing, tenantAxisName(col))
+		return fmt.Errorf("%w: %s", ErrTenantMissing, columnPath(col))
 	}
 	fv := reflect.ValueOf(r).Elem().FieldByIndex(field)
 	if fv.IsZero() {
@@ -465,12 +471,12 @@ func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
 			// thinks it wrote under is not the one on the row.
 			if !ctxTenant.Type().ConvertibleTo(fv.Type()) {
 				return fmt.Errorf("%w: %s cannot hold the ctx tenant",
-					ErrTenantMismatch, tenantAxisName(col))
+					ErrTenantMismatch, columnPath(col))
 			}
 			conv := ctxTenant.Convert(fv.Type())
 			if !sameTenant(conv.Interface(), t) {
 				return fmt.Errorf("%w: %s cannot hold the ctx tenant",
-					ErrTenantMismatch, tenantAxisName(col))
+					ErrTenantMismatch, columnPath(col))
 			}
 			ctxTenant = conv
 		}
@@ -486,7 +492,7 @@ func (e *Entity[T]) stampTenant(ctx context.Context, r *T) error {
 	// column's exact type.
 	if !sameTenant(fv.Interface(), t) {
 		return fmt.Errorf("%w: %s carries another tenant's value",
-			ErrTenantMismatch, tenantAxisName(col))
+			ErrTenantMismatch, columnPath(col))
 	}
 	return nil
 }

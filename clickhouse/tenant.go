@@ -74,9 +74,14 @@ import (
 // # Where the automatic scoping stops
 //
 // These predicates are not an isolation boundary the way a server-side
-// policy is, and ClickHouse has no equivalent of PostgreSQL row-level
-// security to put underneath them. So the list below is not a footnote,
-// it is the whole of what is left when the predicates do not reach:
+// policy is. ClickHouse does have one to put underneath them — row
+// policies, declared with [RowPolicy] — but it covers SELECT alone:
+// there is no WITH CHECK and FOR INSERT does not parse, so nothing
+// server-side constrains what a write may leave behind. On the write
+// side these predicates ARE the whole of it, and on the read side they
+// are a floor only where the deployment declared a policy. So the list
+// below is not a footnote, it is what is left when the predicates do
+// not reach:
 //
 //   - a raw statement, through [DB.Exec] or [DB.Query], carries what
 //     the caller wrote and nothing else;

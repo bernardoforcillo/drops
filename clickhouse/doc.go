@@ -65,12 +65,27 @@
 //
 // It is the same mechanism drops/pg, drops/sqlite and drops/mysql
 // carry — normalise the dialect name and diff clickhouse/resolve.go
-// against any of theirs and the same file comes back. What does NOT
-// come across from drops/pg is the boundary underneath: PostgreSQL
-// row-level security is what those predicates sit on top of, and
-// ClickHouse has no equivalent. Here the predicates are the whole of
-// what there is, which makes tenant.go's list of where they stop
-// load-bearing rather than a footnote.
+// against any of theirs and the same file comes back. What comes
+// across from drops/pg only in HALF is the boundary underneath.
+//
+// PostgreSQL row-level security is what those predicates sit on top of
+// there. ClickHouse has a server-side mechanism of its own — row
+// policies, CREATE ROW POLICY … USING <cond> TO <roles>, shipped since
+// 20.1 — and this package declares one: see [RowPolicy]. Until it did,
+// this paragraph said ClickHouse had no equivalent at all, which sent
+// a reader deploying a multi-tenant ClickHouse away one step before
+// the thing the server has.
+//
+// The half that does not come across is writes. A ClickHouse row
+// policy filters SELECT and only SELECT: there is no WITH CHECK and
+// FOR INSERT is a syntax error, so a principal that can write can
+// write any tenant id it likes. On the READ side the predicates have a
+// floor under them if the deployment declares one; on the WRITE side
+// they are the whole of what there is. rowpolicy.go says what that
+// costs, what drops verified against a running server and what it did
+// not, and why there is no runtime identity surface here to match
+// drops/pg's. Either way tenant.go's list of where the predicates stop
+// is load-bearing rather than a footnote.
 //
 // What this dialect's version of the feature does NOT have, because the
 // surface it would attach to does not exist here:
@@ -109,4 +124,12 @@
 //   - ON CONFLICT (handled by engine choice, e.g. ReplacingMergeTree)
 //   - Foreign keys / referential integrity (ClickHouse has none)
 //   - Schema introspection and Push (planned)
+//   - policy drift tracking. drops/pg carries its policies through
+//     Snapshot, Diff and Push; [RowPolicy] renders DDL and stops
+//     there. That is a scope decision rather than the missing half of
+//     the item above: a ClickHouse row policy lives in the server's
+//     ACCESS storage beside users and roles, not in the table's
+//     metadata, so it would not belong in a schema snapshot even once
+//     this package has one. Put the statement in a migration, or run
+//     it through [DB.ExecExpr]. See rowpolicy.go.
 package clickhouse

@@ -264,28 +264,40 @@ func TestTenantPolicyBlockIsIdenticalInEveryDialect(t *testing.T) {
 		// hundred lines of prose twice: the failure a reader of this
 		// output has is "which word moved", not "what does the block
 		// say".
-		wantLines := strings.Split(want, "\n")
-		gotLines := strings.Split(got, "\n")
-		for i := 0; i < len(wantLines) || i < len(gotLines); i++ {
-			var w, g string
-			if i < len(wantLines) {
-				w = wantLines[i]
-			}
-			if i < len(gotLines) {
-				g = gotLines[i]
-			}
-			if w == g {
-				continue
-			}
+		if n, w, g, ok := firstLineDifference(want, got); ok {
 			t.Errorf("%s: policy block differs from %s at block line %d\n  %s: %q\n  %s: %q",
-				path, ref, i+1, ref, w, path, g)
-			break
+				path, ref, n, ref, w, path, g)
 		}
-		if len(wantLines) != len(gotLines) {
+		if wantLines, gotLines := strings.Count(want, "\n"), strings.Count(got, "\n"); wantLines != gotLines {
 			t.Errorf("%s: policy block is %d lines, %s has %d",
-				path, len(gotLines), ref, len(wantLines))
+				path, gotLines+1, ref, wantLines+1)
 		}
 	}
+}
+
+// firstLineDifference returns the 1-based line where want and got
+// first differ, and the two lines. ok is false when they are equal.
+//
+// Both comparisons in this file dump prose measured in hundreds of
+// lines, and the question a reader of a failure has is which word
+// moved rather than what the text says. A short line pair answers it;
+// two full copies bury it.
+func firstLineDifference(want, got string) (line int, w, g string, ok bool) {
+	wantLines := strings.Split(want, "\n")
+	gotLines := strings.Split(got, "\n")
+	for i := 0; i < len(wantLines) || i < len(gotLines); i++ {
+		w, g = "", ""
+		if i < len(wantLines) {
+			w = wantLines[i]
+		}
+		if i < len(gotLines) {
+			g = gotLines[i]
+		}
+		if w != g {
+			return i + 1, w, g, true
+		}
+	}
+	return 0, "", "", false
 }
 
 // TestTenantPolicyBlockNamesEveryDialectItIsIn closes the other half of
@@ -308,6 +320,109 @@ func TestTenantPolicyBlockNamesEveryDialectItIsIn(t *testing.T) {
 				"a dialect the block does not count is one its prose is wrong about", named)
 		}
 	}
+}
+
+// tenancyRules are the functions section 4 of the block is talking
+// about when it says the rules stay byte-identical in four packages.
+//
+// A list, where the rest of this file derives its sets, and for the
+// opposite reason: what makes a function one of these is that the
+// block makes a claim about it, which is a fact about the prose and
+// not about the package. Deriving it from what tenant.go happens to
+// declare would sweep in stampTenant and tenantWriteAxis, which read
+// each dialect's own column and entity types and cannot be identical.
+// The DIALECTS are still derived, so a fifth is asked the same
+// question rather than exempted by not being on a list.
+var tenancyRules = []string{
+	"sameTenant",
+	"namesAxis",
+	"columnPath",
+	"isNilTenant",
+	"TenantFrom",
+}
+
+// TestTenancyRulesAreIdenticalInEveryDialect pins the sentence in
+// section 4 that says moving the identifier fold out to ident.go is
+// what leaves these rules byte-identical.
+//
+// Without it that sentence is a claim about the code with nothing
+// keeping it, which is the defect the block itself was written to
+// close one level down. The rules ARE the policies in executable form
+// — what counts as the same tenant, which handle names the axis — so
+// a dialect that edits one of them alone has answered a policy
+// question locally again, and the four-file diff that used to be the
+// only way to notice is what this replaces.
+//
+// The fold is deliberately not among them. It is the one rule whose
+// answer is the server's rather than the policy's, it lives in
+// ident.go for that reason, and TestTenantPolicyBlockSurfaceClaimsHold
+// checks it is still there.
+func TestTenancyRulesAreIdenticalInEveryDialect(t *testing.T) {
+	dirs := dialectPackages(t)
+	if len(dirs) < 2 {
+		t.Fatalf("found %d dialect packages (%v): nothing to compare", len(dirs), dirs)
+	}
+	for _, rule := range tenancyRules {
+		texts := make(map[string]string, len(dirs))
+		for _, dir := range dirs {
+			src := declarationText(t, policyFileIn(t, dir), rule)
+			if src == "" {
+				t.Errorf("%s declares no %s: the policy block states this rule for every "+
+					"dialect it is in, and a dialect missing it has the rule somewhere "+
+					"the block does not describe", dir, rule)
+				continue
+			}
+			texts[dir] = src
+		}
+		if len(texts) != len(dirs) {
+			continue
+		}
+		// The reference is whichever dialect sorts first, only because
+		// the comparison needs one. The rule is not that package's to
+		// change alone.
+		ref := dirs[0]
+		for _, dir := range dirs[1:] {
+			if texts[dir] == texts[ref] {
+				continue
+			}
+			n, w, g, _ := firstLineDifference(texts[ref], texts[dir])
+			t.Errorf("%s and %s have drifted apart on %s, at line %d of the declaration\n  %s: %q\n  %s: %q",
+				ref, dir, rule, n, ref, w, dir, g)
+		}
+	}
+}
+
+// declarationText returns the source of the top-level function called
+// name in file, its doc comment included, or "" when there is none.
+//
+// The doc comment is part of what is compared on purpose: these
+// comments carry the reason each rule is written the way it is — the
+// truncating conversion, the []byte that round-trips onto a string —
+// and a dialect whose copy explains a different reason has drifted
+// whether or not the statements still match.
+func declarationText(t *testing.T, file, name string) string {
+	t.Helper()
+	src, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, src, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Recv != nil || fd.Name.Name != name {
+			continue
+		}
+		start := fd.Pos()
+		if fd.Doc != nil {
+			start = fd.Doc.Pos()
+		}
+		return string(src[fset.Position(start).Offset:fset.Position(fd.End()).Offset])
+	}
+	return ""
 }
 
 // TestTenantPolicyBlockSurfaceClaimsHold checks the sentences in the

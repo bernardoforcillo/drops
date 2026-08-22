@@ -308,6 +308,56 @@ func TestATenantGuardBindsEveryConnectionAndIsRemovableByAnyOfThem(t *testing.T)
 	}
 }
 
+// The same fact by the other route, because a deployment that
+// withholds DROP TRIGGER by convention has withheld nothing:
+// PRAGMA writable_schema = ON makes sqlite_master an ordinary table
+// and the guard an ordinary row to delete.
+//
+// The one nuance worth recording: the deletion takes effect when the
+// schema is next parsed. The connection that ran it kept firing the
+// trigger it had already loaded, and the guard was gone for the next
+// connection to open the file.
+func TestWritableSchemaRemovesAGuardLikeAnyOtherRow(t *testing.T) {
+	db, sqlDB, dsn := openSQLiteFile(t)
+	ctx := context.Background()
+
+	docs := sqlite.NewTable("gd_ws")
+	sqlite.Add(docs, sqlite.BigInt("id").PrimaryKey())
+	tenant := sqlite.Add(docs, sqlite.Text("tenantId"))
+	docs.ScopeWritesByTenant(tenant)
+	exec(t, db, sqlite.CreateTable(docs))
+	applyGuard(t, db, sqlite.CreateTenantGuard(sqlite.TenantGuardFor(docs)))
+
+	_, err := db.Exec(ctx, `INSERT INTO "gd_ws" VALUES (1, NULL)`)
+	wantRefused(t, err, `"gd_ws"."tenantId" is null`)
+
+	for _, stmt := range []string{
+		`PRAGMA writable_schema = ON`,
+		`DELETE FROM sqlite_master WHERE "type" = 'trigger' AND "name" = 'gd_ws_tenantGuard_ins'`,
+		`PRAGMA writable_schema = OFF`,
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// Still refused on this connection: it holds the schema it parsed.
+	_, err = db.Exec(ctx, `INSERT INTO "gd_ws" VALUES (1, NULL)`)
+	wantRefused(t, err, `"gd_ws"."tenantId" is null`)
+
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.ExecContext(ctx, `INSERT INTO "gd_ws" VALUES (2, NULL)`); err != nil {
+		t.Fatalf("the guard survived being deleted out of sqlite_master: %v", err)
+	}
+}
+
 // Why a trigger and not a CHECK, part one: a CHECK is switchable at
 // runtime by the code it constrains, and a trigger is not.
 //
@@ -623,5 +673,44 @@ func TestAlterTableAddsANamedCheckAndNothingElse(t *testing.T) {
 		if _, err := reopened.ExecContext(ctx, stmt); err == nil {
 			t.Fatalf("SQLite accepted %q; ddl.go says it does not", stmt)
 		}
+	}
+}
+
+// Why a trigger and not a CHECK, part three: the two guards a CHECK
+// cannot express at all.
+//
+// tenantguard.go gives three reasons for the guards being triggers.
+// The switchable one is above; these are the two structural ones, and
+// they are asserted here rather than asserted in a comment.
+func TestACheckCannotExpressTheCrossRowOrCrossTableGuards(t *testing.T) {
+	db := openSQLite(t)
+	ctx := context.Background()
+
+	if _, err := db.Exec(ctx,
+		`CREATE TABLE "gd_ck_users" ("id" INTEGER PRIMARY KEY, "tenantId" TEXT)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// The parent-agreement guard has no CHECK form: a CHECK may not
+	// contain a subquery, so it cannot look at another row at all.
+	_, err := db.Exec(ctx,
+		`CREATE TABLE "gd_ck_a" ("id" INTEGER PRIMARY KEY, "tenantId" TEXT, "authorId" INTEGER, `+
+			`CHECK ("tenantId" IS (SELECT "tenantId" FROM "gd_ck_users" WHERE "id" IS "authorId")))`)
+	if err == nil {
+		t.Fatalf("a CHECK containing a subquery was accepted; tenantguard.go says SQLite refuses it")
+	}
+	if !strings.Contains(err.Error(), "subqueries prohibited in CHECK constraints") {
+		t.Fatalf("refused for some other reason: %v", err)
+	}
+
+	// The immutability guard has none either: a CHECK sees one row and
+	// there is no OLD to compare it against.
+	_, err = db.Exec(ctx,
+		`CREATE TABLE "gd_ck_b" ("id" INTEGER PRIMARY KEY, "tenantId" TEXT CHECK ("tenantId" IS OLD."tenantId"))`)
+	if err == nil {
+		t.Fatalf("a CHECK naming OLD was accepted; tenantguard.go says there is no OLD in one")
+	}
+	if !strings.Contains(err.Error(), "OLD") {
+		t.Fatalf("refused for some other reason: %v", err)
 	}
 }

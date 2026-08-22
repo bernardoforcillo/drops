@@ -85,8 +85,9 @@ import (
 // wants to see more. A ClickHouse row policy binds to a user. A MySQL
 // definer-rights view binds to an account. SQLite has none of those
 // to bind to: whoever can write the file can DROP TRIGGER, or set
-// PRAGMA writable_schema = ON and delete the row out of sqlite_master.
-// Both measured.
+// PRAGMA writable_schema = ON and delete the guard out of sqlite_master
+// like any other row — both measured, the second taking effect when the
+// schema is next parsed.
 //
 // So a tenant guard holds against MISTAKES and not against an
 // adversary — against the raw statement, the wrong join, the backfill

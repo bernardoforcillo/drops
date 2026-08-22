@@ -372,7 +372,16 @@ func (s *SelectBuilder) Where(preds ...drops.Expression) *SelectBuilder {
 // It is statement-wide rather than per table on purpose: a caller who
 // says Unscoped is describing this query's authority, and a flag that
 // unscoped the FROM table while a joined one kept its tenant axis would
-// read as the narrower claim while making the wider one.
+// answer with a silently narrowed slice of the rows that were asked
+// for.
+//
+// It clears the context filters too because a half-scoped statement is
+// the worse of the two answers: a caller who reaches for Unscoped to
+// read soft-deleted rows and instead gets ErrTenantMissing has learned
+// nothing about the row they were after, and one who gets the tenant
+// predicate they did not ask for silently reads a subset. Scope such a
+// query explicitly — Unscoped().Where(clickhouse.Eq(TenantID, id)) —
+// where the intent is on the page.
 //
 // It does not reach into a CTE body or a subquery: those are statements
 // of their own and keep their own scoping, which is also how to unscope

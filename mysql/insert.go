@@ -239,15 +239,24 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 // ErrNoRows is returned when an INSERT is executed with no rows.
 var ErrNoRows = errors.New("drops/mysql: INSERT has no rows")
 
-// Unscoped opts this INSERT out of the table's tenant axis: the ctx
-// tenant is neither stamped nor required, and an ON DUPLICATE KEY
-// UPDATE is left exactly as it was written.
+// Unscoped opts out of the tenant axis for this INSERT: the ctx tenant
+// is neither stamped onto the rows nor required, and a ctx carrying no
+// tenant is not an error. An ON DUPLICATE KEY UPDATE branch is left
+// exactly as it was written.
 //
-// It is the escape hatch for the statements that legitimately write
-// rows for tenants other than the one on the ctx, or for no tenant at
-// all — a seeder, a migration backfill, an admin tool. It says so at
-// the call site, which is the point: the alternative is a package-level
-// switch nobody sees in review.
+// It is the escape hatch a migration, a backfill, a seed loader or an
+// admin tool needs — the statements that legitimately write rows for
+// tenants other than the one on the ctx, or for no tenant at all. Say
+// which tenant each row belongs to by binding the column yourself. It
+// says so at the call site, where a reviewer reads it, which is the
+// whole difference between this and a package-level switch nobody sees
+// in review.
+//
+// It does not reach the statements written inside this one: a subquery
+// bound as a value is a statement of its own and keeps its own
+// scoping, exactly as [SelectBuilder.Unscoped] leaves a subquery's
+// scoping alone. Unscoping one part of a write and no other is done by
+// saying Unscoped on that part's builder.
 func (i *InsertBuilder) Unscoped() *InsertBuilder { i.unscoped = true; return i }
 
 // ToSQL renders the statement and its arguments.

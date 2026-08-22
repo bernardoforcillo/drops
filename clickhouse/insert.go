@@ -64,10 +64,22 @@ func (i *InsertBuilder) Columns(cols ...ColRef) *InsertBuilder {
 }
 
 // Unscoped opts out of the tenant axis for this INSERT: the ctx tenant
-// is neither stamped nor checked, and a ctx with no tenant is not an
-// error. It is for the statement that legitimately writes rows for
-// tenants other than the ctx one — a backfill, a replay — and says
-// which tenant each row belongs to by binding the column itself.
+// is neither stamped onto the rows nor required, and a ctx carrying no
+// tenant is not an error.
+//
+// It is the escape hatch a migration, a backfill, a seed loader or an
+// admin tool needs — the statements that legitimately write rows for
+// tenants other than the one on the ctx, or for no tenant at all. Say
+// which tenant each row belongs to by binding the column yourself. It
+// says so at the call site, where a reviewer reads it, which is the
+// whole difference between this and a package-level switch nobody sees
+// in review.
+//
+// It does not reach the statements written inside this one: a subquery
+// bound as a value is a statement of its own and keeps its own
+// scoping, exactly as [SelectBuilder.Unscoped] leaves a subquery's
+// scoping alone. Unscoping one part of a write and no other is done by
+// saying Unscoped on that part's builder.
 //
 // Everything else about the statement is unchanged, including the
 // table's InsertHooks.

@@ -175,20 +175,27 @@ func (i *InsertBuilder) Returning(cols ...drops.Expression) *InsertBuilder {
 }
 
 // Unscoped opts out of the tenant axis for this INSERT: the ctx tenant
-// is neither stamped onto the rows nor required, and an ON CONFLICT DO
-// UPDATE branch is left exactly as it was written.
+// is neither stamped onto the rows nor required, and a ctx carrying no
+// tenant is not an error. An ON CONFLICT DO UPDATE branch is left
+// exactly as it was written.
 //
-// It is the escape hatch a migration, a backfill or a seed loader needs
-// — the statements that legitimately write rows for tenants other than
-// the one on the ctx, or for no tenant at all. It says so at the call
-// site, where a reviewer reads it, which is the whole difference
-// between this and the silence it replaced.
+// It is the escape hatch a migration, a backfill, a seed loader or an
+// admin tool needs — the statements that legitimately write rows for
+// tenants other than the one on the ctx, or for no tenant at all. Say
+// which tenant each row belongs to by binding the column yourself. It
+// says so at the call site, where a reviewer reads it, which is the
+// whole difference between this and a package-level switch nobody sees
+// in review.
 //
 // It does not reach the statements written inside this one: a subquery
-// bound as a value or written in a RETURNING term is a statement of its
-// own and keeps its own scoping, exactly as [SelectBuilder.Unscoped]
-// leaves a subquery's scoping alone. Unscoping one relation of a write
-// and no other is done by saying Unscoped on that relation's builder.
+// bound as a value, or written in a RETURNING term, is a statement of
+// its own and keeps its own scoping, exactly as
+// [SelectBuilder.Unscoped] leaves a subquery's scoping alone.
+// Unscoping one part of a write and no other is done by saying
+// Unscoped on that part's builder.
+//
+// Everything else about the statement is unchanged, including the
+// table's InsertHooks.
 func (i *InsertBuilder) Unscoped() *InsertBuilder {
 	i.unscoped = true
 	return i

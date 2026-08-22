@@ -48,14 +48,27 @@ func (i *InsertBuilder) OrIgnore() *InsertBuilder { i.orIgnore = true; return i 
 func (i *InsertBuilder) OrReplace() *InsertBuilder { i.orReplace = true; return i }
 
 // Unscoped opts out of the tenant axis for this INSERT: the ctx tenant
-// is neither stamped onto the rows nor required, and OR REPLACE is
-// permitted. Use it for a migration or an import that writes rows for
-// tenants other than the ctx one — and say which tenant each row
-// belongs to by binding the column yourself.
+// is neither stamped onto the rows nor required, and a ctx carrying no
+// tenant is not an error. INSERT OR REPLACE, which a scoped table
+// refuses with [ErrReplaceScoped], is permitted.
 //
-// It does not reach into a statement written inside this one: a
-// subquery bound as a value is a statement of its own and keeps its own
-// scoping.
+// It is the escape hatch a migration, a backfill, a seed loader or an
+// admin tool needs — the statements that legitimately write rows for
+// tenants other than the one on the ctx, or for no tenant at all. Say
+// which tenant each row belongs to by binding the column yourself. It
+// says so at the call site, where a reviewer reads it, which is the
+// whole difference between this and a package-level switch nobody sees
+// in review.
+//
+// It does not reach the statements written inside this one: a subquery
+// bound as a value, or written in a RETURNING term, is a statement of
+// its own and keeps its own scoping, exactly as
+// [SelectBuilder.Unscoped] leaves a subquery's scoping alone.
+// Unscoping one part of a write and no other is done by saying
+// Unscoped on that part's builder.
+//
+// Everything else about the statement is unchanged, including the
+// table's InsertHooks.
 func (i *InsertBuilder) Unscoped() *InsertBuilder { i.unscoped = true; return i }
 
 // Returning adds a RETURNING clause.

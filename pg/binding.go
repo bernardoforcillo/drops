@@ -27,6 +27,11 @@ type exprBinding struct {
 
 func (e *exprBinding) column() *Column             { return e.col }
 func (e *exprBinding) writeValue(b *drops.Builder) { e.expr.WriteSQL(b) }
+
+// boundExpr and withBoundExpr implement [exprValue], which lives in
+// resolve.go beside the walk that uses it: this is the one binding
+// kind in the package whose value is an expression, so it is the one
+// the resolver has anything to walk into. See resolveSets.
 func (e *exprBinding) boundExpr() drops.Expression { return e.expr }
 
 // withBoundExpr returns a copy carrying x, never this binding with x

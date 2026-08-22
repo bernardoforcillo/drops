@@ -144,7 +144,7 @@ func resolveExprs(ctx context.Context, list []drops.Expression) ([]drops.Express
 // value stored in this tenant's row.
 //
 // Only a binding that holds an expression has anything to walk, which
-// is what [exprValue] is: [ColumnValue] is closed to this package — its
+// is what [exprBound] is: [ColumnValue] is closed to this package — its
 // methods are unexported, so no caller can implement it — and every
 // other implementation binds a Go value that becomes a parameter. The
 // test is an interface rather than the name of one struct so that a

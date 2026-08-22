@@ -82,6 +82,157 @@ import (
 // A reviewer who has not read that list will read a raw fragment or a
 // view body as scoped when it is not.
 
+// ==== THE TENANT POLICIES — NORMATIVE ====
+//
+// This block is byte-identical in pg/tenant.go, sqlite/tenant.go,
+// mysql/tenant.go and clickhouse/tenant.go, and a root-level test
+// fails when one of the four drifts by a word, by whitespace, or by
+// reordering. Edit it in all four or not at all.
+//
+// It exists because every divergence this phase turned up was a policy
+// question that no file owned. Each dialect answered it where the code
+// happened to need an answer, the answers disagreed, and the
+// disagreement was found by reading four files side by side rather
+// than by anything that could fail. resolve.go closed that class for
+// the WALK — normalise the dialect name and the four files are one
+// file. This closes it for the POLICIES.
+//
+// What a dialect cannot do is named here rather than written
+// differently there, so that one set of words is true in four packages
+// instead of four sets each true in one.
+//
+// --- 1. WHAT COUNTS AS THE SAME TENANT ---
+//
+// A tenant value bound to a column and the tenant carried on ctx name
+// the same tenant when they are equal, or when they convert onto each
+// other's type losing nothing in EITHER direction.
+//
+// The comparison is a round trip — convert, compare, convert back,
+// compare again — because a one-way conversion calls a truncating pair
+// equal. int64(1<<32|77) and int32(77) convert onto each other's type
+// and match in whichever direction throws the high bits away, so a
+// check that converts only one way accepts the pair and the statement
+// goes out carrying a value the ctx never named. Only a conversion
+// that loses nothing both ways names the same tenant.
+//
+// A string on one side and a non-string on the other is never the same
+// tenant, whatever the conversion reports. Go converts an integer to a
+// string as a rune, so without that guard a ctx tenant of 65 and a
+// TEXT tenant column holding "A" compare equal, and a numeric tenant
+// is accepted as the owner of a text column's row.
+//
+// Nothing here reaches for strconv. A column whose type disagrees with
+// the ctx tenant's is the schema reporting a type confusion, and
+// inventing a conversion at this point would accept it silently.
+//
+// This rule is sameTenant, and it is the only definition. Comparing
+// with reflect.DeepEqual alone is a bug rather than a stricter
+// version of the same thing: int64(77) on the column and int(77) on
+// ctx are the same tenant, and DeepEqual fires the refusal on a match.
+//
+// --- 2. WHAT MAY ASSIGN THE AXIS ---
+//
+// The tenant column is an axis, never an assignment. It is what
+// addresses a row. It is not a field a caller's data may set, and no
+// value arriving from a caller is ever read as an instruction to move
+// a row to another tenant.
+//
+// Create stamps the axis from ctx onto a zero field and refuses a
+// field naming another tenant. Update does the same, and its stamp
+// runs before the validators so a validator reads the row as it will
+// be written rather than as the caller happened to build it. A struct
+// whose tenant field is zero — one built from a form, or from a
+// decoded request body — is stamped rather than allowed to write that
+// zero over a row and hand it to no tenant at all; a struct carrying
+// somebody else's tenant is [ErrTenantMismatch] rather than a
+// transfer of ownership.
+//
+// Patch refuses ANY op naming the axis, including an op assigning the
+// ctx tenant's own value. That op is a no-op only by coincidence of
+// the value, and a rule with an exception in it is one a caller can be
+// talked into satisfying. Patch is the one write that never reads the
+// row first, so nothing downstream notices what it did, and its op
+// list is exactly what a handler builds out of the fields a request
+// named. The refusal reads the axis off the table, not off a struct
+// field bound to it: a patch never touches the struct, and asking for
+// the field would skip precisely the entities that cannot stamp
+// themselves.
+//
+// Which row is addressed is a separate question from what is written
+// to it, and the table's context filter answers it: the WHERE clause
+// carries the ctx tenant like every other statement's. Both halves
+// have to be right, and a statement that assigns the axis while its
+// WHERE clause still addresses the ctx tenant is not saved by the
+// second half. It is confined to the caller's own rows and gives one
+// of them away — the half a review checks is correct and the other
+// half is the leak.
+//
+// Dialect surface: clickhouse models neither UPDATE nor DELETE. A
+// mutation there is an ALTER TABLE … UPDATE/DELETE, asynchronous and
+// not transactional, which this package does not model — so that
+// dialect has no Update and no Patch, and the write half of the axis
+// is stamping and refusal alone. The other three carry all of it.
+//
+// --- 3. WHAT UNSCOPED MEANS AT EACH LEVEL ---
+//
+// Three levels, three meanings. The differences are deliberate and
+// none of them is a shorthand for another.
+//
+// On a statement builder — the SELECT, and the UPDATE, DELETE and
+// INSERT the dialect has — [SelectBuilder.Unscoped] and its siblings
+// are STATEMENT-WIDE: they drop the DefaultFilter and ContextFilter
+// lists of the FROM table and of every joined table alike.
+//
+// Statement-wide rather than per table, because a caller who says
+// Unscoped is describing this query's authority, and a flag that
+// unscoped the FROM table while a joined one kept its tenant axis
+// would answer with a silently narrowed slice of the rows that were
+// asked for. The context filters go too, because a half-scoped
+// statement is the worse of the two answers: a caller who reaches for
+// Unscoped to read soft-deleted rows and instead gets
+// [ErrTenantMissing] has learned nothing about the row they were
+// after, and one who gets a tenant predicate they did not ask for
+// silently reads a subset. A query that genuinely has to span tenants
+// says so in its own WHERE clause, where the intent is on the page.
+//
+// On an entity query, [EntityQuery.Unscoped] is DEFAULTS-ONLY: it
+// drops the default filters and keeps the context ones. The two are
+// not the same kind of thing — a default filter is a default scope, a
+// context filter is a row-visibility boundary — and their failures are
+// not symmetric. Widening a default scope when the caller asked to
+// widen it costs nothing; dropping the boundary hands this request
+// every tenant's rows, and it would do so on the one method a caller
+// reaches for while thinking about soft-deleted rows rather than about
+// tenancy. So the tenant axis survives there, and a ctx with no tenant
+// is still refused.
+//
+// At EVERY level, Unscoped stops at the edge of the statement it was
+// said on. It does not reach into a statement written inside that one:
+// a CTE body, a subquery operand, a subquery bound as a value or
+// written in a RETURNING term is a statement of its own and keeps its
+// own scoping. That is also how to unscope one relation of a query and
+// no other — say Unscoped on that relation's builder.
+//
+// On an INSERT, [InsertBuilder.Unscoped] additionally means the ctx
+// tenant is neither stamped onto the rows nor required, a ctx with no
+// tenant is not an error, and the dialect's upsert or replace branch
+// is left exactly as it was written. Say which tenant each row belongs
+// to by binding the column yourself. It is the escape hatch a
+// migration, a backfill, a seed loader or an admin tool needs — the
+// statements that legitimately write rows for tenants other than the
+// one on the ctx, or for no tenant at all — and it says so at the call
+// site, where a reviewer reads it, which is the whole difference
+// between this and a package-level switch nobody sees in review.
+//
+// Dialect surface: the relation-level opt-out, RelConfig.Unscoped, is
+// pg's alone. It unscopes one eager-loaded edge and leaves the rest of
+// the query scoped. sqlite loads relations but exposes no per-relation
+// opt-out; mysql and clickhouse declare no relations for one to apply
+// to. In those three, the nesting rule above is the whole of how one
+// part of a query is unscoped and no other.
+//
+// ==== END OF THE TENANT POLICIES ====
+
 type tenantCtxKey int
 
 const tenantKey tenantCtxKey = 1

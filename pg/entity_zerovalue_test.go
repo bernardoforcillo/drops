@@ -180,6 +180,19 @@ func TestCreateColsRejectsColumnsItCannotBind(t *testing.T) {
 	tsv := pg.Add(unmappedTbl, pg.Text("search"))
 	unmapped := pg.NewEntity[flagRow](unmappedTbl, pg.AllowUnmappedColumns("search"))
 
+	// A second table object for the SAME relation, which is the
+	// stranger the tenant-scoping phase is about: its handles render
+	// exactly as the entity's own do, so the table-name refusal above
+	// cannot see them. What catches them is fieldFor, which resolves a
+	// struct field by column identity and has none to offer for a
+	// handle the entity was not built from. The root-level
+	// TestNoColumnKeyComparisonOnARenderedNamePath exempts CreateCols
+	// on that mechanism, and these two cases are the mechanism.
+	twin := pg.NewTable("rows")
+	pg.Add(twin, pg.BigSerial("id").PrimaryKey())
+	twinName := pg.Add(twin, pg.Text("name").NotNull())
+	twinCased := pg.Add(twin, pg.Text("NAME").NotNull())
+
 	ent, c := flagSchema(t)
 	cases := []struct {
 		name string
@@ -195,6 +208,12 @@ func TestCreateColsRejectsColumnsItCannotBind(t *testing.T) {
 		{"column with no struct field", func(db *pg.DB) error {
 			return unmapped.CreateCols(db, context.Background(), &flagRow{}, tsv)
 		}, `no struct field bound to column "search"`},
+		{"handle from another object for the same relation", func(db *pg.DB) error {
+			return ent.CreateCols(db, context.Background(), &flagRow{}, twinName)
+		}, `no struct field bound to column "name"`},
+		{"same relation, name spelled another way", func(db *pg.DB) error {
+			return ent.CreateCols(db, context.Background(), &flagRow{}, c.name, twinCased)
+		}, `no struct field bound to column "NAME"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

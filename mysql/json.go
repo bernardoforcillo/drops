@@ -39,11 +39,17 @@ import (
 // the file leaving it out, because MariaDB users have a use for it.
 //
 // MySQL's own -> and ->> operators are deliberately not exposed:
-// MariaDB does not implement them at all — 10.11 answers a syntax
-// error even against a JSON column — so [JSONGet] and [JSONGetText]
+// MariaDB does not implement them at all — 10.11.14 answers error 1064
+// even against a JSON column, measured — so [JSONGet] and [JSONGetText]
 // render JSON_EXTRACT and JSON_UNQUOTE(JSON_EXTRACT(…)), which are the
 // forms both servers take and exactly what the operators are shorthand
 // for.
+//
+// One function is a family divergence in its ARGUMENTS rather than in
+// its existence. MySQL parses JSON_VALUE's path as part of the
+// statement, so a bound path is a syntax error there and accepted by
+// MariaDB; [JSONValue] writes the path in as a literal, which both
+// take. Every other path in this file binds.
 //
 // # Left out, and why
 //

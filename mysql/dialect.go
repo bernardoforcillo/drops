@@ -99,6 +99,43 @@
 // while MariaDB returns a short answer and no warning. See cte.go and
 // [SetRecursionLimit].
 //
+// # Where the two families part company
+//
+// The suite has now been run against MySQL 8.0.46 and MariaDB
+// 10.11.14, and integration.TestMySQLFamilyDivergences pins each of
+// these on both. They are listed here because each one shapes what
+// this package renders, or whether a helper exists at all:
+//
+//   - MariaDB has no -> or ->> accessor, on a JSON column or anywhere
+//     else, so [JSONGet] and [JSONGetText] render JSON_EXTRACT and
+//     JSON_UNQUOTE(JSON_EXTRACT(…)).
+//   - MariaDB's JSON is an alias for LONGTEXT with a CHECK, so
+//     CAST(x AS JSON) is a syntax error there and pg's ToJSON has no
+//     port. It also means a JSON value read back is the bytes that
+//     were written, where MySQL parses on write and re-serialises on
+//     read — a space after every colon and the server's key order.
+//   - JSON_QUERY is MariaDB's alone; MySQL answers error 1305. It is
+//     the one helper in json.go that does not work on both, and
+//     [JSONQuery] says so.
+//   - MySQL takes JSON_VALUE's path in its GRAMMAR, so a bound path is
+//     error 1064 there and accepted by MariaDB. [JSONValue] writes the
+//     path in as a literal, which both take.
+//   - MySQL 8.0.19's VALUES row alias — INSERT … AS new ON DUPLICATE
+//     KEY UPDATE — is a syntax error on MariaDB, so the upserts here
+//     use the older VALUES(col) spelling. See [NewValueOf].
+//   - a user-level lock name may be 64 characters on MySQL and 192 on
+//     MariaDB, both rejecting past their own limit, so 64 is the
+//     portable ceiling and [Outbox.DrainAggregate] folds a longer name
+//     back under it.
+//   - MySQL fixes a function's result scale while preparing a
+//     statement and a PLACEHOLDER has no scale to fix it from, so
+//     ROUND and TRUNCATE keep the first argument's scale, MAKETIME and
+//     UNIX_TIMESTAMP reserve six fractional digits, and / loses
+//     div_precision_increment. MariaDB answers a parameter exactly as
+//     it answers a literal. drops binds values, so every call here
+//     takes the parameter path: the numbers agree on both servers and
+//     the number of trailing digits does not.
+//
 // # Scope
 //
 // This is the schema, query and migration surface: types, tables, DDL,

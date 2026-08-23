@@ -143,11 +143,33 @@ func JSONExtract(e any, paths ...any) drops.Expression {
 	return funcCall("json_extract", append([]any{e}, paths...))
 }
 
-// JSONValue renders JSON_VALUE(<e>, <path>) — extract and unquote in
+// JSONValue renders JSON_VALUE(<e>, '<path>') — extract and unquote in
 // one call, and unlike JSON_UNQUOTE(JSON_EXTRACT(…)) it can carry a
 // RETURNING type. MySQL 8.0.21+ and MariaDB 10.2.3+; [JSONGetText] is
 // the form that works further back.
-func JSONValue(e, path any) drops.Expression { return funcCall("json_value", []any{e, path}) }
+//
+// A string path is written into the SQL as a literal rather than
+// bound, for the reason [JSONTable] gives: MySQL takes JSON_VALUE's
+// path in its grammar, not as an argument, so json_value(doc, ?) is
+// error 1064 — a syntax error, not a late-bound value. MariaDB accepts
+// the placeholder, so binding it produced a statement that ran on one
+// family and could not parse on the other. Because the path is
+// interpolated it is checked at the door, exactly as JSON_TABLE's is.
+//
+// Anything that is not a string is passed through as an operand, which
+// is the escape hatch for a caller who has measured what their server
+// accepts there. On MySQL that is only ever a literal.
+func JSONValue(e, path any) drops.Expression {
+	if s, ok := path.(string); ok {
+		mustJSONPath(s)
+		var o opBuilder
+		o.text("json_value(")
+		o.value(e)
+		o.text(", '" + quoteLiteral(s) + "')")
+		return o.done()
+	}
+	return funcCall("json_value", []any{e, path})
+}
 
 // JSONQuery renders JSON_QUERY(<e>, <path>) — like JSON_VALUE but for
 // an object or array result rather than a scalar.

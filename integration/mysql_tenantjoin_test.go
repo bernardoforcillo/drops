@@ -2,7 +2,10 @@ package integration_test
 
 import (
 	"context"
+	"strings"
 	"testing"
+
+	"github.com/bernardoforcillo/drops"
 
 	"github.com/bernardoforcillo/drops/integration"
 	"github.com/bernardoforcillo/drops/mysql"
@@ -134,5 +137,134 @@ func TestMySQLGuardBeforeARightJoinKeepsThePreservedRows(t *testing.T) {
 		if tenant != "" && tenant != "acme" {
 			t.Errorf("audit row %d exposed tenant %q\n%s\nargs: %v", id, tenant, text, args)
 		}
+	}
+}
+
+// Why mysql.TenantView REFUSES a tenant value containing a backslash
+// rather than escaping one.
+//
+// tenantLiteral's doc calls this the sharpest edge in that file, and
+// until now it was the sharpest edge with no runnable test: a view
+// body cannot carry a placeholder, so the tenant value is TEXT inside
+// stored DDL, and drops renders that text for an operator to apply
+// later against a server whose sql_mode drops never saw. A single
+// quote is safe because doubling it closes the literal correctly in
+// every mode. A backslash has no such spelling.
+//
+// The statement text here is byte-identical between the two views. The
+// only difference is the sql_mode in force when each was installed —
+// and they end up scoped to two DIFFERENT tenants. A boundary whose
+// predicate depends on a server setting the renderer cannot see is
+// not a boundary, which is why the refusal is a refusal and not an
+// escape.
+//
+// Measured on MySQL 8.0.46 and MariaDB 10.11.14, which agree exactly.
+// The values are VARBINARY and compared as hex, because a client that
+// escapes backslashes on the way out is the reason this is easy to
+// measure wrong.
+func TestMySQLABackslashInAViewLiteralMeansTwoThings(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+
+	tbl := integration.UniqueName(t, "bsdocs")
+	quoted := mysql.Dialect.QuoteIdent(tbl)
+	v1, v2 := mysql.Dialect.QuoteIdent(tbl+"_a"), mysql.Dialect.QuoteIdent(tbl+"_b")
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), "DROP VIEW IF EXISTS "+v1)
+		_, _ = db.Exec(context.Background(), "DROP VIEW IF EXISTS "+v2)
+		_, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS "+quoted)
+	})
+
+	for _, stmt := range []string{
+		"DROP TABLE IF EXISTS " + quoted,
+		"CREATE TABLE " + quoted + " (`id` INT PRIMARY KEY, `tenantId` VARBINARY(16) NOT NULL)",
+		// 61 5C 62 is a\b with ONE backslash; 61 5C 5C 62 has two.
+		// Written as hex so no sql_mode can reinterpret the seed.
+		"INSERT INTO " + quoted + " VALUES (1, UNHEX('615C62')), (2, UNHEX('615C5C62'))",
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// One statement text, installed twice. This is exactly what
+	// mysql.CreateTenantView would render for a tenant whose value
+	// contains a backslash, if tenantLiteral let it.
+	body := " AS SELECT `id` FROM " + quoted + " WHERE `tenantId` = 'a\\\\b'"
+
+	// The session sql_mode has to be set on the connection the CREATE
+	// VIEW runs on, so both go through one pinned pool.
+	pinned, _ := openMySQLPinnedConn(t)
+	var restore string
+	if err := pinned.Select(drops.Raw("@@session.sql_mode")).One(ctx, &restore); err != nil {
+		t.Fatalf("read sql_mode: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pinned.Exec(context.Background(), "SET @@session.sql_mode = ?", restore)
+	})
+
+	if _, err := pinned.Exec(ctx, "SET @@session.sql_mode = ?", restore); err != nil {
+		t.Fatalf("set default mode: %v", err)
+	}
+	if _, err := pinned.Exec(ctx, "CREATE VIEW "+v1+body); err != nil {
+		t.Fatalf("create the default-mode view: %v", err)
+	}
+	if _, err := pinned.Exec(ctx, "SET @@session.sql_mode = ?", restore+",NO_BACKSLASH_ESCAPES"); err != nil {
+		t.Fatalf("set NO_BACKSLASH_ESCAPES: %v", err)
+	}
+	if _, err := pinned.Exec(ctx, "CREATE VIEW "+v2+body); err != nil {
+		t.Fatalf("create the NO_BACKSLASH_ESCAPES view: %v", err)
+	}
+	if _, err := pinned.Exec(ctx, "SET @@session.sql_mode = ?", restore); err != nil {
+		t.Fatalf("restore sql_mode: %v", err)
+	}
+
+	ids := func(view string) []int64 {
+		t.Helper()
+		var out []int64
+		rows, err := db.Select(drops.Raw("`id`")).FromExpr(drops.Raw(view)).Rows(ctx)
+		if err != nil {
+			t.Fatalf("select from %s: %v", view, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out = append(out, id)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		return out
+	}
+
+	// Row 1 is the one-backslash tenant, row 2 the two-backslash one.
+	// Same text in, different tenant out.
+	if got := ids(v1); len(got) != 1 || got[0] != 1 {
+		t.Errorf("the view installed under the default sql_mode selects %v, want row 1 (the one-backslash tenant)", got)
+	}
+	if got := ids(v2); len(got) != 1 || got[0] != 2 {
+		t.Errorf("the view installed under NO_BACKSLASH_ESCAPES selects %v, want row 2 (the two-backslash tenant)", got)
+	}
+
+	// And the refusal that makes the above unreachable through drops.
+	base := mysql.NewTable(tbl)
+	mysql.Add(base, mysql.BigInt("id").PrimaryKey())
+	axis := mysql.Add(base, mysql.Varchar("tenantId", 16).NotNull())
+	sound := mysql.NewTenantView("v_bs_ok").On(base).Axis(axis).
+		ForTenant("acme").DefinedBy(mysql.Acct("app", "localhost"))
+	if err := sound.Err(); err != nil {
+		t.Fatalf("the same declaration without a backslash has to be accepted, "+
+			"or the refusal below proves nothing: %v", err)
+	}
+	bad := mysql.NewTenantView("v_bs").On(base).Axis(axis).
+		ForTenant(`a\b`).DefinedBy(mysql.Acct("app", "localhost"))
+	if err := bad.Err(); err == nil {
+		t.Error("TenantView accepted a tenant value carrying a backslash; " +
+			"the two views above are what that renders into")
+	} else if !strings.Contains(err.Error(), "backslash") {
+		t.Errorf("refused for a reason other than the backslash: %v", err)
 	}
 }

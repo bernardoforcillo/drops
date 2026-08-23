@@ -287,6 +287,29 @@ func TestMySQLTenantViewIsABoundary(t *testing.T) {
 		}
 	})
 
+	// The escape hatch, and the last claim in mysql/tenantview.go's
+	// measured list that nothing here ran. Every subtest above shows
+	// the account cannot reach the base table through the SQL it was
+	// given; this one shows it cannot give itself different SQL. A
+	// definer-rights view is only a boundary while the guarded account
+	// cannot define one of its own, and CREATE VIEW is a privilege
+	// like any other — an account that holds it can write a view with
+	// no WHERE clause and read every tenant through it.
+	t.Run("cannot build itself an unfiltered view", func(t *testing.T) {
+		escape := qualify(t, raw, viewName+"_esc", tbl.Name())
+		_, err := tenantConn.ExecContext(ctx,
+			"CREATE VIEW "+escape.view+" AS SELECT * FROM "+qualified.table)
+		if err == nil {
+			_, _ = raw.ExecContext(context.Background(), "DROP VIEW IF EXISTS "+escape.view)
+			t.Fatal("the tenant account created a view over the base table, " +
+				"so the boundary is one statement wide")
+		}
+		if !strings.Contains(err.Error(), "1142") && !strings.Contains(err.Error(), "1044") {
+			t.Errorf("refused for a reason other than a missing privilege, "+
+				"which may mean it was refused for a reason that will not hold: %v", err)
+		}
+	})
+
 	t.Run("an unqualified DELETE reaches only its own rows", func(t *testing.T) {
 		if _, err := tenantConn.ExecContext(ctx, "DELETE FROM "+qualified.view); err != nil {
 			t.Fatalf("DELETE: %v", err)

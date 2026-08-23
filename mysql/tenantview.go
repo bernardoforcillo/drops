@@ -460,17 +460,22 @@ func (v *TenantView) tableOwnsAxis() bool {
 // backslash introduces an escape and must be doubled; under
 // NO_BACKSLASH_ESCAPES it is an ordinary character and must not be.
 //
-// Measured, on a live MySQL 8.0.46: the identical statement text
+// Measured, on a live MySQL 8.0.46 and a live MariaDB 10.11.14, which
+// agree exactly: the identical statement text
 // "... WHERE tenant = 'a\\b'" installed under the default mode stored
 // a view selecting the row whose tenant is a\b, and installed under
 // NO_BACKSLASH_ESCAPES stored one selecting the row whose tenant is
-// a\\b. Same text, different tenant. The package's own quoteLiteral
-// doubles the backslash and documents that it corrupts the text but
-// never the statement around it; that trade is right for an enum
-// member or a column comment and wrong here, because here the
-// corrupted text is the predicate that IS the boundary, and the
-// failure is a view scoped to a tenant nobody named — which permits
-// silently rather than refusing loudly.
+// a\\b. Same text, different tenant. It runs in
+// integration.TestMySQLABackslashInAViewLiteralMeansTwoThings, against
+// VARBINARY values compared as hex — a client that escapes backslashes
+// on the way out is why this is easy to measure wrong.
+//
+// The package's own quoteLiteral doubles the backslash and documents
+// that it corrupts the text but never the statement around it; that
+// trade is right for an enum member or a column comment and wrong
+// here, because here the corrupted text is the predicate that IS the
+// boundary, and the failure is a view scoped to a tenant nobody named
+// — which permits silently rather than refusing loudly.
 //
 // Control characters are refused on a second ground: this DDL is meant
 // to be read by the operator who applies it, and a NUL or a newline

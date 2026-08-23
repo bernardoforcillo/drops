@@ -85,24 +85,32 @@ import (
 //   - the outbox, the event store and the idempotency store, which
 //     issue their own hand-written SQL against their own tables;
 //   - a column whose name differs from the tenant axis only by a
-//     NON-ASCII case pair, in a configuration where the server folds
-//     one. MySQL folds a column name's case, and folds ASCII in every
-//     configuration and on every platform; whether it also reads
-//     "tenantid" and "tenantİd" as one column is its identifier
-//     collation's answer. That was recorded here as unsettled for
-//     want of a server. It has now been asked of two: MySQL 8.0.46 and
-//     MariaDB 10.11.14, both in their default configurations, read
-//     that pair as TWO columns — a table declaring both is created
-//     rather than refused as a duplicate, and selecting "tenantİd"
-//     from a table holding only "tenantid" is ERROR 1054. The ASCII
-//     fold identKey performs is therefore exactly the fold those two
-//     servers perform, not a conservative approximation of it, and on
-//     them this entry describes no gap at all. It stays in the list
-//     because the identifier collation is configurable and two
-//     defaults are not every configuration. Guessing a wider fold
-//     would remain the worse failure: a match tells the INSERT the
-//     axis is bound already, so what a wrong guess drops is the stamp
-//     — see identKey in ident.go;
+//     NON-ASCII case pair the server folds and identKey does not.
+//     MySQL folds a column name's case, and folds ASCII in every
+//     configuration and on every platform; identKey stops at the
+//     ASCII. This entry was once recorded as unsettled for want of a
+//     server, and then, worse, as settled the other way: two servers
+//     were said to read "tenantid" and "tenantİd" as two columns, from
+//     which this list concluded the ASCII fold was "exactly the fold
+//     those two servers perform" and that the entry described no gap.
+//     That conclusion was false. U+0130 is a Turkish dotted capital I
+//     whose lowercase is not a plain i, so it settles nothing about an
+//     ordinary accented pair — and asked with one, BOTH families fold.
+//     Measured on MySQL 8.0.46 and MariaDB 10.11.14 and pinned by
+//     integration.TestMySQLIdentifierFoldMatrix: "tenanté" and
+//     "tenantÉ" are ONE column on both; "tenantid" and "tenantİd" are
+//     one on MySQL and two on MariaDB; "tenantıd" (U+0131) and
+//     "tenantß" are two on both. So the gap is real and it is on both
+//     families: a handle spelled with the other case of an accented
+//     letter is a different column to drops and the same column to the
+//     server. It is the NARROW direction, which refuses rather than
+//     leaking — the guard answers "not the axis" for a handle the
+//     renderer answers yes for. Widening identKey is not the fix: it
+//     would have to be right for both families at once, and U+0130 is
+//     a pair where they disagree, while a fold wider than the server's
+//     is the silent failure — a match tells the INSERT the axis is
+//     bound already, so what a wrong guess drops is the stamp. See
+//     identKey in ident.go;
 //   - a tenant value the axis column's collation folds onto another
 //     tenant's. sameTenant compares the ctx tenant with a bound value
 //     in Go; the predicate hands both sides to the server, which
@@ -456,13 +464,14 @@ import (
 // fold, and they fold ASCII and stop. SQLite's own comparison is
 // ASCII and nothing more; MySQL folds ASCII in every configuration,
 // while what it does with a NON-ASCII case pair is its identifier
-// collation's answer. That answer is measured now, and it is the same
-// on MySQL 8.0.46 and MariaDB 10.11.14: over a utf8mb4 connection
-// both resolve a non-ASCII case pair to one column and both keep an
-// accent difference as two. identKey stops at ASCII anyway, which
-// leaves it NARROWER than either server there — the invariant holds,
-// and the cost is the refusal named above rather than a dropped
-// stamp. Widening it is a deliberate change against that measurement.
+// collation's answer. That answer is measured now, and it is not one
+// answer: on MySQL 8.0.46 and MariaDB 10.11.14 an accented case pair
+// is ONE column to both, while the dotted capital I is one to MySQL
+// and two to MariaDB. identKey stops at ASCII either way, which
+// leaves it NARROWER than both — the invariant holds, and the cost is
+// the refusal named above rather than a dropped stamp. Widening it is
+// a deliberate change against that measurement, and no single fold is
+// right for both families at once.
 // Two have now been asked — MySQL 8.0.46 and MariaDB 10.11.14, both
 // in their default configurations — and both read such a pair as TWO
 // columns, which is what these packages already read it as: on those

@@ -403,30 +403,44 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
-- **Four doc claims that a server had not been consulted, when it had**
+- **"On those two servers the ASCII fold is not narrower than the
+  server's — it is the same fold." It is narrower, on both**
   (`drops/mysql`, `drops/pg`, `drops/sqlite`, `drops/clickhouse`,
-  `integration`). The non-ASCII half of `identKey`'s folding rule was
-  recorded in five places as unsettled "for want of a server" — in the
-  normative tenant policy block carried by all four dialects, in
-  `mysql/ident_fuzz_test.go`, and in this file. Both MySQL families
-  were reachable by then. Asked: over the utf8mb4 connection drops
-  uses, MySQL 8.0.46 and MariaDB 10.11.14 alike resolve `tenantÉ` to a
-  column declared `tenanté`, and both keep the unaccented `tenante` as
-  a column of its own — a case fold that reaches past ASCII and leaves
-  accents alone, with no divergence between the families.
-  `integration.TestMySQLFoldsANonASCIICasePairInAnIdentifier` pins
-  both halves on both servers.
+  `integration`). The non-ASCII half of `identKey`'s folding rule went
+  from unsettled "for want of a server" to settled the wrong way, and
+  the second state was the dangerous one: `mysql/ident.go` and the
+  "Where the automatic scoping stops" list in `mysql/tenant.go` both
+  concluded that the entry "describes no gap at all". It does.
+
+  The measurement behind that conclusion generalised from one pair,
+  `tenantid` against `tenantİd`, and U+0130 is a Turkish dotted
+  capital I whose lowercase is not a plain i — so reading it as two
+  columns settles nothing about an ordinary accented pair. Asked with
+  one, both families fold. Measured on MySQL 8.0.46 and MariaDB
+  10.11.14 and pinned by `integration.TestMySQLIdentifierFoldMatrix`:
+  `tenanté`/`tenantÉ` are ONE column on both; `tenantid`/`tenantİd`
+  are one on MySQL and two on MariaDB, the one place the families part
+  company; `tenantıd` (U+0131) and `tenantß` are two on both. Two
+  further details of the old claim were also wrong — a table declaring
+  both spellings is refused as a duplicate (`ERROR 1060`) rather than
+  created, for exactly the pairs a `SELECT` resolves, except
+  `tenantİd` on MariaDB, which is refused as a duplicate and still
+  will not resolve; and identifier resolution is not the connection
+  collation's answer, being identical under `utf8mb4_general_ci`,
+  `utf8mb4_0900_ai_ci` and `utf8mb4_bin`. It is not measurable over a
+  `latin1` connection at all, where the exact declared spelling fails
+  too.
 
   `identKey` is unchanged and still stops at ASCII, which leaves it
-  NARROWER than either server for such a pair. The invariant the
-  policy block states — `identKey` never reads two names as one column
-  unless the server does — still holds, and narrow is the direction
-  that refuses rather than the one that drops the tenant stamp out of
-  an `INSERT`. Widening it is now a change to make against a
-  measurement instead of a guess. The fuzz target's failure message no
-  longer calls its ASCII model "the server's own fold", which is what
-  the measurement disproves; it is the rule `identKey` is required to
-  implement.
+  NARROWER than both servers. The invariant the policy block states —
+  `identKey` never reads two names as one column unless the server
+  does — still holds, and narrow is the direction that refuses rather
+  than the one that drops the tenant stamp out of an `INSERT`.
+  Widening it is not the fix either: it would have to be right for
+  both families at once, and U+0130 is a pair where they disagree. The
+  fuzz target's failure message no longer calls its ASCII model "the
+  server's own fold", which is the thing the measurement disproves; it
+  is the rule `identKey` is required to implement.
 
   Two smaller provenance errors went with them: `mysql/dialect.go` said
   `TestMySQLFamilyDivergences` pinned all seven family entries when the

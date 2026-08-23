@@ -398,13 +398,14 @@ import (
 // fold, and they fold ASCII and stop. SQLite's own comparison is
 // ASCII and nothing more; MySQL folds ASCII in every configuration,
 // while what it does with a NON-ASCII case pair is its identifier
-// collation's answer. That answer is measured now, and it is the same
-// on MySQL 8.0.46 and MariaDB 10.11.14: over a utf8mb4 connection
-// both resolve a non-ASCII case pair to one column and both keep an
-// accent difference as two. identKey stops at ASCII anyway, which
-// leaves it NARROWER than either server there — the invariant holds,
-// and the cost is the refusal named above rather than a dropped
-// stamp. Widening it is a deliberate change against that measurement.
+// collation's answer. That answer is measured now, and it is not one
+// answer: on MySQL 8.0.46 and MariaDB 10.11.14 an accented case pair
+// is ONE column to both, while the dotted capital I is one to MySQL
+// and two to MariaDB. identKey stops at ASCII either way, which
+// leaves it NARROWER than both — the invariant holds, and the cost is
+// the refusal named above rather than a dropped stamp. Widening it is
+// a deliberate change against that measurement, and no single fold is
+// right for both families at once.
 // Two have now been asked — MySQL 8.0.46 and MariaDB 10.11.14, both
 // in their default configurations — and both read such a pair as TWO
 // columns, which is what these packages already read it as: on those

@@ -83,27 +83,41 @@ func quoteIdents(names []string) []string {
 // comparison had the same shift-key bypass sqlite's did.
 //
 // The fold is ASCII, which is the part every configuration agrees on.
-// What MySQL does with a NON-ASCII case pair is its identifier
-// collation's answer rather than Unicode's, and neither candidate
-// collation is strings.ToLower.
+// What each family does with a NON-ASCII pair is neither Unicode's
+// answer nor strings.ToLower, and it is not the connection collation's
+// answer either — the matrix below is identical under
+// utf8mb4_general_ci, utf8mb4_0900_ai_ci and utf8mb4_bin.
 //
 // This comment used to end by saying the package had no MySQL to ask.
-// It has since asked two. MySQL 8.0.46 and MariaDB 10.11.14, both in
-// their default configurations, read "tenantid" and "tenantİd" as TWO
-// columns: a table declaring both is created rather than refused as a
-// duplicate, and selecting "tenantİd" off a table holding only
-// "tenantid" is ERROR 1054 on both. U+0131, the dotless i, answers the
-// same. So on those two servers the ASCII fold is not narrower than
-// the server's — it is the same fold.
+// It then said it had asked two and that the ASCII fold "is not
+// narrower than the server's — it is the same fold". That was wrong,
+// and wrong in the direction this file cares about. It generalised
+// from one pair, "tenantid" against "tenantİd", and U+0130 is a
+// Turkish dotted capital I whose lowercase is not a plain i — so
+// reading it as two columns settles nothing about an ordinary
+// accented pair. Measured now, on MySQL 8.0.46 and MariaDB 10.11.14,
+// pinned by integration.TestMySQLIdentifierFoldMatrix:
+//
+//   - "tenanté" and "tenantÉ" are ONE column on BOTH families.
+//   - "tenantid" and "tenantİd" are one column on MySQL and two on
+//     MariaDB — the one place the families part company here.
+//   - "tenantid" and "tenantıd" (U+0131) are two on both.
+//   - "tenantss" and "tenantß" are two on both.
+//
+// A table declaring both spellings is refused as a duplicate, ERROR
+// 1060, for exactly the pairs a SELECT resolves — except "tenantİd"
+// on MariaDB, which is refused as a duplicate and still will not
+// resolve. So identKey IS narrower than both servers, and the "no gap"
+// this comment used to claim does not exist.
 //
 // The function still stops at ASCII, and the invariant above is still
-// the reason. Two defaults are not every configuration, the identifier
-// collation is settable, and a fold wider than the server's is the
-// silent failure: a match tells the INSERT the axis is bound already,
-// so what a wrong guess drops is the stamp. The pairs this therefore
-// reads as two columns where some other configuration's server might
-// read one stay written down in the "Where the automatic scoping
-// stops" list in tenant.go.
+// the reason: a fold wider than the server's is the silent failure,
+// because a match tells the INSERT the axis is bound already, so what
+// a wrong guess drops is the stamp. Narrow costs a refusal, wide costs
+// the tenant. Widening it to the measured fold would have to be right
+// for both families at once, and the U+0130 row is a pair where they
+// disagree. The gap stays written down in the "Where the automatic
+// scoping stops" list in tenant.go.
 //
 // pg and clickhouse compare a quoted identifier byte for byte and
 // their identKey returns the name itself. Asking the question in all

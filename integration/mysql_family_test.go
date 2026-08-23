@@ -134,61 +134,122 @@ func TestMySQLFamilyDivergences(t *testing.T) {
 	}
 }
 
-// What both families do with a NON-ASCII case pair in an identifier,
-// which drops/mysql's identKey has always declined to guess at.
+// Which NON-ASCII pairs each family reads as ONE column, which is the
+// question drops/mysql's identKey declines to guess at.
 //
-// identKey folds ASCII and stops, and the reason recorded beside it
-// used to be that no MySQL was reachable to ask. Both families are
-// reachable now and they agree, so this is not a divergence — it is
-// the answer to a question the package had left open.
+// This list used to be settled the other way. identKey folds ASCII and
+// stops; the comments beside it in ident.go and tenant.go recorded
+// that both servers had been asked and had read "tenantid" and
+// "tenantİd" as TWO columns, and concluded that the ASCII fold "is not
+// narrower than the server's — it is the same fold", with no gap left
+// to describe. That generalised from one pair, and the pair chosen was
+// the wrong one: U+0130 is a Turkish dotted capital I whose Unicode
+// lowercase is not a plain i, so reading it as two columns says
+// nothing about how an ordinary accented pair resolves. Asked with
+// one, both families fold.
 //
-// Over the utf8mb4 connection this suite and drops both use, MySQL
-// 8.0.46 and MariaDB 10.11.14 alike resolve `tenantÉ` to the column
-// declared `tenanté`. That it is a CASE fold and not the accent
-// insensitivity of utf8mb4_general_ci is the second assertion: the
-// unaccented `tenante` is a different column on both, error 1054.
+// So the matrix is pinned here rather than a single example, and it
+// carries the one real divergence between the families as well as the
+// gap identKey leaves on both.
 //
-// Two things this does NOT show, because measuring them wrong is
-// easy. It is not a statement about latin1 connections: under one,
-// the exact lowercase spelling fails too, so the identifier bytes are
-// being misread rather than folded, and nothing about case can be
-// concluded from it. And it is not a reason to widen identKey. The
-// invariant the tenant policy block states — identKey never reads two
-// names as one column unless the server does — is still satisfied by
-// an ASCII-only fold, which errs NARROW: the guard answers no for a
-// handle the renderer answers yes for. Widening it is a change to
-// make deliberately against this measurement, not a bug fix.
-func TestMySQLFoldsANonASCIICasePairInAnIdentifier(t *testing.T) {
+// Two things worth knowing before reading a row. Identifier
+// resolution is NOT the connection collation's answer, though the
+// comments called it that: every row below is unchanged under
+// utf8mb4_general_ci, utf8mb4_0900_ai_ci and utf8mb4_bin alike. And it
+// is not measurable at all over a latin1 connection, where the exact
+// declared spelling fails too — the identifier bytes are being misread
+// rather than folded, and nothing about case can be concluded from it.
+func TestMySQLIdentifierFoldMatrix(t *testing.T) {
 	db := openMySQL(t)
 	ctx := context.Background()
+	_, _, mariadb := mysqlServerVersion(t, db)
 
-	tbl := mysql.NewTable(integration.UniqueName(t, "na"))
-	mysql.Add(tbl, mysql.BigInt("id"))
-	lower := mysql.Add(tbl, mysql.Integer("tenanté"))
-	dropMySQL(t, db, tbl)
-	execMySQL(t, db, mysql.CreateTable(tbl))
-	if _, err := db.Insert(tbl).Row(lower.Val(7)).Exec(ctx); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	name := mysql.Dialect.QuoteIdent(tbl.Name())
+	cases := []struct {
+		name             string
+		declared, probe  string
+		oneOnMySQL       bool
+		oneOnMariaDB     bool
+		duplicateRefused bool
+		why              string
+	}{{
+		name: "an accented case pair", declared: "tenanté", probe: "tenantÉ",
+		oneOnMySQL: true, oneOnMariaDB: true, duplicateRefused: true,
+		why: "the pair the old conclusion never tried. Both families fold it, so " +
+			"identKey — which stops at ASCII — is NARROWER than either server here. " +
+			"This is the gap the scoping-stops list has to keep describing.",
+	}, {
+		name: "the dotted capital I", declared: "tenantid", probe: "tenantİd",
+		oneOnMySQL: true, oneOnMariaDB: false, duplicateRefused: true,
+		why: "U+0130, and the one place the families genuinely part company: " +
+			"MySQL resolves it onto i and MariaDB does not. Note MariaDB still " +
+			"refuses the table that declares both as a duplicate, so its two " +
+			"answers disagree with each other — a column it will not resolve is " +
+			"still a column it will not let you declare alongside.",
+	}, {
+		name: "the dotless i", declared: "tenantid", probe: "tenantıd",
+		oneOnMySQL: false, oneOnMariaDB: false, duplicateRefused: false,
+		why: "U+0131. Two columns on both, and a table may declare both — the " +
+			"half of the old claim that was right.",
+	}, {
+		name: "sharp s against ss", declared: "tenantss", probe: "tenantß",
+		oneOnMySQL: false, oneOnMariaDB: false, duplicateRefused: false,
+		why: "a case pair to German and not to either server. Included so the " +
+			"list is not read as \"anything non-ASCII folds\".",
+	}}
 
-	// The uppercase spelling of the same name: one column, or two.
-	if got := mysqlScalar(t, db, "SELECT `tenantÉ` FROM "+name); got != "7" {
-		t.Errorf("`tenantÉ` read %q, want the 7 written through `tenanté` — "+
-			"the two spellings are supposed to be one column", got)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wantOne := tc.oneOnMySQL
+			if mariadb {
+				wantOne = tc.oneOnMariaDB
+			}
 
-	// And the accent is not folded away with the case, which is what
-	// makes this a case fold rather than utf8mb4_general_ci deciding
-	// that é and e are the same letter.
-	err, _ := mysqlStreamErr(t, func() (drops.Rows, error) {
-		return db.Query(ctx, "SELECT `tenante` FROM "+name)
-	})
-	if err == nil {
-		t.Fatal("`tenante` resolved to `tenanté`; identifier matching is supposed to fold case " +
-			"and not accents, and identKey's rule is written for a fold that leaves accents alone")
-	}
-	if !strings.Contains(err.Error(), "1054") {
-		t.Errorf("`tenante` was rejected with %v, want error 1054", err)
+			// Does the probe spelling resolve to the declared column?
+			tbl := mysql.Dialect.QuoteIdent(integration.UniqueName(t, "fold"))
+			t.Cleanup(func() { _, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS "+tbl) })
+			for _, stmt := range []string{
+				"DROP TABLE IF EXISTS " + tbl,
+				"CREATE TABLE " + tbl + " (`" + tc.declared + "` INT)",
+				"INSERT INTO " + tbl + " VALUES (5)",
+			} {
+				if _, err := db.Exec(ctx, stmt); err != nil {
+					t.Fatalf("%s: %v", stmt, err)
+				}
+			}
+			err, _ := mysqlStreamErr(t, func() (drops.Rows, error) {
+				return db.Query(ctx, "SELECT `"+tc.probe+"` FROM "+tbl)
+			})
+			switch {
+			case wantOne && err != nil:
+				t.Errorf("this family is supposed to resolve %q onto %q and answered %v\n%s",
+					tc.probe, tc.declared, err, tc.why)
+			case !wantOne && err == nil:
+				t.Errorf("this family is supposed to read %q and %q as two columns, and resolved them\n%s",
+					tc.probe, tc.declared, tc.why)
+			case !wantOne && err != nil && !strings.Contains(err.Error(), "1054"):
+				t.Errorf("rejected %q with %v, want error 1054\n%s", tc.probe, err, tc.why)
+			}
+
+			// And whether a table may declare both spellings at once,
+			// which is a SECOND answer the server gives and not always
+			// the same one.
+			dup := mysql.Dialect.QuoteIdent(integration.UniqueName(t, "dup"))
+			t.Cleanup(func() { _, _ = db.Exec(context.Background(), "DROP TABLE IF EXISTS "+dup) })
+			if _, err := db.Exec(ctx, "DROP TABLE IF EXISTS "+dup); err != nil {
+				t.Fatalf("drop: %v", err)
+			}
+			_, derr := db.Exec(ctx, "CREATE TABLE "+dup+" (`"+tc.declared+"` INT, `"+tc.probe+"` INT)")
+			if tc.duplicateRefused {
+				if derr == nil {
+					t.Errorf("a table declaring both %q and %q was created; both families are supposed to "+
+						"refuse it as a duplicate column\n%s", tc.declared, tc.probe, tc.why)
+				} else if !strings.Contains(derr.Error(), "1060") {
+					t.Errorf("refused the duplicate with %v, want error 1060\n%s", derr, tc.why)
+				}
+			} else if derr != nil {
+				t.Errorf("a table declaring both %q and %q was refused with %v; these are two distinct "+
+					"columns to both families\n%s", tc.declared, tc.probe, derr, tc.why)
+			}
+		})
 	}
 }

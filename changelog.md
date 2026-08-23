@@ -330,6 +330,29 @@ once a 1.0 is cut.
   statement with no tenant to name still refuses the whole INSERT.
 
 ### Changed
+- **The MySQL half of the integration suite has been run against both
+  families, and says which is which** (`drops/mysql`,
+  `integration`). Every claim about how MySQL and MariaDB diverge was
+  written from documentation and from rendered SQL, because for most
+  of this project's life neither server was reachable. Run against
+  MySQL 8.0.46 and MariaDB 10.11.14 — the whole suite, nothing skipped
+  for the family — all six of the divergences drops is built around
+  hold exactly as written: MariaDB has no `->` accessor and no type to
+  `CAST … AS JSON`, MySQL has no `JSON_QUERY` and no bound
+  `JSON_VALUE` path, MariaDB has no `VALUES` row alias, and the
+  user-level lock name ceiling is 64 characters on one and 192 on the
+  other. Two more were found in the running: MySQL fixes a function's
+  result scale while preparing a statement and a PLACEHOLDER has no
+  scale to fix it from, so `ROUND` and `TRUNCATE` keep the first
+  argument's scale, `MAKETIME` and `UNIX_TIMESTAMP` reserve six
+  fractional digits and `/` loses `div_precision_increment`, where
+  MariaDB answers a parameter exactly as it answers a literal; and
+  MySQL's `JSON` is a type that re-serialises on read while MariaDB's
+  is `LONGTEXT` that hands the bytes back untouched. The dialect doc
+  lists all of them and `TestMySQLFamilyDivergences` pins what EACH
+  family does, so a divergence that stops being one fails rather than
+  quietly widening what drops works around.
+
 - **BREAKING: a table that declares a tenant axis refuses every
   statement whose ctx carries no tenant** (`drops/pg`, `drops/sqlite`,
   `drops/mysql`, `drops/clickhouse`). Including one built straight from
@@ -380,6 +403,51 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **A tenant guard placed before a `RIGHT JOIN` turned itself off**
+  (`drops/mysql`). Where a table's automatic predicates land was two
+  questions and only one was asked. `joinKind.filterPlacement` decided
+  from the join a table arrives on; `fromFilterJoin` decided for the
+  `FROM` table by looking at the `RIGHT JOIN`s that come after it.
+  Every other table needed both asked of it: a scoped table joined at
+  position 0 and `RIGHT JOIN`ed at position 1 kept its guard in the
+  `WHERE` clause, where the `RIGHT JOIN`'s NULL extension made it false
+  for exactly the rows that join exists to preserve. MySQL 8.0.46 and
+  MariaDB 10.11.14 agree row for row: of three rows in the preserved
+  table the `WHERE` placement returned one and the `ON` placement
+  returns all three, with the other tenant's row NULL-extended rather
+  than shown. It LOSES rows rather than leaking them, which is why nine
+  rounds of adversarial review did not surface it and why it stood
+  written down in `tenant.go` as a known gap rather than fixed —
+  moving where a guard lands wanted a server to check against, and this
+  round had two. Placement is now one function that asks both halves,
+  with the `FROM` table falling out as the case where nothing comes
+  before. A `LEFT JOIN`'s guard does not move and must not: it is
+  already in its own `ON` clause restricting which children match, and
+  moving it would drop the parents that have none — also measured on
+  both.
+
+- **`mysql.JSONValue` rendered SQL MySQL cannot parse** (`drops/mysql`).
+  MySQL takes `JSON_VALUE`'s path in its GRAMMAR rather than as an
+  argument, so binding it produced `json_value(doc, ?)` — error 1064 on
+  MySQL 8.0.46, a statement that cannot run at all. MariaDB 10.11.14
+  accepts the placeholder, which is why rendering alone never showed
+  it. The path is now written into the SQL as a literal, through the
+  same door `JSON_TABLE`'s paths already go through, so a path built
+  from input cannot close the literal and continue the statement.
+
+- **A cancelled caller could strand an outbox lock forever**
+  (`drops/mysql`). `Outbox.DrainAggregate` held a session-scoped
+  `GET_LOCK` on the transaction's connection, and `database/sql` rolls
+  a transaction back from a goroutine the instant its context is
+  cancelled. A caller cancelled during the callback therefore raced
+  that goroutine, and when it lost — about two runs in three under
+  `-race` on MySQL 8.0.46 — the deferred `RELEASE_LOCK` got "sql:
+  transaction has already been committed or rolled back" and the lock
+  went back into the pool still held, so every later drain of that
+  aggregate took the silent skip branch forever. The transaction now
+  opens on a context stripped of cancellation and the cancellation is
+  enforced before the commit instead.
+
 - **A binding that named a column by the name it renders was dropped
   from the row rather than written** (`drops/pg`, `drops/mysql`,
   `drops/clickhouse`). `alignRow` is what decides which of a row's

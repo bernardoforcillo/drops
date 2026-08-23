@@ -42,6 +42,26 @@ services:
       timeout: 3s
       retries: 40
 
+  # The second MySQL family, and not a nicety: drops/mysql is built
+  # around a list of places where these two answer differently, and a
+  # suite run against only one of them tests half of that list. The
+  # tests ask the server which family it is rather than being told, so
+  # this needs no DSN of its own — point DROPS_MYSQL_DSN at 3308
+  # instead of 3307 and run the suite again.
+  mariadb:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_USER: drops
+      MARIADB_PASSWORD: drops
+      MARIADB_DATABASE: drops
+    ports: ["3308:3306"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     environment:

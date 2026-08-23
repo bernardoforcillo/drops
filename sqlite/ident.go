@@ -63,9 +63,10 @@ func mustIdent(kind, name string) {
 // folds pairs SQLite does not — U+0130 onto "i", U+212A onto "k" — so
 // a table declaring "tenantid" and "tenantİd", which SQLite creates as
 // two columns and the integration suite asks it to, had the second
-// read as the axis and the first left out of the INSERT altogether. Folding byte-wise is safe on UTF-8 for the same reason
-// it is right here: no lead or continuation byte falls in A-Z, so a
-// multi-byte sequence is left exactly as it was written.
+// read as the axis and the first left out of the INSERT altogether.
+// Folding byte-wise is safe on UTF-8 for the same reason it is right
+// here: no lead or continuation byte falls in A-Z, so a multi-byte
+// sequence is left exactly as it was written.
 //
 // pg and clickhouse compare a quoted identifier byte for byte and
 // their identKey returns the name itself. Asking the question in all

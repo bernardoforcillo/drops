@@ -318,9 +318,9 @@ statement, a `drops.Raw` or `ExprFunc` body, a view body, a statement
 that said `Unscoped()`, an INSERT into a table with a read filter and
 no write column, and the RIGHT JOIN placement gap — and depart from it
 where the dialect does. `mysql` carries three more: its hand-written
-outbox, event-store and idempotency SQL, the identifier fold it cannot
-settle without a server, and the tenant value its default
-case-insensitive collation folds onto another tenant's. `sqlite`
+outbox, event-store and idempotency SQL, the non-ASCII identifier fold
+both families perform and `identKey` does not, and the tenant value its
+default case-insensitive collation folds onto another tenant's. `sqlite`
 carries the RIGHT JOIN entry to record a gap the dialect cannot have,
 so that adding a join kind is known to bring it, and one entry of its
 own: a `COLLATE NOCASE` axis column is two tenants to drops and one to

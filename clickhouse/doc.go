@@ -87,8 +87,9 @@
 // makes into what was measured on the embedded engine, what was read
 // out of ClickHouse's documentation and what is neither — no
 // ClickHouse SERVER has been reachable from this project — and says
-// why there is no runtime identity surface here to match drops/pg's. Either way tenant.go's list of where the predicates stop
-// is load-bearing rather than a footnote.
+// why there is no runtime identity surface here to match drops/pg's.
+// Either way tenant.go's list of where the predicates stop is
+// load-bearing rather than a footnote.
 //
 // What this dialect's version of the feature does NOT have, because the
 // surface it would attach to does not exist here:

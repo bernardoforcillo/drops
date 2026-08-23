@@ -60,9 +60,16 @@
 // exact answer per family rather than accepting either — see
 // TestMySQLFamilyDivergences and TestMySQLPlaceholderScaleDivergence.
 //
-// The suite has been run whole, with nothing skipped for the family
-// and nothing failing, against MySQL 8.0.46 and MariaDB 10.11.14.
-// Those are the versions the "measured on" notes throughout
-// drops/mysql name; the compose file pins 8.4 and 10.11, which are
-// what a contributor gets rather than what those notes recorded.
+// The suite has been run whole against MySQL 8.0.46 and MariaDB
+// 10.11.14 with nothing failing on either. Nothing skips for the
+// family on MariaDB; on MySQL exactly two tests report a skip, and
+// both are cases whose MySQL half has already been asserted by the
+// time they reach a MariaDB-only tail — DROP CHECK, which only
+// MariaDB rejects, and ADD COLUMN IF NOT EXISTS, which only MariaDB
+// has. Run both servers and every assertion here has been made.
+//
+// 8.0.46 and 10.11.14 are the versions the "measured on" notes
+// throughout drops/mysql name; the compose file pins 8.4 and 10.11,
+// which are what a contributor gets rather than what those notes
+// recorded.
 package integration

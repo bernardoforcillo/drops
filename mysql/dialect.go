@@ -102,8 +102,9 @@
 // # Where the two families part company
 //
 // The suite has now been run against MySQL 8.0.46 and MariaDB
-// 10.11.14, and integration.TestMySQLFamilyDivergences pins each of
-// these on both. They are listed here because each one shapes what
+// 10.11.14, and every entry below is pinned on both —
+// integration.TestMySQLFamilyDivergences for all of them but the
+// last, which is integration.TestMySQLPlaceholderScaleDivergence. They are listed here because each one shapes what
 // this package renders, or whether a helper exists at all:
 //
 //   - MariaDB has no -> or ->> accessor, on a JSON column or anywhere

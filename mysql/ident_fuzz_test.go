@@ -190,10 +190,28 @@ func FuzzMySQLQuoteLiteral(f *testing.F) {
 
 // MySQL folds a column name's case on every platform and in every
 // configuration, and folds ASCII in all of them. What it does with a
-// non-ASCII case pair is its identifier collation's answer, and no
-// MySQL was reachable to ask, so identKey folds the ASCII and stops.
-// [identKey] has to be that map and not a wider one, so the rule is
-// written out here and the fuzz asks whether identKey is it.
+// non-ASCII case pair is its identifier collation's answer, and that
+// answer is measured rather than avoided now that both families are
+// reachable: over the utf8mb4 connection drops uses, MySQL 8.0.46 and
+// MariaDB 10.11.14 alike resolve tenantÉ to a column declared
+// tenanté, while the unaccented tenante stays a column of its own. A
+// case fold that reaches past ASCII and leaves accents alone, and the
+// same on both — it runs in
+// integration.TestMySQLFoldsANonASCIICasePairInAnIdentifier.
+//
+// identKey folds the ASCII and stops anyway, which leaves it NARROWER
+// than either server for such a pair. That is the direction to be
+// wrong in and the invariant still holds: identKey never reads two
+// names as one column unless the server does. What a narrow key costs
+// is a refusal — the axis guard answering no for a handle the
+// renderer answers yes for — and what a wide one costs is below.
+// Widening it to match the measurement is a change to make
+// deliberately, against this test, and not a bug fix.
+//
+// So asciiFoldModel is the rule identKey is REQUIRED to implement,
+// not a model of everything the server folds. [identKey] has to be
+// that map and not a wider one, so the rule is written out here and
+// the fuzz asks whether identKey is it.
 //
 // A wider fold is not the harmless over-approximation it looks like.
 // The axis guard reads a match as the tenant column being bound
@@ -223,7 +241,7 @@ func FuzzMySQLIdentKeyFoldsExactlyWhatMySQLFolds(f *testing.F) {
 	f.Fuzz(func(t *testing.T, name string) {
 		key := identKey(name)
 		if want := asciiFoldModel(name); key != want {
-			t.Fatalf("identKey(%q) = %q, the server's own fold gives %q", name, key, want)
+			t.Fatalf("identKey(%q) = %q, the rule it is required to implement gives %q", name, key, want)
 		}
 		// Matching happens more than once per statement and on both
 		// sides of the comparison, so the key has to be a fixed point:

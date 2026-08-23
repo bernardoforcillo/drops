@@ -403,6 +403,37 @@ once a 1.0 is cut.
   be mapped or named through `AllowUnmappedColumns`.
 
 ### Fixed
+- **Four doc claims that a server had not been consulted, when it had**
+  (`drops/mysql`, `drops/pg`, `drops/sqlite`, `drops/clickhouse`,
+  `integration`). The non-ASCII half of `identKey`'s folding rule was
+  recorded in five places as unsettled "for want of a server" — in the
+  normative tenant policy block carried by all four dialects, in
+  `mysql/ident_fuzz_test.go`, and in this file. Both MySQL families
+  were reachable by then. Asked: over the utf8mb4 connection drops
+  uses, MySQL 8.0.46 and MariaDB 10.11.14 alike resolve `tenantÉ` to a
+  column declared `tenanté`, and both keep the unaccented `tenante` as
+  a column of its own — a case fold that reaches past ASCII and leaves
+  accents alone, with no divergence between the families.
+  `integration.TestMySQLFoldsANonASCIICasePairInAnIdentifier` pins
+  both halves on both servers.
+
+  `identKey` is unchanged and still stops at ASCII, which leaves it
+  NARROWER than either server for such a pair. The invariant the
+  policy block states — `identKey` never reads two names as one column
+  unless the server does — still holds, and narrow is the direction
+  that refuses rather than the one that drops the tenant stamp out of
+  an `INSERT`. Widening it is now a change to make against a
+  measurement instead of a guess. The fuzz target's failure message no
+  longer calls its ASCII model "the server's own fold", which is what
+  the measurement disproves; it is the rule `identKey` is required to
+  implement.
+
+  Two smaller provenance errors went with them: `mysql/dialect.go` said
+  `TestMySQLFamilyDivergences` pinned all seven family entries when the
+  last is pinned by `TestMySQLPlaceholderScaleDivergence`, and
+  `integration/doc.go` said nothing skips for the family, when two
+  tests do on MySQL — both after their MySQL half has been asserted,
+  reaching a tail only MariaDB can answer.
 - **A tenant guard placed before a `RIGHT JOIN` turned itself off**
   (`drops/mysql`). Where a table's automatic predicates land was two
   questions and only one was asked. `joinKind.filterPlacement` decided
@@ -514,9 +545,10 @@ once a 1.0 is cut.
   the server does. `pg` and `clickhouse` compare a quoted identifier
   byte for byte and fold nothing, unchanged. `mysql` folds ASCII, which
   every MySQL agrees on; what its identifier collation does with a
-  non-ASCII case pair is unverified here for want of a server, and is
-  written into that package's "where the automatic scoping stops" list
-  rather than guessed at. `identKey` moved out of `tenant.go` and in
+  non-ASCII case pair is measured now that both families are
+  reachable, and both fold it, so `identKey` is narrower than the
+  server rather than wider — the direction that refuses rather than
+  the one that drops the stamp. `identKey` moved out of `tenant.go` and in
   beside the quoting helpers in `ident.go`, which leaves the tenancy
   rules byte-identical across the four; a fuzz target per dialect pins
   the fold against a model of the server's rule, and

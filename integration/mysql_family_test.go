@@ -133,3 +133,62 @@ func TestMySQLFamilyDivergences(t *testing.T) {
 		}
 	}
 }
+
+// What both families do with a NON-ASCII case pair in an identifier,
+// which drops/mysql's identKey has always declined to guess at.
+//
+// identKey folds ASCII and stops, and the reason recorded beside it
+// used to be that no MySQL was reachable to ask. Both families are
+// reachable now and they agree, so this is not a divergence — it is
+// the answer to a question the package had left open.
+//
+// Over the utf8mb4 connection this suite and drops both use, MySQL
+// 8.0.46 and MariaDB 10.11.14 alike resolve `tenantÉ` to the column
+// declared `tenanté`. That it is a CASE fold and not the accent
+// insensitivity of utf8mb4_general_ci is the second assertion: the
+// unaccented `tenante` is a different column on both, error 1054.
+//
+// Two things this does NOT show, because measuring them wrong is
+// easy. It is not a statement about latin1 connections: under one,
+// the exact lowercase spelling fails too, so the identifier bytes are
+// being misread rather than folded, and nothing about case can be
+// concluded from it. And it is not a reason to widen identKey. The
+// invariant the tenant policy block states — identKey never reads two
+// names as one column unless the server does — is still satisfied by
+// an ASCII-only fold, which errs NARROW: the guard answers no for a
+// handle the renderer answers yes for. Widening it is a change to
+// make deliberately against this measurement, not a bug fix.
+func TestMySQLFoldsANonASCIICasePairInAnIdentifier(t *testing.T) {
+	db := openMySQL(t)
+	ctx := context.Background()
+
+	tbl := mysql.NewTable(integration.UniqueName(t, "na"))
+	mysql.Add(tbl, mysql.BigInt("id"))
+	lower := mysql.Add(tbl, mysql.Integer("tenanté"))
+	dropMySQL(t, db, tbl)
+	execMySQL(t, db, mysql.CreateTable(tbl))
+	if _, err := db.Insert(tbl).Row(lower.Val(7)).Exec(ctx); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	name := mysql.Dialect.QuoteIdent(tbl.Name())
+
+	// The uppercase spelling of the same name: one column, or two.
+	if got := mysqlScalar(t, db, "SELECT `tenantÉ` FROM "+name); got != "7" {
+		t.Errorf("`tenantÉ` read %q, want the 7 written through `tenanté` — "+
+			"the two spellings are supposed to be one column", got)
+	}
+
+	// And the accent is not folded away with the case, which is what
+	// makes this a case fold rather than utf8mb4_general_ci deciding
+	// that é and e are the same letter.
+	err, _ := mysqlStreamErr(t, func() (drops.Rows, error) {
+		return db.Query(ctx, "SELECT `tenante` FROM "+name)
+	})
+	if err == nil {
+		t.Fatal("`tenante` resolved to `tenanté`; identifier matching is supposed to fold case " +
+			"and not accents, and identKey's rule is written for a fold that leaves accents alone")
+	}
+	if !strings.Contains(err.Error(), "1054") {
+		t.Errorf("`tenante` was rejected with %v, want error 1054", err)
+	}
+}

@@ -855,3 +855,73 @@ func TestSelectBuilderUnscopedStaysStatementWide(t *testing.T) {
 		t.Errorf("args = %v, want none", args)
 	}
 }
+
+// A table joined BEFORE a RIGHT JOIN is on the RIGHT JOIN's nullable
+// side, whatever kind its own join was. An INNER join's guard belongs
+// in the WHERE clause only while nothing NULL-extends it afterwards —
+// once a RIGHT JOIN does, that guard is false for exactly the rows the
+// RIGHT JOIN exists to preserve, and they disappear.
+//
+// The row loss is measured in
+// integration.TestMySQLGuardBeforeARightJoinKeepsTheP<...> — this half
+// asserts that the guard moves, and that it moves into the FIRST
+// following RIGHT JOIN, which is where the FROM table's already goes.
+func TestInnerJoinGuardMovesIntoALaterRightJoinsOnClause(t *testing.T) {
+	comments, _ := plainTable("comments")
+	posts, postID, _ := scopedTable("posts")
+	extra, _ := plainTable("extra")
+	db := mysql.New(dropstest.New())
+
+	sql, args := mustCtxSQL(t, db.Select().From(comments).
+		Join(posts, mysql.Eq(comments.Col("postId"), postID)).
+		RightJoin(extra, mysql.Eq(comments.Col("postId"), extra.Col("postId"))))
+	wantText(t, sql, "SELECT * FROM `comments` "+
+		"INNER JOIN `posts` ON (`comments`.`postId` = `posts`.`id`) "+
+		"RIGHT JOIN `extra` ON ((`comments`.`postId` = `extra`.`postId`) "+
+		"AND (`posts`.`tenantId` = ?))")
+	wantArgs(t, args, scopeTenant)
+}
+
+// The same move for a table joined by a RIGHT JOIN that a LATER RIGHT
+// JOIN then NULL-extends. Its own join made it the preserved side, so
+// its guard went to the WHERE clause; the second RIGHT JOIN takes that
+// back.
+func TestRightJoinedGuardMovesIntoTheNextRightJoinsOnClause(t *testing.T) {
+	comments, _ := plainTable("comments")
+	posts, postID, _ := scopedTable("posts")
+	extra, _ := plainTable("extra")
+	db := mysql.New(dropstest.New())
+
+	sql, args := mustCtxSQL(t, db.Select().From(comments).
+		RightJoin(posts, mysql.Eq(comments.Col("postId"), postID)).
+		RightJoin(extra, mysql.Eq(comments.Col("postId"), extra.Col("postId"))))
+	wantText(t, sql, "SELECT * FROM `comments` "+
+		"RIGHT JOIN `posts` ON (`comments`.`postId` = `posts`.`id`) "+
+		"RIGHT JOIN `extra` ON ((`comments`.`postId` = `extra`.`postId`) "+
+		"AND (`posts`.`tenantId` = ?))")
+	wantArgs(t, args, scopeTenant)
+}
+
+// A LEFT JOIN's guard does NOT move. It is already in its own ON
+// clause, where it restricts which rows of the joined table match and
+// leaves the preserved side alone — nothing a later RIGHT JOIN does can
+// make that predicate false for a row it did not already exclude.
+// Moving it into the later RIGHT JOIN would instead drop rows of the
+// FROM table that have no matching child, which is the LEFT JOIN
+// degeneration this placement exists to prevent. Measured on MySQL
+// 8.0.46 and MariaDB 10.11.14.
+func TestLeftJoinGuardStaysInItsOwnOnClauseBeforeARightJoin(t *testing.T) {
+	comments, _ := plainTable("comments")
+	posts, postID, _ := scopedTable("posts")
+	extra, _ := plainTable("extra")
+	db := mysql.New(dropstest.New())
+
+	sql, args := mustCtxSQL(t, db.Select().From(comments).
+		LeftJoin(posts, mysql.Eq(comments.Col("postId"), postID)).
+		RightJoin(extra, mysql.Eq(comments.Col("postId"), extra.Col("postId"))))
+	wantText(t, sql, "SELECT * FROM `comments` "+
+		"LEFT JOIN `posts` ON ((`comments`.`postId` = `posts`.`id`) "+
+		"AND (`posts`.`tenantId` = ?)) "+
+		"RIGHT JOIN `extra` ON (`comments`.`postId` = `extra`.`postId`)")
+	wantArgs(t, args, scopeTenant)
+}

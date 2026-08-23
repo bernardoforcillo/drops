@@ -121,20 +121,23 @@ import (
 //     family ships. A _bin column returned one row on both. The same
 //     shape is measured against PostgreSQL and against SQLite in
 //     integration/tenantvaluefold_test.go. A _bin or _cs collation on
-//     the axis column is the caller's to declare;
-//   - a scoped table INNER- or LEFT-joined BEFORE a RIGHT JOIN keeps its
-//     guard in the WHERE clause, and the RIGHT JOIN NULL-extends the left
-//     side — so the guard is false for exactly the rows the RIGHT JOIN
-//     exists to preserve. fromFilterJoin moves the FROM table's guard
-//     into the first RIGHT JOIN's ON clause; a table joined at position i
-//     takes its placement from its own join kind alone, and nothing looks
-//     at the kinds after it. This LOSES rows rather than leaking them —
-//     fail-closed, which is why nine rounds of adversarial review did not
-//     surface it — and the fix is to make filterPlacement consult the
-//     join kinds after position i. It is written down rather than fixed
-//     because moving where a guard lands is a change to the mechanism
-//     this section describes, and it belongs in a round that can verify
-//     it in its own right.
+//     the axis column is the caller's to declare.
+//
+// One entry has left this list. A scoped table joined BEFORE a RIGHT
+// JOIN used to keep its guard in the WHERE clause, where the RIGHT
+// JOIN's NULL extension made it false for exactly the rows that join
+// exists to preserve: fromFilterJoin moved the FROM table's guard into
+// the first RIGHT JOIN's ON clause, and a table joined at position i
+// took its placement from its own join kind alone. It LOST rows rather
+// than leaking them, which is why nine rounds of adversarial review
+// did not surface it, and it was written down rather than fixed
+// because moving where a guard lands is a change to this mechanism and
+// wanted a server to check against. It has now been had: placement is
+// [SelectBuilder.filterJoin], which asks both halves of the question,
+// and MySQL 8.0.46 and MariaDB 10.11.14 agree row for row that the
+// preserved side comes back whole with the other tenant's row
+// NULL-extended rather than shown — see
+// integration.TestMySQLGuardBeforeARightJoinKeepsThePreservedRows.
 //
 // A reviewer who has not read that list will read a raw fragment or a
 // view body as scoped when it is not.

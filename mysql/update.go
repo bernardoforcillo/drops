@@ -140,8 +140,8 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 // UPDATE t JOIN u ON …, which this builder does not expose: an UPDATE
 // here names exactly one relation. If it ever gains a join, its tables
 // belong in this list and in resolveCtx's context-filter resolution,
-// and the ON-versus-WHERE reasoning in joinKind.filterPlacement applies
-// there too.
+// and the ON-versus-WHERE reasoning in [SelectBuilder.filterJoin]
+// applies there too.
 func (u *UpdateBuilder) autoWheres() []drops.Expression {
 	if u.unscoped {
 		return nil

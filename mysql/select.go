@@ -129,6 +129,15 @@ const (
 // implements FULL OUTER JOIN, so [SelectBuilder] has no such method and
 // there is no fourth case to get wrong.
 //
+// All of that reasons about the join a table arrives on, and it is only
+// half the question. A table is on the nullable side of every RIGHT
+// JOIN that comes AFTER it as well, because that join NULL-extends the
+// whole relation accumulated so far — so a guard in the WHERE clause is
+// false for exactly the rows that RIGHT JOIN exists to preserve, and
+// they vanish. The kind alone cannot see that, which is why the
+// decision is [SelectBuilder.filterJoin] and this function is what it
+// asks when nothing follows.
+//
 // This decides where the *joined* table's predicates go. Where the FROM
 // table's go is the mirror question, and depends on the kinds of every
 // join in the statement rather than on one of them: see fromFilterJoin.
@@ -137,6 +146,52 @@ func (k joinKind) filterPlacement() joinPlacement {
 		return placeInOn
 	}
 	return placeInWhere
+}
+
+// filterJoin returns the index of the join whose ON clause has to carry
+// the automatic predicates of the table entering the statement at
+// position i — the FROM table when i is negative, the table joined at i
+// otherwise — or -1 when they belong in the WHERE clause.
+//
+// It is the whole placement decision, and it is one function because
+// the two halves of it were separately correct and wrong together.
+// [joinKind.filterPlacement] answers for the join a table arrives on;
+// fromFilterJoin answers for the RIGHT JOINs that come after the FROM
+// table. Every OTHER table has both questions asked of it too, and only
+// the first was: a table INNER-joined at position 0 and then RIGHT
+// JOINed at position 1 kept its guard in the WHERE clause, where the
+// RIGHT JOIN's NULL extension made it false for every preserved row
+// that had no match. Measured on MySQL 8.0.46 and MariaDB 10.11.14,
+// which agree exactly: of three rows in the preserved table, the WHERE
+// placement returned one and the ON placement returned all three, with
+// the other tenant's row NULL-extended rather than shown.
+//
+// That LOSES rows rather than leaking them, which is why it survived
+// nine rounds of adversarial review: fail-closed defects do not show up
+// as somebody else's data.
+//
+// A LEFT JOIN is the exception, and not an arbitrary one. Its guard is
+// already in its own ON clause, restricting which rows of the joined
+// table match and leaving the preserved side alone — a later RIGHT JOIN
+// cannot make that predicate false for a row it did not already
+// exclude. Moving it would drop rows of the FROM table with no matching
+// child, which is the degeneration that placement exists to prevent.
+// Also measured on both servers.
+//
+// The ON clause is the FIRST following RIGHT JOIN's, for fromFilterJoin's
+// reason: that is where the relation carrying this table enters the
+// preserved side, so restricting it there restricts it before any later
+// preserved side is added.
+func (s *SelectBuilder) filterJoin(i int, kind joinKind) int {
+	if i >= 0 && kind.filterPlacement() == placeInOn {
+		return i
+	}
+	for k := i + 1; k < len(s.joins); k++ {
+		if s.joins[k].kind == rightJoin {
+			return k
+		}
+	}
+	return -1
 }
 
 // fromFilterJoin says where the FROM table's own automatic predicates
@@ -165,14 +220,7 @@ func (k joinKind) filterPlacement() joinPlacement {
 // later join's ON clause the same predicate would instead be false for
 // the rows an earlier outer join had already NULL-extended, which
 // silently drops them.
-func (s *SelectBuilder) fromFilterJoin() int {
-	for i, j := range s.joins {
-		if j.kind == rightJoin {
-			return i
-		}
-	}
-	return -1
-}
+func (s *SelectBuilder) fromFilterJoin() int { return s.filterJoin(-1, innerJoin) }
 
 // andWith returns on AND every predicate in extra, for an ON clause
 // that has to carry a table's automatic filters. A nil on — a join
@@ -413,10 +461,26 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		}
 	}
 	// autoWheres are the automatic predicates that belong in the WHERE
-	// clause. The joined tables' are gathered here, as the joins render,
-	// so the placement decision lives in one place with its ON-clause
-	// half.
+	// clause, and joinOn holds those that belong in some join's ON
+	// clause. Both are decided BEFORE any join renders, because a
+	// table's guard can belong to a join further along than its own —
+	// see [SelectBuilder.filterJoin] — and by the time that join renders
+	// the earlier one has already gone out.
 	var autoWheres []drops.Expression
+	joinOn := make([][]drops.Expression, len(s.joins))
+	if !s.unscoped {
+		for i, j := range s.joins {
+			dfs := s.autoDefaults(j.table)
+			if len(dfs) == 0 {
+				continue
+			}
+			if t := s.filterJoin(i, j.kind); t >= 0 {
+				joinOn[t] = append(joinOn[t], dfs...)
+			} else {
+				autoWheres = append(autoWheres, dfs...)
+			}
+		}
+	}
 	for i, j := range s.joins {
 		b.WriteByte(' ')
 		b.WriteString(string(j.kind))
@@ -424,12 +488,7 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 		j.table.writeFrom(b)
 		on := j.on
 		if !s.unscoped {
-			switch dfs := s.autoDefaults(j.table); j.kind.filterPlacement() {
-			case placeInOn:
-				on = andWith(on, append(append([]drops.Expression(nil), dfs...), j.ctxOn...))
-			case placeInWhere:
-				autoWheres = append(autoWheres, dfs...)
-			}
+			on = andWith(on, append(append([]drops.Expression(nil), joinOn[i]...), j.ctxOn...))
 		}
 		if i == fromOn {
 			on = andWith(on, append(append([]drops.Expression(nil), fromDefaults...), fromCtx...))
@@ -669,7 +728,8 @@ func (s *SelectBuilder) resolveStatement(ctx context.Context) (drops.Expression,
 // It returns two things because the answer lands in two clauses: a
 // rebuilt join list when some ON clause had to grow (nil when none
 // did), and the predicates bound for the WHERE clause. Which of the two
-// a join contributes to is joinKind.filterPlacement's decision.
+// a join contributes to — and, for the ON clause, WHICH join's — is
+// [SelectBuilder.filterJoin]'s decision.
 //
 // A self-join of a scoped table resolves its filters once per instance
 // and so carries the predicate twice, once qualified per side. That is
@@ -692,11 +752,11 @@ func (s *SelectBuilder) resolveJoins(ctx context.Context) ([]joinClause, []drops
 		if len(jp) == 0 {
 			continue
 		}
-		if j.kind.filterPlacement() == placeInOn {
+		if t := s.filterJoin(i, j.kind); t >= 0 {
 			if joins == nil {
 				joins = append([]joinClause(nil), s.joins...)
 			}
-			joins[i].ctxOn = jp
+			joins[t].ctxOn = append(joins[t].ctxOn, jp...)
 			continue
 		}
 		preds = append(preds, jp...)

@@ -74,6 +74,21 @@ func (s ServerInfo) SupportsDropConstraint() bool {
 	return s.AtLeast(8, 0, 19)
 }
 
+// SupportsRenameColumn reports whether ALTER TABLE … RENAME COLUMN old
+// TO new is understood. MySQL learned it in 8.0 and MariaDB in 10.5.2;
+// before that a rename has to go through CHANGE COLUMN, which restates
+// the whole definition and can copy the table to do it.
+//
+// A zero ServerInfo is a server of unknown version and answers false,
+// so a migration generated without one carries the spelling every
+// server accepts.
+func (s ServerInfo) SupportsRenameColumn() bool {
+	if s.MariaDB {
+		return s.AtLeast(10, 5, 2)
+	}
+	return s.AtLeast(8, 0, 0)
+}
+
 // ServerVersion asks the server what it is.
 func ServerVersion(ctx context.Context, db *DB) (ServerInfo, error) {
 	rows, err := db.Query(ctx, "SELECT VERSION()")

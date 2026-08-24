@@ -178,3 +178,159 @@ func (noopDriver) Query(_ context.Context, _ string, _ ...any) (drops.Rows, erro
 	return nil, nil
 }
 func (noopDriver) Begin(_ context.Context) (drops.Tx, error) { return nil, nil }
+
+// A cursor sitting on a NULL used to render `note > $1` bound to nil,
+// which under SQL's three-valued logic matches nothing — so the caller
+// got an empty page rather than the rest of the walk, on every page
+// from then on, with nothing anywhere saying why. The guard has to be
+// written against where the ORDER BY puts the NULLs instead.
+func TestKeysetGuardPagesPastANull(t *testing.T) {
+	tbl := pg.NewTable("notes")
+	note := pg.Add(tbl, pg.Text("note"))
+	id := pg.Add(tbl, pg.BigInt("id").NotNull())
+	db := pg.New(noopDriver{})
+
+	// Ascending is NULLS LAST by default: the NULLs are the tail of
+	// the walk, so nothing on that key follows one and only the
+	// tiebreaker contributes.
+	asc := pg.NewCursorSpec(pg.OrderKey{Col: note.Column}, pg.OrderKey{Col: id.Column})
+	atNull, err := pg.EncodeCursor(asc, nil, int64(7))
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	sql, _ := db.Select().From(tbl).OrderByCursor(asc).AfterCursor(asc, atNull).ToSQL()
+	if strings.Contains(sql, `"notes"."note" >`) {
+		t.Errorf("nothing sorts past a trailing NULL: %s", sql)
+	}
+	if !strings.Contains(sql, `(("notes"."note" IS NULL) AND ("notes"."id" > $1))`) {
+		t.Errorf("tiebreaker must carry the walk through the NULL block: %s", sql)
+	}
+
+	// Ascending past a value on a nullable column has to reach the
+	// NULLs that sort after it.
+	atValue, err := pg.EncodeCursor(asc, "m", int64(7))
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	sql, _ = db.Select().From(tbl).OrderByCursor(asc).AfterCursor(asc, atValue).ToSQL()
+	if !strings.Contains(sql, `(("notes"."note" > $1) OR ("notes"."note" IS NULL))`) {
+		t.Errorf("ascending on a nullable column must include the NULLs ahead: %s", sql)
+	}
+
+	// Descending is NULLS FIRST by default, so past a NULL lies every
+	// non-NULL row.
+	desc := pg.NewCursorSpec(
+		pg.OrderKey{Col: note.Column, Desc: true},
+		pg.OrderKey{Col: id.Column, Desc: true},
+	)
+	descAtNull, err := pg.EncodeCursor(desc, nil, int64(7))
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	sql, _ = db.Select().From(tbl).OrderByCursor(desc).AfterCursor(desc, descAtNull).ToSQL()
+	if !strings.Contains(sql, `("notes"."note" IS NOT NULL)`) {
+		t.Errorf("descending past a leading NULL must reach the non-NULL rows: %s", sql)
+	}
+	if !strings.Contains(sql, `(("notes"."note" IS NULL) AND ("notes"."id" < $1))`) {
+		t.Errorf("descending tiebreaker inside the NULL block: %s", sql)
+	}
+}
+
+// The NULLS placement the spec asks for is the one the guard is built
+// against — the default is not the only answer PostgreSQL accepts.
+func TestKeysetGuardFollowsTheDeclaredNullsPlacement(t *testing.T) {
+	tbl := pg.NewTable("notes")
+	note := pg.Add(tbl, pg.Text("note"))
+	id := pg.Add(tbl, pg.BigInt("id").NotNull())
+	db := pg.New(noopDriver{})
+
+	spec := pg.NewCursorSpec(
+		pg.OrderKey{Col: note.Column, Nulls: pg.NullsFirst},
+		pg.OrderKey{Col: id.Column},
+	)
+	atNull, err := pg.EncodeCursor(spec, nil, int64(7))
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	sql, _ := db.Select().From(tbl).OrderByCursor(spec).AfterCursor(spec, atNull).ToSQL()
+	if !strings.Contains(sql, `("notes"."note" IS NOT NULL)`) {
+		t.Errorf("ASC NULLS FIRST: past a NULL lies every non-NULL row: %s", sql)
+	}
+
+	atValue, err := pg.EncodeCursor(spec, "m", int64(7))
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	sql, _ = db.Select().From(tbl).OrderByCursor(spec).AfterCursor(spec, atValue).ToSQL()
+	if strings.Contains(sql, `"notes"."note" IS NULL) `) {
+		t.Errorf("ASC NULLS FIRST: the NULLs are behind, not ahead: %s", sql)
+	}
+}
+
+// A NOT NULL column must not pay for a disjunct that can never match.
+func TestKeysetGuardOmitsTheNullBranchOnANotNullColumn(t *testing.T) {
+	tbl := pg.NewTable("notes")
+	id := pg.Add(tbl, pg.BigInt("id").NotNull())
+	spec := pg.NewCursorSpec(pg.OrderKey{Col: id.Column})
+	cur, err := pg.EncodeCursor(spec, int64(7))
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	sql, _ := pg.New(noopDriver{}).Select().From(tbl).AfterCursor(spec, cur).ToSQL()
+	if strings.Contains(sql, "IS NULL") {
+		t.Errorf("NOT NULL column should not get a NULL disjunct: %s", sql)
+	}
+}
+
+// Paging backward reverses the order, and reversing the order reverses
+// the NULL placement with it.
+func TestKeysetGuardReversesTheNullPlacementWhenPagingBackward(t *testing.T) {
+	tbl := pg.NewTable("notes")
+	note := pg.Add(tbl, pg.Text("note"))
+	id := pg.Add(tbl, pg.BigInt("id").NotNull())
+	spec := pg.NewCursorSpec(pg.OrderKey{Col: note.Column}, pg.OrderKey{Col: id.Column})
+	atNull, err := pg.EncodeCursor(spec, nil, int64(7))
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	sql, _ := pg.New(noopDriver{}).Select().From(tbl).BeforeCursor(spec, atNull).ToSQL()
+	// ASC NULLS LAST read backwards is DESC NULLS FIRST: before a NULL
+	// lies every non-NULL row.
+	if !strings.Contains(sql, `("notes"."note" IS NOT NULL)`) {
+		t.Errorf("backward past a NULL must reach the non-NULL rows: %s", sql)
+	}
+}
+
+// A nullable column is a pointer on the row struct, so that is the
+// shape the last row of a page hands to EncodeCursor.
+func TestCursorEncodesAPointerAsItsPointee(t *testing.T) {
+	tbl := pg.NewTable("notes")
+	note := pg.Add(tbl, pg.Text("note"))
+	spec := pg.NewCursorSpec(pg.OrderKey{Col: note.Column})
+
+	v := "m"
+	fromPtr, err := pg.EncodeCursor(spec, &v)
+	if err != nil {
+		t.Fatalf("EncodeCursor(&v): %v", err)
+	}
+	fromVal, err := pg.EncodeCursor(spec, v)
+	if err != nil {
+		t.Fatalf("EncodeCursor(v): %v", err)
+	}
+	if fromPtr != fromVal {
+		t.Errorf("pointer and value cursors differ: %q vs %q", fromPtr, fromVal)
+	}
+
+	var null *string
+	fromNil, err := pg.EncodeCursor(spec, null)
+	if err != nil {
+		t.Fatalf("EncodeCursor((*string)(nil)): %v", err)
+	}
+	vals, err := fromNil.Decode()
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(vals) != 1 || vals[0] != nil {
+		t.Errorf("a nil pointer is the NULL the guard pages past, got %#v", vals)
+	}
+}

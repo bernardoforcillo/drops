@@ -7,11 +7,33 @@ import (
 	"strings"
 )
 
+// DiffOptions tunes how Diff renders statements.
+type DiffOptions struct {
+	// Renames names the objects that changed name rather than being
+	// dropped and re-added. Diff cannot work this out — see rename.go —
+	// so an unstated rename comes out as a rebuild that copies every
+	// column except the one that mattered. Each entry turns its pair
+	// into an ALTER TABLE ... RENAME, and the diff that follows is
+	// computed as if the rename had already happened.
+	//
+	// Diff trusts what it is given: a rename naming an object that is
+	// not there is emitted anyway and fails at the server.
+	// GenerateMigration checks first.
+	Renames []Rename
+}
+
 // DiffDown returns the SQL that reverses the migration from cur back to
 // prev — applying these statements after the corresponding Diff(prev,
-// cur) restores the original schema. It is simply Diff(cur, prev).
-func DiffDown(prev, cur *Snapshot) []string {
-	return Diff(cur, prev)
+// cur) restores the original schema. It is simply Diff(cur, prev), with
+// DiffOptions.Renames inverted along with the arguments so a migration
+// that renames a column rolls back by renaming it the other way.
+func DiffDown(prev, cur *Snapshot, opts ...DiffOptions) []string {
+	if len(opts) == 0 {
+		return Diff(cur, prev)
+	}
+	down := opts[0]
+	down.Renames = invertRenames(down.Renames)
+	return Diff(cur, prev, down)
 }
 
 // Diff returns the ordered list of SQL statements (and inline comments)
@@ -37,9 +59,10 @@ func DiffDown(prev, cur *Snapshot) []string {
 //     a `-- rebuild "t": <reason>` comment.
 //
 // Operation order:
-//  1. DROP TABLE   for tables removed entirely
-//  2. CREATE TABLE for new tables (all constraints inline)
-//  3. per surviving table: ADD COLUMN statements, or a rebuild sequence
+//  1. ALTER TABLE ... RENAME, for the renames DiffOptions.Renames states
+//  2. DROP TABLE   for tables removed entirely
+//  3. CREATE TABLE for new tables (all constraints inline)
+//  4. per surviving table: ADD COLUMN statements, or a rebuild sequence
 //
 // Indexes and triggers are preserved, never diffed. Diff emits no
 // CREATE INDEX, no DROP INDEX and no CREATE TRIGGER of its own: the Go
@@ -56,13 +79,22 @@ func DiffDown(prev, cur *Snapshot) []string {
 // introspection, come through a rebuild with their indexes, and
 // GenerateMigration, which diffs two snapshot files, does not. It says
 // so in the migration it writes; see noteBlindRebuilds.
-func Diff(prev, cur *Snapshot) []string {
+func Diff(prev, cur *Snapshot, opts ...DiffOptions) []string {
+	var opt DiffOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	if prev == nil {
 		prev = EmptySnapshot()
 	}
 	if cur == nil {
 		cur = EmptySnapshot()
 	}
+	// The renames go in front of everything, rebuilds included, and
+	// everything below is computed against a previous schema in which
+	// they have already run.
+	renames := renameStatements(opt.Renames)
+	prev = applyRenames(prev, opt.Renames)
 	var out []string
 
 	// 1. Dropped tables.
@@ -85,7 +117,7 @@ func Diff(prev, cur *Snapshot) []string {
 		}
 		out = append(out, diffTable(prevT, cur.Tables[key])...)
 	}
-	return out
+	return append(renames, out...)
 }
 
 // diffTable produces the statements for a table present in both prev and

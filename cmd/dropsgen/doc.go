@@ -1,10 +1,11 @@
 // dropsgen generates zero-reflection bind / scan helpers for structs
 // tagged as drops entities.
 //
-// It has four modes; this comment covers the bind/scan one, and the
+// It has six modes; this comment covers the bind/scan one, and the
 // others are described where they are implemented: schema mode in
-// schema.go, snapshot introspection in introspect.go, SQL compilation
-// in sqlgen.go.
+// schema.go, row / insert struct generation in rows.go, eager-load
+// shapes in rels.go, snapshot introspection in introspect.go, SQL
+// compilation in sqlgen.go.
 //
 // Usage:
 //
@@ -36,7 +37,10 @@
 //	    Email string `drop:"email"`
 //	}
 //
-// Polymorphism, relations, and validation are intentionally out of
-// scope for the first iteration — the generator focuses on the hot
-// row-binding path that benefits most from skipping reflection.
+// Polymorphism and validation are out of scope for this mode, which
+// focuses on the hot row-binding path that benefits most from
+// skipping reflection. Relations are not bound here either — an
+// eager-loaded field is filled by the reflection loader, not by a
+// generated scan — but the struct that receives one is generated, by
+// rels mode.
 package main

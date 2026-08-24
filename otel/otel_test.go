@@ -273,3 +273,70 @@ func TestArgumentValuesNeverReachTheSpan(t *testing.T) {
 		t.Errorf("args count attr = %v, want 1", n)
 	}
 }
+
+// The split is the reason this package can tell an operator whether to
+// add connections or fix the query, so it has to reach both the
+// histograms and the span.
+func TestSplitMetricsRecordedWhenTheDriverMeasuredIt(t *testing.T) {
+	m := newMeter()
+	tr := &fakeTracer{}
+	inst := otel.New(otel.Config{Meter: m, Tracer: tr, System: "postgresql"})
+
+	inst.Hook()(context.Background(), drops.QueryEvent{
+		Kind:         "query",
+		Duration:     100 * time.Millisecond,
+		WaitDuration: 90 * time.Millisecond,
+		WaitKnown:    true,
+	})
+
+	wait := m.histograms[otel.MetricWaitTime]
+	if len(wait.recs) != 1 || wait.recs[0].value != 0.09 {
+		t.Fatalf("wait histogram: %+v", wait.recs)
+	}
+	query := m.histograms[otel.MetricQueryTime]
+	if len(query.recs) != 1 || query.recs[0].value != 0.01 {
+		t.Fatalf("query histogram: %+v", query.recs)
+	}
+	// The total keeps meaning the total; splitting it must not
+	// silently redefine an instrument dashboards already read.
+	total := m.histograms[otel.MetricDuration]
+	if len(total.recs) != 1 || total.recs[0].value != 0.1 {
+		t.Fatalf("duration histogram: %+v", total.recs)
+	}
+
+	if len(tr.spans) != 1 {
+		t.Fatalf("expected one span, got %d", len(tr.spans))
+	}
+	if v, ok := attrVal(tr.spans[0].attrs, otel.AttrWaitTime); !ok || v != 0.09 {
+		t.Errorf("span wait attr: %v ok=%v", v, ok)
+	}
+	if v, ok := attrVal(tr.spans[0].attrs, otel.AttrQueryTime); !ok || v != 0.01 {
+		t.Errorf("span query attr: %v ok=%v", v, ok)
+	}
+}
+
+// A zero recorded for every unmeasured statement would make an
+// exhausted pool and an uninstrumented driver produce the same
+// histogram, which is the one failure mode worth preventing.
+func TestSplitMetricsAbsentWhenTheDriverDidNot(t *testing.T) {
+	m := newMeter()
+	tr := &fakeTracer{}
+	inst := otel.New(otel.Config{Meter: m, Tracer: tr, System: "postgresql"})
+
+	inst.Hook()(context.Background(), drops.QueryEvent{
+		Kind: "query", Duration: 100 * time.Millisecond,
+	})
+
+	if recs := m.histograms[otel.MetricWaitTime].recs; len(recs) != 0 {
+		t.Errorf("wait histogram should be empty, got %+v", recs)
+	}
+	if recs := m.histograms[otel.MetricQueryTime].recs; len(recs) != 0 {
+		t.Errorf("query histogram should be empty, got %+v", recs)
+	}
+	if len(m.histograms[otel.MetricDuration].recs) != 1 {
+		t.Error("the total is always recorded")
+	}
+	if _, ok := attrVal(tr.spans[0].attrs, otel.AttrWaitTime); ok {
+		t.Error("span carries a wait attribute nobody measured")
+	}
+}

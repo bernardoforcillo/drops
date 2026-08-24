@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/bernardoforcillo/drops"
-	"github.com/bernardoforcillo/drops/dropstest"
 	"github.com/bernardoforcillo/drops/pg"
 )
 
@@ -152,58 +151,67 @@ func TestWithTenantContextRoundTrip(t *testing.T) {
 	}
 }
 
-// ErrTenantMissing is the whole diagnostic a caller gets: nothing
-// exported asks a *Table which filters it carries, so an unwrapped
-// sentence would read the same whichever of a schema's scoped tables
-// refused the statement. Both producers name the axis.
-func TestTenantMissingNamesTheTableThatRefused(t *testing.T) {
-	posts := pg.NewTable("posts")
-	pg.Add(posts, pg.BigSerial("id").PrimaryKey())
-	posts.ContextFilter(pg.TenantFilter(pg.Add(posts, pg.BigInt("tenantId").NotNull())))
+// Stream and Page are reads, and a read on a tenant-scoped entity owes
+// the tenant predicate. Both used to reach past the scoping — Stream
+// straight to the SelectBuilder, Page by building its own — which made
+// a batch job or a paginated listing the one way to read every
+// tenant's rows at once without asking for it.
+func TestScopeByTenantOnStream(t *testing.T) {
+	ent := tenantSchema(t)
+	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
+		return &fakeRows{cols: []string{"id", "tenantId", "name"}}, nil
+	}}
+	db := pg.New(fd)
+	ctx := pg.WithTenant(context.Background(), int64(42))
 
-	tests := []struct {
-		name string
-		run  func() error
-		want string
-	}{
-		{
-			// The shape with no Entity anywhere in the call, which is
-			// the one the old wording ("entity is tenant-scoped") sent
-			// looking for an entity that was never written.
-			name: "a bare select on a scoped table",
-			run: func() error {
-				_, _, err := pg.New(dropstest.New()).Select().From(posts).ToSQLCtx(context.Background())
-				return err
-			},
-			want: "posts.tenantId",
-		},
-		{
-			name: "an entity scoped through ScopeByTenant",
-			run: func() error {
-				_, err := tenantSchema(t).Get(pg.New(dropstest.New()), context.Background(), int64(1))
-				return err
-			},
-			want: "users.tenantId",
-		},
-		{
-			name: "a write that would have stamped the tenant",
-			run: func() error {
-				row := tenantUser{Name: "Ada"}
-				return tenantSchema(t).Create(pg.New(dropstest.New()), context.Background(), &row)
-			},
-			want: "users.tenantId",
-		},
+	if err := ent.Query(db).Stream(ctx, func(*tenantUser) error { return nil }); err != nil {
+		t.Fatalf("Stream: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.run()
-			if !errors.Is(err, pg.ErrTenantMissing) {
-				t.Fatalf("got = %v, want %v", err, pg.ErrTenantMissing)
-			}
-			if !strings.Contains(err.Error(), tt.want) {
-				t.Errorf("error %q does not name the axis that refused; got = %v, want it to contain %v",
-					err.Error(), err.Error(), tt.want)
-			}
-		})
+	sql := fd.queries[0]
+	if !strings.Contains(sql, `"tenantId" = $`) {
+		t.Errorf("Stream must AND tenantId = $: %s", sql)
 	}
+}
+
+func TestScopeByTenantStreamRequiresCtxTenant(t *testing.T) {
+	ent := tenantSchema(t)
+	db := pg.New(&fakeDriver{})
+	err := ent.Query(db).Stream(context.Background(), func(*tenantUser) error { return nil })
+	if !errors.Is(err, pg.ErrTenantMissing) {
+		t.Errorf("Stream without WithTenant must fail closed, got %v", err)
+	}
+}
+
+func TestScopeByTenantOnPage(t *testing.T) {
+	tbl, ent := tenantSchemaTable(t)
+	fd := &fakeDriver{handler: func(string, []any) (drops.Rows, error) {
+		return &fakeRows{cols: []string{"id", "tenantId", "name"}}, nil
+	}}
+	db := pg.New(fd)
+	ctx := pg.WithTenant(context.Background(), int64(42))
+
+	if _, err := ent.Page(db).OrderBy(pg.Asc(tbl.Col("id"))).Limit(10).All(ctx); err != nil {
+		t.Fatalf("Page: %v", err)
+	}
+	sql := fd.queries[0]
+	if !strings.Contains(sql, `"tenantId" = $`) {
+		t.Errorf("Page must AND tenantId = $: %s", sql)
+	}
+}
+
+func TestScopeByTenantPageRequiresCtxTenant(t *testing.T) {
+	tbl, ent := tenantSchemaTable(t)
+	db := pg.New(&fakeDriver{})
+	_, err := ent.Page(db).OrderBy(pg.Asc(tbl.Col("id"))).Limit(10).All(context.Background())
+	if !errors.Is(err, pg.ErrTenantMissing) {
+		t.Errorf("Page without WithTenant must fail closed, got %v", err)
+	}
+}
+
+// tenantSchemaTable is tenantSchema with the table handed back, for
+// the tests that have to name one of its columns.
+func tenantSchemaTable(t *testing.T) (*pg.Table, *pg.Entity[tenantUser]) {
+	t.Helper()
+	tbl := pg.AutoTable[tenantUser]("users")
+	return tbl, pg.NewEntity[tenantUser](tbl).ScopeByTenant(tbl.Col("tenantId"))
 }

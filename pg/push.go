@@ -34,127 +34,29 @@ type PushOptions struct {
 	// default; see Push's doc comment for why.
 	DropUnmanagedIndexes bool
 
-	// DropUnmanagedTables lets Push drop a table that exists in the
-	// database but appears in no table of the Go schema. It is off by
-	// default, for the same reason as DropUnmanagedIndexes and with
-	// more at stake: Push's "previous" side is a database, and a table
-	// the Go schema does not name most likely was never drops's to
-	// begin with — another service's, a vendor's, an extension's, a
-	// migration history table, something a DBA left. The withheld DROPs
-	// are reported as "unmanaged-table" notices whether the push is a
-	// DryRun or a real one, ready to run by hand.
-	//
-	// The restriction is Push's alone. It does not apply to Diff or to
-	// GenerateMigration, where both sides are declarations and a table
-	// missing from the newer one really was removed.
-	//
-	// Turning it on does not by itself authorise the drop of a table
-	// with rows in it; see Allow.
-	DropUnmanagedTables bool
+	// DropUnmanagedObjects lets Push drop an enum, sequence, view or
+	// policy that exists in the database and appears nowhere in the Go
+	// schema, and lets it switch off a row-level security the schema
+	// does not declare. It is off by default for the same reason
+	// DropUnmanagedIndexes is, with a sharper edge: turning RLS off is
+	// not a slow rebuild, it is every row of the table becoming
+	// visible to everyone the moment the push commits.
+	DropUnmanagedObjects bool
 
-	// Allow names the destructive changes this push is permitted to
-	// make to a table that is not empty. Anything destructive that is
-	// not named here, and not against an empty table, is withheld:
-	// Push applies nothing, returns ErrDestructivePush, and reports
-	// what it withheld in PushResult.DataLoss.
+	// Renames answers the rename questions this push raises, for one
+	// run. They are merged over what the schema itself declares — see
+	// DeclaredRenames — with these winning.
 	//
-	// Naming the object rather than passing a global --force is the
-	// whole point. A flag says "destroy whatever today's diff happens
-	// to contain", which is a decision made before anyone knew what
-	// that was; a Destructive names one table and one column, so
-	// yesterday's consent cannot authorise today's unrelated DROP, and
-	// the consent is a Go value visible in the diff of the pull request
-	// that grants it.
+	// This is the per-call answer, the one a command line carries. The
+	// durable one is (*Col[T]).RenamedFrom in the schema, and it is
+	// the better answer for anything that will be pushed more than
+	// once: a flag answers the database in front of you, a declaration
+	// answers every database the schema reaches.
 	//
-	// An entry that names no change in this diff authorises nothing,
-	// and is reported as a "stale-consent" notice rather than passed
-	// over in silence. It is the same argument
-	// [ErrRenameNotApplicable] makes about a rename left behind in the
-	// call after the migration that performed it — with more at stake,
-	// because a consent that has quietly stopped applying reads at the
-	// call site exactly like one that is still doing its job. The
-	// spellings that produce one are a Destructive naming a table or a
-	// column that no longer exists, an Op that no longer matches the
-	// change the diff arrived at, and a table drop written with a
-	// non-empty Object, which matches nothing because Object is empty
-	// on a table drop by construction.
-	Allow []Destructive
+	// A candidate neither of them answers is not guessed at: Push
+	// returns *RenameAmbiguityError and executes nothing.
+	Renames []RenameDecision
 }
-
-// DestructiveOp names a kind of change that destroys data.
-type DestructiveOp string
-
-// The names carry an Op prefix because pg.DropTable is already the DDL
-// builder that renders a DROP TABLE statement, and one of the two
-// spellings has to give way to the other.
-const (
-	// OpDropTable is a DROP TABLE: every row goes.
-	OpDropTable DestructiveOp = "drop-table"
-	// OpDropColumn is an ALTER TABLE ... DROP COLUMN: one value per
-	// row goes.
-	OpDropColumn DestructiveOp = "drop-column"
-	// OpRetypeColumn is an ALTER TABLE ... SET DATA TYPE. It is here
-	// because PostgreSQL casts every existing value on the way, and a
-	// cast can truncate (varchar(20) to varchar(10)), round (numeric to
-	// integer) or fail halfway through the rewrite.
-	OpRetypeColumn DestructiveOp = "retype-column"
-)
-
-// Destructive names one change Push is authorised to make. Pass them
-// in PushOptions.Allow.
-type Destructive struct {
-	// Op is the kind of change being authorised.
-	Op DestructiveOp
-	// Table is the unqualified table name, as the database has it.
-	Table string
-	// Object is the column name; empty for OpDropTable.
-	Object string
-}
-
-// DataLoss is a destructive change Push found, declined to make, and
-// is telling you about.
-//
-// Rows is an ESTIMATE, read from pg_class.reltuples. Distinguishing
-// "empty" from "not empty" is all the rule needs — an empty table has
-// nothing to lose, so dropping it needs no permission — and a COUNT(*)
-// per candidate table is a sequential scan bolted onto the operation
-// you most want to finish quickly.
-//
-// The estimate is -1 on a table PostgreSQL has never analysed, which is
-// every table created since the last autovacuum ran: exactly the tables
-// a development push creates and reshapes minutes later. Refusing those
-// would make the rule fire hardest where there is nothing to protect,
-// so an unknown estimate is settled with SELECT EXISTS (SELECT 1 FROM
-// t LIMIT 1) — one row read, on the only tables whose count nobody
-// knows, and only for a change nobody has authorised. Rows stays -1
-// afterwards, because "some" is all that probe answers.
-type DataLoss struct {
-	// Op is the kind of change.
-	Op DestructiveOp
-	// Table is the table it is against.
-	Table string
-	// Object is the column, empty for a table-level change.
-	Object string
-	// Rows is the planner's row-count estimate for Table, or -1 when
-	// the table has never been analysed.
-	Rows int64
-	// SQL is the statement Push withheld.
-	SQL string
-	// Suggestion is the Destructive value that would authorise it.
-	Suggestion string
-}
-
-// ErrDestructivePush is returned when a push would destroy data in a
-// table that is not empty and PushOptions.Allow does not name the
-// change. Nothing is applied: the whole diff is withheld, not just the
-// destructive part of it, because a half-applied schema is worse than
-// an unapplied one and the caller is about to re-run this anyway.
-//
-// Unlike every other failure in Push, the PushResult is returned
-// alongside the error rather than instead of it — the statements it
-// planned and the DataLoss list are the answer to the question the
-// error raises.
-var ErrDestructivePush = errors.New("drops/pg: push withheld destructive statements; see PushResult.DataLoss")
 
 // PushResult is the outcome of a Push call.
 type PushResult struct {
@@ -169,11 +71,6 @@ type PushResult struct {
 	// database and the schema disagree about something Push declined
 	// to change.
 	Notices []SchemaNotice
-	// DataLoss lists the destructive changes that stopped this push,
-	// in the order the diff put them. It is non-empty exactly when
-	// Push returned ErrDestructivePush; each entry carries the
-	// PushOptions.Allow value that would let it through.
-	DataLoss []DataLoss
 }
 
 // SchemaNotice is a difference Push can see but will not act on.
@@ -183,18 +80,15 @@ type PushResult struct {
 // here rather than being dropped on the floor.
 type SchemaNotice struct {
 	// Rule is a stable identifier for the kind of notice —
-	// "unmanaged-table", "unmanaged-enum", "unmanaged-sequence",
-	// "unmanaged-view", "unmanaged-index", "unrepresentable-index",
-	// "stale-consent", "check-not-normalised",
-	// "index-predicate-not-normalised".
+	// "unmanaged-index", "unmanaged-enum", "unmanaged-sequence",
+	// "unmanaged-view", "unmanaged-policy", "unmanaged-rls",
+	// "unrepresentable-index", "enum-labels-reordered",
+	// "check-not-normalised", "index-predicate-not-normalised",
+	// "policy-expression-not-normalised", "view-not-normalised".
 	Rule string
-	// Table is the table the notice concerns, unqualified. It is empty
-	// on a notice about an object that belongs to the schema rather
-	// than to a table — an enum, a sequence, a view — which names
-	// itself in Object instead.
+	// Table is the table the notice concerns, unqualified.
 	Table string
-	// Object is the index, constraint, enum, sequence, view or column
-	// name, where one applies.
+	// Object is the index or constraint name, where one applies.
 	Object string
 	// Message says what was seen and what was not done about it.
 	Message string
@@ -221,16 +115,16 @@ func (n SchemaNotice) String() string {
 // Behaviour:
 //   - Reads the current state of the configured schema via Introspect.
 //   - Builds a target snapshot from `schema`.
-//   - Asks the server to respell the declared CHECK expressions and
-//     partial-index predicates, so the two sides of the diff are
-//     written in the same dialect of PostgreSQL's own deparser.
-//     See "What the probe costs" below: this happens on a DryRun too.
-//   - Narrows the live side to the objects the Go schema declares,
-//     unless DropUnmanagedTables says otherwise; see ownedBy.
-//   - Diffs the two using DiffOptions{Safe: opts.Safe}.
-//   - Refuses the whole push when the diff would destroy data in a
-//     table that is not empty and PushOptions.Allow does not name the
-//     change; see ErrDestructivePush.
+//   - Settles the rename questions the change raises, or refuses,
+//     before anything below touches the server. See "A change that
+//     could be a rename".
+//   - Asks the server to respell the declared CHECK expressions,
+//     partial-index predicates, policy expressions and view bodies, so
+//     the two sides of the diff are written in the same dialect of
+//     PostgreSQL's own deparser. See "What the probe costs" below:
+//     this happens on a DryRun too.
+//   - Diffs the two using DiffOptions{Safe: opts.Safe} and the renames
+//     it settled.
 //   - If DryRun, returns the statements unexecuted.
 //   - Otherwise applies them inside a single transaction; any failure
 //     rolls back the whole push. CREATE INDEX CONCURRENTLY is the one
@@ -240,17 +134,25 @@ func (n SchemaNotice) String() string {
 //
 // # What the probe costs
 //
-// Respelling a declared expression means handing it to the server as a
-// CHECK constraint added NOT VALID and reading back what the deparser
-// makes of it. NOT VALID skips the table scan, and the whole thing is
-// rolled back, but ALTER TABLE ADD CONSTRAINT still takes an ACCESS
-// EXCLUSIVE lock on the table, and PostgreSQL holds a lock until the
-// transaction ends — not until the savepoint rolls back. So a push
-// against a schema with CHECK constraints or partial indexes briefly
-// locks every table carrying one, all at once, and blocks readers of
-// those tables for the length of the probe. It happens on a DryRun as
-// well, because there is no way to preview a change to an expression
-// without first learning how the server spells it.
+// Respelling a declared expression means handing it to the server
+// under a throwaway name and reading back what the deparser makes of
+// it. Each kind of expression is handed over as the kind of object it
+// is: a CHECK body and an index predicate as a CHECK constraint added
+// NOT VALID, a policy's USING and WITH CHECK as a policy, a view body
+// as a view — the last two because a policy may hold a subquery and a
+// view is one, and a CHECK constraint may not. Reusing one probe for
+// all of them would have reported every such policy as unparseable.
+//
+// NOT VALID skips the table scan, a materialised view is probed WITH
+// NO DATA, and the whole thing is rolled back, but ALTER TABLE ADD
+// CONSTRAINT and CREATE POLICY still take an ACCESS EXCLUSIVE lock on
+// the table, and PostgreSQL holds a lock until the transaction ends —
+// not until the savepoint rolls back. So a push against a schema with
+// CHECK constraints, partial indexes or policies briefly locks every
+// table carrying one, all at once, and blocks readers of those tables
+// for the length of the probe. It happens on a DryRun as well, because
+// there is no way to preview a change to an expression without first
+// learning how the server spells it.
 //
 // Set lock_timeout on the connection if a push must never wait behind
 // a long reader. A probe that fails for an operational reason — a lock
@@ -258,7 +160,7 @@ func (n SchemaNotice) String() string {
 // rather than being reported as an unparseable expression, so a
 // change is never quietly left unapplied.
 //
-// # An index the schema never declared
+// # An object the schema never declared
 //
 // Push does not drop one. Diff does, and is right to: it compares two
 // declarations, so an index missing from the newer one was removed.
@@ -271,37 +173,37 @@ func (n SchemaNotice) String() string {
 // withheld statements are reported as notices either way, ready to run
 // by hand.
 //
-// # A table the schema never declared
+// The same reasoning covers the objects Introspect learned to read
+// after indexes did — an enum, a sequence, a view, a policy, and a
+// row-level security somebody switched on by hand — under
+// DropUnmanagedObjects. The RLS case is the one worth reading twice: a
+// table with RLS enabled in the database and no EnableRLS in the Go
+// schema is one ALTER TABLE away from serving every row to every
+// caller, and a migration tool that performs that silently is worse
+// than one that will not perform it at all. Push withholds it and
+// reports an "unmanaged-rls" notice.
 //
-// The same argument, with the whole table's worth of data behind it.
-// Push against a shared database — a Supabase or Neon project, an RDS
-// instance several services point at, anything with PostGIS in it —
-// used to emit DROP TABLE ... CASCADE for every table the Go schema did
-// not declare, which is the fastest way for a tool to be banned from an
-// organisation for good. It no longer does: the live side is narrowed
-// to the declared tables before the diff, and the drops it would have
-// emitted come back as "unmanaged-table" notices. DropUnmanagedTables
-// takes the other side of the trade.
+// What an extension owns is not withheld, it is never seen: Introspect
+// leaves those out of the snapshot entirely, so no drop is proposed for
+// PostGIS's views or for the sequence behind a serial column.
 //
-// The same narrowing covers the other three things a snapshot names —
-// enums, sequences and views — because Diff emits DROP TYPE, DROP
-// SEQUENCE and DROP VIEW on exactly the same terms, and the PostGIS
-// installation the paragraph above is about announces itself as two
-// views. Introspect does not read any of the three yet, so today the
-// live side carries none of them and the narrowing has nothing to do;
-// see ownedBy for why it is written now rather than when it starts to
-// matter.
+// # A change that could be a rename
 //
-// # Destroying data on purpose
+// A column the database has and the schema does not, paired with one
+// the schema has and the database does not, is either a rename or a
+// drop-and-add, and the two differ by the whole contents of the
+// column. Push cannot tell them apart any more than Diff can, so it
+// asks the same question GenerateMigration asks and returns
+// *RenameAmbiguityError rather than guessing — before any statement
+// runs, and whatever else the push was going to do.
 //
-// A change that destroys data — DROP TABLE, DROP COLUMN, a SET DATA
-// TYPE whose cast rewrites every value — goes through unremarked when
-// the table is empty, because there is nothing to lose, which is what
-// makes the development loop of pushing a table and reshaping it a
-// minute later unaffected. Against a table with rows in it, Push
-// applies nothing at all and returns ErrDestructivePush with a DataLoss entry per statement it withheld;
-// naming each one in PushOptions.Allow is what lets it through. See
-// DataLoss for what "has rows" means and what it costs to ask.
+// Answer it in the schema with (*Col[T]).RenamedFrom or
+// (*Table).RenamedFrom, which is durable and travels to every database
+// the schema is pushed to, or for one run with PushOptions.Renames.
+// A refusal is not something Safe or a destructive-statement
+// permission overrides: whether a change is a rename and whether its
+// consequences may be applied are two different questions, and one
+// answer should not stand in for the other.
 //
 // # What Push cannot see
 //
@@ -318,11 +220,40 @@ func (n SchemaNotice) String() string {
 //     it against one the database already has. It is reported as an
 //     "unrepresentable-index" notice; emit pg.CreateIndex for it;
 //   - a multi-column FOREIGN KEY, which Introspect skips;
-//   - enums, sequences, views, RLS and policies, which Introspect does
-//     not read at all — Diff sees them as new on every push;
-//   - a CHECK expression or index predicate the server refused to
-//     respell, reported as a "not-normalised" notice and left alone
-//     rather than churned;
+//   - where a sequence has got to. Its declared attributes are
+//     compared and an ALTER SEQUENCE states the ones that moved, but
+//     the value it is handing out next is not part of the declaration
+//     and no push restarts a live sequence. So a declaration that
+//     raises MINVALUE above that value, or lowers MAXVALUE below it,
+//     is not a push drops can apply: PostgreSQL refuses the ALTER
+//     (SQLSTATE 22023) rather than move the sequence, and the push
+//     rolls back whole. Where the sequence should resume is a
+//     question only the operator can answer — ALTER SEQUENCE ...
+//     RESTART it by hand, then push;
+//   - which columns a view reads, so a push that drops or retypes a
+//     column takes down every view the schema declares and builds it
+//     again, whether that view was in the way or not. See Diff. A view
+//     the Go schema does not declare is left standing instead: it will
+//     refuse the column change itself (SQLSTATE 2BP01), and if it
+//     selects from a view that is being rebuilt Push refuses the whole
+//     plan up front and names it. Declare it with Schema.AddView so it
+//     is rebuilt too, or set DropUnmanagedObjects to have it removed;
+//   - a view body that resolves against the table it selects from,
+//     SELECT * above all. The probe respells the declared body before
+//     the table DDL runs, so the * is expanded against the shape the
+//     table has now; a migration that drops a column from under such a
+//     view fails on the rebuilt CREATE VIEW naming the column that has
+//     just gone. Name the columns.
+//   - an enum label that was removed or reordered. PostgreSQL cannot
+//     drop a label at all, and can only reorder one by rewriting every
+//     column of the type, so Diff appends new labels and leaves the
+//     rest alone. A reorder is at least reported, as an
+//     "enum-labels-reordered" notice: the order is part of the type,
+//     so leaving it unmentioned would be claiming the database matches
+//     the schema when it does not;
+//   - a CHECK expression, index predicate, policy clause or view body
+//     the server refused to respell, reported as a "not-normalised"
+//     notice and left alone rather than churned;
 //   - a partial index whose predicate binds a value with no literal
 //     spelling, which the snapshot records as no predicate at all —
 //     the same declaration pg.CreateIndex cannot render either.
@@ -349,48 +280,45 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}
 	desired := BuildSnapshot(schema)
 
-	var notices []SchemaNotice
-	if !opt.DropUnmanagedTables {
-		var withheld unmanagedObjects
-		live := current
-		current, withheld = ownedBy(live, desired)
-		notices = append(notices, unmanagedNotices(live, withheld, opt.Safe)...)
+	// Before the probe, not after it. A push that is going to refuse
+	// should not first take an ACCESS EXCLUSIVE lock on every table
+	// carrying a CHECK constraint or a policy to answer a question it
+	// is about to throw away. Renames are settled from column names and
+	// types, which the probe does not touch.
+	renames, err := resolvePushRenames(current, desired,
+		mergeDecisions(DeclaredRenames(schema), opt.Renames))
+	if err != nil {
+		return nil, err
 	}
 
-	exprNotices, err := renormaliseExpressions(ctx, db, current, desired)
+	notices, err := renormaliseExpressions(ctx, db, current, desired)
 	if err != nil {
 		return nil, fmt.Errorf("drops/pg: normalise declared expressions: %w", err)
 	}
-	notices = append(notices, exprNotices...)
 	notices = append(notices, unrepresentableIndexNotices(desired)...)
+	notices = append(notices, enumOrderNotices(current, desired)...)
 
-	stmts := Diff(current, desired, DiffOptions{Safe: opt.Safe})
+	stmts := Diff(current, desired, DiffOptions{Safe: opt.Safe, Renames: renames})
 	if !opt.DropUnmanagedIndexes {
 		var withheld []SchemaNotice
-		stmts, withheld = withholdUnmanagedIndexDrops(stmts, current, desired, opt.Safe)
+		stmts, withheld = withhold(stmts, unmanagedIndexDrops(current, desired, opt.Safe))
 		notices = append(notices, withheld...)
 	}
-
-	// The destructive changes are derived before the empty-diff exit,
-	// because PushOptions.Allow has to be answered either way: consent
-	// for a change that is not in this diff is stale whether or not
-	// there is anything else to do, and a push with nothing to apply is
-	// the likeliest place for it to have gone stale.
-	destructive := destructiveCandidates(stmts, current, desired, opt.Safe)
-	notices = append(notices, staleConsentNotices(opt.Allow, destructive)...)
+	if !opt.DropUnmanagedObjects {
+		var withheld []SchemaNotice
+		stmts, withheld = withhold(stmts, unmanagedObjectDrops(current, desired, opt.Safe))
+		notices = append(notices, withheld...)
+		// Before anything runs, and on a DryRun too: a view Push may
+		// not drop, standing on one it is about to rebuild, is a plan
+		// the server will refuse halfway through.
+		if err := checkUndeclaredViewDependents(current, desired); err != nil {
+			return nil, err
+		}
+	}
 	sortNotices(notices)
 
 	if len(stmts) == 0 {
 		return &PushResult{Statements: nil, Applied: false, Notices: notices}, nil
-	}
-	loss, err := withheldDataLoss(ctx, db, schemaName, destructive, opt.Allow)
-	if err != nil {
-		return nil, err
-	}
-	if len(loss) > 0 {
-		return &PushResult{Statements: stmts, Applied: false, Notices: notices, DataLoss: loss},
-			fmt.Errorf("%w: %d of %d statements would destroy data, starting with %q",
-				ErrDestructivePush, len(loss), len(stmts), excerptSQL(loss[0].SQL))
 	}
 	if opt.DryRun {
 		return &PushResult{Statements: stmts, Applied: false, Notices: notices}, nil
@@ -419,6 +347,98 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	return &PushResult{Statements: stmts, Applied: true, Notices: notices}, nil
 }
 
+// checkUndeclaredViewDependents refuses a push that would walk into
+// SQLSTATE 2BP01 on a view.
+//
+// A migration that drops or retypes a column takes every view the Go
+// schema declares down around it and builds them again — see Diff. The
+// drops are plain, not CASCADE, so a view the database holds and the
+// schema does not, selecting from one of those, stops the drop dead.
+// PostgreSQL's message names the view it could not drop, which is the
+// declared one, and says only that "other objects depend on it": the
+// object worth naming is the one nobody declared, and Push is the half
+// that knows which views those are.
+//
+// It does not run under DropUnmanagedObjects, where such a view is
+// dropped along with the rest and there is nothing left to block.
+func checkUndeclaredViewDependents(current, desired *Snapshot) error {
+	if !columnWorkAViewCanBlock(current, desired) {
+		return nil
+	}
+	for _, key := range sortedKeys(current.Views) {
+		if _, declared := desired.Views[key]; !declared {
+			continue
+		}
+		rebuilt := current.Views[key]
+		for _, other := range sortedKeys(current.Views) {
+			if other == key {
+				continue
+			}
+			if _, declared := desired.Views[other]; declared {
+				continue // coming down too, in dependency order
+			}
+			dependent := current.Views[other]
+			if !mentionsIdent(dependent.Definition, rebuilt.Name) {
+				continue
+			}
+			return fmt.Errorf("drops/pg: view %q selects from %q and is declared by no Schema.AddView. "+
+				"This push changes a column PostgreSQL will not change while a view reads it, so %[2]q has to be "+
+				"dropped and rebuilt around the change — which %[1]q blocks (SQLSTATE 2BP01). Declare %[1]q with "+
+				"Schema.AddView so it is rebuilt too, drop it by hand, or set PushOptions.DropUnmanagedObjects",
+				dependent.Name, rebuilt.Name)
+		}
+	}
+	return nil
+}
+
+// resolvePushRenames settles the rename questions this push raises, or
+// refuses.
+//
+// It is the same reasoning GenerateMigration applies, against the same
+// detector, for the same reason: a column gone from the database and
+// one arrived in the schema is either a rename or a drop-and-add, the
+// two differ by the whole contents of the column, and nothing in
+// either side says which. Push reaching that comparison without asking
+// the question was a second door into the data loss the question
+// exists to close — and the quieter of the two doors, because a push
+// that goes through executes immediately with no migration file for
+// anybody to read first.
+//
+// The answers come from the schema (DeclaredRenames) and from the call
+// (PushOptions.Renames), the call winning, merged by the caller. There
+// is no rename log here: a push has no migration directory, so the
+// advice on the refusal points at the schema instead.
+func resolvePushRenames(current, desired *Snapshot, answers []RenameDecision) ([]Rename, error) {
+	renames, unresolved := ResolveRenames(current, desired, answers)
+	if len(unresolved) > 0 {
+		return nil, &RenameAmbiguityError{Candidates: unresolved, Advice: pushRenameAdvice}
+	}
+	if err := validateRenames(current, desired, renames); err != nil {
+		return nil, err
+	}
+	return renames, nil
+}
+
+// pushRenameAdvice closes a push's refusal, in place of the flags and
+// the rename log the generator points at — a push has neither.
+//
+// The schema declaration comes first because it is the answer that
+// lasts: an operator answering at a terminal answers for the one
+// database in front of them, and the next database the schema is
+// pushed to asks again. The per-run answer is named second, and it is
+// the only way to say the other thing, that the column really is being
+// dropped — which is not a fact about the schema at all. Once such a
+// drop has been pushed the old column is gone and the question never
+// comes back, so there is nothing lasting to record.
+const pushRenameAdvice = "a rename is a fact about the schema's history and belongs with the schema:\n" +
+	"    pg.Add(Users, pg.Text(\"emailAddress\").RenamedFrom(\"email\"))\n" +
+	"    pg.NewTable(\"people\").RenamedFrom(\"users\")\n" +
+	"stated there it answers every database the schema is pushed to, and it goes inert once the rename has happened.\n" +
+	"For one run instead, or to say the column really is being dropped rather than renamed:\n" +
+	"    drops push --rename-column users.email=emailAddress   (or --drop-column users.email)\n" +
+	"    PushOptions.Renames, for a caller that is not the CLI: a RenameDecision naming the pair\n" +
+	"    renames it, one naming only the object that is going declines."
+
 // needsOwnTransaction reports whether a statement has to run outside
 // the push transaction. Only CONCURRENTLY index builds do: PostgreSQL
 // rejects them inside a transaction block with SQLSTATE 25001. They
@@ -439,33 +459,44 @@ var errProbeDone = errors.New("drops/pg: probe complete")
 
 // exprProbe is one expression to be respelled by the server.
 type exprProbe struct {
-	table    string // qualified, as written into the ALTER TABLE
-	name     string // table name for the notice
-	object   string // index or constraint name
+	name     string // table name for the notice, empty for a schema-level object
+	object   string
 	rule     string
 	expr     string  // the declared expression, as the Go schema wrote it
 	target   *string // where the server's spelling is written back
 	fallback *string // what to use instead when the probe fails
+	// respell creates the throwaway object named probe, reads the
+	// deparsed form back out of the catalogue, and leaves the caller
+	// to roll the savepoint back.
+	respell func(ctx context.Context, tx *DB, probe string) (string, error)
 }
 
 // renormaliseExpressions rewrites the expression-valued fields of the
 // desired snapshot into the spelling PostgreSQL itself would report,
 // so Diff can compare them as text.
 //
-// This is the one thing only a server can do. pg_get_expr and
-// pg_get_constraintdef do not echo an expression back, they print a
-// parse tree: `"age" >= 0` comes back `(age >= 0)`, `status = 'x'`
-// comes back `(status = 'x'::text)`, and `IN (...)` comes back
-// `= ANY (ARRAY[...])`. No amount of string tidying in Go reproduces
-// that, and guessing produces a diff that either churns forever or
-// misses a real change. So the declared expression is handed to the
-// server as a CHECK constraint that is added NOT VALID — which skips
-// the table scan — read back through the same deparser Introspect
-// reads, and rolled back.
+// This is the one thing only a server can do. pg_get_expr,
+// pg_get_constraintdef and pg_get_viewdef do not echo an expression
+// back, they print a parse tree: `"age" >= 0` comes back `(age >= 0)`,
+// `status = 'x'` comes back `(status = 'x'::text)`, `IN (...)` comes
+// back `= ANY (ARRAY[...])`, and a view's SELECT comes back with its
+// columns expanded and its table aliases rewritten. No amount of
+// string tidying in Go reproduces that, and guessing produces a diff
+// that either churns forever or misses a real change. So the declared
+// expression is handed to the server, read back through the same
+// deparser Introspect reads, and rolled back.
+//
+// Each kind goes over as the kind of object it is — a CHECK body and
+// an index predicate as a NOT VALID CHECK constraint, a policy's
+// clauses as a policy, a view's body as a view. A policy may hold a
+// subquery and a view is one; a CHECK constraint may not hold either,
+// so probing everything as a CHECK would have reported the whole class
+// as unparseable and silently frozen it at whatever the database held.
 //
 // Only expressions already present on both sides are probed: a
-// constraint or index the database does not have yet is created from
-// the declared spelling, and the server stores its own on the way in.
+// constraint, index, policy or view the database does not have yet is
+// created from the declared spelling, and the server stores its own on
+// the way in.
 //
 // A probe that fails leaves the desired side carrying the database's
 // value, so the push does not churn, and returns a notice saying the
@@ -486,13 +517,13 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 			}
 			dc := dt.CheckConstraints[name]
 			probes = append(probes, &exprProbe{
-				table:    qualified,
 				name:     dt.Name,
 				object:   name,
 				rule:     "check-not-normalised",
 				expr:     dc.Value,
 				target:   &dc.Value,
 				fallback: &cc.Value,
+				respell:  checkProbe(qualified, dc.Value),
 			})
 		}
 		for _, name := range sortedKeys(dt.Indexes) {
@@ -502,15 +533,60 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 				continue
 			}
 			probes = append(probes, &exprProbe{
-				table:    qualified,
 				name:     dt.Name,
 				object:   name,
 				rule:     "index-predicate-not-normalised",
 				expr:     di.Where,
 				target:   &di.Where,
 				fallback: &ci.Where,
+				respell:  checkProbe(qualified, di.Where),
 			})
 		}
+		for _, name := range sortedKeys(dt.Policies) {
+			cp, ok := ct.Policies[name]
+			if !ok {
+				continue
+			}
+			dp := dt.Policies[name]
+			for _, clause := range []struct {
+				withCheck        bool
+				declared, actual *string
+			}{
+				{false, &dp.Using, &cp.Using},
+				{true, &dp.WithCheck, &cp.WithCheck},
+			} {
+				if *clause.declared == "" {
+					continue
+				}
+				probes = append(probes, &exprProbe{
+					name:     dt.Name,
+					object:   name,
+					rule:     "policy-expression-not-normalised",
+					expr:     *clause.declared,
+					target:   clause.declared,
+					fallback: clause.actual,
+					respell:  policyProbe(qualified, *clause.declared, clause.withCheck),
+				})
+			}
+		}
+	}
+	for _, key := range sortedKeys(desired.Views) {
+		dv := desired.Views[key]
+		cv, ok := current.Views[key]
+		if !ok || dv.Definition == "" {
+			continue
+		}
+		probes = append(probes, &exprProbe{
+			object:   dv.Name,
+			rule:     "view-not-normalised",
+			expr:     dv.Definition,
+			target:   &dv.Definition,
+			fallback: &cv.Definition,
+			// The probe goes into the namespace the view was read
+			// from, so the catalogue lookup that follows cannot land
+			// on a same-named view in another schema of the path.
+			respell: viewProbe(cv.Schema, dv.Definition, dv.Materialized),
+		})
 	}
 	if len(probes) == 0 {
 		return nil, nil
@@ -526,7 +602,7 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 			if _, err := tx.Exec(ctx, "SAVEPOINT "+savepoint); err != nil {
 				return err
 			}
-			def, perr := probeConstraintDef(ctx, tx, p, savepoint)
+			def, perr := p.respell(ctx, tx, savepoint)
 			if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepoint); err != nil {
 				return err
 			}
@@ -553,21 +629,85 @@ func renormaliseExpressions(ctx context.Context, db *DB, current, desired *Snaps
 	return notices, nil
 }
 
-// probeConstraintDef adds the declared expression as a NOT VALID CHECK
-// constraint, reads the spelling the server gives it back, and leaves
-// the caller to roll the savepoint back.
-func probeConstraintDef(ctx context.Context, tx *DB, p *exprProbe, name string) (string, error) {
-	stmt := fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID`,
-		p.table, quoteIdent(name), p.expr)
-	if _, err := tx.Exec(ctx, stmt); err != nil {
-		return "", err
+// checkProbe adds the declared expression as a NOT VALID CHECK
+// constraint and reads the spelling the server gives it back.
+func checkProbe(table, expr string) func(context.Context, *DB, string) (string, error) {
+	return func(ctx context.Context, tx *DB, name string) (string, error) {
+		stmt := fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s) NOT VALID`,
+			table, quoteIdent(name), expr)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return "", err
+		}
+		// Scoped to the table, not just the name: a probe is
+		// short-lived but the catalogue is global, and another schema
+		// is entitled to a constraint called the same thing.
+		def, err := probeScalar(ctx, tx,
+			`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+			 WHERE conrelid = $1::regclass AND conname = $2`, table, name)
+		if err != nil {
+			return "", err
+		}
+		return checkExprOf(def), nil
 	}
-	// Scoped to the table, not just the name: a probe is short-lived
-	// but the catalogue is global, and another schema is entitled to a
-	// constraint called the same thing.
-	rows, err := tx.Query(ctx,
-		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
-		 WHERE conrelid = $1::regclass AND conname = $2`, p.table, name)
+}
+
+// policyProbe adds the declared expression as a policy on the table and
+// reads back pg_get_expr's spelling of it — the same column and the
+// same function readIntrospectPolicies reads.
+//
+// The probe policy is created without a FOR clause whatever command the
+// real one names: PostgreSQL rejects USING on a FOR INSERT policy and
+// WITH CHECK on a FOR SELECT one, and the deparsing does not depend on
+// which command the expression was attached to.
+func policyProbe(table, expr string, withCheck bool) func(context.Context, *DB, string) (string, error) {
+	clause, column := "USING", "polqual"
+	if withCheck {
+		clause, column = "WITH CHECK", "polwithcheck"
+	}
+	return func(ctx context.Context, tx *DB, name string) (string, error) {
+		stmt := fmt.Sprintf(`CREATE POLICY %s ON %s %s (%s)`,
+			quoteIdent(name), table, clause, expr)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return "", err
+		}
+		return probeScalar(ctx, tx, fmt.Sprintf(
+			`SELECT coalesce(pg_get_expr(%s, polrelid), '') FROM pg_policy
+			 WHERE polrelid = $1::regclass AND polname = $2`, column), table, name)
+	}
+}
+
+// viewProbe creates the declared body as a view and reads back
+// pg_get_viewdef's spelling of it.
+//
+// A materialised view is probed as one, WITH NO DATA so the query is
+// planned and rewritten but never run — a matview accepts query shapes
+// a plain view does not, and the point of the probe is to find out
+// what the server makes of this query, not of one like it.
+func viewProbe(schema, def string, materialized bool) func(context.Context, *DB, string) (string, error) {
+	return func(ctx context.Context, tx *DB, name string) (string, error) {
+		qualified := quoteIdent(schema) + "." + quoteIdent(name)
+		stmt := fmt.Sprintf(`CREATE VIEW %s AS %s`, qualified, def)
+		if materialized {
+			stmt = fmt.Sprintf(`CREATE MATERIALIZED VIEW %s AS %s WITH NO DATA`, qualified, def)
+		}
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return "", err
+		}
+		body, err := probeScalar(ctx, tx,
+			`SELECT pg_get_viewdef(oid, true) FROM pg_class WHERE oid = $1::regclass`, qualified)
+		if err != nil {
+			return "", err
+		}
+		return viewBodyOf(body), nil
+	}
+}
+
+// probeScalar runs a one-row, one-column catalogue query and returns
+// the value. A missing row means the object the probe just created is
+// not where it was looked for, which is a bug in the probe rather than
+// a verdict on the expression.
+func probeScalar(ctx context.Context, tx *DB, query string, args ...any) (string, error) {
+	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return "", err
 	}
@@ -576,13 +716,13 @@ func probeConstraintDef(ctx context.Context, tx *DB, p *exprProbe, name string) 
 		if err := rows.Err(); err != nil {
 			return "", err
 		}
-		return "", errors.New("the probe constraint was not found in pg_constraint")
+		return "", errors.New("the probe object was not found in the catalogue")
 	}
-	var def string
-	if err := rows.Scan(&def); err != nil {
+	var out string
+	if err := rows.Scan(&out); err != nil {
 		return "", err
 	}
-	return checkExprOf(def), rows.Err()
+	return out, rows.Err()
 }
 
 // probeRefusedExpression reports whether err is the server refusing the
@@ -620,450 +760,19 @@ func qualifiedTableSQL(t *TableSnapshot) string {
 }
 
 // ----------------------------------------------------------------------
-// Ownership
-// ----------------------------------------------------------------------
-
-// ownedBy narrows a live introspection to the tables the Schema
-// declares, and returns the keys of the ones it held back so Push can
-// report them.
-//
-// A PostgreSQL schema is often not a namespace one application has to
-// itself: a Supabase or Neon project puts extensions, auth tables and
-// storage tables beside yours, an RDS instance serves several services,
-// PostGIS leaves spatial_ref_sys behind, and another migration tool
-// keeps its history table somewhere. To Diff, every one of those looks
-// like a table that used to exist and should no longer, and it emits
-// DROP TABLE ... CASCADE for it — so a push against a database drops
-// did not create alone deletes other people's data, cascading through
-// their foreign keys on the way out.
-//
-// A list of vendor names to skip cannot work; it has to grow for ever,
-// one paper cut at a time, and it says nothing about the table another
-// team added last week. The Go Schema is the only statement of
-// ownership drops has, and it is one the compiler already checks, so a
-// table it never names is left alone. drops/sqlite and drops/mysql
-// draw the same line for the same reason.
-//
-// The cost is that dropping a table means writing the DROP into a
-// migration rather than deleting the Go declaration and pushing —
-// which is the reviewable path anyway — or setting
-// PushOptions.DropUnmanagedTables, which puts the live side back
-// whole.
-//
-// # Why all four maps and not just Tables
-//
-// A Snapshot names enums, sequences and views beside its tables, and
-// Diff drops each of them on the same terms: DROP TYPE, DROP SEQUENCE
-// and DROP VIEW for anything the previous side has and the current
-// side does not declare. A narrowing that covered Tables alone was not
-// safe-because-designed, it was safe-because-unreachable — Introspect
-// does not populate those three maps, so the live side never carries
-// one. Its own doc comment calls them "the remaining gaps", which is a
-// promise to fill them, and filling them would have re-opened the
-// destructive push inside the function whose entire job is preventing
-// it, in a commit about reading the catalogue. The PostGIS example
-// this comment opens with is the demonstration: geometry_columns and
-// geography_columns are views, not tables, so the very case the
-// narrowing was written for is one it would have missed the moment
-// Introspect could see it.
-func ownedBy(live, declared *Snapshot) (*Snapshot, unmanagedObjects) {
-	out := *live
-	var held unmanagedObjects
-	out.Tables, held.tables = ownedObjects(live.Tables, declared.Tables)
-	out.Enums, held.enums = ownedObjects(live.Enums, declared.Enums)
-	out.Sequences, held.sequences = ownedObjects(live.Sequences, declared.Sequences)
-	out.Views, held.views = ownedObjects(live.Views, declared.Views)
-	return &out, held
-}
-
-// unmanagedObjects is what ownedBy held back, one list of snapshot keys
-// per kind of object a Snapshot carries.
-type unmanagedObjects struct {
-	tables    []string
-	enums     []string
-	sequences []string
-	views     []string
-}
-
-// ownedObjects splits one of a snapshot's maps into the entries the
-// declared side also has and the keys of the entries it does not.
-func ownedObjects[V any](live, declared map[string]V) (map[string]V, []string) {
-	out := make(map[string]V, len(live))
-	var withheld []string
-	for _, key := range sortedKeys(live) {
-		if _, ok := declared[key]; ok {
-			out[key] = live[key]
-			continue
-		}
-		withheld = append(withheld, key)
-	}
-	return out, withheld
-}
-
-// unmanagedNotices reports one withheld DROP per object ownedBy held
-// back, carrying the statement Diff would have emitted so a caller who
-// wants it can run it by hand.
-func unmanagedNotices(live *Snapshot, held unmanagedObjects, safe bool) []SchemaNotice {
-	out := make([]SchemaNotice, 0,
-		len(held.tables)+len(held.enums)+len(held.sequences)+len(held.views))
-	for _, key := range held.tables {
-		t := live.Tables[key]
-		out = append(out, SchemaNotice{
-			Rule:  "unmanaged-table",
-			Table: t.Name,
-			Message: fmt.Sprintf(
-				"table %q exists in the database and is declared by no table in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
-				t.Name),
-			SQL: dropTableSQL(t, safe),
-		})
-	}
-	for _, key := range held.enums {
-		e := live.Enums[key]
-		out = append(out, SchemaNotice{
-			Rule:   "unmanaged-enum",
-			Object: e.Name,
-			Message: fmt.Sprintf(
-				"type %q exists in the database and is declared by no enum in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
-				e.Name),
-			SQL: dropEnumSQL(e.Name, safe),
-		})
-	}
-	for _, key := range held.sequences {
-		s := live.Sequences[key]
-		out = append(out, SchemaNotice{
-			Rule:   "unmanaged-sequence",
-			Object: s.Name,
-			Message: fmt.Sprintf(
-				"sequence %q exists in the database and is declared by no sequence in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
-				s.Name),
-			SQL: dropSequenceSQL(s.Name, safe),
-		})
-	}
-	for _, key := range held.views {
-		v := live.Views[key]
-		out = append(out, SchemaNotice{
-			Rule:   "unmanaged-view",
-			Object: v.Name,
-			Message: fmt.Sprintf(
-				"view %q exists in the database and is declared by no view in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
-				v.Name),
-			SQL: dropViewSQL(v, safe),
-		})
-	}
-	return out
-}
-
-// ----------------------------------------------------------------------
-// Destructive changes
-// ----------------------------------------------------------------------
-
-// destructiveCandidates returns one DataLoss per statement in stmts
-// that destroys data, in the order the diff put them, whether or not
-// PushOptions.Allow authorises it and whether or not the table is
-// empty. It is the list both halves of the rule are answered from:
-// what the push has to withhold, and which entries of Allow named
-// something real.
-//
-// The candidates are derived from the same two snapshots Diff was given
-// and then matched against the statements by text, exactly as
-// withholdUnmanagedIndexDrops does: re-deriving the statement is what
-// keeps a rule from firing on a statement that came from somewhere
-// else, and text is what makes the match total.
-func destructiveCandidates(stmts []string, current, desired *Snapshot, safe bool) []DataLoss {
-	candidates := map[string]DataLoss{}
-	add := func(sql string, d DataLoss) {
-		d.SQL = sql
-		candidates[sql] = d
-	}
-	for _, key := range sortedKeys(current.Tables) {
-		ct := current.Tables[key]
-		dt, declared := desired.Tables[key]
-		if !declared {
-			add(dropTableSQL(ct, safe), DataLoss{Op: OpDropTable, Table: ct.Name})
-			continue
-		}
-		for _, name := range sortedKeys(ct.Columns) {
-			dc, kept := dt.Columns[name]
-			if !kept {
-				add(dropColumnSQL(dt.Name, name, safe),
-					DataLoss{Op: OpDropColumn, Table: ct.Name, Object: name})
-				continue
-			}
-			if dc.Type != ct.Columns[name].Type {
-				add(setColumnTypeSQL(dt.Name, name, dc.Type),
-					DataLoss{Op: OpRetypeColumn, Table: ct.Name, Object: name})
-			}
-		}
-	}
-	out := make([]DataLoss, 0, len(candidates))
-	for _, s := range stmts {
-		if d, ok := candidates[s]; ok {
-			out = append(out, d)
-		}
-	}
-	return out
-}
-
-// staleConsentNotices reports every PushOptions.Allow entry that names
-// no destructive change in this diff.
-//
-// applyRenames refuses a declared rename that matches nothing, and says
-// why in ErrRenameNotApplicable's doc comment: a declaration left in the
-// call after the migration that performed it would sit there for ever,
-// doing nothing, looking exactly like one that still applies. A stale
-// consent is the same declaration with the opposite failure mode, and
-// the more dangerous one — a rename that has stopped applying leaves the
-// schema alone, while a Destructive that has stopped applying leaves the
-// caller believing a DROP is authorised when the next diff to contain
-// one will be refused, or believing they reviewed a change that is no
-// longer the change being made.
-//
-// It is a notice rather than an error because consent is not itself an
-// instruction: an Allow entry that matches nothing has changed nothing,
-// and failing a push whose diff is otherwise fine would punish the
-// caller for the tidy-up they have not done yet. The notice is what
-// tells them to do it.
-func staleConsentNotices(allow []Destructive, found []DataLoss) []SchemaNotice {
-	var out []SchemaNotice
-	for _, a := range allow {
-		matched := false
-		for _, d := range found {
-			if allowsDestructive([]Destructive{a}, d) {
-				matched = true
-				break
-			}
-		}
-		if matched {
-			continue
-		}
-		out = append(out, SchemaNotice{
-			Rule:    "stale-consent",
-			Table:   a.Table,
-			Object:  a.Object,
-			Message: staleConsentMessage(a),
-		})
-	}
-	return out
-}
-
-// staleConsentMessage says why one Allow entry authorises nothing. The
-// four malformed shapes are separated from the merely out-of-date one
-// because the fix is different: a Destructive that cannot match any
-// change is a mistake at the call site, and reading "matches nothing in
-// this diff" would send its author looking at the schema instead of at
-// the value they wrote.
-func staleConsentMessage(a Destructive) string {
-	switch {
-	case a.Op != OpDropTable && a.Op != OpDropColumn && a.Op != OpRetypeColumn:
-		return fmt.Sprintf(
-			"PushOptions.Allow names Op %q, which is not one of %q, %q or %q; it authorises nothing",
-			a.Op, OpDropTable, OpDropColumn, OpRetypeColumn)
-	case a.Table == "":
-		return fmt.Sprintf(
-			"PushOptions.Allow names a %q with an empty Table; it authorises nothing", a.Op)
-	case a.Op == OpDropTable && a.Object != "":
-		return fmt.Sprintf(
-			"PushOptions.Allow names a drop of table %q with Object %q; Object is empty on a table drop, so this authorises nothing",
-			a.Table, a.Object)
-	case a.Op != OpDropTable && a.Object == "":
-		return fmt.Sprintf(
-			"PushOptions.Allow names a %q on %q with an empty Object; a column change is authorised by column name, so this authorises nothing",
-			a.Op, a.Table)
-	}
-	return fmt.Sprintf(
-		"PushOptions.Allow names a %q on %q that this push does not contain; the change was already applied, or the object is gone, and the consent now authorises nothing — delete it",
-		a.Op, destructiveObjectName(a))
-}
-
-// destructiveObjectName renders "table" or "table.column" for a message.
-func destructiveObjectName(a Destructive) string {
-	if a.Object == "" {
-		return a.Table
-	}
-	return a.Table + "." + a.Object
-}
-
-// withheldDataLoss returns one DataLoss per destructive change that
-// PushOptions.Allow does not authorise and that would land on a table
-// with rows in it.
-//
-// The row estimates cost one query against pg_class, asked once for the
-// whole schema and only when an unauthorised destructive statement is
-// actually in the diff — the overwhelmingly common push has none, and
-// pays nothing.
-func withheldDataLoss(ctx context.Context, db *DB, schema string, found []DataLoss, allow []Destructive) ([]DataLoss, error) {
-	// Consent first: a caller who has already named every destructive
-	// change in the diff is owed neither an estimate nor a probe, and
-	// the overwhelmingly common push has no destructive change at all.
-	var unconsented []DataLoss
-	for _, d := range found {
-		if !allowsDestructive(allow, d) {
-			unconsented = append(unconsented, d)
-		}
-	}
-	if len(unconsented) == 0 {
-		return nil, nil
-	}
-	rows, err := tableRowEstimates(ctx, db, schema)
-	if err != nil {
-		return nil, fmt.Errorf("drops/pg: estimate rows before a destructive push: %w", err)
-	}
-	var withheld []DataLoss
-	probed := map[string]bool{}
-	for _, d := range unconsented {
-		est, known := rows[d.Table]
-		if !known {
-			// Not in pg_class under this schema at all, which this
-			// connection has no business assuming is empty.
-			est = -1
-		}
-		if est == 0 {
-			continue // nothing to lose
-		}
-		if est < 0 {
-			has, seen := probed[d.Table]
-			if !seen {
-				has, err = tableHasRows(ctx, db, schema, d.Table)
-				if err != nil {
-					return nil, fmt.Errorf("drops/pg: deciding whether %q is empty before destroying data in it: %w", d.Table, err)
-				}
-				probed[d.Table] = has
-			}
-			if !has {
-				continue
-			}
-		}
-		d.Rows = est
-		d.Suggestion = fmt.Sprintf("allow with pg.Destructive{Op: pg.%s, Table: %q, Object: %q}",
-			destructiveOpConst(d.Op), d.Table, d.Object)
-		withheld = append(withheld, d)
-	}
-	return withheld, nil
-}
-
-// allowsDestructive reports whether the caller named this exact change.
-func allowsDestructive(allow []Destructive, d DataLoss) bool {
-	for _, a := range allow {
-		if a.Op == d.Op && a.Table == d.Table && a.Object == d.Object {
-			return true
-		}
-	}
-	return false
-}
-
-// destructiveOpConst renders the Go identifier for an op, so the
-// suggestion can be pasted into the call rather than transcribed.
-func destructiveOpConst(op DestructiveOp) string {
-	switch op {
-	case OpDropTable:
-		return "OpDropTable"
-	case OpDropColumn:
-		return "OpDropColumn"
-	case OpRetypeColumn:
-		return "OpRetypeColumn"
-	}
-	return string(op)
-}
-
-// tableRowEstimates reads the planner's row-count estimate for every
-// table in the schema.
-//
-// reltuples is what the last ANALYZE or autovacuum left behind, which
-// is why this is one cheap catalogue read rather than a COUNT(*) per
-// table. PostgreSQL 14 and later store -1 for a table that has never
-// been analysed, and this passes that through: the caller has to
-// distinguish "no rows" from "nobody has looked", because only the
-// first of those is a reason to let a DROP through. See tableHasRows
-// for how the second is settled.
-func tableRowEstimates(ctx context.Context, db *DB, schema string) (map[string]int64, error) {
-	rows, err := db.Query(ctx, `SELECT c.relname, c.reltuples::bigint
-		FROM pg_class c
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')`, schema)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]int64{}
-	for rows.Next() {
-		var name string
-		var est int64
-		if err := rows.Scan(&name, &est); err != nil {
-			return nil, err
-		}
-		out[name] = est
-	}
-	return out, rows.Err()
-}
-
-// tableHasRows answers the one question the estimate could not: is
-// there anything in here at all.
-//
-// LIMIT 1 stops at the first row, so this reads one page of a table of
-// any size — the property COUNT(*) does not have, and the reason a
-// probe is affordable here and a count is not. It runs only for a table
-// PostgreSQL has never analysed, and only for a destructive change
-// nobody has authorised, so the common push never reaches it.
-//
-// A probe that fails fails the push. Not being able to tell whether a
-// table holds data is not a reason to go ahead and destroy it, and it
-// is not a reason to report it as data loss either — the caller would
-// be granting consent for a table nobody has looked inside.
-//
-// # It carries no tenant predicate, on purpose
-//
-// This is the one statement Push sends against a caller's own table
-// rather than against the catalogues, so it is the one place the
-// question "should this carry the tenant axis" arises at all — and the
-// answer is that carrying it would be wrong, not merely unnecessary.
-// What has to be settled is whether the table is empty for EVERYBODY,
-// because that is what DROP TABLE and DROP COLUMN decide. A predicate
-// on the ctx tenant would answer "empty for me", and the first tenant
-// to push a destructive change from an account with no rows in it
-// would take every other tenant's rows with it — consent given for one
-// tenant's data, spent on all of it.
-//
-// Nothing anybody owns leaves the server either way: the statement
-// selects EXISTS, so what comes back is one boolean about the table,
-// which is the object Push is reconciling. The reasoning is repeated
-// as the exemption in pg/scopeexec_test.go, where the executor census
-// requires every door that can send a statement for a scoped table to
-// carry the axis or to say why it must not.
-func tableHasRows(ctx context.Context, db *DB, schema, table string) (bool, error) {
-	stmt := fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %s.%s LIMIT 1)`,
-		quoteIdent(schema), quoteIdent(table))
-	rows, err := db.Query(ctx, stmt)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return false, err
-		}
-		return false, errors.New("the emptiness probe returned no row")
-	}
-	var has bool
-	if err := rows.Scan(&has); err != nil {
-		return false, err
-	}
-	return has, rows.Err()
-}
-
-// ----------------------------------------------------------------------
 // Notices
 // ----------------------------------------------------------------------
 
-// withholdUnmanagedIndexDrops removes from stmts every DROP INDEX that
-// targets an index the database has and the Go schema never declared,
-// returning what is left and a notice for each one held back.
+// unmanagedIndexDrops returns, keyed by the exact statement Diff would
+// emit, a notice for every DROP INDEX that targets an index the
+// database has and the Go schema never declared.
 //
-// The statements are matched by text rather than re-derived, because
-// the text is what Diff produced from the same two snapshots a moment
-// earlier — anything that does not match is a drop Diff emitted for a
-// different reason (an index declared on both sides whose shape
-// changed) and has to go through.
-func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot, safe bool) ([]string, []SchemaNotice) {
+// The statements are matched by text rather than re-derived by the
+// caller, because the text is what Diff produced from the same two
+// snapshots a moment earlier — anything that does not match is a drop
+// Diff emitted for a different reason (an index declared on both sides
+// whose shape changed) and has to go through.
+func unmanagedIndexDrops(current, desired *Snapshot, safe bool) map[string]SchemaNotice {
 	// Index names are unique across a schema, not per table, so the
 	// question is whether the Go schema declares the name anywhere —
 	// not whether it declares it on the table the database put it on.
@@ -1090,19 +799,173 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot, saf
 			}
 		}
 	}
-	if len(withheld) == 0 {
+	return withheld
+}
+
+// unmanagedObjectDrops is unmanagedIndexDrops for the rest of what
+// Introspect reads: enums, sequences, views, policies, and the two
+// row-level security flags.
+//
+// The RLS entries are the odd ones out in that they are not drops of
+// anything. They are here for the same reason: the database has a
+// protection the Go schema does not mention, and the difference between
+// "the schema removed it" and "the schema never knew about it" is not
+// one a snapshot can tell — so the statement that would remove it is
+// withheld and named rather than run.
+//
+// Only a table the Go schema declares is examined. A table absent from
+// it is being dropped whole, and Diff's DROP TABLE takes its policies
+// with it; withholding an RLS statement for a table that will not
+// exist would report a difference nobody can act on.
+func unmanagedObjectDrops(current, desired *Snapshot, safe bool) map[string]SchemaNotice {
+	withheld := map[string]SchemaNotice{}
+	add := func(sql string, n SchemaNotice) {
+		n.SQL = sql
+		withheld[sql] = n
+	}
+	for _, key := range sortedKeys(current.Enums) {
+		if _, ok := desired.Enums[key]; ok {
+			continue
+		}
+		add(dropEnumSQL(key, safe), SchemaNotice{
+			Rule:   "unmanaged-enum",
+			Object: key,
+			Message: fmt.Sprintf(
+				"enum type %q exists in the database and is declared by no Schema.AddEnum; Push left it alone", key),
+		})
+	}
+	for _, key := range sortedKeys(current.Sequences) {
+		if _, ok := desired.Sequences[key]; ok {
+			continue
+		}
+		seq := current.Sequences[key]
+		add(dropSequenceSQL(seq.Name, safe), SchemaNotice{
+			Rule:   "unmanaged-sequence",
+			Object: seq.Name,
+			Message: fmt.Sprintf(
+				"sequence %q exists in the database and is declared by no Schema.AddSequence; Push left it alone", seq.Name),
+		})
+	}
+	for _, key := range sortedKeys(current.Views) {
+		if _, ok := desired.Views[key]; ok {
+			continue
+		}
+		view := current.Views[key]
+		add(dropViewSQL(view, safe), SchemaNotice{
+			Rule:   "unmanaged-view",
+			Object: view.Name,
+			Message: fmt.Sprintf(
+				"view %q exists in the database and is declared by no Schema.AddView; Push left it alone", view.Name),
+		})
+	}
+	for _, key := range sortedKeys(current.Tables) {
+		ct := current.Tables[key]
+		dt, ok := desired.Tables[key]
+		if !ok {
+			continue
+		}
+		for _, name := range sortedKeys(ct.Policies) {
+			if _, ok := dt.Policies[name]; ok {
+				continue
+			}
+			add(dropPolicySQL(dt.Name, name, safe), SchemaNotice{
+				Rule:   "unmanaged-policy",
+				Table:  dt.Name,
+				Object: name,
+				Message: fmt.Sprintf(
+					"policy %q on %q exists in the database and is declared by no Table.AddPolicy; Push left it alone", name, dt.Name),
+			})
+		}
+		if ct.IsRLSEnabled && !dt.IsRLSEnabled {
+			add(fmt.Sprintf(`ALTER TABLE %s DISABLE ROW LEVEL SECURITY;`, quoteIdent(dt.Name)), SchemaNotice{
+				Rule:   "unmanaged-rls",
+				Table:  dt.Name,
+				Object: dt.Name,
+				Message: fmt.Sprintf(
+					"row-level security is enabled on %q in the database and no EnableRLS declares it; Push did not switch it off, which would have made every row readable by every caller", dt.Name),
+			})
+		}
+		if ct.IsRLSForced && !dt.IsRLSForced {
+			add(fmt.Sprintf(`ALTER TABLE %s NO FORCE ROW LEVEL SECURITY;`, quoteIdent(dt.Name)), SchemaNotice{
+				Rule:   "unmanaged-rls",
+				Table:  dt.Name,
+				Object: dt.Name,
+				Message: fmt.Sprintf(
+					"row-level security is forced on %q in the database and no ForceRLS declares it; Push did not lift it, which would have exempted the table's owner from its own policies", dt.Name),
+			})
+		}
+	}
+	return withheld
+}
+
+// withhold removes from stmts every statement the map has a notice
+// for, returning what is left and the notices for what was held back.
+func withhold(stmts []string, unmanaged map[string]SchemaNotice) ([]string, []SchemaNotice) {
+	if len(unmanaged) == 0 {
 		return stmts, nil
 	}
 	kept := make([]string, 0, len(stmts))
 	var notices []SchemaNotice
 	for _, s := range stmts {
-		if n, ok := withheld[s]; ok {
+		if n, ok := unmanaged[s]; ok {
 			notices = append(notices, n)
 			continue
 		}
 		kept = append(kept, s)
 	}
 	return kept, notices
+}
+
+// enumOrderNotices reports an enum whose labels the Go schema declares
+// in a different order from the one the database holds.
+//
+// Label order is part of the type — it is the ordering `<` uses and the
+// one ORDER BY follows — and PostgreSQL offers no way to change it in
+// place. Diff appends the new labels and stops there, so the reorder
+// would otherwise be a difference Push saw, could not act on, and did
+// not mention: a push that reports success against a database whose
+// enum sorts differently from the declared one.
+//
+// Only the labels both sides carry are compared. A label the schema
+// adds has not been placed yet, and one the database has and the
+// schema does not cannot be removed at all.
+func enumOrderNotices(current, desired *Snapshot) []SchemaNotice {
+	var out []SchemaNotice
+	for _, key := range sortedKeys(desired.Enums) {
+		ce, ok := current.Enums[key]
+		if !ok {
+			continue
+		}
+		de := desired.Enums[key]
+		shared := commonLabels(ce.Values, de.Values)
+		if sameStrings(shared, commonLabels(de.Values, ce.Values)) {
+			continue
+		}
+		out = append(out, SchemaNotice{
+			Rule:   "enum-labels-reordered",
+			Object: key,
+			Message: fmt.Sprintf(
+				"enum type %q holds its labels as %v and the Go schema declares them as %v; PostgreSQL cannot reorder them and Push did not try",
+				key, ce.Values, de.Values),
+		})
+	}
+	return out
+}
+
+// commonLabels returns the members of a that also appear in b, in a's
+// order.
+func commonLabels(a, b []string) []string {
+	in := make(map[string]bool, len(b))
+	for _, v := range b {
+		in[v] = true
+	}
+	out := make([]string, 0, len(a))
+	for _, v := range a {
+		if in[v] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // unrepresentableIndexNotices reports declared indexes the snapshot

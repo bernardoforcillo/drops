@@ -42,8 +42,8 @@ type AuditCols[T any] struct {
 func Audit[T any](t *Table, target *Col[T]) AuditCols[T] {
 	refType := target.Type().TypeSQL()
 	return AuditCols[T]{
-		CreatedBy: Add(t, Custom[T]("createdBy", refType).References(target)),
-		UpdatedBy: Add(t, Custom[T]("updatedBy", refType).References(target)),
+		CreatedBy: Add(t, Custom[T]("createdBy", refType).Nullable().References(target)),
+		UpdatedBy: Add(t, Custom[T]("updatedBy", refType).Nullable().References(target)),
 	}
 }
 

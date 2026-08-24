@@ -52,19 +52,6 @@ type GenerateOptions struct {
 	// so the migration can be re-run idempotently. See DiffOptions.Safe.
 	Safe bool
 
-	// Renames names the drop/add pairs in this diff that are really one
-	// object under a new name, so the migration renames it instead of
-	// destroying it and creating an empty one beside it. They are
-	// applied to the previous snapshot before the diff runs, in the
-	// order given; see Rename.
-	//
-	// A rename that matches nothing fails the generation with
-	// ErrRenameNotApplicable rather than being ignored. A declaration
-	// left behind after the migration that performed it would otherwise
-	// sit in the call for ever, doing nothing, until the day a column
-	// with the old name comes back and it renames that one instead.
-	Renames []Rename
-
 	// WithDown enables auto-generated rollback SQL. When true, the
 	// generator emits a paired <tag>.down.sql file alongside the
 	// up SQL containing DiffDown(prev, cur). The down direction is
@@ -74,17 +61,32 @@ type GenerateOptions struct {
 	// losslessly because the data is gone — review generated down
 	// scripts before relying on them.
 	WithDown bool
+
+	// Renames answers the rename questions this run raises, for a caller
+	// that already knows the answer — a command line, a prompt, a test.
+	// Answers are merged over the ones already recorded in
+	// RenameLogFile, with these winning, and the merged set is written
+	// back so the next run does not ask again.
+	//
+	// A candidate left unanswered by both is not guessed at: the run
+	// returns *RenameAmbiguityError and writes nothing. See rename.go.
+	Renames []RenameDecision
 }
 
 // GenerateResult describes what a Run produced.
 type GenerateResult struct {
-	Tag      string // e.g. "0003_warm_iron_man"; empty when NoOp
-	Idx      int    // sequence index for the new migration
-	SQL      string // statement-breakpoint-joined migration SQL (up)
-	DownSQL  string // rollback SQL; empty unless WithDown was set
-	NoOp     bool   // true when prev and cur snapshots are equivalent
-	Snapshot []byte // bytes written to meta/<idx>_snapshot.json
-	Journal  []byte // bytes written to meta/_journal.json
+	Tag      string   // e.g. "0003_warm_iron_man"; empty when NoOp
+	Idx      int      // sequence index for the new migration
+	SQL      string   // statement-breakpoint-joined migration SQL (up)
+	DownSQL  string   // rollback SQL; empty unless WithDown was set
+	NoOp     bool     // true when prev and cur snapshots are equivalent
+	Snapshot []byte   // bytes written to meta/<idx>_snapshot.json
+	Journal  []byte   // bytes written to meta/_journal.json
+	Renames  []Rename // the renames this migration performs, if any
+
+	// RenameLog is what was written to RenameLogFile, or nil when
+	// there was no rename decision to record.
+	RenameLog []byte
 }
 
 // GenerateMigration computes the schema diff and writes a new drizzle-kit
@@ -92,7 +94,17 @@ type GenerateResult struct {
 // meta/_journal.json.
 //
 // It is a no-op when there are no differences between the current Go
-// schema and the latest snapshot; no files are written in that case.
+// schema and the latest snapshot; no migration files are written in
+// that case. The one thing a no-op run still writes is RenameLogFile,
+// and only when this run was given an answer to record — a decision
+// that settles a question without moving the schema is still a
+// decision, and leaving it unrecorded means being asked again.
+//
+// It refuses, returning *RenameAmbiguityError and writing nothing, when
+// the change could be a rename and nothing on disk or in the options
+// says whether it is. Answer with GenerateOptions.Renames; the answer
+// is recorded in RenameLogFile and replayed from then on. See rename.go
+// for why guessing is not on the list of options.
 func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	if opts.Schema == nil {
 		return nil, errors.New("drops/pg: Schema is required")
@@ -130,21 +142,52 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	cur := BuildSnapshot(opts.Schema)
 	cur.PrevID = prev.ID
 
-	// The renames rewrite the previous side before the diff sees it, so
-	// the drop/add pair they describe is never in the diff at all, and
-	// they are recorded in the snapshot this migration writes: the
-	// statements are the migration, and _meta is the record of why they
-	// are renames and not a drop followed by an add.
-	renames, err := applyRenames(prev, cur, opts.Renames)
+	recorded, err := loadRenameLog(opts.FS, opts.Dir)
 	if err != nil {
 		return nil, err
 	}
-	cur.Meta = renames.meta
+	decisions := mergeDecisions(recorded, opts.Renames)
+	// The schema can state a rename of its own — see DeclaredRenames.
+	// That is a fact the schema carries, not an answer somebody gave
+	// to a question, so it settles the question without being written
+	// into the log, and a recorded answer wins where the two disagree.
+	resolving := mergeDecisions(DeclaredRenames(opts.Schema), decisions)
+	renames, unresolved := ResolveRenames(prev, cur, resolving)
+	if len(unresolved) > 0 {
+		// Nothing is written. A migration that turns a rename into a
+		// DROP COLUMN is worse than no migration at all, and this is the
+		// only point at which drops can still say so.
+		return nil, &RenameAmbiguityError{Candidates: unresolved}
+	}
+	if err := validateRenames(prev, cur, renames); err != nil {
+		return nil, err
+	}
 
-	statements := append(append([]string{}, renames.up...),
-		Diff(renames.prev, cur, DiffOptions{Safe: opts.Safe})...)
+	diffOpts := DiffOptions{Safe: opts.Safe, Renames: renames}
+	statements := Diff(prev, cur, diffOpts)
+
+	var renameLogBytes []byte
+	if len(decisions) > 0 {
+		if renameLogBytes, err = marshalRenameLog(decisions); err != nil {
+			return nil, err
+		}
+	}
+	// A no-op run still records an answer it was just given. Not every
+	// decision moves the schema: saying "no, that column really is
+	// going" about a column the diff no longer proposes anything for
+	// settles the question and produces no statement, and returning
+	// here without writing it meant the same question came back on the
+	// next run — with the same nobody to answer it. Nothing is written
+	// when no answer was given this run, so a settled schema stays
+	// silent.
 	if len(statements) == 0 {
-		return &GenerateResult{NoOp: true}, nil
+		if len(opts.Renames) == 0 {
+			return &GenerateResult{NoOp: true}, nil
+		}
+		if err := opts.Write(RenameLogFile, renameLogBytes); err != nil {
+			return nil, fmt.Errorf("drops/pg: write rename log: %w", err)
+		}
+		return &GenerateResult{NoOp: true, RenameLog: renameLogBytes}, nil
 	}
 
 	name := opts.Name
@@ -180,12 +223,7 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 
 	var downSQL string
 	if opts.WithDown {
-		// The renames come last on the way down, after the diff they
-		// enabled has been undone, and in the reverse of the order they
-		// were applied — so each one is taken back while the schema
-		// still wears the names its own rename left.
-		downStmts := append(DiffDown(renames.prev, cur, DiffOptions{Safe: opts.Safe}),
-			renames.down...)
+		downStmts := DiffDown(prev, cur, diffOpts)
 		if len(downStmts) > 0 {
 			downSQL = strings.Join(downStmts, "\n--> statement-breakpoint\n") + "\n"
 		}
@@ -205,14 +243,21 @@ func GenerateMigration(opts GenerateOptions) (*GenerateResult, error) {
 	if err := opts.Write("meta/_journal.json", journalBytes); err != nil {
 		return nil, fmt.Errorf("drops/pg: write journal: %w", err)
 	}
+	if renameLogBytes != nil {
+		if err := opts.Write(RenameLogFile, renameLogBytes); err != nil {
+			return nil, fmt.Errorf("drops/pg: write rename log: %w", err)
+		}
+	}
 
 	return &GenerateResult{
-		Tag:      tag,
-		Idx:      idx,
-		SQL:      sql,
-		DownSQL:  downSQL,
-		Snapshot: snapshotBytes,
-		Journal:  journalBytes,
+		Tag:       tag,
+		Idx:       idx,
+		SQL:       sql,
+		DownSQL:   downSQL,
+		Snapshot:  snapshotBytes,
+		Journal:   journalBytes,
+		Renames:   renames,
+		RenameLog: renameLogBytes,
 	}, nil
 }
 

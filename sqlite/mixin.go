@@ -47,10 +47,15 @@ func (m *TimestampsMixin) Apply(t *Table) {
 	}))
 }
 
-// SoftDeleteMixin registers a "deletedAt" column, a DefaultFilter
-// (deletedAt IS NULL), and a DeleteHook that rewrites DELETE as
-// UPDATE deletedAt = CURRENT_TIMESTAMP — the row stays but is hidden by
-// default. Use Unscoped() on any builder to bypass the guard.
+// SoftDeleteMixin registers a "deletedAt" column, a filter named
+// [FilterSoftDelete] (deletedAt IS NULL), and a DeleteHook that
+// rewrites DELETE as UPDATE deletedAt = CURRENT_TIMESTAMP — the row
+// stays but is hidden by default.
+//
+// To read the hidden rows, name the guard:
+// IgnoreFilters(sqlite.FilterSoftDelete), which leaves every other
+// filter on the table in force. Unscoped() also works and drops all of
+// them.
 type SoftDeleteMixin struct {
 	Cols SoftDeleteCols
 }
@@ -66,6 +71,8 @@ type SoftDeleteMixin struct {
 // filter is a duplicate walk, and a duplicated predicate is one more
 // thing a reader of a rendered statement has to decide is harmless.
 func (m *SoftDeleteMixin) Apply(t *Table) {
+	// SoftDelete has already registered the FilterSoftDelete guard;
+	// the mixin only adds the DELETE rewrite on top of it.
 	m.Cols = SoftDelete(t)
 	deletedAt := m.Cols.DeletedAt.Column
 	t.OnDelete(DeleteHookFunc(func(d *DeleteBuilder) drops.Expression {

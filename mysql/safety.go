@@ -145,6 +145,9 @@ func AnalyzeStatements(stmts []string, opts ...SafetyOptions) []SafetyWarning {
 			}
 		}
 	}
+	for _, w := range analyzePairs(ddl) {
+		out = emit(out, w)
+	}
 	return out
 }
 
@@ -505,4 +508,198 @@ func ruleRenameTable(stmt string) (SafetyWarning, bool) {
 		Message:    "RENAME TO breaks every query still using the old name, and takes any foreign key pointing at the table with it.",
 		Suggestion: "Create a view under the old name pointing at the new table, deploy, then drop the view in a later migration.",
 	}, true
+}
+
+// ----------------------------------------------------------------------
+// Cross-statement rules
+// ----------------------------------------------------------------------
+
+// The rename work established that an ambiguity is refused rather than
+// guessed. DetectRenames does the refusing, but it only sees the
+// ambiguities it is built to see: a table rename is a candidate only
+// when the two tables still agree on half their column names, and a
+// column rename only when the two types belong to one family. A table
+// whose every column was renamed with it, and a column renamed across
+// a type family, fall through both — and come out of the generator as
+// the destructive pair, silently.
+//
+// Nothing can tell those apart from a genuine drop-and-add; that is
+// what makes them ambiguous. What the analyser can do is say what
+// shape the migration has, and let the reader — who knows which it was
+// — decide.
+//
+// Loudness is the whole design question here. The obvious move is to
+// grade the pair an error, and it is the wrong one: DROP TABLE and
+// DROP COLUMN are both already errors here, so a second
+// finding at that level on the same statements adds urgency to nothing
+// and becomes the first rule people put in Ignore. These are graded
+// info, and they earn even that by needing *both* halves — a lone drop
+// says nothing, because a warning that fires on every genuine drop is
+// one people learn to skip.
+
+// analyzePairs runs the rules that read the migration as a whole
+// rather than one statement at a time.
+func analyzePairs(stmts []string) []SafetyWarning {
+	var out []SafetyWarning
+	out = append(out, pairTableRename(stmts)...)
+	out = append(out, pairColumnRename(stmts)...)
+	return out
+}
+
+// ident matches one SQL identifier — backtick-quoted, which is what
+// drops emits, double-quoted for a caller running under ANSI_QUOTES,
+// or bare — optionally database-qualified. Good enough for the names
+// drops itself emits, and a name it fails to parse simply produces no
+// finding.
+const identOne = "(?:`[^`]*`|\"[^\"]*\"|[A-Za-z_][\\w$]*)"
+
+const identPat = identOne + `(?:\.` + identOne + `)?`
+
+var (
+	reDropTableName   = regexp.MustCompile(`(?i)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(` + identPat + `)`)
+	reCreateTableName = regexp.MustCompile(`(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(` + identPat + `)`)
+	reRenameToNames   = regexp.MustCompile(`(?i)\bALTER\s+TABLE\s+(?:ONLY\s+)?(` + identPat + `)\s+RENAME\s+TO\s+(` + identPat + `)`)
+	reDropColumnName  = regexp.MustCompile(`(?i)\bALTER\s+TABLE\s+(?:ONLY\s+)?(` + identPat + `)\s+DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?(` + identPat + `)`)
+	reAddColumnName   = regexp.MustCompile(`(?i)\bALTER\s+TABLE\s+(?:ONLY\s+)?(` + identPat + `)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(` + identPat + `)`)
+)
+
+// unquoteIdent strips the quoting from an identifier so two spellings
+// of one name compare equal, and so a message reads as prose.
+func unquoteIdent(s string) string {
+	return strings.NewReplacer("`", "", `"`, "").Replace(s)
+}
+
+// pairTableRename reports each DROP TABLE that shares its migration
+// with a CREATE TABLE of some other name.
+//
+// A drop and a create of the *same* name is a rebuild, not a rename:
+// nothing moved, so there is nothing to have lost.
+//
+// So is the longer form — create the replacement, copy, drop the old
+// one, rename the replacement into its place. MySQL has MODIFY COLUMN
+// and does not need to write that itself, but people write it by hand
+// for an online change and hand the result here. A create whose table
+// is renamed away, and a drop whose name something is renamed into, are
+// both accounted for by a rename the migration states out loud, so
+// neither is a lost one.
+func pairTableRename(stmts []string) []SafetyWarning {
+	renamedFrom := map[string]bool{}
+	renamedTo := map[string]bool{}
+	for _, s := range stmts {
+		if m := reRenameToNames.FindStringSubmatch(s); m != nil {
+			renamedFrom[unquoteIdent(m[1])] = true
+			renamedTo[unquoteIdent(m[2])] = true
+		}
+	}
+	var created []string
+	for _, s := range stmts {
+		if m := reCreateTableName.FindStringSubmatch(s); m != nil {
+			if name := unquoteIdent(m[1]); !renamedFrom[name] {
+				created = append(created, name)
+			}
+		}
+	}
+	if len(created) == 0 {
+		return nil
+	}
+	var out []SafetyWarning
+	for _, s := range stmts {
+		m := reDropTableName.FindStringSubmatch(s)
+		if m == nil {
+			continue
+		}
+		dropped := unquoteIdent(m[1])
+		if renamedTo[dropped] {
+			continue
+		}
+		others := excluding(created, dropped)
+		if len(others) == 0 {
+			continue
+		}
+		out = append(out, SafetyWarning{
+			Severity:  SeverityInfo,
+			Rule:      "unstated-table-rename",
+			Statement: s,
+			Message: "this migration drops " + dropped + " and creates " + humanList(others) +
+				". That is the shape a rename makes when nobody stated it: a stated rename carries the rows over, a drop and a create does not.",
+			Suggestion: "If one of the new tables is " + dropped + " under a new name, state the rename (--rename-table " + dropped +
+				"=NEW, or answer the generator's prompt) so the migration renames instead of destroying. If it really is a drop, silence this with SafetyOptions{Ignore: []string{\"unstated-table-rename\"}}.",
+		})
+	}
+	return out
+}
+
+// pairColumnRename reports each table that loses a column and gains one
+// in the same migration.
+func pairColumnRename(stmts []string) []SafetyWarning {
+	type pair struct {
+		dropped, added []string
+		stmt           string
+	}
+	byTable := map[string]*pair{}
+	var order []string
+	get := func(t string) *pair {
+		p, ok := byTable[t]
+		if !ok {
+			p = &pair{}
+			byTable[t] = p
+			order = append(order, t)
+		}
+		return p
+	}
+	for _, s := range stmts {
+		if m := reDropColumnName.FindStringSubmatch(s); m != nil {
+			p := get(unquoteIdent(m[1]))
+			p.dropped = append(p.dropped, unquoteIdent(m[2]))
+			if p.stmt == "" {
+				p.stmt = s
+			}
+			continue
+		}
+		if m := reAddColumnName.FindStringSubmatch(s); m != nil {
+			p := get(unquoteIdent(m[1]))
+			p.added = append(p.added, unquoteIdent(m[2]))
+		}
+	}
+	var out []SafetyWarning
+	for _, t := range order {
+		p := byTable[t]
+		if len(p.dropped) == 0 || len(p.added) == 0 {
+			continue
+		}
+		out = append(out, SafetyWarning{
+			Severity:  SeverityInfo,
+			Rule:      "unstated-column-rename",
+			Statement: p.stmt,
+			Message: "this migration drops " + humanList(p.dropped) + " from " + t + " and adds " + humanList(p.added) +
+				" to it. That is the shape a rename makes when nobody stated it — and a rename detector that pairs columns by type family will not have asked about a pair whose types are in different families.",
+			Suggestion: "If one of the added columns is a dropped one under a new name, state the rename (--rename-column " + t + "." + p.dropped[0] +
+				"=NEW, or answer the generator's prompt) so the data comes with it. If they really are different columns, silence this with SafetyOptions{Ignore: []string{\"unstated-column-rename\"}}.",
+		})
+	}
+	return out
+}
+
+// excluding returns the entries of xs that are not name.
+func excluding(xs []string, name string) []string {
+	out := make([]string, 0, len(xs))
+	for _, x := range xs {
+		if x != name {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// humanList renders names as "a", "a and b", "a, b and c".
+func humanList(xs []string) string {
+	switch len(xs) {
+	case 0:
+		return ""
+	case 1:
+		return xs[0]
+	case 2:
+		return xs[0] + " and " + xs[1]
+	}
+	return strings.Join(xs[:len(xs)-1], ", ") + " and " + xs[len(xs)-1]
 }

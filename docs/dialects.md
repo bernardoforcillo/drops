@@ -10,29 +10,31 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Entity CRUD | ✅ | ✅ | ✅ | ✅ | n/a |
 | Drift check | ✅ | ✅ | ✅ | ✅ | n/a |
 | Composite keys | ✅ | ✅ | ✅ | n/a | n/a |
-| Relations, eager loading | ✅ | partial | — | — | — |
-| Keyset pagination | ✅ | ✅ | — | ✅ (via mirror) | ✅ (via vector) |
-| Migrations, diff, snapshot | ✅ | ✅ | — | ✅ | — |
-| Outbox, saga, event store | ✅ | ✅ | — | event store | — |
-| Tenant scoping | ✅ | ✅ | ✅ | ✅ (narrower) | — |
-| Server-side boundary under it | ✅ RLS, reads + writes | file per tenant | definer view, reads + writes, needs a grant drops cannot write | row policy, reads only, fails open by default | — |
-| Audit, authz, cache | ✅ | ✅ | — | — | — |
+| Relations, eager loading | ✅ | partial | declaration only | — | — |
+| Keyset pagination | ✅ | ✅ | ✅ | ✅ (via mirror) | ✅ (via vector) |
+| Migrations, diff, snapshot | ✅ | ✅ | ✅ | diff + push² | — |
+| Introspection reads back | most¹ | ✅ | ✅ | most² | — |
+| Outbox, saga, event store | ✅ | ✅ | outbox, event store | event store | — |
+| Typed driver errors, retry | ✅ | sentinels only | ✅ | — | — |
+| Audit, tenancy, authz, cache | ✅ | ✅ | — | — | — |
 | Vector search | ✅ pgvector | — | — | ✅ built-in | ✅ native |
 
-Where a cell is empty the feature is not there yet, not disabled. The
-package doc for each dialect says what it covers.
+² ClickHouse has `Introspect`, `BuildSnapshot`, `Diff` and `Push` but
+no migration generator, and its `Diff` returns a plan rather than a
+list of statements — a great deal of what a ClickHouse schema change
+would mean has no `ALTER` behind it and comes back as a refusal. Column
+TTLs are the one declared thing `system.columns` cannot report, so they
+are left out of the comparison and reported as a notice.
 
-The "server-side boundary" row is the one to read twice, because the
-row above it flattens a difference that decides how a multi-tenant
-deployment is built. Tenant scoping is an application-level predicate
-in all four dialects; what sits UNDER it is not the same thing four
-times. Only PostgreSQL's is a boundary drops can both declare and
-satisfy. On MySQL drops renders the DDL and the deployment has to
-withhold the base-table grant that makes it a boundary; on ClickHouse
-the policy covers reads only and exempts any principal it does not
-name; on SQLite there is no principal at all, so the triggers drops
-renders guard against mistakes and the boundary is one file per
-tenant. See "Tenant scoping" below.
+¹ PostgreSQL introspection does not yet read back enums, sequences,
+views, RLS or policies, though the diff generator can write all of
+them. A schema declaring one enum therefore makes `Push` re-emit its
+`CREATE TYPE` on every run and `DetectDrift` permanently noisy. See
+`pg/introspect.go`.
+
+Where a cell is empty the feature is not there yet, not disabled. The
+package doc for each dialect says what it covers, and `## What's not
+here` in the readme says what none of them do.
 
 ## PostgreSQL
 
@@ -94,6 +96,92 @@ with its own indexes. So the generated SQL carries a comment above
 every rebuild saying exactly that, `AnalyzeMigration` reports it as
 `rebuild-loses-indexes`, and re-creating them is the reviewer's job.
 
+### `sqlite.Push` refuses a destructive change (breaking change)
+
+A rebuild is also where SQLite's destructive changes hide, and until
+now `Push` had no guard against them at all. Pushing a schema with a
+column removed applied cleanly, the rebuild copied the columns both
+sides named, the data was gone and `err` was `nil`.
+
+The reason it went unnoticed is worth stating, because it shapes the
+fix. On PostgreSQL, `drops push` reads the plan it is about to run and
+refuses the destructive statements in it — `DROP COLUMN`, `DROP TABLE`,
+`TRUNCATE`. On SQLite there is no such statement to find. The plan is a
+`CREATE`, an `INSERT … SELECT`, a `DROP TABLE` and a `RENAME`, and
+those four are identical whether the rebuild widens the table or empties
+half of it; the column that is going is simply absent from the
+`INSERT`'s column list. **No guard that reads the SQL can see this.**
+The fact lives in the diff — this column is in the previous snapshot
+and not in the next one — so that is where it is computed, and it is
+carried out to the caller rather than recovered afterwards.
+
+`sqlite.Push` now returns `*sqlite.DestructiveChangeError` and applies
+nothing when the change would destroy any of:
+
+| Rule | What it is |
+|---|---|
+| `drop-column` | the column is in the database and not in the schema |
+| `alter-column-type` | the column moves from `TEXT` affinity to a numeric one, and the copy converts as it goes: `'007'` arrives as `7` |
+| `alter-column-set-not-null` | the column gains `NOT NULL` and rows still hold `NULL`, which the copy will not accept |
+| `add-unique-constraint` | the column or column list gains `UNIQUE` and the rows already hold a value twice |
+| `add-check-constraint` | the table gains a `CHECK` and a row already breaks it |
+| `rebuild-drops-index` | the rebuild drops an index keyed on a departing column and does not put it back |
+| `rebuild-stale-trigger` | the rebuild puts a trigger back naming a departing column; SQLite accepts it and it fails when it fires |
+
+Three of them — `alter-column-set-not-null`, `add-unique-constraint`
+and `add-check-constraint`, the tightenings — cost no data at all:
+SQLite refuses the copy and the whole transaction rolls back. They are
+in the list because without them the push dies partway through a
+rebuild on a constraint message, which is the thing this guard exists
+to turn into a readable refusal.
+
+The names are `drops/pg`'s names wherever the meaning is the same, so
+`drop-column` means here what it means there. The last two are what
+`GenerateMigration` has always warned about through `AnalyzeMigration`
+and `Push`, which prints no migration for anyone to read, did not.
+
+There is one more rule, `drop-table`, and `Push` never reaches it. It
+diffs only over the tables the schema declares — a table drops was
+never told about belongs to somebody else — so deleting a `NewTable`
+from the schema does not drop the table and does not raise a finding
+either; it is left alone, silently, exactly as before. The rule is for
+callers of `sqlite.DestructiveChanges` (below), which diffs whatever
+two snapshots it is handed. Dropping a table still means writing the
+`DROP` into a migration.
+
+`PushOptions.AllowDestructive` applies them anyway — the same
+permission `drops push --allow-destructive` carries on PostgreSQL, and
+the same meaning: not that the change is safe, but that somebody has
+read what it destroys. It does **not** answer a rename question, and a
+rename answer does not permit a drop; a column being renamed rather
+than dropped is a question about what the change means, and the two
+must not collapse into one option. `sqlite.DestructiveChanges(prev,
+cur, opts)` computes the same list from any pair of snapshots.
+
+Two things deliberately do not trigger it. A rebuild that only widens a
+table loses nothing and is not refused — otherwise the option would be
+needed on almost every push and would stop meaning anything. And the
+three tightenings are put to the rows before they are reported:
+tightening a column that holds no `NULL`, declaring one unique that has
+held distinct values all along, or adding a `CHECK` every row satisfies
+all go through untouched.
+
+The probe reads the table as the rebuild's `INSERT … SELECT` will
+present it, not as it stands: a column this push renames is supplied
+under its new name and one it adds under its default. SQLite reads a
+double-quoted identifier matching no column as a string literal rather
+than failing, so a probe against the raw table would ask a different
+question and answer it confidently — which for a `CHECK` means a
+silent acquittal and a push that then dies on that very constraint.
+
+`PushOptions.DryRun` does not refuse. It returns the plan with
+`PushResult.Destructive` filled in, because a preview that will not show
+you what you would have to permit is no preview.
+
+**This is a breaking change** for anyone who relied on the old silence:
+a push that used to drop a column now stops. The migration path is one
+option, or one flag.
+
 One rebuild is impossible rather than lossy. `ALTER TABLE t_new RENAME
 TO t` resolves every view and every trigger body that names `t`, and
 between the `DROP` and the `RENAME` there is no `t` — so a table
@@ -103,14 +191,13 @@ dependent object, rebuild, and re-create it.
 
 ## MySQL / MariaDB
 
-The schema and query surface, plus entity CRUD with the drift check
-and composite keys. None of the cross-cutting packages yet, and no
-relations: `mysql` has no eager loader, so the declaration API that
-used to be here compiled, ran, and loaded nothing. It is gone rather
-than deprecated — an API that silently does nothing is worse than one
-that is not there, because nothing tells the caller. Write the join.
+The schema and query surface, entity CRUD with the drift check and
+composite keys, migrations against `information_schema`, a
+transactional outbox and event store, keyset pagination, typed driver
+errors and the expression library. Not audit, tenancy, authz or cache,
+and relations are declaration-only — there is no eager loader.
 
-Three differences shape the API rather than the SQL:
+Four differences shape the API rather than the SQL:
 
 - **No `RETURNING`.** `Entity.Create` issues the INSERT and reads the
   generated key back through the driver's `LastInsertId`. `CreateMany`
@@ -128,29 +215,46 @@ Three differences shape the API rather than the SQL:
   batched delete goes through the un-aliased handle; `Exec` returns
   `ErrAliasedDeleteBounded` rather than posting a statement the server
   is certain to reject.
+- **No transactional DDL.** MySQL commits implicitly on every DDL
+  statement, so a migration that fails half-way leaves the schema half
+  changed — there is nothing to roll back to. That is the contract
+  rather than a surprise: `Push` reports how far it got, and a single
+  `ALTER TABLE` carrying several actions is atomic even though the
+  migration around it is not.
 
-`Push` is bounded by the same two consents as PostgreSQL's, and for a
-sharper reason. `DropUnmanagedTables` answers "is this table drops's to
-drop"; `Allow` answers "may this table lose its data". A destructive
-change — `DROP TABLE`, `DROP COLUMN`, a `MODIFY COLUMN` that retypes —
-against a table with rows in it is withheld, the whole push is refused
-with `ErrDestructivePush` before a single statement is sent, and
-`PushResult.DataLoss` names what it would have destroyed and the
-`mysql.Destructive` value that would authorise it. An `Allow` entry that
-matches nothing in the diff is reported as a `stale-consent` notice
-rather than discarded, because a consent that has quietly stopped
-applying reads at the call site exactly like one that has not.
-PostgreSQL rolls a failed push back; MySQL has no transactional DDL, so
-the refusal in front of the statement is the whole of the protection.
+### What a dropped column takes with it
 
-"Has rows" is read from `information_schema.TABLES.TABLE_ROWS`, which
-for InnoDB is a sampled estimate rather than a count and can report 0
-for a table that is not empty. Since 0 is exactly the value that would
-let a DROP through, both 0 and NULL are settled with
-`SELECT EXISTS (SELECT 1 FROM t LIMIT 1)` — one row read, on the only
-tables in doubt, and only for a change nobody authorised. An
-over-estimate needs no such care: it can only withhold a change that
-did not need withholding.
+A migration that drops a column and something naming it has one working
+order — the dependent goes first — and getting there is not a port of
+PostgreSQL's rule, because MySQL answers a different way for each kind.
+Read off MariaDB 10.11: a secondary index over the dropped column alone
+is **removed with the column**, so a `DROP INDEX` afterwards is 1091;
+one over several columns is **narrowed** to the columns that remain and
+stays, so the drop is not stale and is the only thing that gets rid of
+it. A `UNIQUE` key over the column alone goes with it, but MariaDB will
+not narrow a multi-column one and refuses the column drop with 1072. A
+`CHECK` naming only that column goes with it on MariaDB and is refused
+on MySQL 8.0.16+ with 3959; one naming a surviving column too is
+refused on both with 1054. Either side of a foreign key — the column
+the key is on, the column it points at, and the index it needs —
+refuses with 1553. A single-column `PRIMARY KEY` goes with its column;
+a composite one refuses with 1072.
+
+`Diff` emits the foreign-key drops first, across every table, then the
+indexes, `CHECK`s and primary keys on each, and only then the columns.
+One hazard is not an ordering problem and remains: `DROP PRIMARY KEY`
+on a table whose key covers an `AUTO_INCREMENT` column is 1075 wherever
+it is put.
+
+`Push` reaches the drop of an index the Go schema never declared only
+under `PushOptions.DropUnmanagedIndexes`; under the default it withholds
+it as an `unmanaged-index` notice, because it cannot tell an index the
+schema stopped declaring from one somebody made by hand. The one
+exception is an index keying a column the same push drops, which MySQL
+will not leave as it is whatever Push does — so withholding the drop
+there preserves nothing: it leaves a narrowed index nobody asked for, or
+stops the push on 1072 or 1553. That drop goes through by default, under
+a notice naming the index and the departing column.
 
 Smaller things worth knowing before you port a schema: `TEXT` cannot be
 indexed without a prefix length (`Index.Prefix`), so a column you mean
@@ -176,6 +280,26 @@ There is no `UPDATE`/`DELETE` in the usual sense — mutations rewrite
 whole parts asynchronously — so the shape of a ClickHouse workload is
 append, and collapse on merge. [mirror.md](mirror.md) is built on that.
 
+`Introspect` reads a table back out of `system.tables` and
+`system.columns`, `BuildSnapshot` derives the same shape from the Go
+declaration, `Diff` puts them side by side and `Push` applies the
+result. What makes this dialect different is what `Diff` cannot emit:
+ClickHouse has no `ALTER` for a table's engine, its partitioning, its
+primary key or — beyond appending columns the same statement adds — its
+sorting key, and none for a column that takes part in any of them.
+Those come back as refusals naming the remedy, which is always a new
+table and a copy.
+
+On a `ReplacingMergeTree` the sorting key deserves the emphasis it
+gets: the engine collapses rows that share it, so the key is the
+definition of "the same row" rather than a layout choice, and changing
+it changes how many rows the table holds.
+
+`clickhouse.Analyze` grades what a plan does carry — metadata, a
+background rewrite, or a deletion with no way back. A ClickHouse
+`ALTER` returns before its work is done (`mutations_sync` defaults to
+0), so `system.mutations` is where a migration actually finishes.
+
 ## Qdrant
 
 Not SQL. A focused HTTP client (net/http and encoding/json only) for
@@ -183,152 +307,6 @@ collections, points, search, recommend and scroll, plus a filter DSL.
 
 Through [`drops/vector`](vector-search.md) it also satisfies the same
 portable search interface as pgvector and ClickHouse.
-
-## Tenant scoping
-
-The one feature that is the same mechanism in four dialects, on
-purpose. A table declares the axis; the *executors* resolve it; the
-predicate reaches every statement drops composed, to any depth — a
-joined table, a CTE body, a subquery operand, an eager-loaded edge, the
-predicate another table's filter answers with — and a ctx with no
-tenant is refused before anything is sent.
-
-A nil is no tenant. `WithTenant` takes an `any`, so a `(*string)(nil)`
-read out of a request struct arrives inside an interface that is not
-itself nil; it is refused exactly as an absent tenant is, rather than
-stamping `NULL` onto a row that then belongs to nobody. A zero that is
-not a nil — an empty string, a zero int — is a tenant like any other:
-the schema can store it and it addresses the same rows on the way back
-out.
-
-```go
-Posts.ContextFilter(pg.TenantFilter(PostTenantID)).
-    ScopeWritesByTenant(PostTenantID)
-
-ctx = pg.WithTenant(ctx, currentTenant)
-```
-
-Read the same line with `sqlite.`, `mysql.` or `clickhouse.` in front
-of it and it means the same thing. Each package holds a `resolve.go`
-carrying the walk; normalise the dialect name and diff any two of them
-and the same file comes back, which is how the next divergence is meant
-to be caught rather than re-derived.
-
-What differs is surface, and it differs where the SQL does:
-
-- **PostgreSQL** is the reference, and the only one where the
-  predicates are *not* the isolation boundary: row-level security is,
-  and `EnableRLS` / `AddPolicy` / `DB.InTxAs` are how you declare it.
-  Read the predicates as defence in depth there.
-- **SQLite** has the whole mechanism minus what the dialect lacks: no
-  `RIGHT` or `FULL JOIN`, so the join-placement shapes cannot arise.
-  There is no row-level security to sit underneath — no roles, no
-  policies, and a process that can open the file reads every byte. What
-  it does have is triggers, which are inside the database and so run
-  for the statements the predicates cannot reach: `TenantGuard` renders
-  them from the same axis and refuses a write that leaves a row with no
-  tenant, moves one between tenants, or points a foreign key at another
-  tenant's row. That is a guard against mistakes, not a boundary
-  against a principal, because there is no principal here to bind rows
-  to — anyone who can write the file can `DROP TRIGGER`. The boundary
-  this dialect has is architectural: one database file per tenant, and
-  `sqlite/tenantguard.go` says what that costs and which half of it
-  `PinnedTo` can put in the schema.
-- **MySQL** has the whole mechanism, including the aliased `UPDATE` and
-  `DELETE` that must name their alias twice and the upsert whose
-  `ON DUPLICATE KEY UPDATE` has no conflict target and no `WHERE`
-  clause for a predicate to reach. Its nearest thing to RLS is a
-  definer-rights view, which drops does not manage.
-- **ClickHouse** is narrower because the dialect is. There is no
-  `UPDATE` or `DELETE` to carry a predicate, so the write side is
-  stamping and refusal only; no upsert to gate, because a merging
-  engine folds rows sharing a sorting key in the background — which is
-  where the check went instead, as `ErrTenantNotInSortingKey`; no
-  relations and so no eager-loaded edge; no cache to key by tenant; and
-  no set operations. A materialised view evaluates its stored body on
-  INSERT with no ctx anywhere near it.
-
-`Unscoped` has one meaning per level in all four: **statement-wide** on
-a raw builder, where the caller is describing the whole statement's
-authority, and **defaults-only** on an entity query, which drops the
-declaration-time filters (a soft-delete guard) and keeps the tenant
-axis and the authorization guard. A query that genuinely has to span
-tenants is written on the raw builder, where a reviewer reads the whole
-of what was given up. On an **INSERT** it additionally means the ctx
-tenant is neither stamped nor required and the dialect's upsert branch
-is left as written — the escape hatch a migration or a backfill needs.
-
-At every level it stops at the edge of the statement it was said on. A
-CTE body, a subquery operand, a subquery bound as an INSERT value is a
-statement of its own and keeps its own scoping, and an inner statement
-with no tenant to name still refuses. That is also how one part of a
-query is unscoped and no other. The wide misreading is the dangerous
-one: a caller who expects `Unscoped` on the INSERT to widen the
-subquery bound as its value will write a row computed from one
-tenant's data while believing it spans them all.
-
-The rules are written down once rather than per dialect. Each package's
-`tenant.go` carries a block delimited `THE TENANT POLICIES —
-NORMATIVE`, byte-identical in all four and pinned by a root-level test
-that fails when one drifts by a word, by whitespace, or by reordering.
-The set of dialects it pins is derived from the source — every package
-declaring `WithTenant` — rather than listed, so a fifth dialect that
-carried no block would fail rather than pass unnoticed.
-It states what counts as the same tenant (a round-trip conversion, so a
-truncating pair cannot compare equal), what may assign the axis
-(`Create` and `Update` stamp and refuse a mismatch; `Patch` refuses any
-op naming it), and what `Unscoped` means at each level. Dialect
-differences are named inside the shared text — `clickhouse` models
-neither `UPDATE` nor `DELETE`, `RelConfig.Unscoped` is `pg`'s alone —
-so the same words are true in four packages.
-
-What the mechanism does *not* reach is listed per dialect, under
-"Where the automatic scoping stops" — in `tenant.go` for `sqlite`,
-`mysql` and `clickhouse`, and in `doc.go` for `pg`, where it continues
-the package overview that opened the subject. It is not a footnote: none of the other
-three has row-level security to put underneath them, so what a
-statement leaves behind when it walks off that list is not caught the
-way `pg` catches it.
-
-That is not the same as the predicates being the whole of what there
-is, which is what this paragraph used to say. Each of the three has
-something, and the three are not alike. `clickhouse` has `CREATE ROW
-POLICY`, which filters reads for a user or role and has no `WITH CHECK`
-half, so writes have no floor at all — and which fails *open*, so a
-principal no policy names reads every tenant's rows unless the server's
-`access_control_improvements` says otherwise (`clickhouse/rowpolicy.go`).
-`mysql` has a definer-rights view with `WITH CASCADED CHECK OPTION`
-reached by an account holding nothing on the base table, which covers
-reads and writes both, and whose boundary is the *absence* of a grant —
-so drops renders the DDL and cannot establish it
-(`mysql/tenantview.go`). `sqlite` has no principal of any kind, and so
-nothing inside the database that binds rows to one; what it has is
-triggers, which run for the statements on the list and hold against
-mistakes rather than against an adversary (`sqlite/tenantguard.go`).
-Its boundary is one database file per tenant.
-
-The four lists are not one list repeated, and reading one is not
-reading them all. `pg`'s is written against `pg`'s own surface and
-shares no entry's wording with the other three: eleven entries,
-covering among others the FULL JOIN refusal, the `DeleteHook` rewrite
-path, what `ToSQL` renders without a ctx, how far `Unscoped` reaches,
-and what the axis column's collation and type do to two tenant values
-Go calls different. The other three share a spine of six — a raw
-statement, a `drops.Raw` or `ExprFunc` body, a view body, a statement
-that said `Unscoped()`, an INSERT into a table with a read filter and
-no write column, and the RIGHT JOIN placement gap — and depart from it
-where the dialect does. `mysql` carries three more: its hand-written
-outbox, event-store and idempotency SQL, the non-ASCII identifier fold
-both families perform and `identKey` does not, and the tenant value its
-default case-insensitive collation folds onto another tenant's. `sqlite`
-carries the RIGHT JOIN entry to record a gap the dialect cannot have,
-so that adding a join kind is known to bring it, and one entry of its
-own: a `COLLATE NOCASE` axis column is two tenants to drops and one to
-the server. `clickhouse` carries no entry of that kind: it has no
-per-column collation for `=`, its `String` comparison being binary,
-and no ClickHouse was reachable to probe what its drivers do with a
-tenant value of the wrong Go type. Read the list for the dialect you
-are writing against.
 
 ## Porting between them
 

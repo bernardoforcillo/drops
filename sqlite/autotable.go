@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/bernardoforcillo/drops/internal/drift"
 )
 
 // moneyTypeName / moneyPkgPath identify sqlite.Money so AutoTable maps
@@ -18,8 +20,9 @@ var moneyPkgPath = reflect.TypeOf(Money{}).PkgPath()
 //
 //	drop:"<col_name>[,opt[,opt...]]"
 //
-// where each opt is one of: primaryKey, autoIncrement, notNull, unique,
-// pii, default=<sql>. Use `drop:"-"` (or an untagged field) to skip.
+// where each opt is one of: primaryKey, autoIncrement, notNull, null,
+// unique, pii, default=<sql>. Use `drop:"-"` (or an untagged field) to
+// skip.
 //
 // Go type → SQLite affinity:
 //
@@ -31,7 +34,12 @@ var moneyPkgPath = reflect.TypeOf(Money{}).PkgPath()
 //	time.Time             → DATETIME
 //	json.RawMessage       → TEXT
 //	sqlite.Money          → INTEGER
-//	*T                    → same as T (nullable unless notNull is set)
+//	*T                    → same as T, column NULL-able
+//
+// Nullability comes from the field's type, not from the absence of a
+// tag: a pointer or an sql.Null[T] field declares a nullable column,
+// everything else declares NOT NULL. `null` overrides that for a
+// field whose type cannot say it.
 //
 // SQLite has no serial family — autoIncrement simply keeps INTEGER; pair
 // it with primaryKey to get an auto-assigning rowid alias.
@@ -65,6 +73,7 @@ type autoOpts struct {
 	PK      bool
 	AutoInc bool
 	NotNull bool
+	Null    bool
 	Unique  bool
 	Default string
 	PII     bool
@@ -111,6 +120,8 @@ func parseAutoTag(raw string) (autoOpts, error) {
 			opts.AutoInc = true
 		case "notNull":
 			opts.NotNull = true
+		case "null":
+			opts.Null = true
 		case "unique":
 			opts.Unique = true
 		case "pii":
@@ -124,25 +135,48 @@ func parseAutoTag(raw string) (autoOpts, error) {
 			return opts, fmt.Errorf("unknown drop tag option %q", k)
 		}
 	}
+	if opts.NotNull && opts.Null {
+		return opts, fmt.Errorf("`notNull` and `null` contradict each other; drop one or the other")
+	}
 	return opts, nil
 }
 
+// makeAutoColumn assembles a *Column from a parsed field.
+//
+// Nullability is read off the field's type — a pointer or an
+// sql.Null[T] gives a nullable column, anything else NOT NULL — so
+// the derived table always states it and NewAutoEntity cannot trip
+// the nullability check its own NewEntity runs.
 func makeAutoColumn(structName string, f reflect.StructField, opts autoOpts) *Column {
 	ft := f.Type
 	for ft.Kind() == reflect.Ptr {
 		ft = ft.Elem()
 	}
+	// An sql.Null[T] field carries no SQL type of its own — it says
+	// the column is optional and wraps the type that does.
+	if payload, ok := drift.NullPayload(ft); ok {
+		ft = payload
+	}
 	if isMoneyType(ft) {
 		c := &Column{name: opts.Name, typ: simpleType("INTEGER")}
-		applyAutoOpts(c, opts)
+		applyAutoOpts(c, f.Type, opts)
 		return c
 	}
 	c := &Column{name: opts.Name, typ: autoColumnType(structName, f.Name, ft)}
-	applyAutoOpts(c, opts)
+	applyAutoOpts(c, f.Type, opts)
 	return c
 }
 
-func applyAutoOpts(c *Column, opts autoOpts) {
+// applyAutoOpts stamps the parsed flags onto c. ft is the field's
+// declared type, which decides nullability unless a tag overrides it.
+func applyAutoOpts(c *Column, ft reflect.Type, opts autoOpts) {
+	// Every derived column states nullability, and the field type is
+	// the statement: the tag options only override it.
+	c.notNull = !drift.InferNullable(ft)
+	c.nullStated = true
+	if opts.Null {
+		c.notNull = false
+	}
 	if opts.PK {
 		c.primary = true
 		c.notNull = true

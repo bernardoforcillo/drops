@@ -96,6 +96,17 @@ func emitIntrospectFile(pkg string, tbl *introspectTable) ([]byte, error) {
 		case "json.RawMessage":
 			needsJSON = true
 		}
+		// A column production will hand back as NULL gets a pointer
+		// field, because that is the field type that can receive one
+		// — and because it is the spelling schema mode reads back as
+		// "this column is nullable", so introspecting a table and
+		// regenerating its schema returns the schema it started from.
+		// A []byte or json.RawMessage already receives NULL, but the
+		// pointer is what states the intent, and stating it is the
+		// point.
+		if !c.NotNull && !c.PrimaryKey {
+			gtype = "*" + gtype
+		}
 		tag := tagLiteral(buildDropTag(c, singleUniqs[c.Name]))
 		fields = append(fields, fmt.Sprintf("\t%s %s %s", goIdentFor(c.Name), gtype, tag))
 	}

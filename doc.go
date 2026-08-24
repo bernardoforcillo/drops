@@ -5,14 +5,38 @@
 // pgx, or your own pool) plus the building blocks for composing SQL:
 // [Expression] and [Builder].
 //
+// [SQL] is the escape hatch for the operator the DSL does not model:
+// it mixes literal SQL text with column references and with values that
+// [Arg] binds as parameters, so leaving the builder no longer means
+// leaving parameterisation with it.
+//
+// [FieldError] is the shape a constraint violation takes once a dialect
+// has translated it back into the struct field the database refused —
+// the answer to "the email is taken" that cannot be established in
+// application code without a race.
+//
 // [All] and [One] give an ad-hoc query the typing an entity query gets
 // for free: they are generic over [RowSource], the Rows method every
 // dialect's SELECT builder already has, so a join or an aggregate
 // scans into a type named at the call site.
 //
+// [Multi] is a transaction written down as a value: an ordered list of
+// named steps run inside one transaction. When a step fails, the
+// [MultiError] says which one, why, and what had already succeeded —
+// the three things a bare closure passed to [InTx] cannot tell you.
+// Being a value, it can also be enumerated before it runs, which is
+// something a test can assert about a transaction script.
+//
 // Observability is provided by [Hook], [ChainHooks], and [CallHook] — a
 // single contract shared by every dialect. A ready-made structured hook
 // is available via [LoggerHook].
+//
+// [WithQueryTags] attaches application context — controller, action,
+// request id — to every statement as a trailing SQLCommenter comment,
+// which is what lets a slow entry in pg_stat_statements be traced back
+// to the code that issued it. It is plumbed into the statement path
+// rather than built on [Hook], because a hook fires after the
+// operation and cannot change what was sent.
 //
 // # Dialect packages
 //

@@ -1,273 +1,165 @@
 package pg_test
 
 import (
-	"context"
-	"errors"
-	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/bernardoforcillo/drops"
-	"github.com/bernardoforcillo/drops/dropstest"
 	"github.com/bernardoforcillo/drops/pg"
 )
 
-// pg used to resolve columns to fields with its own reflection walk,
-// and every case below is one the copy answered differently from the
-// root scanner every other dialect uses. They are here rather than only
-// in the root package's scan_test.go because the thing under test is
-// that pg does not answer them on its own: delete the delegation in
-// pg/scan.go and these fail again, one per drift.
-
-// scanAudit is the shape pg.Audit encourages — bookkeeping columns
-// factored into an embedded struct that the row type does not export.
+// scanAudit is the shape the scanner has to reach through: a struct
+// that factors the timestamps every row carries into one embedded
+// type, and keeps that type unexported because it is an implementation
+// detail of the package that declares it.
 type scanAudit struct {
 	CreatedAt time.Time
-	Note      string
+	UpdatedAt time.Time
 }
 
 type scanArticle struct {
-	ID int64
+	ID    int64
+	Title string
 	scanAudit
 }
 
-// ScanKey is an exported embedded type on purpose: an unexported one
-// exposes the drift in the walk, an exported one the drift in the
-// tie-break, and each needs its own pin.
-type ScanKey struct{ ID int64 }
+func TestScanReachesThroughAnUnexportedEmbeddedStruct(t *testing.T) {
+	created := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+	updated := created.Add(time.Hour)
+	cols := []string{"id", "title", "createdAt", "updatedAt"}
+	row := []any{int64(7), "seven", created, updated}
 
-// scanShadowFirst declares its own ID above the embedded one, which is
-// the order a last-write-wins walk got wrong: the outer field is the
-// one ordinary Go field access reaches, so it is the one the column
-// belongs to.
-type scanShadowFirst struct {
-	ID string
-	ScanKey
+	var got scanArticle
+	if err := pg.ScanOne(&fakeRows{cols: cols, data: [][]any{row}}, &got); err != nil {
+		t.Fatalf("pg.ScanOne: %v", err)
+	}
+	// The root scanner is the reference — the same struct reaches it
+	// whenever a caller goes through drops.One instead of a pg builder.
+	var want scanArticle
+	if err := drops.ScanOne(&fakeRows{cols: cols, data: [][]any{row}}, &want); err != nil {
+		t.Fatalf("drops.ScanOne: %v", err)
+	}
+	if got != want {
+		t.Errorf("pg and root scanners disagree\n  pg:   %+v\n  root: %+v", got, want)
+	}
+	if !got.CreatedAt.Equal(created) || !got.UpdatedAt.Equal(updated) {
+		t.Errorf("timestamps promoted out of the unexported embedded struct were dropped: got %v/%v, want %v/%v",
+			got.CreatedAt, got.UpdatedAt, created, updated)
+	}
 }
 
-type scanShadowLast struct {
-	ScanKey
-	ID string
-}
-
-type scanTagged struct {
-	Label string `drop:"b"`
-	B     string
-}
-
-// scanColliding has two fields whose camelCase forms are both "sku".
-type scanColliding struct {
-	SKU int64
-	Sku int64
-}
-
-// scanReading embeds a time.Time, which is a destination for a column
-// rather than a struct to look inside.
-type scanReading struct {
+// An embedded time.Time receives a column; it does not lend its fields.
+// The root scanner says so, and pg has to say the same.
+type scanStamped struct {
 	ID int64
 	time.Time
 }
 
-type scanOptions struct {
-	Name string `drop:"n,notnull"`
-}
+func TestScanTreatsAnEmbeddedScalarAsAColumn(t *testing.T) {
+	at := time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)
+	cols := []string{"id", "time"}
+	row := []any{int64(3), at}
 
-type scanSkipped struct {
-	ID   int64
-	Skip string `drop:"-"`
-}
-
-type scanUnexported struct {
-	ID     int64
-	secret string
-}
-
-// scanRows hands back a cursor over canned data. dropstest converts the
-// way a driver does — a nil into a *string, an int64 into an int — so a
-// mis-bound column surfaces as a scan error instead of a panic.
-func scanRows(t *testing.T, cols []string, data ...[]any) drops.Rows {
-	t.Helper()
-	rows, err := dropstest.New().Rows(cols, data...).Query(context.Background(), "q")
-	if err != nil {
-		t.Fatalf("canned query: %v", err)
+	var got scanStamped
+	if err := pg.ScanOne(&fakeRows{cols: cols, data: [][]any{row}}, &got); err != nil {
+		t.Fatalf("pg.ScanOne: %v", err)
 	}
-	return rows
-}
-
-func TestScanOneResolvesColumnsLikeTheRootScanner(t *testing.T) {
-	when := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
-
-	for _, tc := range []struct {
-		name string
-		cols []string
-		row  []any
-		dest any
-		want any
-	}{
-		{
-			name: "unexported embedded struct keeps its promoted fields",
-			cols: []string{"id", "createdAt", "note"},
-			row:  []any{int64(1), when, "draft"},
-			dest: &scanArticle{},
-			want: &scanArticle{ID: 1, scanAudit: scanAudit{CreatedAt: when, Note: "draft"}},
-		},
-		{
-			name: "outer field declared first shadows the embedded one",
-			cols: []string{"id"},
-			row:  []any{"a1"},
-			dest: &scanShadowFirst{},
-			want: &scanShadowFirst{ID: "a1"},
-		},
-		{
-			name: "outer field declared last shadows the embedded one",
-			cols: []string{"id"},
-			row:  []any{"a1"},
-			dest: &scanShadowLast{},
-			want: &scanShadowLast{ID: "a1"},
-		},
-		{
-			name: "tag beats another field's camelCase form",
-			cols: []string{"b"},
-			row:  []any{"tagged"},
-			dest: &scanTagged{},
-			want: &scanTagged{Label: "tagged"},
-		},
-		{
-			name: "camelCase collision goes to the first-declared field",
-			cols: []string{"sku"},
-			row:  []any{int64(9)},
-			dest: &scanColliding{},
-			want: &scanColliding{SKU: 9},
-		},
-		{
-			name: "embedded time.Time receives a column instead of lending fields",
-			cols: []string{"id", "time"},
-			row:  []any{int64(1), when},
-			dest: &scanReading{},
-			want: &scanReading{ID: 1, Time: when},
-		},
-		{
-			name: "tag options after the comma are not part of the column name",
-			cols: []string{"n"},
-			row:  []any{"v"},
-			dest: &scanOptions{},
-			want: &scanOptions{Name: "v"},
-		},
-		{
-			name: "drop:- leaves the field alone",
-			cols: []string{"id", "Skip"},
-			row:  []any{int64(1), "written"},
-			dest: &scanSkipped{},
-			want: &scanSkipped{ID: 1},
-		},
-		{
-			name: "unexported field is not a destination",
-			cols: []string{"id", "secret"},
-			row:  []any{int64(1), "shh"},
-			dest: &scanUnexported{},
-			want: &scanUnexported{ID: 1},
-		},
-		{
-			name: "a column with no field is discarded",
-			cols: []string{"id", "unrelated"},
-			row:  []any{int64(4), "ignored"},
-			dest: &scanArticle{},
-			want: &scanArticle{ID: 4},
-		},
-		{
-			name: "a field with no column keeps its zero value",
-			cols: []string{"id"},
-			row:  []any{int64(4)},
-			dest: &scanArticle{},
-			want: &scanArticle{ID: 4},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := pg.ScanOne(scanRows(t, tc.cols, tc.row), tc.dest); err != nil {
-				t.Fatalf("ScanOne: %v", err)
-			}
-			if !reflect.DeepEqual(tc.dest, tc.want) {
-				t.Errorf("got = %+v, want %+v", tc.dest, tc.want)
-			}
-		})
+	if !got.Time.Equal(at) {
+		t.Errorf("embedded time.Time was walked into instead of scanned: got %v, want %v", got.Time, at)
 	}
 }
 
-func TestScanAllWalksUnexportedEmbeddedStruct(t *testing.T) {
-	when := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
-	var got []scanArticle
-	rows := scanRows(t, []string{"id", "createdAt", "note"},
-		[]any{int64(1), when, "first"},
-		[]any{int64(2), when, "second"},
-	)
-	if err := pg.ScanAll(rows, &got); err != nil {
-		t.Fatalf("ScanAll: %v", err)
+// A name reachable at two depths belongs to the shallower field —
+// otherwise the walk order decides which field a column lands in, and
+// the answer changes with an unrelated edit to the declaration. The
+// rule has to hold for an embedded type either way round, because
+// whether the embedded type is exported says nothing about which of
+// the two fields the caller meant.
+type ScanInnerName struct{ Title string }
+
+type scanInnerName struct{ Title string }
+
+type scanOuterExported struct {
+	Title string
+	ScanInnerName
+}
+
+type scanOuterUnexported struct {
+	Title string
+	scanInnerName
+}
+
+func TestScanPrefersTheShallowerFieldOnACollision(t *testing.T) {
+	var exported scanOuterExported
+	if err := pg.ScanOne(&fakeRows{cols: []string{"title"}, data: [][]any{{"outer"}}}, &exported); err != nil {
+		t.Fatalf("pg.ScanOne: %v", err)
 	}
-	want := []scanArticle{
-		{ID: 1, scanAudit: scanAudit{CreatedAt: when, Note: "first"}},
-		{ID: 2, scanAudit: scanAudit{CreatedAt: when, Note: "second"}},
+	if exported.Title != "outer" || exported.ScanInnerName.Title != "" {
+		t.Errorf("exported embed: column landed in the embedded field: outer=%q inner=%q",
+			exported.Title, exported.ScanInnerName.Title)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("got = %+v, want %+v", got, want)
+
+	var unexported scanOuterUnexported
+	if err := pg.ScanOne(&fakeRows{cols: []string{"title"}, data: [][]any{{"outer"}}}, &unexported); err != nil {
+		t.Fatalf("pg.ScanOne: %v", err)
+	}
+	if unexported.Title != "outer" || unexported.scanInnerName.Title != "" {
+		t.Errorf("unexported embed: column landed in the embedded field: outer=%q inner=%q",
+			unexported.Title, unexported.scanInnerName.Title)
 	}
 }
 
-// A single-column result into a slice of scalars is the most ordinary
-// query there is, and the pg scanner used to refuse it as "slice
-// element must be struct or *struct".
-func TestScanAllAcceptsASliceOfScalars(t *testing.T) {
+// A single-column result into a slice of scalars is the shape SELECT id
+// produces, and drops.All[int64] over a pg builder already reads it —
+// so pg's own All has to read it too. It used to reject an []int64
+// outright, and, worse, take a []time.Time apart field-by-field: a
+// time.Time is a struct, so the walk matched no column, and the caller
+// got a slice of zero timestamps and a nil error.
+func TestScanAllReadsASliceOfScalars(t *testing.T) {
+	at := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	stamps := func() *fakeRows {
+		return &fakeRows{cols: []string{"t"}, data: [][]any{{at}, {at.Add(time.Hour)}}}
+	}
+
+	var got []time.Time
+	if err := pg.ScanAll(stamps(), &got); err != nil {
+		t.Fatalf("pg.ScanAll into []time.Time: %v", err)
+	}
+	var want []time.Time
+	if err := drops.ScanAll(stamps(), &want); err != nil {
+		t.Fatalf("drops.ScanAll into []time.Time: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("pg read %d rows, root read %d", len(got), len(want))
+	}
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Errorf("[%d] pg %v, root %v", i, got[i], want[i])
+		}
+	}
+	if got[0].IsZero() {
+		t.Error("a []time.Time was taken apart field-by-field instead of scanned")
+	}
+
 	var ids []int64
-	if err := pg.ScanAll(scanRows(t, []string{"id"}, []any{int64(1)}, []any{int64(2)}), &ids); err != nil {
-		t.Fatalf("ScanAll: %v", err)
+	if err := pg.ScanAll(&fakeRows{cols: []string{"id"}, data: [][]any{{int64(1)}, {int64(2)}}}, &ids); err != nil {
+		t.Fatalf("pg.ScanAll into []int64: %v", err)
 	}
-	if want := []int64{1, 2}; !reflect.DeepEqual(ids, want) {
-		t.Errorf("got = %v, want %v", ids, want)
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Errorf("got %v, want [1 2]", ids)
 	}
 }
 
-// The scanner moved but the sentinel must not: pg callers write
-// errors.Is(err, pg.ErrNoRows), and drops.ErrNoRows arriving instead
-// would turn every one of those checks into a silently missed empty
-// result.
-func TestEmptyCursorStillReportsThePgSentinel(t *testing.T) {
-	t.Run("ScanOne", func(t *testing.T) {
-		var got scanArticle
-		err := pg.ScanOne(scanRows(t, []string{"id"}), &got)
-		if !errors.Is(err, pg.ErrNoRows) {
-			t.Errorf("got = %v, want %v", err, pg.ErrNoRows)
-		}
-	})
-	t.Run("SelectBuilder.One", func(t *testing.T) {
-		tbl := pg.NewTable("scan_empty")
-		pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-		db := pg.New(dropstest.New().Rows([]string{"id"}))
-		var got scanArticle
-		err := db.Select().From(tbl).One(context.Background(), &got)
-		if !errors.Is(err, pg.ErrNoRows) {
-			t.Errorf("got = %v, want %v", err, pg.ErrNoRows)
-		}
-	})
-}
-
-// The builder path is the one users travel, and the embedded-audit row
-// type is what it used to lose on the way.
-func TestSelectOneScansPromotedFields(t *testing.T) {
-	when := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
-	tbl := pg.NewTable("scan_articles")
-	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
-	pg.Add(tbl, pg.Timestamp("createdAt", true).NotNull())
-	pg.Add(tbl, pg.Text("note").NotNull())
-
-	db := pg.New(dropstest.New().Rows(
-		[]string{"id", "createdAt", "note"},
-		[]any{int64(7), when, "draft"},
-	))
-	var got scanArticle
-	if err := db.Select().From(tbl).One(context.Background(), &got); err != nil {
-		t.Fatalf("One: %v", err)
+// The width check the root scanner makes has to be made here too, or a
+// two-column result silently binds its first column and drops the rest.
+func TestScanAllRejectsAWideResultIntoScalars(t *testing.T) {
+	var ids []int64
+	err := pg.ScanAll(&fakeRows{cols: []string{"id", "name"}, data: [][]any{{int64(1), "a"}}}, &ids)
+	if err == nil {
+		t.Fatal("a two-column result into []int64 should be an error")
 	}
-	want := scanArticle{ID: 7, scanAudit: scanAudit{CreatedAt: when, Note: "draft"}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("got = %+v, want %+v", got, want)
+	if !strings.Contains(err.Error(), "single-column") {
+		t.Errorf("the error should say what is wrong: %v", err)
 	}
 }

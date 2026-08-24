@@ -10,11 +10,17 @@ import (
 
 // CreateTable renders CREATE TABLE for t.
 //
-// Column constraints go inline; the primary key, unique keys and
-// foreign keys go in table-level clauses. That split is not stylistic:
-// MySQL cannot express a composite primary key inline, and a
-// table-level FOREIGN KEY is the only form that can be named, which is
-// what makes it droppable later.
+// Column constraints go inline; the primary key, unique keys, CHECK
+// constraints and foreign keys go in table-level clauses. That split
+// is not stylistic: MySQL cannot express a composite primary key
+// inline, and a table-level FOREIGN KEY is the only form that can be
+// named, which is what makes it droppable later.
+//
+// The CHECK constraints are the ones [Table.AddCheck] declared, under
+// the names it was given, so that the table this renders and the table
+// the migration path arrives at are the same table. Whether the server
+// enforces them is its business — MySQL does from 8.0.16 and MariaDB
+// from 10.2, and 5.7 parses and ignores them.
 func CreateTable(t *Table) drops.Expression { return createTable(t, false) }
 
 // CreateTableIfNotExists is CreateTable with IF NOT EXISTS.
@@ -59,6 +65,19 @@ func createTable(t *Table, ifNotExists bool) drops.Expression {
 			b.WriteIdent(constraintName("uq_", t.name, c.name))
 			b.WriteString(" (")
 			writeKeyPart(b, c)
+			b.WriteByte(')')
+		}
+		// CHECK constraints, in name order so that two renderings of
+		// one declaration are the same string. They belong here rather
+		// than in a follow-up ALTER: a table created without them is a
+		// table the migration path would have constrained, and two
+		// paths that build different tables from one declaration is a
+		// difference nobody is told about.
+		for _, name := range sortedKeys(t.checks) {
+			b.WriteString(",\n\tCONSTRAINT ")
+			b.WriteIdent(name)
+			b.WriteString(" CHECK (")
+			b.WriteString(t.checks[name])
 			b.WriteByte(')')
 		}
 		for _, c := range t.columns {

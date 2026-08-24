@@ -152,3 +152,28 @@ func mermaidWordRune(r rune) bool {
 	}
 	return false
 }
+
+// runDiagram renders a snapshot as a Mermaid ER diagram. It is the one
+// command that needs neither a database nor a Go schema: the snapshot
+// on disk is the whole input.
+func runDiagram(args []string) error {
+	fs := newFlagSet("diagram", "emit a Mermaid ER diagram from a snapshot JSON")
+	snapshot := fs.String("snapshot", "", "path to a drops snapshot JSON, such as drizzle/meta/0000_snapshot.json (required)")
+	out := fs.String("out", "", "file to write; stdout when empty")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if *snapshot == "" {
+		fs.Usage()
+		return usagef("--snapshot is required")
+	}
+	src, err := renderMermaid(*snapshot)
+	if err != nil {
+		return err
+	}
+	if *out == "" {
+		_, err = os.Stdout.Write(src)
+		return err
+	}
+	return os.WriteFile(*out, src, 0o644)
+}

@@ -52,7 +52,9 @@ func TestSchemaGeneratesTypedDeclarations(t *testing.T) {
 		`Users = pg.NewTable("users")`,
 		`UserID = pg.Add(Users, pg.BigSerial("id").PrimaryKey())`,
 		`UserEmail = pg.Add(Users, pg.Text("email").NotNull().Unique())`,
-		`UserAge = pg.Add(Users, pg.Integer("age"))`,
+		// Nullability is stated on every column, and the field's
+		// type is the statement: Age is a *int32.
+		`UserAge = pg.Add(Users, pg.Integer("age").Nullable())`,
 		`pg.Timestamp("createdAt", true).NotNull().Default("now()")`,
 	} {
 		if !strings.Contains(flat, want) {

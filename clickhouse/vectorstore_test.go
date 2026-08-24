@@ -339,3 +339,32 @@ func TestVectorSearchDecodesPayloadAndVector(t *testing.T) {
 		t.Errorf("Score = %v", hit.Score)
 	}
 }
+
+// Params is a bag the caller fills, and a caller who fills it from a
+// request is the one place a SETTINGS key reaches the SQL without an
+// author having written it. A key that is not a setting name is
+// dropped: the search still runs, and the clause is still drops's.
+func TestVectorSearchDropsASettingKeyThatIsNotAName(t *testing.T) {
+	sql, _ := searchSQL(t, vector.Search([]float32{1, 0}).
+		Param("clickhouse.max_threads = 1, allow_nullable_key", true).
+		Param("clickhouse.max_threads", 4).
+		Build())
+	if !strings.Contains(sql, "max_threads = 4") {
+		t.Errorf("the well-formed setting should still be there:\n%s", sql)
+	}
+	if strings.Contains(sql, "allow_nullable_key") {
+		t.Errorf("a key the caller wrote as SQL reached the clause:\n%s", sql)
+	}
+}
+
+// A string param is quoted, and the quoting has to survive a value
+// that ends in a backslash — which would otherwise escape the closing
+// quote and leave the literal open over the rest of the clause.
+func TestVectorSearchQuotesASettingValueEndingInABackslash(t *testing.T) {
+	sql, _ := searchSQL(t, vector.Search([]float32{1, 0}).
+		Param("clickhouse.storage_policy", `tier\`).
+		Build())
+	if !strings.Contains(sql, `storage_policy = 'tier\\'`) {
+		t.Errorf("the backslash is not escaped:\n%s", sql)
+	}
+}

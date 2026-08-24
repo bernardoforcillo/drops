@@ -34,91 +34,46 @@
 // builder-side UPDATE/DELETE); default filters on SelectBuilder
 // honour Unscoped() for opt-out.
 //
-// # Tenant scoping
-//
-// A table can declare an axis that every statement against it carries:
-//
-//	Events.ContextFilter(clickhouse.TenantFilter(EventTenantID)).
-//	    ScopeWritesByTenant(EventTenantID)
-//
-//	ctx := clickhouse.WithTenant(ctx, currentTenant)
-//
-// From there a SELECT takes the predicate and an INSERT takes the
-// stamp, whether it was built through an [Entity], through db.Select /
-// db.Insert, or by [VectorStore.Search] — because the axis lives on the
-// TABLE and is resolved by the executors rather than injected by one
-// entry point. A ctx with no tenant is [ErrTenantMissing] and no
-// statement at all. See tenant.go for the whole of it, including the
-// list of places the predicates do not reach.
-//
-// tenant.go also carries the block delimited THE TENANT POLICIES —
-// NORMATIVE: what counts as the same tenant, what may assign the axis,
-// and what Unscoped means at each level. It is byte-identical in all
-// four dialects and a root-level test fails when one of them drifts, so
-// it is the reference rather than this package's own account of the
-// rules.
-//
-// One consequence changes an existing habit: since a table's context
-// filters are resolved against a ctx, [SelectBuilder.ToSQL] no longer
-// necessarily shows the whole statement. [SelectBuilder.ToSQLCtx] does,
-// and it is what to log and what to assert on in a test.
-//
-// It is the same mechanism drops/pg, drops/sqlite and drops/mysql
-// carry — normalise the dialect name and diff clickhouse/resolve.go
-// against any of theirs and the same file comes back. What comes
-// across from drops/pg only in HALF is the boundary underneath.
-//
-// PostgreSQL row-level security is what those predicates sit on top of
-// there. ClickHouse has a server-side mechanism of its own — row
-// policies, CREATE ROW POLICY … USING <cond> TO <roles>, shipped since
-// 20.1 — and this package declares one: see [RowPolicy]. Until it did,
-// this paragraph said ClickHouse had no equivalent at all, which sent
-// a reader deploying a multi-tenant ClickHouse away one step before
-// the thing the server has.
-//
-// The half that does not come across is writes. A ClickHouse row
-// policy filters SELECT and only SELECT: FOR INSERT is a syntax error,
-// and the WITH CHECK token the parser tolerates has nowhere to store a
-// condition, so a principal that can write can write any tenant id it
-// likes. On the READ side the predicates have a floor under them if
-// the deployment declares one, and only for the principals that
-// policy applies to; on the WRITE side they are the whole of what
-// there is. rowpolicy.go says what that costs, splits every claim it
-// makes into what was measured on the embedded engine, what was read
-// out of ClickHouse's documentation and what is neither — no
-// ClickHouse SERVER has been reachable from this project — and says
-// why there is no runtime identity surface here to match drops/pg's.
-// Either way tenant.go's list of where the predicates stop is
-// load-bearing rather than a footnote.
-//
-// What this dialect's version of the feature does NOT have, because the
-// surface it would attach to does not exist here:
-//
-//   - no UPDATE or DELETE to carry a predicate, so the write side is
-//     stamping and refusal only. A mutation is an
-//     ALTER TABLE … UPDATE/DELETE, asynchronous and not transactional,
-//     and this package does not model one.
-//   - no upsert to gate. PostgreSQL's cross-tenant overwrite needs an
-//     ON CONFLICT DO UPDATE; ClickHouse's needs no statement at all,
-//     because a merging engine folds rows sharing a sorting key in the
-//     background. That is where the check went instead — see
-//     [ErrTenantNotInSortingKey].
-//   - no relations and no eager loader, so there is no child query to
-//     carry the axis into and no per-parent LIMIT rewrite to get wrong.
-//   - no query cache and no primary-key cache, so there is no cache key
-//     that could answer one tenant's question with another's rows.
-//   - no set operations, so a UNION operand cannot lose its scoping.
-//     CTE bodies and subquery operands are resolved recursively.
-//   - no bulk path of drops' own beyond the batch INSERT, which is
-//     stamped like any other. The native columnar protocol this
-//     package's doc points very large batches at is a driver API drops
-//     is not in: rows written that way are the caller's to stamp.
-//
 // Entity[T] (see entity.go) binds a Go struct to a Table and exposes
 // Create / CreateMany / Query — the narrow subset of CRUD that maps
 // to ClickHouse's Insert + Select builders. Entity.Validate registers
 // per-row validators that run before Create / CreateMany; on
 // CreateMany the first failing row aborts the whole batch.
+//
+// # Schema introspection, diffing and Push
+//
+// Introspect reads a table's real shape out of system.tables and
+// system.columns — columns and types, the engine and its parameters,
+// the sorting, primary, partition and sampling keys, the table's TTL
+// and SETTINGS, and which columns take part in which key.
+// BuildSnapshot derives the same shape from a Go [Schema], Diff
+// produces the statements between the two, and Push applies them.
+//
+// Diff returns a [Plan] rather than the []string the other dialects
+// return, because ClickHouse is the dialect where a schema difference
+// does not always have a statement behind it. There is no ALTER that
+// changes a table's engine, its partitioning, its primary key or —
+// beyond appending columns the same statement adds — its sorting key,
+// and no ALTER touches a column that takes part in any of those keys.
+// Those differences come back as [Refusal] values naming the remedy,
+// which is always a new table and a copy.
+//
+// The sorting key is worth singling out. A ReplacingMergeTree
+// collapses rows that share it, so it is not a layout choice that
+// happens to affect performance — it is the definition of "the same
+// row". Changing it changes which rows are one row, and every group
+// the old key merged comes back apart.
+//
+// [Analyze] grades the statements a plan does carry: metadata, a
+// rewrite of every part in a background mutation, or a deletion with
+// no way back. It matters more here than elsewhere because a
+// ClickHouse ALTER returns before its work is done — mutations_sync
+// defaults to 0 — so a statement the server accepted may have hours of
+// rewriting still ahead of it in system.mutations.
+//
+// drops/mirror builds on the same analysis for its own evolution
+// planner, which layers per-column opt-ins over it and knows things
+// about a mirror the dialect cannot know — see mirror.Evolver.
 //
 // What this package does NOT try to mirror from drops/pg:
 //
@@ -127,13 +82,7 @@
 //     SQL when you need them)
 //   - ON CONFLICT (handled by engine choice, e.g. ReplacingMergeTree)
 //   - Foreign keys / referential integrity (ClickHouse has none)
-//   - Schema introspection and Push (planned)
-//   - policy drift tracking. drops/pg carries its policies through
-//     Snapshot, Diff and Push; [RowPolicy] renders DDL and stops
-//     there. That is a scope decision rather than the missing half of
-//     the item above: a ClickHouse row policy lives in the server's
-//     ACCESS storage beside users and roles, not in the table's
-//     metadata, so it would not belong in a schema snapshot even once
-//     this package has one. Put the statement in a migration, or run
-//     it through [DB.ExecExpr]. See rowpolicy.go.
+//   - a DiffDown. Reversing a ClickHouse migration is mostly not
+//     something a statement can do, and a function whose name promises
+//     it would be lying.
 package clickhouse

@@ -46,6 +46,11 @@ import (
 // SoftDelete, …) registered on the table fire normally because every
 // operation routes through the underlying Insert / Update / Delete
 // builders.
+//
+// The write paths return a constraint violation as a
+// [drops.FieldError] naming the struct field the database refused —
+// see [Entity.FieldError] for the mapping and [Entity.MapConstraint]
+// for the constraints whose names do not follow from the table.
 type Entity[T any] struct {
 	table *Table
 
@@ -58,8 +63,15 @@ type Entity[T any] struct {
 	pks      []*Column
 	pkFields [][]int
 
-	colFields    []entityColField // columns that map to a struct field
-	validators   []Validator[T]
+	colFields  []entityColField // columns that map to a struct field
+	validators []Validator[T]
+
+	// constraintFields maps a database constraint name to the
+	// struct field a violation of it is reported against. Filled by
+	// MapConstraint; the conventional names PostgreSQL generates
+	// are derived rather than stored — see (*Entity[T]).FieldError.
+	constraintFields map[string]string
+
 	versionCol   *Column // optimistic-locking version column, nil if none
 	versionField []int   // field path on T for the version value
 
@@ -67,18 +79,7 @@ type Entity[T any] struct {
 	// supplied by cmd/dropsgen-emitted Register<T>() at init time.
 	// When set, the SELECT executors (Get / Query.All / Query.One)
 	// skip the reflection path entirely.
-	//
-	// fastCols is the column list that scanner was generated for, and
-	// every executor taking the fast path renders it instead of
-	// letting the SELECT default to "*". A scanner that decodes by
-	// position against "*" is bound to the table's physical column
-	// order, which belongs to the database and not to the generated
-	// file: one ALTER TABLE ADD COLUMN in the middle of the table
-	// shifts every following value one field sideways, and nothing in
-	// the scan can notice. Naming the columns makes the row's order
-	// the generator's order.
 	fastScan func(Scanner, *T) error
-	fastCols []drops.Expression
 
 	// cache, when set via WithCache, makes Get / Query.All /
 	// Query.One read-through and Update / Save / Delete
@@ -109,42 +110,6 @@ type Entity[T any] struct {
 	// Delete. The subject lives on ctx (WithSubject); missing
 	// subject errors out.
 	guard Guard
-
-	// rowType is T with pointers stripped. It names the entity in
-	// the keys under which the tenant axis and the guard register
-	// their context filters on the table.
-	rowType reflect.Type
-}
-
-// hasRowScope reports whether anything restricts which rows an
-// operation on this entity may touch: a tenant axis or an
-// authorisation guard declared through the entity, or any context
-// filter registered straight onto the table.
-//
-// The table half is the half that bites, and it is why this predicate
-// cannot be a field test on the Entity. P0-1 moved the tenant axis off
-// the Entity and onto the Table precisely so it would reach the
-// statements no Entity builds, and the spelling this package
-// recommends — Posts.ContextFilter(pg.TenantFilter(PostTenantID)) —
-// never sets tenantCol at all. An entity over such a table is fully
-// scoped and used to answer "unscoped" to whoever only asked the
-// Entity.
-//
-// The invariant the answer guards is the strong one: the PK cache
-// never *holds* a scoped row, not merely "a scoped Get does not read
-// it". That key is the primary key and nothing else — it has no room
-// for the tenant, the subject, or whatever else a filter consults — so
-// a scoped row sitting in that namespace is a row waiting to be handed
-// to the next caller who asks for that id, whoever they are, without a
-// statement ever being sent and therefore without the filter ever
-// running or ErrTenantMissing ever firing. Gating only the read leaves
-// the namespace poisoned by every write and puts the leak one refactor
-// away; so the read in Get and the writes in insertRow and Update are
-// all gated on this one predicate. The writes ask through refreshPK,
-// which also deletes the entry the gate refuses to overwrite — an entry
-// a scoped write leaves in place is an entry nothing will ever correct.
-func (e *Entity[T]) hasRowScope() bool {
-	return e.tenantCol != nil || e.guard != nil || e.table.hasContextFilters()
 }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
@@ -247,7 +212,6 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 
 	return &Entity[T]{
 		table:        t,
-		rowType:      rt,
 		pk:           pk,
 		pkField:      pkField,
 		pks:          pks,
@@ -264,6 +228,8 @@ type EntityOption func(*entityConfig)
 type entityConfig struct {
 	allowUnmapped map[string]bool
 	allowAny      bool
+	allowNullable map[string]bool
+	allowAnyNull  bool
 }
 
 // AllowUnmappedColumns exempts the named columns from the check that
@@ -293,6 +259,33 @@ func AllowAnyUnmappedColumn() EntityOption {
 	return func(c *entityConfig) { c.allowAny = true }
 }
 
+// AllowNullableColumns exempts the named columns from the check that
+// a column admitting NULL is bound to a field that can receive one.
+//
+// Use it where the database will never actually produce a NULL and
+// the constraint cannot say so — a column another writer keeps
+// populated, a view whose outer join can never miss. Naming the
+// columns is the point: the exemption applies to those and leaves the
+// check working everywhere else.
+func AllowNullableColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowNullable == nil {
+			c.allowNullable = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowNullable[n] = true
+		}
+	}
+}
+
+// AllowAnyNullableColumn disables the nullability check entirely. It
+// exists for migrating an existing codebase that has too many
+// mismatches to fix at once; prefer [AllowNullableColumns], which
+// keeps the check working for the columns you have not exempted.
+func AllowAnyNullableColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAnyNull = true }
+}
+
 // checkDrift reports columns that no struct field is bound to.
 //
 // Such a column is dropped from every INSERT and UPDATE the entity
@@ -318,8 +311,58 @@ func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entit
 		}
 		missing = append(missing, c.Name())
 	}
-	return drift.Report("drops/pg", rt.Name(), t.Name(), missing,
-		drift.SpareFields(rt, bound), "pg.AllowUnmappedColumns")
+	if err := drift.Report("drops/pg", rt.Name(), t.Name(), missing,
+		drift.SpareFields(rt, bound), "pg.AllowUnmappedColumns"); err != nil {
+		return err
+	}
+	return checkNullability(rt, t, colFields, cfg)
+}
+
+// checkNullability reports columns that admit NULL bound to a field
+// that cannot receive one.
+//
+// The mismatch is invisible to the compiler — a column's T is the
+// type its comparisons take, and the scan destination is a field
+// drops reaches only by reflection — and invisible at run time too,
+// until the first row that happens to be NULL. NewEntity is the one
+// place both types are in scope.
+//
+// It fires on whether the column admits NULL, not on whether it said
+// so. A bare pg.Text("bio") is exactly the shape that has been
+// accepting NULLs nobody declared, and a check that only questioned
+// columns which had already thought about it would protect nobody.
+func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAnyNull {
+		return nil
+	}
+	// A PRIMARY KEY column does not admit NULL whatever its own flag
+	// says. (*Col[T]).PrimaryKey sets notNull, but the composite
+	// spelling — Table.PrimaryKey(cols...) — records the key on the
+	// table and leaves the columns alone, so a perfectly ordinary join
+	// table would otherwise be refused and its caller told to make the
+	// key fields pointers.
+	inKey := make(map[string]bool)
+	for _, c := range t.primaryKeyColumns() {
+		inKey[c.Name()] = true
+	}
+	var bad []drift.NullMismatch
+	for _, cf := range colFields {
+		c := cf.col
+		if !c.IsNullable() || inKey[c.Name()] || cfg.allowNullable[c.Name()] {
+			continue
+		}
+		ft := drift.FieldTypeAt(rt, cf.field)
+		if ft == nil || drift.AcceptsNull(ft) {
+			continue
+		}
+		bad = append(bad, drift.NullMismatch{
+			Column:    c.Name(),
+			Field:     drift.FieldPath(rt, cf.field),
+			FieldType: ft.String(),
+			Stated:    c.nullStated,
+		})
+	}
+	return drift.ReportNullable("drops/pg", rt.Name(), t.Name(), bad, "pg.AllowNullableColumns")
 }
 
 // Validate registers a validator that runs before Create / Update /
@@ -331,58 +374,16 @@ func (e *Entity[T]) Validate(v Validator[T]) *Entity[T] {
 	return e
 }
 
-// SetFastScan registers a zero-reflection per-row scanner together
-// with the column list it was generated for — the Cols<T> / Scan<T>
-// pair cmd/dropsgen emits, handed over by the generated Register<T>
-// helper. When set, Get / Query.One / Query.All / Page / Stream
-// consume rows directly through scan instead of routing through the
-// reflection scanner. Eager-loaded relations still fall back to the
-// reflection path because they rely on field-map introspection of
-// the loaded slice.
-//
-// cols is not decoration. It is what the fast-path executors render,
-// so the order of the values in the row is the order the generator
-// wrote the Scan<T> body in. Left implicit, the statement is a
-// SELECT * and the scanner reads the table's physical column order
-// instead: an ALTER TABLE ADD COLUMN in the middle of the table then
-// shifts every subsequent value into the neighbouring field, and a
-// positional scan has nothing to compare against — no error is
-// raised, the rows just come back wrong, one field over.
-//
-// It panics when a name is not a column of the entity's table. The
-// generated file and the schema have diverged at that point, and the
-// alternative to failing at startup is scanning rows into the wrong
-// fields for as long as the process runs; a scanner registered from
-// an init block is exactly where bad configuration should surface,
-// the same reason NewEntity panics.
-func (e *Entity[T]) SetFastScan(cols []string, scan func(Scanner, *T) error) *Entity[T] {
-	if len(cols) == 0 {
-		panic(fmt.Sprintf(
-			"drops/pg: SetFastScan on %s: a positional scanner needs the column list it was generated for; pass Cols%s()",
-			e.rowType.Name(), e.rowType.Name()))
-	}
-	refs := make([]drops.Expression, 0, len(cols))
-	for _, n := range cols {
-		c := e.table.Col(n)
-		if c == nil {
-			panic(fmt.Sprintf(
-				"drops/pg: SetFastScan on %s: table %q has no column %q; re-run go generate",
-				e.rowType.Name(), e.table.Name(), n))
-		}
-		refs = append(refs, c)
-	}
-	e.fastCols, e.fastScan = refs, scan
+// SetFastScan registers a zero-reflection per-row scanner — the
+// generated Scan<T> helper from cmd/dropsgen is the canonical
+// implementation. When set, Get / Query.One / Query.All consume rows
+// directly through scan instead of routing through the reflection
+// scanner. Eager-loaded relations still fall back to the reflection
+// path because they rely on field-map introspection of the loaded
+// slice.
+func (e *Entity[T]) SetFastScan(scan func(Scanner, *T) error) *Entity[T] {
+	e.fastScan = scan
 	return e
-}
-
-// projectFast restricts sel to the fast scanner's column list. Every
-// path that hands rows to fastScan goes through here or builds its
-// SELECT with fastCols directly, because the projection and the
-// positional decode are one decision: a row is only safe to read by
-// position if this statement chose the positions.
-func (e *Entity[T]) projectFast(sel *SelectBuilder) *SelectBuilder {
-	sel.columns = e.fastCols
-	return sel
 }
 
 // HasFastScan reports whether a zero-reflection scanner is wired up.
@@ -462,8 +463,7 @@ func (e *Entity[T]) pkValuesOf(r *T) []any {
 }
 
 // pkIsZero reports whether every key field is the zero value — the
-// test Save uses to decide between insert and update, and the one
-// Update uses to refuse a row that addresses no row at all.
+// test Save uses to decide between insert and update.
 func (e *Entity[T]) pkIsZero(r *T) bool {
 	v := reflect.ValueOf(r).Elem()
 	for _, idx := range e.pkFields {
@@ -502,12 +502,8 @@ func colNames(cols []*Column) []string {
 // CRUD operations
 // ----------------------------------------------------------------------
 
-// ErrPKNotSet is returned by Update when r's primary-key field is the
-// zero value. The alternative is a statement whose WHERE addresses id
-// = 0: it matches nothing, reports success, and leaves the caller
-// believing a write landed. Save never returns it — a zero key is how
-// Save tells a row that has never been written from one that has, and
-// it routes that row to Create.
+// ErrPKNotSet is returned by Update / Save when r's primary-key
+// field is the zero value but the operation requires it to be set.
 var ErrPKNotSet = errors.New("drops/pg: primary key field is the zero value")
 
 // ErrStaleObject is returned by Update on an entity whose table
@@ -529,11 +525,7 @@ var ErrStaleObject = errors.New("drops/pg: stale object — optimistic-lock vers
 //
 // When a cache is attached via WithCache, Get serves hits from the
 // cache and dedupes concurrent cache misses via single-flight so a
-// thundering herd resolves to one DB query. An entity whose rows are
-// scoped — by a tenant axis, a guard, or a context filter on the table
-// — skips that path entirely: the cache is keyed by primary key alone,
-// so answering from it would hand one caller a row another caller
-// cached, without a statement ever being sent. See hasRowScope.
+// thundering herd resolves to one DB query.
 func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	pred, err := e.pkPredicate(key)
 	if err != nil {
@@ -541,15 +533,42 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	}
 	ctx, cancel := e.budgetCtx(ctx)
 	defer cancel()
-	if e.cache != nil && !e.hasRowScope() {
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return *new(T), err
+	}
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return *new(T), err
+	}
+	if e.cache != nil && tenantPred == nil && guardPred == nil {
 		return e.getCached(db, ctx, key, pred)
 	}
 	var out T
 	if e.fastScan != nil {
-		err := e.scanOneFast(ctx, db.Select(e.fastCols...).From(e.table).Where(pred), &out)
+		sel := db.Select().From(e.table).Where(pred)
+		if tenantPred != nil {
+			sel.Where(tenantPred)
+		}
+		if guardPred != nil {
+			sel.Where(guardPred)
+		}
+		err := e.scanOneFast(ctx, sel, &out)
 		return out, err
 	}
-	err = db.Find(e.table).Where(pred).One(ctx, &out)
+	// Get addresses a row by primary key and has no vocabulary for
+	// loading a relation, so the strict-loading check would be an
+	// unconditional refusal rather than a signal about this query.
+	// Query(db) is the strict-checked path — see strict.go.
+	fb := db.Find(e.table).Where(pred)
+	fb.strict = false
+	if tenantPred != nil {
+		fb.Where(tenantPred)
+	}
+	if guardPred != nil {
+		fb.Where(guardPred)
+	}
+	err = fb.One(ctx, &out)
 	return out, err
 }
 
@@ -572,9 +591,11 @@ func (e *Entity[T]) getCached(db *DB, ctx context.Context, pkValues []any, pred 
 		}
 		var err error
 		if e.fastScan != nil {
-			err = e.scanOneFast(ctx, db.Select(e.fastCols...).From(e.table).Where(pred), &t)
+			err = e.scanOneFast(ctx, db.Select().From(e.table).Where(pred), &t)
 		} else {
-			err = db.Find(e.table).Where(pred).One(ctx, &t)
+			fb := db.Find(e.table).Where(pred)
+			fb.strict = false // as in Get: no relations to load here
+			err = fb.One(ctx, &t)
 		}
 		if err != nil {
 			return t, err
@@ -631,27 +652,11 @@ func (e *Entity[T]) scanAllFast(db *DB, ctx context.Context, sel *SelectBuilder,
 // rows is rarely what callers want), so generated PKs and
 // hook-supplied values do not flow back into rs; use Create when you
 // need the post-INSERT row.
-//
-// The tenant is stamped onto every row first, exactly as Create stamps
-// its one row, and rs is written through: a row whose tenant field is
-// zero comes back carrying the ctx tenant. This is not a convenience.
-// A tenant-scoped entity that skipped the stamp bound tenantId = 0 for
-// the whole batch — a value no tenant predicate matches, so the rows
-// landed outside every tenant including the one that wrote them,
-// invisible to the very next SELECT and reported as a successful
-// insert. Missing the ctx tenant is [ErrTenantMissing] and no
-// statement at all; a row carrying a different tenant than ctx is
-// [ErrTenantMismatch]. Either aborts the whole batch before the first
-// binding is collected, because a partially stamped INSERT is a batch
-// nobody can reason about.
 func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
 	if len(rs) == 0 {
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
-		if err := e.stampTenant(ctx, &rs[i]); err != nil {
-			return nil, err
-		}
 		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
@@ -661,7 +666,8 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		v := reflect.ValueOf(&rs[i]).Elem()
 		ins.Row(e.collectInsertBindings(v)...)
 	}
-	return ins.Exec(ctx)
+	res, err := ins.Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // UpsertMany INSERTs rs and, on PK conflict, updates every non-PK
@@ -671,54 +677,11 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 //
 // Useful for idempotent ingestion: the same set of rows can be
 // replayed safely without producing duplicates.
-//
-// The tenant is stamped onto every row before binding, on the same
-// terms as [Entity.CreateMany]: no tenant on ctx is [ErrTenantMissing]
-// and no statement, a disagreeing row is [ErrTenantMismatch].
-//
-// A tenant-scoped entity also changes the shape of the conflict
-// branch, and the reasoning is worth spelling out because the
-// straightforward version is a cross-tenant write. A primary key is
-// unique across the whole table, not per tenant, so the row an INSERT
-// collides with may well belong to somebody else. Setting every non-PK
-// column from EXCLUDED then rewrites that row's data *and* its
-// "tenantId", which is to say tenant A takes ownership of tenant B's
-// row by guessing an id — silently, reported as one row affected.
-// Refusing is the only defensible answer: the tenant column is left
-// out of the SET list, so a row's owner is never rewritten by an
-// upsert, and the update is gated on WHERE <tenant> = EXCLUDED.<tenant>
-// so a collision with another tenant's row updates nothing at all
-// rather than overwriting its data. Moving a row between tenants is a
-// deliberate act and belongs in a statement that says so.
-//
-// The caller sees that refusal as a shortfall in rows-affected, which
-// is the most an ON CONFLICT branch can report — SQL has no way to
-// raise from a WHERE that did not match. Ingestion that must know
-// whether every row landed should compare the count.
-//
-// That shape is not applied here any more, and the difference is the
-// point rather than a tidy-up: it is applied by the builder, to every
-// INSERT into a table that named a tenant column — see
-// [InsertBuilder.ToSQLCtx]. This method used to be the only place the
-// reasoning existed, so db.Insert(t).OnConflictUpdate(pk).Set(...),
-// the same upsert written by hand, rewrote another tenant's row and
-// its owner. Two places building the same gate would eventually
-// disagree, and the way they disagree is that one of them stops being
-// applied to a path somebody added later.
-//
-// The gate needs a tenant column to name, so it reaches the tables
-// that named one — with [Entity.ScopeByTenant] or with
-// [Table.ScopeWritesByTenant]. A table scoped only by
-// [Table.ContextFilter] keeps the plain conflict branch: the filter is
-// a predicate, and an INSERT has no WHERE for it to reach.
 func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Result, error) {
 	if len(rs) == 0 {
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
-		if err := e.stampTenant(ctx, &rs[i]); err != nil {
-			return nil, err
-		}
 		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
@@ -732,23 +695,15 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 	for i, c := range e.pks {
 		keyCols[i] = c
 	}
-	sets := make([]ColumnValue, 0, len(e.colFields))
+	cu := ins.OnConflictUpdate(keyCols...)
 	for _, cf := range e.colFields {
 		if e.isKeyColumn(cf.col) {
 			continue
 		}
-		sets = append(sets, &exprBinding{col: cf.col, expr: Excluded(cf.col)})
+		cu = cu.Set(&exprBinding{col: cf.col, expr: Excluded(cf.col)})
 	}
-	if len(sets) == 0 {
-		// Every column is part of the key, so there is nothing a
-		// conflict could rewrite even before the tenant axis has its
-		// say. DO NOTHING says that in SQL; "DO UPDATE SET" with an
-		// empty list is a syntax error the server would report
-		// instead. The builder makes the same substitution when
-		// dropping the tenant assignment is what empties the list.
-		return ins.OnConflictDoNothing(keyCols...).Exec(ctx)
-	}
-	return ins.OnConflictUpdate(keyCols...).Set(sets...).Done().Exec(ctx)
+	res, err := cu.Done().Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // EntityQuery is the typed counterpart of FindBuilder — same shape,
@@ -764,11 +719,33 @@ type EntityQuery[T any] struct {
 // from fn aborts the iteration and propagates the error to the
 // caller. Eager-loaded relations are not supported in Stream
 // (relation loaders need the populated parent slice).
+//
+// Stream carries the entity's scoping like every other read: the
+// tenant axis and the authorisation guard both narrow what it
+// iterates, and a missing ctx tenant or subject fails the call rather
+// than widening it.
 func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 	if q.fb.HasEagerLoads() {
 		return errors.New("drops/pg: Stream is incompatible with eager-loaded relations; use Query.All instead")
 	}
-	fast := q.useFast()
+	// A relation name nothing answered to, from a WhereHas. Stream
+	// renders the SelectBuilder itself and never reaches
+	// FindBuilder.All, where this is otherwise surfaced — and the query
+	// it would fall back to is the whole table, with the predicate the
+	// caller asked for simply absent.
+	if q.fb.relErr != nil {
+		return q.fb.relErr
+	}
+	// Stream is a read like any other, so it owes the same scoping.
+	// Reaching straight for the SelectBuilder used to skip both, which
+	// made a batch job or an export the one way to read every tenant's
+	// rows at once without asking.
+	if err := q.applyTenantOnFB(ctx); err != nil {
+		return err
+	}
+	if err := q.applyGuardOnFB(ctx); err != nil {
+		return err
+	}
 	rows, err := q.fb.Select().Rows(ctx)
 	if err != nil {
 		return err
@@ -782,7 +759,7 @@ func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 	fields := fieldMap(reflect.TypeOf(sample))
 	for rows.Next() {
 		var t T
-		if fast {
+		if q.e.fastScan != nil {
 			if err := q.e.fastScan(rows, &t); err != nil {
 				return err
 			}
@@ -803,15 +780,10 @@ func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 // values (e.g. createdAt = now()).
 //
 // Columns whose Go field is the zero value are omitted from the
-// INSERT when the column has a declared DEFAULT or is the primary
-// key, so the server fills them in. That inference cannot tell "not
-// set" from "set to the zero value", so a field left at false, "" or
-// the zero time on a column with a DEFAULT is stored as the default,
-// silently. Three ways to say the value is meant, none of which
-// guesses: mark the column with [Col.AlwaysInsert] so every Create
-// binds it, make the field a pointer so a non-nil pointer to false is
-// bound and a nil one is not, or name the columns for one call with
-// [Entity.CreateCols].
+// INSERT when the column either has a declared DEFAULT or is the
+// primary key — letting the DB generate the value. To override that
+// behaviour for a specific field, set it to a non-zero value before
+// calling Create.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if err := e.stampTenant(ctx, r); err != nil {
 		return err
@@ -824,83 +796,6 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if len(bindings) == 0 {
 		return errors.New("drops/pg: Create has nothing to insert")
 	}
-	return e.insertRow(db, ctx, r, bindings)
-}
-
-// CreateCols INSERTs r binding exactly cols, whatever their values —
-// the zero-value skip rule Create applies is not consulted at all. It
-// is the per-call form of [Col.AlwaysInsert], for the caller that
-// knows which columns this particular write is responsible for:
-//
-//	err := UserEntity.CreateCols(db, ctx, &u, UserName, UserEmail, UserActive)
-//
-// Columns not named are left out of the statement entirely, so the
-// database fills them from their DEFAULT — including a primary key
-// from its sequence. Everything else behaves as Create does: the
-// tenant is stamped, validators run, the row is refreshed from
-// RETURNING, the audit row is written in the same transaction and the
-// PK cache is populated.
-//
-// It returns an error, rather than skipping quietly, when a column is
-// not on the entity's table or has no struct field bound to it: the
-// caller has named a column this row cannot supply a value for, and
-// writing the other ones would produce a row nobody asked for. A
-// tenant-scoped entity must include its tenant column for the same
-// reason — the row would otherwise land outside every tenant, visible
-// to none of them.
-func (e *Entity[T]) CreateCols(db *DB, ctx context.Context, r *T, cols ...ColRef) error {
-	if len(cols) == 0 {
-		return errors.New("drops/pg: CreateCols requires at least one column")
-	}
-	if err := e.stampTenant(ctx, r); err != nil {
-		return err
-	}
-	if err := e.runValidators(r); err != nil {
-		return err
-	}
-	v := reflect.ValueOf(r).Elem()
-	bindings := make([]ColumnValue, 0, len(cols))
-	tenantNamed := e.tenantCol == nil
-	for _, ref := range cols {
-		c := ref.col()
-		if c.Table() != nil && c.Table().Name() != e.table.Name() {
-			return fmt.Errorf("drops/pg: CreateCols on %s: column %q belongs to table %q, not %q",
-				e.rowType.Name(), c.Name(), c.Table().Name(), e.table.Name())
-		}
-		field, ok := e.fieldFor(c)
-		if !ok {
-			return fmt.Errorf("drops/pg: CreateCols on %s: no struct field bound to column %q on table %q",
-				e.rowType.Name(), c.Name(), e.table.Name())
-		}
-		if e.tenantCol != nil && c.key() == e.tenantCol.key() {
-			tenantNamed = true
-		}
-		bindings = append(bindings, insertBinding(c, v.FieldByIndex(field).Interface()))
-	}
-	if !tenantNamed {
-		return fmt.Errorf("drops/pg: CreateCols on %s: tenant column %q is missing from the column list; the row would be written outside every tenant",
-			e.rowType.Name(), e.tenantCol.Name())
-	}
-	return e.insertRow(db, ctx, r, bindings)
-}
-
-// fieldFor resolves a column to its field-index path on T, comparing
-// by column identity so a handle taken off an alias resolves to the
-// same field as the declared one.
-func (e *Entity[T]) fieldFor(c *Column) ([]int, bool) {
-	for _, cf := range e.colFields {
-		if cf.col.key() == c.key() {
-			return cf.field, true
-		}
-	}
-	return nil, false
-}
-
-// insertRow issues the INSERT for one row and refreshes r from the
-// RETURNING clause. Create and CreateCols differ only in which
-// bindings they hand over, so everything downstream of that decision
-// — the audit transaction, the cache write — lives here once.
-func (e *Entity[T]) insertRow(db *DB, ctx context.Context, r *T, bindings []ColumnValue) error {
 	doCreate := func(tx *DB) error {
 		ins := tx.Insert(e.table).Row(bindings...)
 		for _, c := range e.table.Columns() {
@@ -918,15 +813,13 @@ func (e *Entity[T]) insertRow(db *DB, ctx context.Context, r *T, bindings []Colu
 		err = doCreate(db)
 	}
 	if err != nil {
-		return err
+		return e.FieldError(err)
 	}
-	// Populate the PK cache with the freshly-inserted row so the next
-	// Get hits immediately. A scoped entity writes nothing and clears
-	// the key instead: it carries the primary key and no scope at all,
-	// so the entry would be served to every other tenant and subject
-	// that asks for this id. See hasRowScope for the invariant and
-	// refreshPK for why the clearing is not optional.
-	e.refreshPK(ctx, e.pkValuesOf(r), *r)
+	if e.cache != nil {
+		// Populate the PK cache with the freshly-inserted row so the
+		// next Get hits immediately.
+		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
+	}
 	return nil
 }
 
@@ -938,37 +831,23 @@ func (e *Entity[T]) insertRow(db *DB, ctx context.Context, r *T, bindings []Colu
 // list — the typical "blind UPDATE" semantics. Change-tracking is
 // out of scope for now; callers needing finer control use db.Update
 // directly.
-//
-// The tenant column is an axis, never an assignment: Create stamps it,
-// Update stamps it, both refuse a mismatch, and neither ever takes the
-// value from the struct as an instruction.
-//
-// On a tenant-scoped entity the tenant column is one of those non-key
-// columns, so the row's own tenant is stamped from ctx before the
-// assignments are taken. Without that an Update of a struct whose
-// tenant field is zero — one built from a form, or from a decoded
-// request body — would write that zero over a row it is otherwise
-// allowed to touch, and hand it to no tenant at all; a struct carrying
-// somebody else's tenant is [ErrTenantMismatch] rather than a
-// transfer of ownership. Which row is addressed is a separate
-// question, and the table's context filter answers it: the WHERE
-// clause carries the ctx tenant like every other statement's.
-//
-// The stamp runs before the validators, as it does in Create, so a
-// validator reading the tenant field sees the row as it will be
-// written rather than as the caller happened to build it.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
-	if e.pkIsZero(r) {
-		return ErrPKNotSet
-	}
-	if err := e.stampTenant(ctx, r); err != nil {
-		return err
-	}
 	if err := e.runValidators(r); err != nil {
 		return err
 	}
 	v := reflect.ValueOf(r).Elem()
+	if e.pkIsZero(r) {
+		return ErrPKNotSet
+	}
 	pred, err := e.pkPredicate(e.pkValuesOf(r))
+	if err != nil {
+		return err
+	}
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	guardPred, err := e.guardPredicate(ctx)
 	if err != nil {
 		return err
 	}
@@ -1006,6 +885,12 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 			return errors.New("drops/pg: Update has no fields to set")
 		}
 		upd.Where(pred)
+		if tenantPred != nil {
+			upd.Where(tenantPred)
+		}
+		if guardPred != nil {
+			upd.Where(guardPred)
+		}
 		if e.versionCol != nil {
 			curVer := v.FieldByIndex(e.versionField).Interface()
 			upd.Where(Eq(e.versionCol, curVer))
@@ -1027,14 +912,10 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = doUpdate(db)
 	}
-	if err == nil {
-		// Same rule as insertRow: a scoped row must not enter a
-		// namespace keyed by the primary key alone, and an entry a
-		// scoped write leaves in place is an entry nothing will ever
-		// correct. See hasRowScope and refreshPK.
-		e.refreshPK(ctx, e.pkValuesOf(r), *r)
+	if err == nil && e.cache != nil {
+		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
-	return err
+	return e.FieldError(err)
 }
 
 // Save inserts r if its primary-key field is the zero value, or
@@ -1058,9 +939,24 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
+	tenantPred, err := e.tenantPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	guardPred, err := e.guardPredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var res drops.Result
 	doDelete := func(tx *DB) error {
-		r, derr := tx.Delete(e.table).Where(pred).Exec(ctx)
+		del := tx.Delete(e.table).Where(pred)
+		if tenantPred != nil {
+			del.Where(tenantPred)
+		}
+		if guardPred != nil {
+			del.Where(guardPred)
+		}
+		r, derr := del.Exec(ctx)
 		if derr != nil {
 			return derr
 		}
@@ -1075,7 +971,7 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err == nil {
 		e.invalidatePK(ctx, key)
 	}
-	return res, err
+	return res, e.FieldError(err)
 }
 
 // auditKey renders a key for the audit trail's single rowID column.
@@ -1094,51 +990,26 @@ func auditKey(values []any) any {
 
 // collectInsertBindings extracts column values from r. Columns whose
 // Go field is the zero value are omitted when they have a DEFAULT or
-// are the primary key — letting the DB fill them in.
-//
-// This is the one inference drops makes about intent, and it is worth
-// naming what it costs. A Go zero value is indistinguishable from a
-// field nobody assigned, so false on a column declared DEFAULT true
-// is skipped and comes back true; so is "" on a column defaulting to
-// 'pending', and a zero time.Time on one defaulting to now(). Nothing
-// errors. The rule earns its place on createdAt and on a serial key,
-// where the field genuinely has no value yet, and there are three
-// ways to opt a value out of it:
-//
-//   - [Col.AlwaysInsert] on the column, when the zero value is always
-//     meaningful there — the whole "active bool DEFAULT true" family;
-//   - a pointer field, when "unset" and "the zero value" are two
-//     different states of the same field. A nil pointer is the zero
-//     value and is skipped, a non-nil one is not — so a *bool
-//     pointing at false is bound, which is the convention
-//     encoding/json established and Go developers already read
-//     correctly;
-//   - [Entity.CreateCols], which binds the named columns and consults
-//     no rule at all.
-//
-// PII-flagged columns get their values wrapped in pg.PIIParam so any
+// are the primary key — letting the DB fill them in. PII-flagged
+// columns get their values wrapped in pg.PIIParam so any
 // hook / tracer formatting them sees "<redacted>".
 func (e *Entity[T]) collectInsertBindings(v reflect.Value) []ColumnValue {
 	out := make([]ColumnValue, 0, len(e.colFields))
 	for _, cf := range e.colFields {
 		fv := v.FieldByIndex(cf.field)
-		if fv.IsZero() && !cf.col.IsAlwaysInsert() &&
-			(cf.col.HasDefault() || e.isKeyColumn(cf.col) || isImplicitDefault(cf.col)) {
+		if fv.IsZero() && (cf.col.HasDefault() || e.isKeyColumn(cf.col) || isImplicitDefault(cf.col)) {
 			continue
 		}
-		out = append(out, insertBinding(cf.col, fv.Interface()))
+		val := fv.Interface()
+		var expr drops.Expression
+		if cf.col.IsPII() {
+			expr = PIIParam{Value: val}
+		} else {
+			expr = drops.Param{Value: val}
+		}
+		out = append(out, &exprBinding{col: cf.col, expr: expr})
 	}
 	return out
-}
-
-// insertBinding binds val to c, routing a PII-flagged column through
-// PIIParam so a hook or tracer that formats the argument sees
-// "<redacted>" instead of the value.
-func insertBinding(c *Column, val any) ColumnValue {
-	if c.IsPII() {
-		return &exprBinding{col: c, expr: PIIParam{Value: val}}
-	}
-	return &exprBinding{col: c, expr: drops.Param{Value: val}}
 }
 
 // isImplicitDefault reports whether a column's SQL type implies a
@@ -1168,6 +1039,38 @@ func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 	return &EntityQuery[T]{e: e, fb: db.Find(e.table)}
 }
 
+// applyTenantOnFB injects the tenant predicate on q.fb when the
+// entity is scoped. Helper used by All / One / Stream / Page.
+func (q *EntityQuery[T]) applyTenantOnFB(ctx context.Context) error {
+	// A query that named FilterTenant asked for the cross-tenant read
+	// explicitly, ctx tenant or not — so this must come before
+	// tenantPredicate, which errors when the ctx carries none.
+	if q.fb.ignoresFilter(FilterTenant) {
+		return nil
+	}
+	tenantPred, err := q.e.tenantPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if tenantPred != nil {
+		q.fb.Where(tenantPred)
+	}
+	return nil
+}
+
+// applyGuardOnFB injects the authorisation predicate on q.fb
+// when the entity is guarded.
+func (q *EntityQuery[T]) applyGuardOnFB(ctx context.Context) error {
+	guardPred, err := q.e.guardPredicate(ctx)
+	if err != nil {
+		return err
+	}
+	if guardPred != nil {
+		q.fb.Where(guardPred)
+	}
+	return nil
+}
+
 // Where appends predicates joined by AND.
 func (q *EntityQuery[T]) Where(preds ...drops.Expression) *EntityQuery[T] {
 	q.fb.Where(preds...)
@@ -1185,6 +1088,42 @@ func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T] { q.fb.Limit(n); return 
 
 // Offset sets the OFFSET.
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.fb.Offset(n); return q }
+
+// Strict turns the strict-loading check on for this query alone — see
+// [DB.StrictLoading].
+func (q *EntityQuery[T]) Strict() *EntityQuery[T] {
+	q.fb.Strict()
+	return q
+}
+
+// NoLoad declares that this query deliberately does not load rels, so
+// the strict-loading check lets it through — see [FindBuilder.NoLoad].
+func (q *EntityQuery[T]) NoLoad(rels ...*Relation) *EntityQuery[T] {
+	q.fb.NoLoad(rels...)
+	return q
+}
+
+// Without is [EntityQuery.NoLoad] taking relation names (dot paths
+// included) rather than handles.
+func (q *EntityQuery[T]) Without(names ...string) *EntityQuery[T] {
+	q.fb.Without(names...)
+	return q
+}
+
+// checkStrict runs the strict-loading check against T. The fast-scan
+// and cache paths never reach FindBuilder.All, so the check has to be
+// stated here too or it would apply to some queries and not others.
+//
+// The deferred relation-path error is surfaced here for the same
+// reason: a name no relation on the table answers to — in a With, or in
+// a WhereHas, where dropping the predicate would silently widen the
+// result — must not be swallowed by whichever path happens to run.
+func (q *EntityQuery[T]) checkStrict() error {
+	if q.fb.relErr != nil {
+		return q.fb.relErr
+	}
+	return q.fb.checkStrictLoading(reflect.TypeOf((*T)(nil)).Elem())
+}
 
 // With eager-loads the named relations (see FindBuilder.With).
 func (q *EntityQuery[T]) With(names ...string) *EntityQuery[T] {
@@ -1212,29 +1151,31 @@ func (q *EntityQuery[T]) LoadRel(rel *Relation, fn func(*RelConfig)) *EntityQuer
 	return q
 }
 
-// Unscoped opts out of the table's DEFAULT filters for this query —
-// the declaration-time ones, a soft-delete guard above all. Without it
-// a soft-deleted row is unreachable through the entity at all, which
-// makes an audit or a restore flow impossible to write.
-//
-// It does NOT drop the table's context filters: the tenant axis and the
-// authorization guard survive it, and a ctx with no tenant is still
-// refused. That is a deliberate difference from
-// [SelectBuilder.Unscoped], which is statement-wide, and it is the
-// difference the four dialects state in the same words. The two lists
-// are not the same kind of thing — a default filter is a default scope,
-// a context filter is a row-visibility boundary — and the failures of
-// conflating them are not symmetric. Widening a default scope when the
-// caller asked to widen it costs nothing. Dropping the boundary hands
-// this request every tenant's rows, or every subject's, and it does so
-// on the one method a caller reaches for while thinking about
-// soft-deleted rows rather than about tenancy.
-//
-// A query that genuinely has to span tenants is written on the raw
-// builder, db.Select().From(t).Unscoped(), where a reviewer reading the
-// call sees the whole of what was given up.
+// Unscoped opts out of every global filter registered on the table —
+// the blunt instrument; see [SelectBuilder.Unscoped]. The tenant guard
+// [Entity.ScopeByTenant] installs is deliberately out of its reach: it
+// is built from the ctx, not from the table, and losing customer
+// isolation as a side effect of asking for soft-deleted rows is the
+// accident this API exists to prevent. Drop it by naming it —
+// IgnoreFilters(pg.FilterTenant).
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
-	q.fb.Select().unscopeDefaults()
+	q.fb.Unscoped()
+	return q
+}
+
+// IgnoreFilters bypasses the named global filters and leaves every
+// other one standing:
+//
+//	// this tenant's rows, deleted ones included
+//	Posts.Query(db).IgnoreFilters(pg.FilterSoftDelete).All(ctx)
+//
+// Beyond the table's own filters ([Table.AddFilter]) it also accepts
+// [FilterTenant], which drops the isolation predicate
+// [Entity.ScopeByTenant] injects — a cross-tenant admin report is a
+// real need, and one that should read as one at the call site rather
+// than fall out of an unrelated Unscoped.
+func (q *EntityQuery[T]) IgnoreFilters(names ...string) *EntityQuery[T] {
+	q.fb.IgnoreFilters(names...)
 	return q
 }
 
@@ -1244,33 +1185,32 @@ func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
 // cache attached and the query has no eager-loaded relations, the
 // result is cached under sha256(SQL+args) with the cache's TTL.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
+	if err := q.checkStrict(); err != nil {
+		return nil, err
+	}
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
-	// Project before anything renders the statement: the budget's
-	// argument count and the cache key are both taken from the SQL,
-	// and they have to describe the statement that actually runs.
-	fast := q.useFast()
+	if err := q.applyTenantOnFB(ctx); err != nil {
+		return nil, err
+	}
+	if err := q.applyGuardOnFB(ctx); err != nil {
+		return nil, err
+	}
 	if q.e.budget.MaxRows > 0 {
 		// Apply the row-cap LIMIT before rendering. Honour the
 		// user's tighter Limit by leaving it alone.
 		applyBudgetLimit(q.fb.Select(), q.e.budget.MaxRows)
 	}
 	if q.e.budget.MaxArgs > 0 {
-		// Rendered with the ctx: the tenant axis and the guard bind
-		// arguments too, and a budget that counted only the ones the
-		// caller wrote would pass a statement the server rejects.
-		_, args, err := q.fb.Select().ToSQLCtx(ctx)
-		if err != nil {
-			return nil, err
-		}
+		_, args := q.fb.Select().ToSQL()
 		if err := q.e.checkArgs(args); err != nil {
 			return nil, err
 		}
 	}
 	if q.cacheable() {
-		return q.allCached(ctx, fast)
+		return q.allCached(ctx)
 	}
-	if fast {
+	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
 		var out []T
 		err := q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &out)
 		return out, err
@@ -1284,13 +1224,21 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 // ErrNoRows if the query produces no rows. Honours the entity cache
 // the same way All does.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
+	if err := q.checkStrict(); err != nil {
+		return *new(T), err
+	}
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
-	fast := q.useFast()
-	if q.cacheable() {
-		return q.oneCached(ctx, fast)
+	if err := q.applyTenantOnFB(ctx); err != nil {
+		return *new(T), err
 	}
-	if fast {
+	if err := q.applyGuardOnFB(ctx); err != nil {
+		return *new(T), err
+	}
+	if q.cacheable() {
+		return q.oneCached(ctx)
+	}
+	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
 		var out T
 		err := q.e.scanOneFast(ctx, q.fb.Select(), &out)
 		return out, err
@@ -1304,36 +1252,12 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // the entity must have a cache, and the query must not pull in
 // eager-loaded relations (those need the reflection-populated slice
 // for stitching).
-//
-// A scoped entity stays cacheable, unlike Get: the key is built from
-// the statement the ctx resolves to, so the tenant and the subject are
-// part of it and two tenants asking the same question get two entries.
 func (q *EntityQuery[T]) cacheable() bool {
 	return q.e.cache != nil && !q.fb.HasEagerLoads()
 }
 
-// useFast reports whether this query can hand its rows to the
-// generated scanner and, when it can, projects the statement onto the
-// column list that scanner was generated for.
-//
-// Deciding and projecting are one call on purpose. The fast scanner
-// reads by position, so the only statement it may consume is one this
-// entity chose the columns of; splitting the two invites a path that
-// takes the scanner and forgets the projection, which is the
-// SELECT * bug the column list exists to close.
-func (q *EntityQuery[T]) useFast() bool {
-	if q.e.fastScan == nil || q.fb.HasEagerLoads() {
-		return false
-	}
-	q.e.projectFast(q.fb.Select())
-	return true
-}
-
-func (q *EntityQuery[T]) allCached(ctx context.Context, fast bool) ([]T, error) {
-	sql, args, err := q.fb.Select().ToSQLCtx(ctx)
-	if err != nil {
-		return nil, err
-	}
+func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
+	sql, args := q.fb.Select().ToSQL()
 	key := queryKey(q.e.table.Name(), sql, args)
 	var out []T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
@@ -1346,7 +1270,7 @@ func (q *EntityQuery[T]) allCached(ctx context.Context, fast bool) ([]T, error) 
 		}
 		var rs []T
 		var rerr error
-		if fast {
+		if q.e.fastScan != nil {
 			rerr = q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &rs)
 		} else {
 			rerr = q.fb.All(ctx, &rs)
@@ -1363,13 +1287,10 @@ func (q *EntityQuery[T]) allCached(ctx context.Context, fast bool) ([]T, error) 
 	return v.([]T), nil
 }
 
-func (q *EntityQuery[T]) oneCached(ctx context.Context, fast bool) (T, error) {
-	var out T
-	sql, args, err := q.fb.Select().ToSQLCtx(ctx)
-	if err != nil {
-		return out, err
-	}
+func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
+	sql, args := q.fb.Select().ToSQL()
 	key := queryKey(q.e.table.Name(), sql, args) + ":one"
+	var out T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
 		return out, nil
 	}
@@ -1379,7 +1300,7 @@ func (q *EntityQuery[T]) oneCached(ctx context.Context, fast bool) (T, error) {
 			return t, nil
 		}
 		var rerr error
-		if fast {
+		if q.e.fastScan != nil {
 			rerr = q.e.scanOneFast(ctx, q.fb.Select(), &t)
 		} else {
 			rerr = q.fb.One(ctx, &t)

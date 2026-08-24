@@ -120,7 +120,10 @@ func TestPageAfterAppliesCursorGuard(t *testing.T) {
 		t.Fatalf("second page: %v", err)
 	}
 	sql := fd.queries[0]
-	if !strings.Contains(sql, `("users"."id") > (`) {
+	// The guard is keysetWhere, the same one SelectBuilder.AfterCursor
+	// builds, so a single ordering column renders as a plain strict
+	// comparison rather than a one-element row comparison.
+	if !strings.Contains(sql, `("users"."id" > $`) {
 		t.Errorf("second page must include cursor guard: %s", sql)
 	}
 }

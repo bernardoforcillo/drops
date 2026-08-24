@@ -106,10 +106,11 @@ func TestPageCursorGuardResumesAfter(t *testing.T) {
 	if len(p2.Items) != 1 || p2.HasMore {
 		t.Errorf("last page wrong: items=%d hasMore=%v", len(p2.Items), p2.HasMore)
 	}
-	// The second query must carry the row-comparison guard and bind the
-	// last id from page 1 (which was 2).
+	// The second query must carry the keyset guard and bind the last id
+	// from page 1 (which was 2). One ordering column renders as a plain
+	// strict comparison, the shape SelectBuilder.AfterCursor emits.
 	q2 := drv.queries[1]
-	if !strings.Contains(q2, `("users"."id") > (?)`) {
+	if !strings.Contains(q2, `("users"."id" > ?)`) {
 		t.Errorf("missing keyset guard: %s", q2)
 	}
 	if drv.args[1][0] != int64(2) {

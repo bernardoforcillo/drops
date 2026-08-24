@@ -55,137 +55,24 @@ type PushOptions struct {
 	// default; see Push's doc comment.
 	DropUnmanagedIndexes bool
 
-	// DropUnmanagedTables lets Push drop a table that exists in the
-	// database and appears in no table of the Go schema. Off by
-	// default, for the same reason as DropUnmanagedIndexes and with a
-	// whole table's worth of data at stake; see ownedBy. The withheld
-	// DROPs are reported as "unmanaged-table" notices whether the push
-	// is a DryRun or a real one, ready to run by hand.
-	//
-	// The restriction is Push's alone. It does not apply to Diff or to
-	// GenerateMigration, where both sides are declarations and a table
-	// missing from the newer one really was removed.
-	DropUnmanagedTables bool
-
 	// SplitAlters emits one ALTER TABLE per column change rather than
 	// batching a table's changes. See DiffOptions.SplitAlters.
 	SplitAlters bool
 
-	// Allow names the destructive changes this push is permitted to
-	// make to a table that is not empty. Anything destructive that is
-	// not named here, and not against an empty table, is withheld:
-	// Push applies nothing, returns ErrDestructivePush, and reports
-	// what it withheld in PushResult.DataLoss.
+	// Renames answers the rename questions this push raises, for one
+	// run. They are merged over what the schema itself declares — see
+	// DeclaredRenames — with these winning.
 	//
-	// Naming the object rather than passing a global --force is the
-	// whole point. A flag says "destroy whatever today's diff happens
-	// to contain", which is a decision made before anyone knew what
-	// that was; a Destructive names one table and one column, so
-	// yesterday's consent cannot authorise today's unrelated DROP, and
-	// the consent is a Go value visible in the diff of the pull request
-	// that grants it.
+	// This is the per-call answer, the one a command line carries. The
+	// durable one is (*Col[T]).RenamedFrom in the schema, and it is
+	// the better answer for anything that will be pushed more than
+	// once: a flag answers the database in front of you, a declaration
+	// answers every database the schema reaches.
 	//
-	// The rule is drops/pg's, ported unchanged, and it matters more
-	// here: PostgreSQL rolls a failed push back, and MySQL cannot roll
-	// a DROP COLUMN back at all. There is nothing after the fact — no
-	// transaction, no undo — so the refusal in front of it is the only
-	// protection there is.
-	//
-	// An entry that names no change in this diff authorises nothing,
-	// and is reported as a "stale-consent" notice rather than passed
-	// over in silence: a consent that has quietly stopped applying
-	// reads at the call site exactly like one that is still doing its
-	// job.
-	Allow []Destructive
+	// A candidate neither of them answers is not guessed at: Push
+	// returns *RenameAmbiguityError and executes nothing.
+	Renames []RenameDecision
 }
-
-// DestructiveOp names a kind of change that destroys data.
-type DestructiveOp string
-
-// The names carry an Op prefix because mysql.DropTable is already the
-// DDL builder that renders a DROP TABLE statement, and one of the two
-// spellings has to give way to the other.
-const (
-	// OpDropTable is a DROP TABLE: every row goes.
-	OpDropTable DestructiveOp = "drop-table"
-	// OpDropColumn is an ALTER TABLE ... DROP COLUMN: one value per
-	// row goes.
-	OpDropColumn DestructiveOp = "drop-column"
-	// OpRetypeColumn is an ALTER TABLE ... MODIFY COLUMN that changes
-	// the column's type. MySQL casts every existing value on the way,
-	// and a cast can truncate (varchar(20) to varchar(10)), round
-	// (decimal to int) or, in strict mode, fail partway through — after
-	// the table copy has already begun and with no transaction to undo
-	// it.
-	OpRetypeColumn DestructiveOp = "retype-column"
-)
-
-// Destructive names one change Push is authorised to make. Pass them
-// in PushOptions.Allow.
-type Destructive struct {
-	// Op is the kind of change being authorised.
-	Op DestructiveOp
-	// Table is the table name, as the database has it.
-	Table string
-	// Object is the column name; empty for OpDropTable.
-	Object string
-}
-
-// DataLoss is a destructive change Push found, declined to make, and is
-// telling you about.
-//
-// Rows is an ESTIMATE, read from information_schema.TABLES.TABLE_ROWS.
-// Distinguishing "empty" from "not empty" is all the rule needs — an
-// empty table has nothing to lose, so dropping it needs no permission —
-// and a COUNT(*) per candidate table is a full scan bolted onto the
-// operation you most want to finish quickly.
-//
-// It is a far rougher estimate than the reltuples drops/pg reads. For
-// InnoDB the server derives TABLE_ROWS from a handful of random index
-// dives, so it is routinely off by tens of percent, it is NULL for a
-// table the server has no statistics for, and — the part that decides
-// how this is used — it can read 0 for a table that has rows in it. A
-// rule that took 0 for "empty" would therefore hand back exactly the
-// silent destructive push it exists to prevent, so 0 and NULL are both
-// treated as "nobody knows" and settled with
-// SELECT EXISTS (SELECT 1 FROM t LIMIT 1) — one row read, on the only
-// tables whose count is in doubt, and only for a change nobody has
-// authorised. An over-estimate needs no such care: it can only make
-// Push withhold a change it did not have to, which is the direction
-// this rule is allowed to be wrong in.
-//
-// Rows is -1 when the estimate was unusable and the probe found rows,
-// because "some" is all that probe answers.
-type DataLoss struct {
-	// Op is the kind of change.
-	Op DestructiveOp
-	// Table is the table it is against.
-	Table string
-	// Object is the column, empty for a table-level change.
-	Object string
-	// Rows is the server's row-count estimate for Table, or -1 when
-	// the estimate was unusable.
-	Rows int64
-	// SQL is the statement Push withheld. One batched ALTER TABLE can
-	// carry several destructive changes, so two DataLoss entries may
-	// name the same statement.
-	SQL string
-	// Suggestion is the Destructive value that would authorise it.
-	Suggestion string
-}
-
-// ErrDestructivePush is returned when a push would destroy data in a
-// table that is not empty and PushOptions.Allow does not name the
-// change. Nothing is applied: the whole diff is withheld, not just the
-// destructive part of it.
-//
-// Here that is not a preference. drops/pg withholds everything because
-// a half-applied schema is worse than an unapplied one; this package
-// cannot offer even that choice, since a MySQL push has no transaction
-// and stopping partway through is the one outcome it can never take
-// back. So the refusal happens before the first statement is sent, and
-// PushResult.AppliedCount is 0 whenever this error is returned.
-var ErrDestructivePush = errors.New("drops/mysql: push withheld destructive statements; see PushResult.DataLoss")
 
 // PushResult is the outcome of a Push call.
 //
@@ -210,11 +97,6 @@ type PushResult struct {
 	// Statements list with a non-empty Notices list means the database
 	// and the schema disagree about something Push declined to change.
 	Notices []SchemaNotice
-	// DataLoss lists the destructive changes that stopped this push, in
-	// the order the diff put them. It is non-empty exactly when Push
-	// returned ErrDestructivePush; each entry carries the
-	// PushOptions.Allow value that would let it through.
-	DataLoss []DataLoss
 }
 
 // SchemaNotice is a difference Push can see but will not act on.
@@ -224,14 +106,13 @@ type PushResult struct {
 // here rather than being dropped on the floor.
 type SchemaNotice struct {
 	// Rule is a stable identifier for the kind of notice —
-	// "unmanaged-table", "unmanaged-index", "unrepresentable-index",
-	// "index-method-ignored", "stale-consent", "check-not-normalised",
+	// "unmanaged-index", "unrepresentable-index",
+	// "index-method-ignored", "check-not-normalised",
 	// "checks-not-enforced", "table-options".
 	Rule string
 	// Table is the table the notice concerns.
 	Table string
-	// Object is the index, constraint or column name, where one
-	// applies.
+	// Object is the index or constraint name, where one applies.
 	Object string
 	// Message says what was seen and what was not done about it.
 	Message string
@@ -258,15 +139,15 @@ func (n SchemaNotice) String() string {
 // Behaviour:
 //   - Reads the current state of the database via Introspect.
 //   - Builds a target snapshot from schema.
-//   - Narrows the live side to the tables the schema declares, unless
-//     DropUnmanagedTables says otherwise; see ownedBy.
+//   - Narrows the live side to the tables the schema declares; see
+//     ownedBy.
+//   - Settles the rename questions the change raises, or refuses,
+//     before anything below touches the server. See "A change that
+//     could be a rename".
 //   - Asks the server to respell the declared CHECK expressions, so
 //     both sides of the diff are written in the server's own dialect.
-//   - Diffs the two.
-//   - Refuses the whole push when the diff would destroy data in a
-//     table that is not empty and PushOptions.Allow does not name the
-//     change; see ErrDestructivePush.
-//   - Unless DryRun, applies the statements one at a time in order.
+//   - Diffs the two and, unless DryRun, applies the statements one at a
+//     time in order.
 //
 // # A failed push leaves the schema half-changed
 //
@@ -293,12 +174,20 @@ func (n SchemaNotice) String() string {
 // fails leaves none of its own actions applied. The migration around it
 // is what is not atomic.
 //
-// # A table the schema never declared
+// # A change that could be a rename
 //
-// Push does not drop one either, and here the argument is stronger
-// still: MySQL has no transactional DDL, so a DROP TABLE against
-// another service's data cannot be rolled back by anything. See
-// ownedBy; DropUnmanagedTables takes the other side of the trade.
+// A column the database has and the schema does not, paired with one
+// the schema has and the database does not, is either a rename or a
+// drop-and-add, and the two differ by the whole contents of the
+// column. Push cannot tell them apart any more than Diff can, so it
+// asks the same question GenerateMigration asks and returns
+// *RenameAmbiguityError rather than guessing — before any statement
+// runs. There is no transaction around a push here, so the DROP COLUMN
+// the guess would have emitted is a commit nobody can take back.
+//
+// Answer it in the schema with (*Col[T]).RenamedFrom or
+// (*Table).RenamedFrom, which is durable and travels to every database
+// the schema is pushed to, or for one run with PushOptions.Renames.
 //
 // # An index the schema never declared
 //
@@ -310,24 +199,6 @@ func (n SchemaNotice) String() string {
 // enough to have needed it. Set DropUnmanagedIndexes to take the other
 // side of that trade; the withheld statements are reported as notices
 // either way.
-//
-// # Destroying data on purpose
-//
-// A change that destroys data — DROP TABLE, DROP COLUMN, a MODIFY
-// COLUMN that retypes — goes through unremarked when the table is
-// empty, because there is nothing to lose, which is what keeps the
-// development loop of pushing a table and reshaping it a minute later
-// unaffected. Against a table with rows in it, Push applies nothing at
-// all and returns ErrDestructivePush with a DataLoss entry per change
-// it withheld; naming each one in PushOptions.Allow is what lets it
-// through. See DataLoss for what "has rows" means here, why the
-// server's estimate is not taken at face value, and what it costs to
-// ask.
-//
-// The two halves belong together, and only one of them shipped first:
-// DropUnmanagedTables answers "whose table is this", and Allow answers
-// "may this table lose its data". A push can be entitled to a table and
-// still have no business emptying it.
 //
 // # What Push cannot see
 //
@@ -384,19 +255,22 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		return nil, fmt.Errorf("drops/mysql: introspect: %w", err)
 	}
 	desired := BuildSnapshot(schema)
-	current := live
-	var notices []SchemaNotice
-	if !opt.DropUnmanagedTables {
-		var withheld []string
-		current, withheld = ownedBy(live, desired)
-		notices = append(notices, unmanagedTableNotices(live, withheld, opt)...)
+	answers := mergeDecisions(DeclaredRenames(schema), opt.Renames)
+	current := ownedBy(live, desired, renamedAwayTables(live, answers)...)
+
+	// Before the probe, not after it: a push that is going to refuse
+	// should not first create and drop a table on the server to answer
+	// a question it is about to throw away. Renames are settled from
+	// column names and types, which the probe does not touch.
+	renames, err := resolvePushRenames(current, desired, answers)
+	if err != nil {
+		return nil, err
 	}
 
-	exprNotices, err := probeCheckExpressions(ctx, db, opt.Database, server, current, desired)
+	notices, err := probeCheckExpressions(ctx, db, opt.Database, server, current, desired)
 	if err != nil {
 		return nil, fmt.Errorf("drops/mysql: normalise declared expressions: %w", err)
 	}
-	notices = append(notices, exprNotices...)
 	notices = append(notices, tableOptionNotices(current, desired)...)
 	notices = append(notices, unrepresentableIndexNotices(current)...)
 	notices = append(notices, indexMethodNotices(current, desired)...)
@@ -405,36 +279,17 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		Safe:        opt.Safe,
 		Server:      server,
 		SplitAlters: opt.SplitAlters,
+		Renames:     renames,
 	})
 	if !opt.DropUnmanagedIndexes {
 		var withheld []SchemaNotice
 		stmts, withheld = withholdUnmanagedIndexDrops(stmts, current, desired)
 		notices = append(notices, withheld...)
 	}
-
-	// The destructive changes are derived before the empty-diff exit,
-	// because PushOptions.Allow has to be answered either way: consent
-	// for a change that is not in this diff is stale whether or not
-	// there is anything else to do, and a push with nothing to apply is
-	// the likeliest place for it to have gone stale.
-	destructive := destructiveCandidates(stmts, current, desired, server, opt)
-	notices = append(notices, staleConsentNotices(opt.Allow, destructive)...)
 	sortNotices(notices)
 
 	res := &PushResult{Statements: stmts, Notices: notices}
-	if len(stmts) == 0 {
-		return res, nil
-	}
-	loss, err := withheldDataLoss(ctx, db, opt.Database, destructive, opt.Allow)
-	if err != nil {
-		return res, err
-	}
-	if len(loss) > 0 {
-		res.DataLoss = loss
-		return res, fmt.Errorf("%w: %d destructive change(s) across %d statements, starting with %q",
-			ErrDestructivePush, len(loss), len(stmts), excerptSQL(loss[0].SQL))
-	}
-	if opt.DryRun {
+	if len(stmts) == 0 || opt.DryRun {
 		return res, nil
 	}
 	for _, s := range stmts {
@@ -449,6 +304,54 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	res.Applied = true
 	return res, nil
 }
+
+// resolvePushRenames settles the rename questions this push raises, or
+// refuses.
+//
+// It is the same reasoning GenerateMigration applies, against the same
+// detector, for the same reason: a column gone from the database and
+// one arrived in the schema is either a rename or a drop-and-add, the
+// two differ by the whole contents of the column, and nothing in
+// either side says which. Push reaching that comparison without asking
+// the question was a second door into the data loss the question
+// exists to close — and here the door has no transaction behind it: a
+// DROP COLUMN commits itself, so a wrong guess is not something a
+// failed push rolls back.
+//
+// The answers come from the schema (DeclaredRenames) and from the
+// call (PushOptions.Renames), the call winning; the caller merges the
+// two because it needs the merged set before this point as well — see
+// renamedAwayTables. There is no rename log here: a push has no
+// migration directory, so the advice on the refusal points at the
+// schema instead.
+func resolvePushRenames(current, desired *Snapshot, answers []RenameDecision) ([]Rename, error) {
+	renames, unresolved := ResolveRenames(current, desired, answers)
+	if len(unresolved) > 0 {
+		return nil, &RenameAmbiguityError{Candidates: unresolved, Advice: pushRenameAdvice}
+	}
+	if err := validateRenames(current, desired, renames); err != nil {
+		return nil, err
+	}
+	return renames, nil
+}
+
+// pushRenameAdvice closes a push's refusal, in place of the flags and
+// the rename log the generator points at — a push has neither.
+//
+// The schema declaration comes first because it is the answer that
+// lasts: an operator answering at a terminal answers for the one
+// database in front of them, and the next database the schema is
+// pushed to asks again. The per-run answer is named second, and it is
+// the only way to say the other thing, that the column really is being
+// dropped — which is not a fact about the schema at all. Once such a
+// drop has been pushed the old column is gone and the question never
+// comes back, so there is nothing lasting to record.
+const pushRenameAdvice = "a rename is a fact about the schema's history and belongs with the schema:\n" +
+	"    mysql.Add(Users, mysql.Varchar(\"emailAddress\", 255).RenamedFrom(\"email\"))\n" +
+	"    mysql.NewTable(\"people\").RenamedFrom(\"users\")\n" +
+	"stated there it answers every database the schema is pushed to, and it goes inert once the rename has happened.\n" +
+	"For one run instead, or to say the column really is being dropped, use PushOptions.Renames: a\n" +
+	"RenameDecision naming the pair renames it, one naming only the object that is going declines."
 
 // currentDatabase returns the database the connection is pointed at,
 // which is empty when the DSN named none — in which case unqualified
@@ -473,8 +376,7 @@ func currentDatabase(ctx context.Context, db *DB) (string, error) {
 }
 
 // ownedBy narrows a live introspection to the tables the Schema
-// declares, and returns the names of the ones it held back so Push can
-// report them.
+// declares.
 //
 // A MySQL database is not a namespace a schema gets to itself: it is
 // what the DSN names, so the application's tables sit beside another
@@ -483,18 +385,21 @@ func currentDatabase(ctx context.Context, db *DB) (string, error) {
 // exist and no longer should, and it emits a DROP for it — which here
 // deletes someone else's data with no transaction to undo it.
 //
-// drops/pg and drops/sqlite draw the same line, for the same reason: a
-// table the Go schema never names was never drops's to drop, and the
-// Schema is the only statement of ownership either of them has. A list
-// of table names to skip cannot do the job — it would have to grow for
-// ever, and it would say nothing about the table another team added
-// last week.
+// drops/pg takes the opposite line, because a PostgreSQL schema can be
+// given to one application and Push's Schema option points at exactly
+// one. drops/sqlite takes this one, for the same reason as here.
 //
 // The cost is that dropping a table means writing the DROP into a
 // migration rather than deleting the Go declaration and pushing, which
-// is the reviewable path anyway — or setting
-// PushOptions.DropUnmanagedTables, which puts the live side back whole.
-func ownedBy(live, declared *Snapshot) (*Snapshot, []string) {
+// is the reviewable path anyway.
+//
+// alsoKeep names tables to keep whatever the Schema says now — see
+// renamedAwayTables.
+func ownedBy(live, declared *Snapshot, alsoKeep ...string) *Snapshot {
+	keep := make(map[string]bool, len(alsoKeep))
+	for _, n := range alsoKeep {
+		keep[n] = true
+	}
 	out := &Snapshot{
 		ID:      live.ID,
 		PrevID:  live.PrevID,
@@ -502,362 +407,48 @@ func ownedBy(live, declared *Snapshot) (*Snapshot, []string) {
 		Dialect: live.Dialect,
 		Tables:  make(map[string]*TableSnapshot, len(live.Tables)),
 	}
-	var withheld []string
-	for _, name := range sortedKeys(live.Tables) {
-		if _, ok := declared.Tables[name]; ok {
-			out.Tables[name] = live.Tables[name]
-			continue
-		}
-		withheld = append(withheld, name)
-	}
-	return out, withheld
-}
-
-// unmanagedTableNotices reports one withheld DROP TABLE per table
-// ownedBy held back, carrying the statement Diff would have emitted so
-// a caller who wants it can run it by hand.
-func unmanagedTableNotices(live *Snapshot, names []string, opt PushOptions) []SchemaNotice {
-	out := make([]SchemaNotice, 0, len(names))
-	for _, name := range names {
-		t := live.Tables[name]
-		out = append(out, SchemaNotice{
-			Rule:  "unmanaged-table",
-			Table: t.Name,
-			Message: fmt.Sprintf(
-				"table %q exists in the database and is declared by no table in the Go schema; Push left it alone — set PushOptions.DropUnmanagedTables if it really is drops's to drop",
-				t.Name),
-			SQL: dropTableSQL(t, DiffOptions{Safe: opt.Safe}),
-		})
-	}
-	return out
-}
-
-// ----------------------------------------------------------------------
-// Destructive changes
-// ----------------------------------------------------------------------
-
-// destructiveChange is one candidate: the loss it would cause, and the
-// text Diff renders for it. A DROP TABLE is a whole statement; a column
-// change is one action inside an ALTER TABLE that may carry several.
-type destructiveChange struct {
-	loss  DataLoss
-	text  string
-	whole bool
-}
-
-// destructiveCandidates returns one DataLoss per destructive change in
-// stmts, in the order the diff put them, whether or not
-// PushOptions.Allow authorises it and whether or not the table is
-// empty. It is the list both halves of the rule are answered from: what
-// the push has to withhold, and which entries of Allow named something
-// real.
-//
-// The candidates are derived from the same two snapshots Diff was given
-// and then matched against the statements by text, exactly as
-// withholdUnmanagedIndexDrops does: re-deriving is what keeps a rule
-// from firing on a statement that came from somewhere else.
-//
-// Matching by text is where this parts company with drops/pg, whose
-// diff emits one statement per change. Here diffColumns folds a table's
-// actions into a single ALTER TABLE unless SplitAlters says otherwise,
-// so the unit that has to be recognised is the action rather than the
-// statement — and a statement carrying a DROP COLUMN beside an ADD
-// COLUMN is destructive for the one and not the other. Each action is
-// re-rendered exactly as diffColumns renders it and looked for inside
-// the statements for its own table, delimited by the comma or the
-// semicolon that always follows it, so an action name can never match
-// the prefix of a longer one.
-func destructiveCandidates(stmts []string, current, desired *Snapshot, server ServerInfo, opt PushOptions) []DataLoss {
-	var want []destructiveChange
-	for _, key := range sortedKeys(current.Tables) {
-		ct := current.Tables[key]
-		dt, declared := desired.Tables[key]
-		if !declared {
-			want = append(want, destructiveChange{
-				loss:  DataLoss{Op: OpDropTable, Table: ct.Name},
-				text:  dropTableSQL(ct, DiffOptions{Safe: opt.Safe}),
-				whole: true,
-			})
-			continue
-		}
-		for _, name := range sortedKeys(ct.Columns) {
-			dc, kept := dt.Columns[name]
-			if !kept {
-				want = append(want, destructiveChange{
-					loss: DataLoss{Op: OpDropColumn, Table: ct.Name, Object: name},
-					text: "DROP COLUMN " + quoteIdent(name),
-				})
-				continue
-			}
-			if !typeEqual(ct.Columns[name].Type, dc.Type, server) {
-				want = append(want, destructiveChange{
-					loss: DataLoss{Op: OpRetypeColumn, Table: ct.Name, Object: name},
-					text: "MODIFY COLUMN " + columnDefSQL(dc),
-				})
-			}
-		}
-	}
-	var out []DataLoss
-	for _, s := range stmts {
-		for _, c := range want {
-			if c.whole && s != c.text {
-				continue
-			}
-			if !c.whole && !statementCarries(s, c.loss.Table, c.text) {
-				continue
-			}
-			d := c.loss
-			d.SQL = s
-			out = append(out, d)
+	for name, ts := range live.Tables {
+		if _, ok := declared.Tables[name]; ok || keep[ts.Name] {
+			out.Tables[name] = ts
 		}
 	}
 	return out
 }
 
-// statementCarries reports whether stmt is an ALTER TABLE on table
-// containing action as one of its actions.
+// renamedAwayTables names the tables a rename answer says a declared
+// table used to be called, while the rename is still ahead of this
+// database.
 //
-// The table is matched on the whole quoted identifier, so `users` does
-// not match a statement against `users_archive`: the closing backtick
-// is part of the prefix. The action is matched with its trailing
-// delimiter for the same reason — "DROP COLUMN `a`" is a prefix of
-// "DROP COLUMN `ab`" but not of "DROP COLUMN `ab`," .
-func statementCarries(stmt, table, action string) bool {
-	prefix := "ALTER TABLE " + quoteIdent(table)
-	if !strings.HasPrefix(stmt, prefix) {
-		return false
-	}
-	rest := stmt[len(prefix):]
-	if rest == "" || (rest[0] != ' ' && rest[0] != '\n') {
-		return false
-	}
-	return strings.Contains(rest, action+",") || strings.Contains(rest, action+";")
-}
-
-// staleConsentNotices reports every PushOptions.Allow entry that names
-// no destructive change in this diff.
+// The schema does not name them any more, which is precisely the
+// problem: ownedBy would file them under "somebody else's" and drop
+// them from the previous side a moment before the rename would have
+// named one — leaving the push to create the new table empty beside
+// the old one, with the rename it was told about applied to nothing. A
+// schema that says "people used to be users" has claimed users, and
+// this is what says so.
 //
-// A consent that has quietly stopped applying is more dangerous than a
-// declaration that has: it leaves the call site reading exactly as it
-// did when it authorised something, so the next reviewer sees a DROP
-// that someone signed off on and no sign that the signature has come
-// away from it.
-//
-// It is a notice rather than an error because consent is not itself an
-// instruction: an Allow entry that matches nothing has changed nothing,
-// and failing a push whose diff is otherwise fine would punish the
-// caller for the tidy-up they have not done yet.
-func staleConsentNotices(allow []Destructive, found []DataLoss) []SchemaNotice {
-	var out []SchemaNotice
-	for _, a := range allow {
-		matched := false
-		for _, d := range found {
-			if allowsDestructive([]Destructive{a}, d) {
-				matched = true
-				break
-			}
-		}
-		if matched {
+// The claim expires. A declaration is meant to be left in the source
+// until every deployment has caught up, so it outlives the rename; what
+// it must not outlive is its hold on the old name. Once live carries
+// the new name the rename has happened here, and whatever answers to
+// the old one now is somebody else's table — which is the case ownedBy
+// exists for. Keeping the hole open past that point offered that table
+// to the diff as the previous life of a table the schema does declare:
+// the push either asked an unanswerable question pairing its columns
+// with the wrong table's, or, once told the old name really was going,
+// dropped it.
+func renamedAwayTables(live *Snapshot, answers []RenameDecision) []string {
+	var out []string
+	for _, d := range answers {
+		if d.Kind != RenameTable || !d.IsRename || d.From == "" {
 			continue
 		}
-		out = append(out, SchemaNotice{
-			Rule:    "stale-consent",
-			Table:   a.Table,
-			Object:  a.Object,
-			Message: staleConsentMessage(a),
-		})
+		if live.Tables[d.To] != nil {
+			continue
+		}
+		out = append(out, d.From)
 	}
 	return out
-}
-
-// staleConsentMessage says why one Allow entry authorises nothing. The
-// malformed shapes are separated from the merely out-of-date one
-// because the fix is different: a Destructive that cannot match any
-// change is a mistake at the call site, and reading "matches nothing in
-// this diff" would send its author looking at the schema instead of at
-// the value they wrote.
-func staleConsentMessage(a Destructive) string {
-	switch {
-	case a.Op != OpDropTable && a.Op != OpDropColumn && a.Op != OpRetypeColumn:
-		return fmt.Sprintf(
-			"PushOptions.Allow names Op %q, which is not one of %q, %q or %q; it authorises nothing",
-			a.Op, OpDropTable, OpDropColumn, OpRetypeColumn)
-	case a.Table == "":
-		return fmt.Sprintf(
-			"PushOptions.Allow names a %q with an empty Table; it authorises nothing", a.Op)
-	case a.Op == OpDropTable && a.Object != "":
-		return fmt.Sprintf(
-			"PushOptions.Allow names a drop of table %q with Object %q; Object is empty on a table drop, so this authorises nothing",
-			a.Table, a.Object)
-	case a.Op != OpDropTable && a.Object == "":
-		return fmt.Sprintf(
-			"PushOptions.Allow names a %q on %q with an empty Object; a column change is authorised by column name, so this authorises nothing",
-			a.Op, a.Table)
-	}
-	name := a.Table
-	if a.Object != "" {
-		name = a.Table + "." + a.Object
-	}
-	return fmt.Sprintf(
-		"PushOptions.Allow names a %q on %q that this push does not contain; the change was already applied, or the object is gone, and the consent now authorises nothing — delete it",
-		a.Op, name)
-}
-
-// withheldDataLoss returns one DataLoss per destructive change that
-// PushOptions.Allow does not authorise and that would land on a table
-// with rows in it.
-//
-// The estimates cost one query against information_schema, asked once
-// for the whole database and only when an unauthorised destructive
-// statement is actually in the diff — the overwhelmingly common push
-// has none, and pays nothing.
-func withheldDataLoss(ctx context.Context, db *DB, database string, found []DataLoss, allow []Destructive) ([]DataLoss, error) {
-	// Consent first: a caller who has already named every destructive
-	// change in the diff is owed neither an estimate nor a probe, and
-	// the overwhelmingly common push has no destructive change at all.
-	var unconsented []DataLoss
-	for _, d := range found {
-		if !allowsDestructive(allow, d) {
-			unconsented = append(unconsented, d)
-		}
-	}
-	if len(unconsented) == 0 {
-		return nil, nil
-	}
-
-	rows, err := tableRowEstimates(ctx, db, database)
-	if err != nil {
-		return nil, fmt.Errorf("drops/mysql: estimate rows before a destructive push: %w", err)
-	}
-	var withheld []DataLoss
-	probed := map[string]bool{}
-	for _, d := range unconsented {
-		est, known := rows[d.Table]
-		if !known {
-			// Not in information_schema under this database at all,
-			// which this connection has no business assuming is empty.
-			est = -1
-		}
-		if est <= 0 {
-			// See DataLoss: TABLE_ROWS reads 0 for tables that have
-			// rows, so 0 is a question rather than an answer.
-			has, seen := probed[d.Table]
-			if !seen {
-				has, err = tableHasRows(ctx, db, d.Table)
-				if err != nil {
-					return nil, fmt.Errorf("drops/mysql: deciding whether %q is empty before destroying data in it: %w", d.Table, err)
-				}
-				probed[d.Table] = has
-			}
-			if !has {
-				continue
-			}
-			est = -1
-		}
-		d.Rows = est
-		d.Suggestion = fmt.Sprintf("allow with mysql.Destructive{Op: mysql.%s, Table: %q, Object: %q}",
-			destructiveOpConst(d.Op), d.Table, d.Object)
-		withheld = append(withheld, d)
-	}
-	return withheld, nil
-}
-
-// allowsDestructive reports whether the caller named this exact change.
-func allowsDestructive(allow []Destructive, d DataLoss) bool {
-	for _, a := range allow {
-		if a.Op == d.Op && a.Table == d.Table && a.Object == d.Object {
-			return true
-		}
-	}
-	return false
-}
-
-// destructiveOpConst renders the Go identifier for an op, so the
-// suggestion can be pasted into the call rather than transcribed.
-func destructiveOpConst(op DestructiveOp) string {
-	switch op {
-	case OpDropTable:
-		return "OpDropTable"
-	case OpDropColumn:
-		return "OpDropColumn"
-	case OpRetypeColumn:
-		return "OpRetypeColumn"
-	}
-	return string(op)
-}
-
-// tableRowEstimates reads the server's row-count estimate for every
-// base table in the database.
-//
-// TABLE_ROWS is what the storage engine last reported, which is why
-// this is one catalogue read rather than a COUNT(*) per table. For
-// InnoDB it is a sampled estimate and not a count, and it is NULL when
-// the server has nothing to go on; both are passed through as -1,
-// because the caller has to distinguish "no rows" from "nobody knows"
-// and only the first of those is a reason to let a DROP through. See
-// tableHasRows for how the second is settled — and see DataLoss for why
-// a reported 0 goes the same way.
-func tableRowEstimates(ctx context.Context, db *DB, database string) (map[string]int64, error) {
-	pred, args := schemaPredicate("TABLE_SCHEMA", database)
-	rows, err := db.Query(ctx, `
-		SELECT TABLE_NAME, TABLE_ROWS
-		FROM information_schema.TABLES
-		WHERE `+pred+` AND TABLE_TYPE = 'BASE TABLE'`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]int64{}
-	for rows.Next() {
-		var name string
-		var est sql.NullInt64
-		if err := rows.Scan(&name, &est); err != nil {
-			return nil, err
-		}
-		if !est.Valid {
-			out[name] = -1
-			continue
-		}
-		out[name] = est.Int64
-	}
-	return out, rows.Err()
-}
-
-// tableHasRows answers the one question the estimate could not: is
-// there anything in here at all.
-//
-// LIMIT 1 stops at the first row, so this reads one page of a table of
-// any size — the property COUNT(*) does not have, and the reason a
-// probe is affordable here and a count is not. It runs only for a table
-// whose estimate was 0 or unknown, and only for a destructive change
-// nobody has authorised, so the common push never reaches it.
-//
-// The table is named unqualified, like every other statement this
-// package renders, which is why Push refuses a foreign Database up
-// front: the probe has to read the same table the DDL will write.
-//
-// A probe that fails fails the push. Not being able to tell whether a
-// table holds data is not a reason to go ahead and destroy it, and it
-// is not a reason to report it as data loss either — the caller would
-// be granting consent for a table nobody has looked inside.
-func tableHasRows(ctx context.Context, db *DB, table string) (bool, error) {
-	rows, err := db.Query(ctx, fmt.Sprintf(
-		"SELECT EXISTS (SELECT 1 FROM %s LIMIT 1)", quoteIdent(table)))
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return false, err
-		}
-		return false, errors.New("the emptiness probe returned no row")
-	}
-	var has bool
-	if err := rows.Scan(&has); err != nil {
-		return false, err
-	}
-	return has, rows.Err()
 }
 
 // excerptSQL trims a statement to a short single-line form for error
@@ -1182,16 +773,38 @@ func sqlStateByReflection(err error) string {
 // ----------------------------------------------------------------------
 
 // withholdUnmanagedIndexDrops removes from stmts every DROP INDEX that
-// targets an index the database has and the Go schema never declared,
-// returning what is left and a notice for each one held back.
+// targets an index the database has, the Go schema never declared, and
+// this push can actually leave standing — returning what is left and a
+// notice for each one held back.
 //
 // The statements are matched by text rather than re-derived, because
 // the text is what Diff produced from the same two snapshots a moment
 // earlier — anything that does not match is a drop Diff emitted for a
 // different reason (an index declared on both sides whose shape
 // changed) and has to go through.
+//
+// # Why an index over a departing column is not withheld
+//
+// Withholding exists because Push cannot tell an index the schema
+// stopped declaring from one somebody built by hand, and destroying the
+// second by mistake is worse than leaving the first behind. That
+// reasoning holds only while the index can survive the migration. An
+// index spanning a column this push drops cannot: MySQL takes a
+// single-column one away with the column, narrows a multi-column one
+// to what remains, and refuses the DROP COLUMN outright when the index
+// is UNIQUE and spans more than one column (1072) or is one a foreign
+// key needs (1553). See Diff.
+//
+// So withholding there protects nothing. It either leaves a narrowed
+// index the caller never asked for — under a notice claiming the index
+// was left alone, which by then is false — or it stops the push on a
+// server error with no explanation attached. Both were reachable under
+// the default options, which is where most pushes run. The drop goes
+// through instead, and the notice says the index was dropped and why,
+// so the fact still reaches the caller.
 func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]string, []SchemaNotice) {
 	withheld := map[string]SchemaNotice{}
+	var forced []SchemaNotice
 	for _, key := range sortedKeys(current.Tables) {
 		ct := current.Tables[key]
 		dt := desired.Tables[key]
@@ -1205,6 +818,18 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 				}
 			}
 			sql := dropIndexSQL(ct.Name, name)
+			if lost := departingColumns(ct.Indexes[name], ct, dt); len(lost) > 0 {
+				forced = append(forced, SchemaNotice{
+					Rule:   "unmanaged-index",
+					Table:  ct.Name,
+					Object: name,
+					Message: fmt.Sprintf(
+						"index %q on %q is declared by no table in the Go schema, but it keys column %s, which this push drops; MySQL will not leave it as it is, so Push dropped the index rather than leave a narrowed one behind or stop on the column drop",
+						name, ct.Name, strings.Join(quoteIdents(lost), ", ")),
+					SQL: sql,
+				})
+				continue
+			}
 			withheld[sql] = SchemaNotice{
 				Rule:    "unmanaged-index",
 				Table:   ct.Name,
@@ -1215,10 +840,10 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 		}
 	}
 	if len(withheld) == 0 {
-		return stmts, nil
+		return stmts, forced
 	}
 	kept := make([]string, 0, len(stmts))
-	var notices []SchemaNotice
+	notices := forced
 	for _, s := range stmts {
 		if n, ok := withheld[s]; ok {
 			notices = append(notices, n)
@@ -1227,6 +852,25 @@ func withholdUnmanagedIndexDrops(stmts []string, current, desired *Snapshot) ([]
 		kept = append(kept, s)
 	}
 	return kept, notices
+}
+
+// departingColumns lists, in key order, the index's columns that this
+// push drops. A table the schema no longer declares is not one Push
+// narrows, so a nil desired side means nothing is departing.
+func departingColumns(idx *IndexSnapshot, current, desired *TableSnapshot) []string {
+	if idx == nil || desired == nil {
+		return nil
+	}
+	var out []string
+	for _, c := range idx.Columns {
+		if _, live := current.Columns[c]; !live {
+			continue
+		}
+		if _, kept := desired.Columns[c]; !kept {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // unrepresentableIndexNotices reports live indexes the snapshot cannot

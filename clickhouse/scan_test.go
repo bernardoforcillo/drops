@@ -3,133 +3,190 @@ package clickhouse_test
 import (
 	"context"
 	"errors"
-	"reflect"
 	"testing"
 	"time"
 
+	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/clickhouse"
-	"github.com/bernardoforcillo/drops/dropstest"
 )
 
-// clickhouse carried a copy of the pg reflection walk, drift included,
-// so it lost the same rows for the same reasons. These pin the shapes
-// that copy got wrong through the builder a caller actually uses.
-
-// chAudit is the bookkeeping struct a row type embeds without
-// exporting — the case the old walk dropped on the floor.
-type chAudit struct {
-	Ts   time.Time
-	Kind string
+// scanRows is a canned cursor carrying real values, which the package's
+// fakeRows cannot: it is empty by construction.
+type scanRows struct {
+	cols []string
+	data [][]any
+	pos  int
 }
 
-type chEvent struct {
-	ID uint64
-	chAudit
-}
-
-// ChKey is exported, so it exercises the other half: two fields
-// claiming "id", where the outer one must win however the two are
-// ordered.
-type ChKey struct{ ID uint64 }
-
-type chShadowFirst struct {
-	ID string
-	ChKey
-}
-
-type chTagged struct {
-	Label string `drop:"b"`
-	B     string
-}
-
-func chTable(t *testing.T, name string) *clickhouse.Table {
-	t.Helper()
-	tbl := clickhouse.NewTable(name)
-	clickhouse.Add(tbl, clickhouse.UInt64("id"))
-	clickhouse.Add(tbl, clickhouse.DateTime("ts", "UTC"))
-	clickhouse.Add(tbl, clickhouse.String("kind"))
-	return tbl
-}
-
-func TestSelectOneResolvesColumnsLikeTheRootScanner(t *testing.T) {
-	when := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
-
-	for _, tc := range []struct {
-		name string
-		cols []string
-		row  []any
-		dest any
-		want any
-	}{
-		{
-			name: "unexported embedded struct keeps its promoted fields",
-			cols: []string{"id", "ts", "kind"},
-			row:  []any{uint64(1), when, "click"},
-			dest: &chEvent{},
-			want: &chEvent{ID: 1, chAudit: chAudit{Ts: when, Kind: "click"}},
-		},
-		{
-			name: "outer field declared first shadows the embedded one",
-			cols: []string{"id"},
-			row:  []any{"a1"},
-			dest: &chShadowFirst{},
-			want: &chShadowFirst{ID: "a1"},
-		},
-		{
-			name: "tag beats another field's camelCase form",
-			cols: []string{"b"},
-			row:  []any{"tagged"},
-			dest: &chTagged{},
-			want: &chTagged{Label: "tagged"},
-		},
-		{
-			name: "a column with no field is discarded",
-			cols: []string{"id", "unrelated"},
-			row:  []any{uint64(4), "ignored"},
-			dest: &chEvent{},
-			want: &chEvent{ID: 4},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			db := clickhouse.New(dropstest.New().Rows(tc.cols, tc.row))
-			if err := db.Select().From(chTable(t, "scan_one")).One(context.Background(), tc.dest); err != nil {
-				t.Fatalf("One: %v", err)
-			}
-			if !reflect.DeepEqual(tc.dest, tc.want) {
-				t.Errorf("got = %+v, want %+v", tc.dest, tc.want)
-			}
-		})
+func (r *scanRows) Next() bool {
+	if r.pos >= len(r.data) {
+		return false
 	}
+	r.pos++
+	return true
 }
 
-func TestSelectAllWalksUnexportedEmbeddedStruct(t *testing.T) {
-	when := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
-	db := clickhouse.New(dropstest.New().Rows(
-		[]string{"id", "ts", "kind"},
-		[]any{uint64(1), when, "click"},
-		[]any{uint64(2), when, "view"},
-	))
-	var got []chEvent
-	if err := db.Select().From(chTable(t, "scan_all")).All(context.Background(), &got); err != nil {
+func (r *scanRows) Scan(dest ...any) error {
+	row := r.data[r.pos-1]
+	for i, d := range dest {
+		switch p := d.(type) {
+		case *any:
+			*p = row[i]
+		case *int64:
+			*p = row[i].(int64)
+		case *string:
+			*p = row[i].(string)
+		case *time.Time:
+			*p = row[i].(time.Time)
+		default:
+			return errors.New("scanRows: unexpected destination")
+		}
+	}
+	return nil
+}
+
+func (r *scanRows) Columns() ([]string, error) { return r.cols, nil }
+func (r *scanRows) Close() error               { return nil }
+func (r *scanRows) Err() error                 { return nil }
+
+// scanDriver replies to every query with the same canned cursor.
+type scanDriver struct{ rows func() drops.Rows }
+
+func (scanDriver) Exec(context.Context, string, ...any) (drops.Result, error) {
+	return nil, errors.New("unexpected Exec")
+}
+func (d scanDriver) Query(context.Context, string, ...any) (drops.Rows, error) {
+	return d.rows(), nil
+}
+func (scanDriver) Begin(context.Context) (drops.Tx, error) {
+	return nil, errors.New("unexpected Begin")
+}
+
+// chScanAudit is the shape the scanner has to reach through: a struct
+// that factors the timestamps every row carries into one embedded type,
+// and keeps that type unexported because it is an implementation detail
+// of the package that declares it.
+type chScanAudit struct {
+	CreatedAt time.Time
+}
+
+type chScanEvent struct {
+	ID   int64
+	Name string
+	chScanAudit
+}
+
+// This package kept its own copy of the reflection walk, which skipped
+// unexported fields before it looked for embedded ones — so the
+// timestamps went to the discard sink and the row came back with a zero
+// CreatedAt and nothing anywhere saying why. Every other dialect binds
+// the same struct through the root scanner; this one has to agree.
+func TestScanReachesThroughAnUnexportedEmbeddedStruct(t *testing.T) {
+	created := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+	cols := []string{"id", "name", "createdAt"}
+	row := []any{int64(7), "seven", created}
+
+	db := clickhouse.New(scanDriver{rows: func() drops.Rows {
+		return &scanRows{cols: cols, data: [][]any{row}}
+	}})
+
+	var got []chScanEvent
+	if err := db.Select().From(clickhouse.NewTable("events")).All(context.Background(), &got); err != nil {
 		t.Fatalf("All: %v", err)
 	}
-	want := []chEvent{
-		{ID: 1, chAudit: chAudit{Ts: when, Kind: "click"}},
-		{ID: 2, chAudit: chAudit{Ts: when, Kind: "view"}},
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("got = %+v, want %+v", got, want)
+	if !got[0].CreatedAt.Equal(created) {
+		t.Errorf("timestamp promoted out of the unexported embedded struct was dropped: got %v, want %v",
+			got[0].CreatedAt, created)
+	}
+
+	// The root scanner is the reference — the same struct reaches it
+	// whenever a caller goes through drops.One instead of a builder.
+	var want chScanEvent
+	if err := drops.ScanOne(&scanRows{cols: cols, data: [][]any{row}}, &want); err != nil {
+		t.Fatalf("drops.ScanOne: %v", err)
+	}
+	if got[0] != want {
+		t.Errorf("clickhouse and root scanners disagree\n  clickhouse: %+v\n  root:       %+v", got[0], want)
 	}
 }
 
-// The root scanner raises its own sentinel; the package one is what
-// clickhouse callers compare against, and moving the scanner must not
-// move that.
-func TestEmptyCursorStillReportsTheClickhouseSentinel(t *testing.T) {
-	db := clickhouse.New(dropstest.New().Rows([]string{"id"}))
-	var got chEvent
-	err := db.Select().From(chTable(t, "scan_empty")).One(context.Background(), &got)
-	if !errors.Is(err, clickhouse.ErrNoRows) {
-		t.Errorf("got = %v, want %v", err, clickhouse.ErrNoRows)
+// An embedded time.Time receives a column; it does not lend its fields.
+// The fork walked into it, found nothing exported, and left the column
+// unbound.
+type chScanStamped struct {
+	ID int64
+	time.Time
+}
+
+func TestScanTreatsAnEmbeddedScalarAsAColumn(t *testing.T) {
+	at := time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)
+	db := clickhouse.New(scanDriver{rows: func() drops.Rows {
+		return &scanRows{cols: []string{"id", "time"}, data: [][]any{{int64(3), at}}}
+	}})
+
+	var got []chScanStamped
+	if err := db.Select().From(clickhouse.NewTable("events")).All(context.Background(), &got); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if len(got) != 1 || !got[0].Time.Equal(at) {
+		t.Errorf("embedded time.Time was walked into instead of scanned: %+v", got)
+	}
+}
+
+// A name reachable at two depths belongs to the shallower field —
+// otherwise the walk order decides which field a column lands in, and
+// the answer changes with an unrelated edit to the declaration.
+type ChScanInner struct{ Name string }
+
+type chScanOuter struct {
+	Name string
+	ChScanInner
+}
+
+func TestScanPrefersTheShallowerFieldOnACollision(t *testing.T) {
+	db := clickhouse.New(scanDriver{rows: func() drops.Rows {
+		return &scanRows{cols: []string{"name"}, data: [][]any{{"outer"}}}
+	}})
+
+	var got []chScanOuter
+	if err := db.Select().From(clickhouse.NewTable("events")).All(context.Background(), &got); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "outer" || got[0].ChScanInner.Name != "" {
+		t.Errorf("column landed in the embedded field: %+v", got)
+	}
+}
+
+// A single-column result into a slice of scalars — SELECT count(),
+// SELECT id — is a shape the root scanner reads and this one did not.
+// []int64 was rejected outright, and a []time.Time was taken apart
+// field-by-field: a time.Time is a struct, so the walk matched no
+// column and the caller got zero timestamps with a nil error.
+func TestScanAllReadsASliceOfScalars(t *testing.T) {
+	at := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	db := clickhouse.New(scanDriver{rows: func() drops.Rows {
+		return &scanRows{cols: []string{"t"}, data: [][]any{{at}, {at.Add(time.Hour)}}}
+	}})
+
+	var stamps []time.Time
+	if err := db.Select().From(clickhouse.NewTable("events")).All(context.Background(), &stamps); err != nil {
+		t.Fatalf("All into []time.Time: %v", err)
+	}
+	if len(stamps) != 2 || !stamps[0].Equal(at) {
+		t.Errorf("a []time.Time was taken apart field-by-field instead of scanned: %v", stamps)
+	}
+
+	dbi := clickhouse.New(scanDriver{rows: func() drops.Rows {
+		return &scanRows{cols: []string{"id"}, data: [][]any{{int64(1)}, {int64(2)}}}
+	}})
+	var ids []int64
+	if err := dbi.Select().From(clickhouse.NewTable("events")).All(context.Background(), &ids); err != nil {
+		t.Fatalf("All into []int64: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 2 {
+		t.Errorf("got %v, want [1 2]", ids)
 	}
 }

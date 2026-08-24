@@ -26,18 +26,11 @@ type Entity[T any] struct {
 	pkFields  [][]int
 	colFields []entityColField
 
-	// rowType is T with its pointers stripped, kept so the entity can
-	// name the context-filter slot it owns on the shared table — see
-	// rowScopeFilterKey.
-	rowType reflect.Type
-
-	// tenantCol / tenantField are the axis [Entity.ScopeByTenant]
-	// declared, nil on an entity that declared none. The read-side
-	// predicate they build is registered on the table; these two are
-	// what a WRITE needs, which is a column to stamp and the field to
-	// stamp it from.
-	tenantCol   *Column
-	tenantField []int
+	// constraintFields maps an index or constraint name to the
+	// struct field a violation of it is reported against. Filled by
+	// MapConstraint; the names drops and MySQL generate are derived
+	// rather than stored — see (*Entity[T]).FieldError.
+	constraintFields map[string]string
 }
 
 type entityColField struct {
@@ -51,6 +44,8 @@ type EntityOption func(*entityConfig)
 type entityConfig struct {
 	allowUnmapped map[string]bool
 	allowAny      bool
+	allowNullable map[string]bool
+	allowAnyNull  bool
 }
 
 // AllowUnmappedColumns exempts the named columns from the check that
@@ -72,16 +67,37 @@ func AllowAnyUnmappedColumn() EntityOption {
 	return func(c *entityConfig) { c.allowAny = true }
 }
 
+// AllowNullableColumns exempts the named columns from the check that
+// a column admitting NULL is bound to a field that can receive one.
+//
+// Use it where the database will never actually produce a NULL and
+// the constraint cannot say so — a column another writer keeps
+// populated, a view whose outer join can never miss. Naming the
+// columns leaves the check working everywhere else.
+func AllowNullableColumns(names ...string) EntityOption {
+	return func(c *entityConfig) {
+		if c.allowNullable == nil {
+			c.allowNullable = map[string]bool{}
+		}
+		for _, n := range names {
+			c.allowNullable[n] = true
+		}
+	}
+}
+
+// AllowAnyNullableColumn disables the nullability check entirely, for
+// migrating a codebase with too many mismatches to fix at once;
+// prefer [AllowNullableColumns], which keeps the check working for
+// the columns you have not exempted.
+func AllowAnyNullableColumn() EntityOption {
+	return func(c *entityConfig) { c.allowAnyNull = true }
+}
+
 // ErrKeyArity is returned when a key carries the wrong number of
 // values for the entity's primary key.
 var ErrKeyArity = errors.New("drops/mysql: wrong number of primary-key values")
 
-// ErrPKNotSet is returned by Update when r's primary-key field is the
-// zero value. The alternative is a statement whose WHERE addresses id
-// = 0: it matches nothing, reports success, and leaves the caller
-// believing a write landed. Save never returns it — a zero key is how
-// Save tells a row that has never been written from one that has, and
-// it routes that row to Create.
+// ErrPKNotSet is returned by Update when the key fields are all zero.
 var ErrPKNotSet = errors.New("drops/mysql: primary key field is the zero value")
 
 // NewEntity builds the entity, panicking on misconfiguration —
@@ -131,15 +147,7 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	if err := checkDrift(rt, t, colFields, cfg); err != nil {
 		panic(err.Error())
 	}
-	return &Entity[T]{
-		table:     t,
-		pk:        pk,
-		pkField:   pkField,
-		pks:       pks,
-		pkFields:  pkFields,
-		colFields: colFields,
-		rowType:   rt,
-	}
+	return &Entity[T]{table: t, pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields}
 }
 
 // checkDrift reports columns bound to no struct field — see
@@ -161,8 +169,45 @@ func checkDrift(rt reflect.Type, t *Table, colFields []entityColField, cfg entit
 		}
 		missing = append(missing, c.name)
 	}
-	return drift.Report("drops/mysql", rt.Name(), t.name, missing,
-		drift.SpareFields(rt, bound), "mysql.AllowUnmappedColumns")
+	if err := drift.Report("drops/mysql", rt.Name(), t.name, missing,
+		drift.SpareFields(rt, bound), "mysql.AllowUnmappedColumns"); err != nil {
+		return err
+	}
+	return checkNullability(rt, t, colFields, cfg)
+}
+
+// checkNullability reports columns that admit NULL bound to a field
+// that cannot receive one.
+//
+// The mismatch is invisible to the compiler — a column's T is the
+// type its comparisons take, and the scan destination is a field
+// drops reaches only by reflection — and invisible at run time too,
+// until the first row that happens to be NULL. NewEntity is the one
+// place both types are in scope. It fires on whether the column
+// admits NULL, not on whether it said so: a bare mysql.Text("bio") is
+// exactly the shape that has been accepting NULLs nobody declared.
+func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg entityConfig) error {
+	if cfg.allowAnyNull {
+		return nil
+	}
+	var bad []drift.NullMismatch
+	for _, cf := range colFields {
+		c := cf.col
+		if !c.IsNullable() || cfg.allowNullable[c.Name()] {
+			continue
+		}
+		ft := drift.FieldTypeAt(rt, cf.field)
+		if ft == nil || drift.AcceptsNull(ft) {
+			continue
+		}
+		bad = append(bad, drift.NullMismatch{
+			Column:    c.Name(),
+			Field:     drift.FieldPath(rt, cf.field),
+			FieldType: ft.String(),
+			Stated:    c.nullStated,
+		})
+	}
+	return drift.ReportNullable("drops/mysql", rt.Name(), t.name, bad, "mysql.AllowNullableColumns")
 }
 
 // Table returns the entity's table.
@@ -210,9 +255,6 @@ func (e *Entity[T]) pkValuesOf(r *T) []any {
 	return out
 }
 
-// pkIsZero reports whether every key field is the zero value — the
-// test Save uses to decide between insert and update, and the one
-// Update uses to refuse a row that addresses no row at all.
 func (e *Entity[T]) pkIsZero(r *T) bool {
 	v := reflect.ValueOf(r).Elem()
 	for _, idx := range e.pkFields {
@@ -287,28 +329,24 @@ func (q *EntityQuery[T]) OrderBy(exprs ...drops.Expression) *EntityQuery[T] {
 func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T]  { q.sb.Limit(n); return q }
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 
-// Unscoped opts out of the table's DEFAULT filters for this query —
-// the declaration-time ones, a soft-delete guard above all. Without it
-// a soft-deleted row is unreachable through the entity at all, which
-// makes an audit or a restore flow impossible to write.
+// Unscoped opts out of every global filter on the table — named and
+// anonymous alike; the blunt instrument. See [SelectBuilder.Unscoped].
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+
+// IgnoreFilters bypasses the named global filters and leaves every
+// other one standing — see [SelectBuilder.IgnoreFilters]. It is the
+// method to reach for on a table wearing more than one guard, where
+// Unscoped would drop the ones this query still wants.
 //
-// It does NOT drop the table's context filters: the tenant axis and the
-// authorization guard survive it, and a ctx with no tenant is still
-// refused. That is a deliberate difference from
-// [SelectBuilder.Unscoped], which is statement-wide, and it is the
-// difference the four dialects state in the same words. The two lists
-// are not the same kind of thing — a default filter is a default scope,
-// a context filter is a row-visibility boundary — and the failures of
-// conflating them are not symmetric. Widening a default scope when the
-// caller asked to widen it costs nothing. Dropping the boundary hands
-// this request every tenant's rows, or every subject's, and it does so
-// on the one method a caller reaches for while thinking about
-// soft-deleted rows rather than about tenancy.
-//
-// A query that genuinely has to span tenants is written on the raw
-// builder, db.Select().From(t).Unscoped(), where a reviewer reading the
-// call sees the whole of what was given up.
-func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.unscopeDefaults(); return q }
+//	postEntity.Query(db).IgnoreFilters(mysql.FilterSoftDelete).All(ctx)
+func (q *EntityQuery[T]) IgnoreFilters(names ...string) *EntityQuery[T] {
+	q.sb.IgnoreFilters(names...)
+	return q
+}
+
+// ToSQL renders the query without running it — the same statement All
+// and One would send.
+func (q *EntityQuery[T]) ToSQL() (string, []any) { return q.sb.ToSQL() }
 
 // All returns every matching row.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
@@ -335,15 +373,12 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // leaves the field alone rather than failing: the row is inserted
 // either way, and silently reporting an id of 0 would be worse.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
-	if err := e.stampTenant(ctx, r); err != nil {
-		return err
-	}
 	v := reflect.ValueOf(r).Elem()
 	ins := db.Insert(e.table)
 	ins.Row(e.bindings(v, false)...)
 	res, err := ins.Exec(ctx)
 	if err != nil {
-		return err
+		return e.FieldError(err)
 	}
 	e.applyGeneratedKey(v, res)
 	return nil
@@ -359,16 +394,10 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
-		// Stamped one row at a time, before any of them is bound: a
-		// batch half of which carries the ctx tenant and half of which
-		// carries whatever the caller left in the struct is the shape
-		// nobody can reason about afterwards.
-		if err := e.stampTenant(ctx, &rows[i]); err != nil {
-			return nil, err
-		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
-	return ins.Exec(ctx)
+	res, err := ins.Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // UpsertMany inserts rows, updating the non-key columns of any that
@@ -385,37 +414,17 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
-		if err := e.stampTenant(ctx, &rows[i]); err != nil {
-			return nil, err
-		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
-	return ins.OnDuplicateKeyUpdateAll().Exec(ctx)
+	res, err := ins.OnDuplicateKeyUpdateAll().Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // Update writes every non-key column of r to the row its key
-// addresses. ErrPKNotSet is returned if r's PK is the zero value.
-//
-// The tenant column is an axis, never an assignment: Create stamps it,
-// Update stamps it, both refuse a mismatch, and neither ever takes the
-// value from the struct as an instruction.
-//
-// On a tenant-scoped entity the tenant column is one of those non-key
-// columns, so the row's own tenant is stamped from ctx before the
-// assignments are taken. Without that an Update of a struct whose
-// tenant field is zero — one built from a form, or from a decoded
-// request body — would write that zero over a row it is otherwise
-// allowed to touch, and hand it to no tenant at all; a struct carrying
-// somebody else's tenant is [ErrTenantMismatch] rather than a
-// transfer of ownership. Which row is addressed is a separate
-// question, and the table's context filter answers it: the WHERE
-// clause carries the ctx tenant like every other statement's.
+// addresses.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if e.pkIsZero(r) {
 		return ErrPKNotSet
-	}
-	if err := e.stampTenant(ctx, r); err != nil {
-		return err
 	}
 	pred, err := e.pkPredicate(e.pkValuesOf(r))
 	if err != nil {
@@ -427,7 +436,7 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		return ErrNoAssignments
 	}
 	_, err = db.Update(e.table).Set(sets...).Where(pred).Exec(ctx)
-	return err
+	return e.FieldError(err)
 }
 
 // Save inserts r when every key field is zero, and updates it
@@ -445,7 +454,8 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
-	return db.Delete(e.table).Where(pred).Exec(ctx)
+	res, err := db.Delete(e.table).Where(pred).Exec(ctx)
+	return res, e.FieldError(err)
 }
 
 // bindings extracts column values from a row. skipKey omits the

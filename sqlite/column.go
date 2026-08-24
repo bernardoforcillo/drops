@@ -1,6 +1,10 @@
 package sqlite
 
-import "github.com/bernardoforcillo/drops"
+import (
+	"database/sql"
+
+	"github.com/bernardoforcillo/drops"
+)
 
 // ColumnType describes the SQL type of a column as it appears in CREATE
 // TABLE — e.g. "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC".
@@ -17,6 +21,7 @@ type Column struct {
 	table      *Table
 	typ        ColumnType
 	notNull    bool
+	nullStated bool // NotNull, PrimaryKey or Nullable was called
 	primary    bool
 	unique     bool
 	autoInc    bool
@@ -26,29 +31,11 @@ type Column struct {
 	pii        bool
 	managed    bool // drops writes this column, not the application
 
-	// origin is the column this one was copied from by (*Table).As,
-	// and nil on a column as declared. An alias rebinds its columns so
-	// they render under the alias; origin is what lets the copy still
-	// BE the declared column everywhere a column is identified rather
-	// than rendered — see key.
-	origin *Column
-}
-
-// key returns the identity a column is recognised by, collapsing every
-// alias copy onto the column it was declared as.
-//
-// Aliasing changes how a reference RENDERS and nothing else, so
-// everywhere drops compares columns rather than writing them — an
-// entity's key columns, the tenant axis, a hook's Has, a page's
-// ordering column — it compares keys. Without it an alias's handle
-// looks like a second column that happens to have the same name, and
-// the caller who declared the tenant axis over an alias handle gets a
-// statement that stamps two of them.
-func (c *Column) key() *Column {
-	if c.origin != nil {
-		return c.origin
-	}
-	return c
+	// renamedFrom is the name this column used to have, set by
+	// (*Col[T]).RenamedFrom. It is the one fact about a column that no
+	// comparison of two schemas can recover — see rename.go — and the
+	// schema is where Push can find it.
+	renamedFrom string
 }
 
 // FK describes a single-column foreign-key reference.
@@ -72,6 +59,14 @@ func (c *Column) IsAutoIncrement() bool { return c.autoInc }
 func (c *Column) HasDefault() bool      { return c.hasDefault }
 func (c *Column) DefaultSQL() string    { return c.defaultSQL }
 func (c *Column) ForeignKey() *FK       { return c.ref }
+
+// IsNullable reports whether the column admits NULL. It is the
+// complement of IsNotNull, named for the question that matters at
+// bind and scan time and spelled the same in all four dialects so the
+// shared checker asks exactly one question. A SQLite column admits
+// NULL unless it says otherwise, so one that stated nothing answers
+// true.
+func (c *Column) IsNullable() bool { return !c.notNull }
 
 // col implements ColRef for *Column; *Col[T] inherits it via embedding.
 func (c *Column) col() *Column { return c }
@@ -108,12 +103,23 @@ func newCol[T any](name string, typ ColumnType) *Col[T] {
 }
 
 // NotNull marks the column NOT NULL.
-func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull = true; return c }
+func (c *Col[T]) NotNull() *Col[T] { c.Column.notNull, c.Column.nullStated = true, true; return c }
+
+// Nullable states that the column admits NULL.
+//
+// It changes nothing in the DDL — a SQLite column is nullable unless
+// it says otherwise — and everything in what drops will let you bind
+// it to: NewEntity requires the struct field bound to a nullable
+// column to be one that can receive NULL. It is the counterpart of
+// NotNull, and the two are last-writer-wins.
+func (c *Col[T]) Nullable() *Col[T] { c.Column.notNull, c.Column.nullStated = false, true; return c }
 
 // PrimaryKey marks the column as the (single-column) PRIMARY KEY.
 func (c *Col[T]) PrimaryKey() *Col[T] {
 	c.Column.primary = true
 	c.Column.notNull = true
+	// A primary key states NOT NULL implicitly.
+	c.Column.nullStated = true
 	return c
 }
 
@@ -135,6 +141,39 @@ func (c *Col[T]) Managed() *Col[T] { c.Column.managed = true; return c }
 // IsManaged reports whether drops writes this column rather than the
 // application.
 func (c *Column) IsManaged() bool { return c.managed }
+
+// RenamedFrom states that this column is the column that used to be
+// called previous — the same column, the same data, a different name.
+//
+// Nothing in a pair of schemas can tell a rename from a drop and an
+// add, so drops asks rather than guesses, and this is the answer
+// written where the question is. GenerateMigration can record an
+// answer in the migration directory; Push has no migration directory,
+// and its refusal is otherwise unanswerable by anything durable. A
+// rename is a fact about the schema's history, the schema is what Push
+// reads, so the schema is where the fact belongs — and it then travels
+// to every database the schema is pushed to, not just to the one
+// whoever typed the flag was pointed at.
+//
+// It matters most here. A SQLite rename that goes unstated is not a
+// DROP COLUMN anybody can read in the statement list: the rebuild
+// copies the columns both sides name and simply leaves this one out,
+// so the data goes with nothing at all in the SQL to say so.
+//
+// The declaration is inert once the rename has happened: it is applied
+// only while the old name is still in the database and the new one is
+// not, so it may be left in place, and should be until every database
+// the schema is pushed to has moved past it.
+//
+//	sqlite.Add(Users, sqlite.Text("emailAddress").NotNull().RenamedFrom("email"))
+func (c *Col[T]) RenamedFrom(previous string) *Col[T] {
+	c.Column.renamedFrom = previous
+	return c
+}
+
+// PreviousName returns the name the column was declared to have been
+// renamed from, or empty when it was not. See (*Col[T]).RenamedFrom.
+func (c *Column) PreviousName() string { return c.renamedFrom }
 
 // Default sets a raw SQL default expression (e.g. "0", "CURRENT_TIMESTAMP").
 func (c *Col[T]) Default(sqlExpr string) *Col[T] {
@@ -164,7 +203,13 @@ func (c *Col[T]) Lte(v T) drops.Expression { return cmp(c.Column, "<=", v) }
 
 // EqCol compares two columns.
 func (c *Col[T]) EqCol(other ColRef) drops.Expression {
-	return binOp(c.Column, "=", other.col())
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteByte('(')
+		c.Column.WriteSQL(b)
+		b.WriteString(" = ")
+		other.col().WriteSQL(b)
+		b.WriteByte(')')
+	})
 }
 
 // IsNull / IsNotNull.
@@ -172,33 +217,23 @@ func (c *Col[T]) IsNull() drops.Expression    { return nullCheck(c.Column, true)
 func (c *Col[T]) IsNotNull() drops.Expression { return nullCheck(c.Column, false) }
 
 // In renders (col IN (?, ?, ...)). Empty renders "(0)" (never matches).
-//
-// Every value is BOUND, never rendered as an expression, which is the
-// rule the whole typed column form follows and the reason it needs
-// saying: T can be instantiated as an interface type, so a *Col[any]
-// would otherwise render whatever an Expression-valued argument writes
-// instead of binding it — a change of meaning decided by the type
-// parameter rather than by the call. The package-level [In] is the one
-// that takes an operand, and it holds it.
 func (c *Col[T]) In(values ...T) drops.Expression {
-	if len(values) == 0 {
-		return drops.Raw("(0)")
-	}
-	// One part before the column, one opening the list, one comma per
-	// further value, and the two closing parentheses.
-	parts := make([]string, len(values)+2)
-	parts[0] = "("
-	parts[1] = " IN ("
-	for i := 2; i <= len(values); i++ {
-		parts[i] = ", "
-	}
-	parts[len(values)+1] = "))"
-	operands := make([]drops.Expression, 0, len(values)+1)
-	operands = append(operands, c.Column)
-	for _, v := range values {
-		operands = append(operands, drops.Param{Value: v})
-	}
-	return &opExpr{parts: parts, operands: operands}
+	return drops.ExprFunc(func(b *drops.Builder) {
+		if len(values) == 0 {
+			b.WriteString("(0)")
+			return
+		}
+		b.WriteByte('(')
+		c.Column.WriteSQL(b)
+		b.WriteString(" IN (")
+		for i, v := range values {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.AddArg(v)
+		}
+		b.WriteString("))")
+	})
 }
 
 // Asc / Desc produce ORDER BY terms.
@@ -210,58 +245,113 @@ func (c *Column) Asc() drops.Expression  { return orderTerm(c, " ASC") }
 func (c *Column) Desc() drops.Expression { return orderTerm(c, " DESC") }
 
 func orderTerm(c *Column, dir string) drops.Expression {
-	return &opExpr{parts: []string{"", dir}, operands: []drops.Expression{c}}
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(dir)
+	})
 }
 
 // As aliases a column in a SELECT projection.
 func (c *Column) As(alias string) drops.Expression {
-	return aliasExpr(c, alias)
+	return drops.ExprFunc(func(b *drops.Builder) {
+		c.WriteSQL(b)
+		b.WriteString(" AS ")
+		b.WriteIdent(alias)
+	})
 }
 
 // Val binds a typed value for INSERT/UPDATE.
 func (c *Col[T]) Val(v T) ColumnValue { return columnValue{col: c.Column, val: v} }
 
-// cmp renders "(<col> <op> ?)". The value is always BOUND — never
-// rendered as an expression — because this is the typed column form and
-// its argument is a Go value of the column's own type. The untyped
-// package-level operators in op.go are the ones that take an operand,
-// and they hold it.
-func cmp(c *Column, op string, v any) drops.Expression {
-	return &opExpr{
-		parts:    []string{"(", " " + op + " ", ")"},
-		operands: []drops.Expression{c, drops.Param{Value: v}},
+// SetNull binds SQL NULL as the column's value.
+//
+// It is a parameter placeholder bound to nil, not the literal token,
+// so an INSERT that sometimes writes NULL is the same statement as
+// one that writes a value, and the NULL travels through the same
+// binding every other value does — where PII redaction, hooks and
+// tracers can see it. Before this existed there was no way at all to
+// write NULL into a SQLite INSERT through the public API.
+//
+// It does not refuse a NOT NULL column: that violation is one the
+// database reports precisely, and turning it into a panic on a
+// request path would trade a good error for a process failure.
+func (c *Col[T]) SetNull() ColumnValue { return columnValue{col: c.Column, val: nil} }
+
+// ValPtr binds *p, or NULL when p is nil. It is the shape an optional
+// struct field already has, and the one AutoTable reads as "this
+// column is nullable".
+func (c *Col[T]) ValPtr(p *T) ColumnValue {
+	if p == nil {
+		return c.SetNull()
 	}
+	// Binding *p rather than p keeps the bound argument's Go type
+	// identical to what Val would have bound.
+	return c.Val(*p)
+}
+
+// ValNull binds v.V, or NULL when v is not Valid.
+func (c *Col[T]) ValNull(v sql.Null[T]) ColumnValue {
+	if !v.Valid {
+		return c.SetNull()
+	}
+	// Unwrapped rather than handed to the driver: sql.Null[T].Value
+	// did not convert its payload before Go 1.25, so passing the
+	// wrapper through would make the parameter depend on the
+	// toolchain.
+	return c.Val(v.V)
+}
+
+func cmp(c *Column, op string, v any) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteByte('(')
+		c.WriteSQL(b)
+		b.WriteByte(' ')
+		b.WriteString(op)
+		b.WriteByte(' ')
+		b.AddArg(v)
+		b.WriteByte(')')
+	})
 }
 
 func nullCheck(c *Column, isNull bool) drops.Expression {
-	tail := " IS NOT NULL)"
-	if isNull {
-		tail = " IS NULL)"
-	}
-	return &opExpr{parts: []string{"(", tail}, operands: []drops.Expression{c}}
+	return drops.ExprFunc(func(b *drops.Builder) {
+		b.WriteByte('(')
+		c.WriteSQL(b)
+		if isNull {
+			b.WriteString(" IS NULL)")
+		} else {
+			b.WriteString(" IS NOT NULL)")
+		}
+	})
 }
 
-// And / Or combine predicates.
-//
-// Each operand is held rather than closed over, so a conjunct that is a
-// statement — And(Exists(sub), guard) — keeps its own scoping, and each
-// is bracketed when leaving it bare would let it reassociate its
-// neighbours: And(drops.Raw("a OR b"), guard) rendered
-// "(a OR b AND guard)", which is "(a OR (b AND guard))" and leaves the
-// guard binding nothing. See bracketConjunct.
-//
-// A single predicate is not bracketed, because there is nothing beside
-// it to reassociate, and the enclosing parentheses these render anyway
-// are the wrapper the caller sees. That keeps And(p) and Or(p)
-// rendering exactly the bytes they always did.
-func And(preds ...drops.Expression) drops.Expression { return boolChain(" AND ", preds) }
-func Or(preds ...drops.Expression) drops.Expression  { return boolChain(" OR ", preds) }
+// And / Or combine predicates, ignoring the nil ones. With no
+// arguments — or with nothing but nils — And renders TRUE and Or
+// renders FALSE, the identity of each. (SQLite has understood the two
+// keywords since 3.23.)
+func And(preds ...drops.Expression) drops.Expression { return boolChain(" AND ", "TRUE", preds) }
+func Or(preds ...drops.Expression) drops.Expression  { return boolChain(" OR ", "FALSE", preds) }
 
-func boolChain(sep string, preds []drops.Expression) drops.Expression {
-	if len(preds) > 1 {
-		preds = bracketConjuncts(preds)
-	}
-	return listOp("(", sep, ")", preds)
+func boolChain(sep, empty string, preds []drops.Expression) drops.Expression {
+	preds = dropNilPreds(preds)
+	return drops.ExprFunc(func(b *drops.Builder) {
+		if len(preds) == 0 {
+			b.WriteString(empty)
+			return
+		}
+		if len(preds) == 1 {
+			b.Append(preds[0])
+			return
+		}
+		b.WriteByte('(')
+		for i, p := range preds {
+			if i > 0 {
+				b.WriteString(sep)
+			}
+			b.Append(p)
+		}
+		b.WriteByte(')')
+	})
 }
 
 // ColumnValue is a column bound to a value for INSERT/UPDATE.
@@ -294,14 +384,3 @@ type exprValue struct {
 
 func (v exprValue) column() *Column             { return v.col }
 func (v exprValue) writeValue(b *drops.Builder) { b.Append(v.expr) }
-
-// boundExpr and withBoundExpr implement exprBound, so the statements
-// inside an [UpdateBuilder.SetExpr] assignment are resolved for the
-// executing ctx. The assigned value is the operand that decides what
-// gets written rather than which rows do; see resolveSets.
-func (v exprValue) boundExpr() drops.Expression { return v.expr }
-
-func (v exprValue) withBoundExpr(x drops.Expression) ColumnValue {
-	v.expr = x
-	return v
-}

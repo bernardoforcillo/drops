@@ -18,7 +18,7 @@ func counterFixture() (*mysql.Table, *mysql.Col[int64], *mysql.Col[int64], *mysq
 	t := mysql.NewTable("counters")
 	id := mysql.Add(t, mysql.BigSerial("id").PrimaryKey())
 	likes := mysql.Add(t, mysql.BigInt("likes").NotNull())
-	name := mysql.Add(t, mysql.Varchar("name", 64))
+	name := mysql.Add(t, mysql.Varchar("name", 64).NotNull())
 	return t, id, likes, name
 }
 

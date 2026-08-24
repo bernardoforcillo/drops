@@ -196,7 +196,7 @@ type acct struct {
 func TestPatch(t *testing.T) {
 	tbl := sqlite.NewTable("accts")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
-	balance := sqlite.Add(tbl, sqlite.BigInt("balance"))
+	balance := sqlite.Add(tbl, sqlite.BigInt("balance").NotNull())
 	ent := sqlite.NewEntity[acct](tbl)
 
 	drv := &entDriver{}
@@ -227,7 +227,7 @@ func TestPatch(t *testing.T) {
 func TestPatchDecSubtracts(t *testing.T) {
 	tbl := sqlite.NewTable("seatmaps")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
-	seats := sqlite.Add(tbl, sqlite.Custom[uint32]("seats", "INTEGER"))
+	seats := sqlite.Add(tbl, sqlite.Custom[uint32]("seats", "INTEGER").NotNull())
 	ent := sqlite.NewEntity[struct {
 		ID    int64  `drop:"id"`
 		Seats uint32 `drop:"seats"`
@@ -361,7 +361,10 @@ func TestPageCursorRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(drv2.queries[0], `("users"."id") > (?)`) {
+	// The guard is keysetWhere, the same one SelectBuilder.AfterCursor
+	// builds, so a single ordering column renders as a plain strict
+	// comparison rather than a one-element row comparison.
+	if !strings.Contains(drv2.queries[0], `("users"."id" > ?)`) {
 		t.Errorf("keyset guard absent:\n%s", drv2.queries[0])
 	}
 }

@@ -139,8 +139,11 @@ func TestSoftDeleteAgainstTheEngine(t *testing.T) {
 	tbl := sqlite.NewTable("posts")
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey().AutoIncrement())
 	title := sqlite.Add(tbl, sqlite.Text("title").NotNull())
+	// SoftDelete registers the FilterSoftDelete guard itself; declaring
+	// a second, anonymous copy of the same predicate would leave
+	// SoftDeleteByID and Restore unable to reach the hidden row, since
+	// only the named one is bypassable.
 	sd := sqlite.SoftDelete(tbl)
-	tbl.DefaultFilter(sd.DeletedAt.IsNull())
 	exec(t, db, sqlite.CreateTable(tbl))
 
 	type post struct {

@@ -603,3 +603,464 @@ func TestCHInsertThroughAliasColumnsKeepsItsValues(t *testing.T) {
 			gotGame, gotSeq, text, args)
 	}
 }
+
+// ----------------------------------------------------------------------
+// Introspection, diffing and Push
+//
+// These are the tests for clickhouse.Introspect / BuildSnapshot / Diff
+// / Push, and they are all here rather than in the package's own test
+// file for one reason: every claim they make is a claim about what a
+// ClickHouse server does. Which columns system.tables and
+// system.columns have, how the server re-spells a type or an engine
+// argument when it echoes one back, whether MODIFY COLUMN … REMOVE
+// CODEC parses at all — none of that can be settled by rendering a
+// string. The package's unit tests pin the shape of the SQL; these
+// pin that the server accepts it and reports back what drops expects.
+// ----------------------------------------------------------------------
+
+// pushSchema is the declaration the Push tests converge on: an engine
+// with a parameter, a composite sorting key, a partition expression, a
+// default, a codec, a comment and a setting.
+func pushSchema(name string) *clickhouse.Table {
+	tbl := clickhouse.NewTable(name)
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	ts := clickhouse.Add(tbl, clickhouse.DateTime("ts", "UTC"))
+	clickhouse.Add(tbl, clickhouse.String("kind").LowCardinality())
+	clickhouse.Add(tbl, clickhouse.Decimal("amount", 10, 2).Default("0"))
+	clickhouse.Add(tbl, clickhouse.String("note").Comment("free text").Codec("ZSTD(3)"))
+	clickhouse.Add(tbl, clickhouse.UInt64("version"))
+	tbl.Engine(clickhouse.ReplacingMergeTree("version")).
+		OrderBy(ts, id).
+		PartitionBy(clickhouse.ToYYYYMM(ts)).
+		Setting("index_granularity", "8192")
+	return tbl
+}
+
+// The test the introspection layer exists to pass. A table drops
+// created, read back through system.tables and system.columns, must
+// diff to nothing against the declaration that created it.
+//
+// This is not a tidiness property. The server echoes a declared
+// "Decimal(10,2)" as "Decimal(10, 2)", quotes identifiers only when it
+// has to, wraps a codec in CODEC(…), reports an engine's arguments
+// only inside engine_full, and materialises index_granularity into the
+// metadata whether or not anyone asked for it. Every one of those is a
+// difference a naive comparison reads as drift, and a push that reads
+// drift where there is none re-emits the same statements for ever.
+func TestCHIntrospectRoundTripsADeclaration(t *testing.T) {
+	db := openCH(t)
+	tbl := pushSchema(integration.UniqueName(t, "roundtrip"))
+	dropCH(t, db, tbl)
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	live, err := clickhouse.Introspect(context.Background(), db,
+		clickhouse.IntrospectOptions{Tables: []string{tbl.Name()}})
+	if err != nil {
+		t.Fatalf("Introspect: %v", err)
+	}
+	ts := live.Tables[tbl.Name()]
+	if ts == nil {
+		t.Fatalf("the table drops just created is not in %v", live.Tables)
+	}
+	if ts.Engine != "ReplacingMergeTree" {
+		t.Errorf("engine = %q", ts.Engine)
+	}
+	if len(ts.EngineParams) != 1 || ts.EngineParams[0] != "version" {
+		t.Errorf("engine params = %q — they live only in engine_full", ts.EngineParams)
+	}
+	if ts.SortingKey != "ts,id" {
+		t.Errorf("sorting key = %q", ts.SortingKey)
+	}
+	if ts.PartitionKey != "toYYYYMM(ts)" {
+		t.Errorf("partition key = %q", ts.PartitionKey)
+	}
+	if ts.Settings["index_granularity"] != "8192" {
+		t.Errorf("settings = %v", ts.Settings)
+	}
+	if got := ts.Columns["note"].Codec; got != "ZSTD(3)" {
+		t.Errorf("codec = %q, want the CODEC() wrapper undone", got)
+	}
+	if got := ts.Columns["note"].Comment; got != "free text" {
+		t.Errorf("comment = %q", got)
+	}
+	if got := ts.Columns["amount"].Default; got != "0" {
+		t.Errorf("default = %q", got)
+	}
+	if !ts.Columns["ts"].InSortingKey || !ts.Columns["ts"].InPartitionKey {
+		t.Errorf("ts is in the sorting key and the partition key: %+v", ts.Columns["ts"])
+	}
+	if ts.Columns["kind"].InKey() {
+		t.Errorf("kind is in no key: %+v", ts.Columns["kind"])
+	}
+
+	plan := clickhouse.Diff(live, clickhouse.BuildSnapshot(clickhouse.NewSchema(tbl)))
+	if !plan.Aligned() || len(plan.Notices) != 0 {
+		t.Errorf("a table diffed against the declaration that made it:\nstatements = %q\nrefusals = %v\nnotices = %v",
+			plan.Statements, plan.Refusals, plan.Notices)
+	}
+}
+
+// Push against an empty database creates the table; push again after
+// adding a column emits the ALTER and nothing else; push a third time
+// emits nothing at all. The third push is the one that matters — a
+// push that is not idempotent is a push nobody can run from CI.
+func TestCHPushCreatesThenEvolvesThenSettles(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "push")
+	dropCH(t, db, clickhouse.NewTable(name))
+
+	res, err := clickhouse.Push(ctx, db, clickhouse.NewSchema(pushSchema(name)))
+	if err != nil {
+		t.Fatalf("Push: %v (statements %q)", err, res.Statements)
+	}
+	if len(res.Statements) != 1 || !strings.HasPrefix(res.Statements[0], "CREATE TABLE") {
+		t.Fatalf("statements = %q", res.Statements)
+	}
+
+	grown := pushSchema(name)
+	clickhouse.Add(grown, clickhouse.String("source").Nullable())
+	res, err = clickhouse.Push(ctx, db, clickhouse.NewSchema(grown))
+	if err != nil {
+		t.Fatalf("Push: %v (statements %q)", err, res.Statements)
+	}
+	if len(res.Statements) != 1 || !strings.Contains(res.Statements[0], "ADD COLUMN") {
+		t.Fatalf("statements = %q", res.Statements)
+	}
+
+	res, err = clickhouse.Push(ctx, db, clickhouse.NewSchema(pushSchemaWithSource(name)))
+	if err != nil {
+		t.Fatalf("Push: %v (statements %q)", err, res.Statements)
+	}
+	if len(res.Statements) != 0 {
+		t.Errorf("a settled schema still wants %q", res.Statements)
+	}
+	if len(res.Notices) != 0 {
+		t.Errorf("notices = %v", res.Notices)
+	}
+}
+
+// pushSchemaWithSource is pushSchema plus the column the evolution
+// added, in the position the ALTER put it.
+func pushSchemaWithSource(name string) *clickhouse.Table {
+	tbl := pushSchema(name)
+	clickhouse.Add(tbl, clickhouse.String("source").Nullable())
+	return tbl
+}
+
+// The statements drops emits for the properties of a column are the
+// ones this repository is least sure of, because their grammar is
+// written down in the docs and nowhere else: IF EXISTS after MODIFY
+// COLUMN and before REMOVE, an empty literal as the way to clear a
+// comment, MODIFY TTL and REMOVE TTL on the table. This test exists to
+// let the server rule on all of them at once.
+func TestCHColumnPropertyStatementsParse(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "props")
+	tbl := clickhouse.NewTable(name)
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	ts := clickhouse.Add(tbl, clickhouse.DateTime("ts", "UTC"))
+	clickhouse.Add(tbl, clickhouse.String("note").
+		Default("'unset'").
+		Comment("free text").
+		Codec("ZSTD(3)"))
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(ts, id)
+	dropCH(t, db, tbl)
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	q := `ALTER TABLE "` + name + `" `
+	for _, stmt := range []string{
+		q + `MODIFY COLUMN IF EXISTS "note" REMOVE DEFAULT`,
+		q + `MODIFY COLUMN IF EXISTS "note" REMOVE CODEC`,
+		q + `COMMENT COLUMN IF EXISTS "note" ''`,
+		q + `MODIFY COLUMN IF EXISTS "note" String DEFAULT 'set' COMMENT 'back again' CODEC(LZ4)`,
+		q + `MODIFY TTL "ts" + INTERVAL 30 DAY`,
+		q + `REMOVE TTL`,
+		q + `MODIFY SETTING merge_with_ttl_timeout = 3600`,
+	} {
+		if _, err := db.Exec(ctx, stmt); err != nil {
+			t.Errorf("ClickHouse rejected the statement: %v\n%s", err, stmt)
+		}
+	}
+
+	// And the column really did come back to the shape the last
+	// restatement asked for, rather than the statement merely parsing.
+	live, err := clickhouse.IntrospectTable(ctx, db, "", name)
+	if err != nil {
+		t.Fatalf("IntrospectTable: %v", err)
+	}
+	note := live.Columns["note"]
+	if note.Default != "'set'" || note.Comment != "back again" || note.Codec != "LZ4" {
+		t.Errorf("note = %+v, want the restated default, comment and codec", note)
+	}
+	if live.TTL != "" {
+		t.Errorf("REMOVE TTL left %q behind", live.TTL)
+	}
+}
+
+// The premise behind every RefuseSortingKey: on a ReplacingMergeTree
+// the sorting key is not a layout choice, it is the definition of "the
+// same row". Two rows that share it become one; the same two rows
+// under a wider key stay two. A schema tool that changed the key in
+// place would be silently changing how much data the table holds.
+func TestCHSortingKeyDecidesWhatOneRowIs(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+
+	count := func(tbl *clickhouse.Table) uint64 {
+		t.Helper()
+		if _, err := db.Exec(ctx, `OPTIMIZE TABLE "`+tbl.Name()+`" FINAL`); err != nil {
+			t.Fatalf("optimize: %v", err)
+		}
+		var n uint64
+		if err := db.Select(clickhouse.CountAll()).From(tbl).One(ctx, &n); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+
+	narrow := clickhouse.NewTable(integration.UniqueName(t, "narrow"))
+	nid := clickhouse.Add(narrow, clickhouse.UInt64("id"))
+	nslug := clickhouse.Add(narrow, clickhouse.String("slug"))
+	nver := clickhouse.Add(narrow, clickhouse.UInt64("version"))
+	narrow.Engine(clickhouse.ReplacingMergeTree("version")).OrderBy(nid)
+	dropCH(t, db, narrow)
+	execCH(t, db, clickhouse.CreateTable(narrow))
+
+	wide := clickhouse.NewTable(integration.UniqueName(t, "wide"))
+	wid := clickhouse.Add(wide, clickhouse.UInt64("id"))
+	wslug := clickhouse.Add(wide, clickhouse.String("slug"))
+	wver := clickhouse.Add(wide, clickhouse.UInt64("version"))
+	wide.Engine(clickhouse.ReplacingMergeTree("version")).OrderBy(wid, wslug)
+	dropCH(t, db, wide)
+	execCH(t, db, clickhouse.CreateTable(wide))
+
+	for _, slug := range []string{"a", "b"} {
+		if _, err := db.Insert(narrow).Row(nid.Val(1), nslug.Val(slug), nver.Val(1)).Exec(ctx); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if _, err := db.Insert(wide).Row(wid.Val(1), wslug.Val(slug), wver.Val(1)).Exec(ctx); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	if n := count(narrow); n != 1 {
+		t.Errorf("ORDER BY (id) left %d rows, want 1 — the engine collapses on the sorting key", n)
+	}
+	if n := count(wide); n != 2 {
+		t.Errorf("ORDER BY (id, slug) left %d rows, want 2 — the same two rows are two rows under this key", n)
+	}
+}
+
+// Push refuses a sorting key that moved rather than emitting a
+// statement for it, and runs nothing at all until it is told to.
+func TestCHPushRefusesASortingKeyThatMoved(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "refuse")
+	dropCH(t, db, clickhouse.NewTable(name))
+	if _, err := clickhouse.Push(ctx, db, clickhouse.NewSchema(pushSchema(name))); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+
+	moved := pushSchema(name)
+	rekeyed := clickhouse.NewTable(name)
+	for _, c := range moved.Columns() {
+		clickhouse.Add(rekeyed, clickhouse.Custom[string](c.Name(), c.Type().TypeSQL()))
+	}
+	rekeyed.Engine(clickhouse.ReplacingMergeTree("version")).
+		OrderBy(rekeyed.Col("id")).
+		PartitionBy(clickhouse.ToYYYYMM(rekeyed.Col("ts"))).
+		Setting("index_granularity", "8192")
+
+	res, err := clickhouse.Push(ctx, db, clickhouse.NewSchema(rekeyed))
+	if !errors.Is(err, clickhouse.ErrRefused) {
+		t.Fatalf("err = %v, want ErrRefused", err)
+	}
+	if res.AppliedCount != 0 {
+		t.Errorf("a refused push ran %d statements", res.AppliedCount)
+	}
+	var found bool
+	for _, r := range res.Refusals {
+		if r.Kind == clickhouse.RefuseSortingKey {
+			found = true
+			if !strings.Contains(r.Detail, "copy") {
+				t.Errorf("the refusal has to name the remedy: %s", r.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("refusals = %v", res.Refusals)
+	}
+}
+
+// The premise behind RefuseColumnType: ClickHouse will not ALTER a
+// column that is part of a key, whatever drops or the operator thinks
+// about it. If a future version starts allowing it, this test says so
+// and the refusal can be relaxed rather than being carried for ever on
+// a rule nobody re-checked.
+func TestCHRefusesToAlterAKeyColumn(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "keycol")
+	tbl := clickhouse.NewTable(name)
+	id := clickhouse.Add(tbl, clickhouse.UInt32("id"))
+	clickhouse.Add(tbl, clickhouse.String("payload"))
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(id)
+	dropCH(t, db, tbl)
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	if _, err := db.Exec(ctx, `ALTER TABLE "`+name+`" MODIFY COLUMN "id" String`); err == nil {
+		t.Error("ClickHouse accepted an ALTER of a sorting-key column; the RefuseColumnType rule is now wrong")
+	}
+	if _, err := db.Exec(ctx, `ALTER TABLE "`+name+`" DROP COLUMN "id"`); err == nil {
+		t.Error("ClickHouse accepted a DROP of a sorting-key column; the RefuseDropColumn rule is now wrong")
+	}
+	// And the column outside the key is fine, so the refusal is about
+	// the key and not about the table having data.
+	if _, err := db.Exec(ctx, `ALTER TABLE "`+name+`" MODIFY COLUMN "payload" Nullable(String)`); err != nil {
+		t.Errorf("a non-key column must still be alterable: %v", err)
+	}
+}
+
+// The premise behind clickhouse.LowCardinalitySafe: the wrapper is
+// refused over a fixed-width type unless the server is told to allow
+// it, and accepted over String. It decides whether a MODIFY COLUMN can
+// carry an operator's encoding onto a new type or has to report the
+// loss, so it is worth asking the server rather than the changelog.
+func TestCHLowCardinalityOverANumberNeedsTheSetting(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+
+	ok := clickhouse.NewTable(integration.UniqueName(t, "lcstr"))
+	okID := clickhouse.Add(ok, clickhouse.UInt64("id"))
+	clickhouse.Add(ok, clickhouse.Custom[string]("label", "LowCardinality(String)"))
+	ok.Engine(clickhouse.MergeTree()).OrderBy(okID)
+	dropCH(t, db, ok)
+	execCH(t, db, clickhouse.CreateTable(ok))
+
+	bad := clickhouse.NewTable(integration.UniqueName(t, "lcnum"))
+	badID := clickhouse.Add(bad, clickhouse.UInt64("id"))
+	clickhouse.Add(bad, clickhouse.Custom[string]("n", "LowCardinality(Int32)"))
+	bad.Engine(clickhouse.MergeTree()).OrderBy(badID)
+	dropCH(t, db, bad)
+
+	sql, _ := drops.StringWithDialect(clickhouse.Dialect, clickhouse.CreateTable(bad))
+	if _, err := db.Exec(ctx, sql); err == nil {
+		t.Error("ClickHouse accepted LowCardinality(Int32) with its default settings; " +
+			"clickhouse.LowCardinalitySafe is now too narrow")
+	} else if !strings.Contains(err.Error(), "allow_suspicious_low_cardinality_types") {
+		t.Errorf("the server refused for a different reason than drops reports to callers: %v", err)
+	}
+}
+
+// The one string in a schema statement drops did not write itself. A
+// comment travels as a literal in CREATE TABLE, in COMMENT COLUMN and
+// inside a MODIFY COLUMN restatement, and ClickHouse's lexer reads
+// C-style escapes inside a literal — so a comment ending in a
+// backslash escapes its own closing quote and a comment of \' OR 1=1
+// -- leaves the literal altogether. Only a server can settle which
+// escapes its lexer honours, which is why the round trip is here
+// rather than in the package's own tests.
+func TestCHACommentCannotEscapeItsLiteral(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+	const nasty = `C:\ and 'quoted' and \' OR 1=1 --`
+
+	name := integration.UniqueName(t, "comments")
+	tbl := clickhouse.NewTable(name)
+	id := clickhouse.Add(tbl, clickhouse.UInt64("id"))
+	clickhouse.Add(tbl, clickhouse.String("note").Comment(nasty))
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(id)
+	dropCH(t, db, tbl)
+	// A statement the server rejects is the loud failure; a statement
+	// it accepts having read something else is the quiet one, so both
+	// halves are checked.
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	live, err := clickhouse.IntrospectTable(ctx, db, "", name)
+	if err != nil {
+		t.Fatalf("IntrospectTable: %v", err)
+	}
+	if got := live.Columns["note"].Comment; got != nasty {
+		t.Errorf("CREATE TABLE stored the comment as %q, want %q", got, nasty)
+	}
+
+	// And again through the statement Diff emits, which is the other
+	// writer.
+	changed := clickhouse.NewTable(name)
+	cid := clickhouse.Add(changed, clickhouse.UInt64("id"))
+	clickhouse.Add(changed, clickhouse.String("note").Comment(nasty+` \`))
+	changed.Engine(clickhouse.MergeTree()).OrderBy(cid)
+
+	res, err := clickhouse.Push(ctx, db, clickhouse.NewSchema(changed))
+	if err != nil {
+		t.Fatalf("Push: %v (statements %q)", err, res.Statements)
+	}
+	if len(res.Statements) != 1 || !strings.Contains(res.Statements[0], "COMMENT COLUMN") {
+		t.Fatalf("statements = %q", res.Statements)
+	}
+	live, err = clickhouse.IntrospectTable(ctx, db, "", name)
+	if err != nil {
+		t.Fatalf("IntrospectTable: %v", err)
+	}
+	if got := live.Columns["note"].Comment; got != nasty+` \` {
+		t.Errorf("COMMENT COLUMN stored %q, want %q", got, nasty+` \`)
+	}
+	// The push has to settle, or the comparison is reading the escape
+	// back as drift and will re-emit the statement for ever.
+	res, err = clickhouse.Push(ctx, db, clickhouse.NewSchema(changed))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(res.Statements) != 0 {
+		t.Errorf("a settled comment still wants %q", res.Statements)
+	}
+}
+
+// A view in the same database is not drops's to touch: the Go schema
+// cannot declare one, so a diff that treated it as a table nobody
+// declared would drop it.
+func TestCHPushLeavesAViewAlone(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+	name := integration.UniqueName(t, "viewbase")
+	tbl := pushSchema(name)
+	dropCH(t, db, tbl)
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	view := integration.UniqueName(t, "viewof")
+	t.Cleanup(func() { _, _ = db.Exec(ctx, `DROP VIEW IF EXISTS "`+view+`"`) })
+	if _, err := db.Exec(ctx, `CREATE VIEW "`+view+`" AS SELECT "id" FROM "`+name+`"`); err != nil {
+		t.Fatalf("create view: %v", err)
+	}
+
+	res, err := clickhouse.Push(ctx, db, clickhouse.NewSchema(tbl))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	for _, s := range res.Statements {
+		if strings.Contains(s, view) {
+			t.Errorf("push touched a view it was never told about: %s", s)
+		}
+	}
+	// And the view is still there, which is the half that a statement
+	// list cannot prove on its own.
+	rows, err := db.Query(ctx,
+		`SELECT count() FROM system.tables WHERE database = currentDatabase() AND name = ?`, view)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	var n uint64
+	if !rows.Next() {
+		t.Fatal("count() with no GROUP BY produces exactly one row")
+	}
+	if err := rows.Scan(&n); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("the view is gone")
+	}
+}

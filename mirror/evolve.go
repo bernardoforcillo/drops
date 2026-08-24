@@ -850,9 +850,9 @@ func (e *Evolver) dropStep(cur MirrorColumn) EvolutionStep {
 // It reads the steps built so far rather than a map so the answer does
 // not depend on iteration order.
 func evolveRenameTwin(steps []EvolutionStep, dropped string) string {
-	want := evolveNormalizeType(dropped)
+	want := clickhouse.NormalizeType(dropped)
 	for _, s := range steps {
-		if s.Kind == EvolveAddColumn && evolveNormalizeType(s.To) == want {
+		if s.Kind == EvolveAddColumn && clickhouse.NormalizeType(s.To) == want {
 			return s.Column
 		}
 	}
@@ -889,49 +889,39 @@ const (
 // a MODIFY COLUMN should actually set — which is the derived type
 // except where a live LowCardinality wrapper is carried onto it — and
 // the sentence that explains the decision.
+//
+// The analysis itself belongs to the dialect and lives there, in
+// [clickhouse.ClassifyTypeChange]: whether Int16 widens to Int32,
+// whether a LowCardinality wrapper can travel onto the new type, and
+// what ClickHouse will refuse outright are facts about ClickHouse
+// rather than about mirroring, and two copies of them would drift.
+//
+// What stays here is the part that is about this mirror, and it is not
+// only wording. A column losing its Nullable is merely unprovable for
+// a table in general — the mutation fails on the first NULL and there
+// may be none — and it is certain to fail here, because
+// [ClickHouseSink] writes NULL into every non-key column of every
+// tombstone. So the verdict is upgraded, and the explanations name the
+// mirror's own reasons: the sorting key doubling as what
+// ReplacingMergeTree deduplicates on, the source deriving the type
+// rather than an operator declaring it.
 func evolveClassifyType(want, live string, inKey bool) (verdict evolveVerdict, to, why string) {
-	w := evolveNormalizeType(want)
-	l := evolveNormalizeType(live)
-	if w == l {
-		return evolveTypeMatches, "", ""
-	}
-	// LowCardinality changes how values are stored, not which values
-	// can be stored. The derived declaration says nothing about
-	// encodings, so one applied by hand is a tuning decision to
-	// respect rather than drift to undo.
-	stripped := evolveStripLowCardinality(l)
-	lowCard := stripped != l
-	if stripped == w {
-		return evolveTypeMatches, "", ""
-	}
-	if inKey {
+	change := clickhouse.ClassifyTypeChange(want, live, inKey)
+	switch change.Cause {
+	case clickhouse.CauseKeyColumn:
 		return evolveTypeImpossible, "", fmt.Sprintf(
 			"%s is part of the sorting, primary or partition key, and ClickHouse will not ALTER such a column: "+
 				"the key is the on-disk layout, and for this mirror it is also what ReplacingMergeTree deduplicates on. "+
 				"Changing it to %s means creating a new table and copying into it", live, want)
-	}
-	wBase, wNull := evolveNullable(w)
-	lBase, lNull := evolveNullable(stripped)
-	if lNull && !wNull {
+
+	case clickhouse.CauseNullRemoval:
+		// Unprovable for a table in general, certain here.
 		return evolveTypeImpossible, "", fmt.Sprintf(
 			"going from %s to %s means casting every stored NULL, and this mirror writes NULL into every "+
 				"non-key column of every tombstone, so the mutation fails as soon as one delete has been mirrored. "+
 				"Keep the column Nullable, or rebuild the table", live, want)
-	}
-	// Whether the values themselves survive is a separate question
-	// from whether the encoding does, and a column can fail both at
-	// once. Settle it first so neither answer can hide the other.
-	keepsEveryValue := wBase == lBase || evolveWidens(lBase, wBase)
 
-	// A live wrapper has to survive the statement or the ALTER
-	// rewrites a column somebody encoded on purpose. Keeping it is
-	// only safe where ClickHouse accepts the wrapper on the new type:
-	// LowCardinality over a fixed-size type of eight bytes or less is
-	// refused unless allow_suspicious_low_cardinality_types is on, and
-	// of everything [MapType] derives that leaves String. So either
-	// the wrapper travels, or the caller says which of the two losses
-	// they want.
-	if lowCard && !evolveLowCardinalitySafe(wBase) {
+	case clickhouse.CauseLowCardinalityWrapper:
 		why := fmt.Sprintf(
 			"the mirror holds %s where the source derives %s, and the wrapper cannot come along: ClickHouse "+
 				"refuses LowCardinality(%s) unless allow_suspicious_low_cardinality_types is set, so the "+
@@ -943,149 +933,20 @@ func evolveClassifyType(want, live string, inKey bool) (verdict evolveVerdict, t
 		// storage-size decision, and the caller who shrugs at that
 		// and passes the column to AllowTypeChange has not been told
 		// the mutation may not finish.
-		if !keepsEveryValue {
+		if change.ValuesAtRisk {
 			why += fmt.Sprintf(
 				". The values are the larger risk: ClickHouse would cast every one of them from %s to %s, and "+
 					"drops cannot prove that conversion keeps them — it can round, overflow, or throw part-way "+
 					"through the mutation", live, want)
 		}
-		return evolveTypeLossy, want, why
+		return evolveTypeLossy, change.To, why
 	}
-	if lowCard {
-		to = "LowCardinality(" + want + ")"
-	} else {
-		to = want
-	}
-	if keepsEveryValue {
-		if lowCard {
-			return evolveTypeInPlace, to, fmt.Sprintf(
-				"%s widens to %s, so every value ClickHouse already holds is still a value of the new type, and "+
-					"the LowCardinality wrapper is kept rather than undone", live, to)
-		}
-		return evolveTypeInPlace, to, fmt.Sprintf(
-			"%s widens to %s, so every value ClickHouse already holds is still a value of the new type", live, to)
-	}
-	return evolveTypeLossy, to, fmt.Sprintf(
-		"ClickHouse would cast every stored value from %s to %s, and drops cannot prove that conversion keeps "+
-			"them — it can round, overflow, or throw part-way through the mutation", live, to)
-}
 
-// evolveLowCardinalitySafe reports whether ClickHouse accepts a
-// LowCardinality wrapper around this type with its default settings.
-// Everything of fixed size up to eight bytes — every number, Date32,
-// DateTime64, Bool — needs allow_suspicious_low_cardinality_types, so
-// of the types [MapType] derives only the variable-width one is safe.
-func evolveLowCardinalitySafe(base string) bool {
-	return base == "String"
-}
-
-// evolveNormalizeType strips the whitespace ClickHouse adds when it
-// echoes a type back — "Decimal(10, 2)" for a column declared
-// "Decimal(10,2)" — so that a comparison is about the type rather than
-// about the server's formatting. Text inside quotes is left alone,
-// because a time zone name is a value and not syntax.
-func evolveNormalizeType(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	inQuote := false
-	for _, r := range s {
-		if r == '\'' {
-			inQuote = !inQuote
-		} else if !inQuote && (r == ' ' || r == '\t' || r == '\n' || r == '\r') {
-			continue
-		}
-		b.WriteRune(r)
+	switch change.Verdict {
+	case clickhouse.TypeWidens:
+		return evolveTypeInPlace, change.To, change.Why
+	case clickhouse.TypeUnprovable:
+		return evolveTypeLossy, change.To, change.Why
 	}
-	return b.String()
-}
-
-// evolveStripLowCardinality removes one LowCardinality wrapper.
-func evolveStripLowCardinality(t string) string {
-	if inner, ok := evolveInner(t, "LowCardinality"); ok {
-		return inner
-	}
-	return t
-}
-
-// evolveNullable splits Nullable(T) into T and true.
-func evolveNullable(t string) (base string, nullable bool) {
-	if inner, ok := evolveInner(t, "Nullable"); ok {
-		return inner, true
-	}
-	return t, false
-}
-
-// evolveInner unwraps "Wrapper(inner)". It only ever runs against a
-// normalised type, where the wrapper is the outermost token and there
-// is no whitespace to skip.
-func evolveInner(t, wrapper string) (string, bool) {
-	if !strings.HasPrefix(t, wrapper+"(") || !strings.HasSuffix(t, ")") {
-		return "", false
-	}
-	return t[len(wrapper)+1 : len(t)-1], true
-}
-
-// evolveWidens reports whether every value of type from is also a
-// value of type to, which is the condition under which a MODIFY COLUMN
-// can neither lose a value nor fail on one.
-//
-// The rule is deliberately narrow. Only same-family numeric widening
-// and Decimal precision growth qualify; Int64 to Float64 does not,
-// because floats above 2^53 stop being exact, and unsigned to signed
-// does not, because the top of the range wraps.
-func evolveWidens(from, to string) bool {
-	if f, ok := evolveNumeric(from); ok {
-		t, ok := evolveNumeric(to)
-		return ok && f.family == t.family && t.bits > f.bits
-	}
-	fp, fs, ok := evolveDecimal(from)
-	if !ok {
-		return false
-	}
-	tp, ts, ok := evolveDecimal(to)
-	return ok && ts == fs && tp > fp
-}
-
-// evolveNumericType is a ClickHouse fixed-width number.
-type evolveNumericType struct {
-	family string
-	bits   int
-}
-
-// evolveNumeric parses "Int32", "UInt8", "Float64" and friends.
-func evolveNumeric(t string) (evolveNumericType, bool) {
-	// UInt before Int: "UInt8" carries both prefixes and only the
-	// first is the family.
-	for _, family := range []string{"UInt", "Int", "Float"} {
-		if !strings.HasPrefix(t, family) {
-			continue
-		}
-		bits, err := strconv.Atoi(t[len(family):])
-		if err != nil {
-			return evolveNumericType{}, false
-		}
-		return evolveNumericType{family: family, bits: bits}, true
-	}
-	return evolveNumericType{}, false
-}
-
-// evolveDecimal parses "Decimal(p,s)".
-func evolveDecimal(t string) (precision, scale int, ok bool) {
-	args, found := evolveInner(t, "Decimal")
-	if !found {
-		return 0, 0, false
-	}
-	p, s, split := strings.Cut(args, ",")
-	if !split {
-		return 0, 0, false
-	}
-	precision, err := strconv.Atoi(p)
-	if err != nil {
-		return 0, 0, false
-	}
-	scale, err = strconv.Atoi(s)
-	if err != nil {
-		return 0, 0, false
-	}
-	return precision, scale, true
+	return evolveTypeMatches, "", ""
 }

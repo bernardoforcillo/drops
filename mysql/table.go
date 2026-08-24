@@ -2,11 +2,14 @@ package mysql
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/bernardoforcillo/drops"
 )
 
-// Table is a MySQL table: a name and its columns.
+// Table is a MySQL table: a name, its columns, and the relations
+// declared against it.
 type Table struct {
 	database  string
 	name      string
@@ -17,6 +20,12 @@ type Table struct {
 	comment   string
 	columns   []*Column
 	byName    map[string]*Column
+	relations map[string]*Relation
+
+	// filters are AND-ed onto every SELECT from this table. A named
+	// one (AddFilter) can be bypassed on its own with IgnoreFilters;
+	// an anonymous one (DefaultFilter) only by Unscoped.
+	filters []tableFilter
 
 	// indexes and checks are what the migration layer needs and the
 	// query layer never looks at: the secondary indexes and CHECK
@@ -29,18 +38,31 @@ type Table struct {
 	// a table as declared — see key.
 	origin *Table
 
-	// scope carries every automatic predicate the table declares —
-	// both filter lists and the write-side tenant column. It is a
-	// pointer, and an alias taken off this table SHARES it rather than
-	// copying it — see tableScope, and see Table.As for the write that
-	// went out unscoped while it was a snapshot.
-	scope *tableScope
+	// renamedFrom is the name this table used to have, set by
+	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
+	renamedFrom string
 }
+
+// RenamedFrom states that this table is the table that used to be
+// called previous. It is the table-level counterpart of
+// (*Col[T]).RenamedFrom, and carries the same fact for the same
+// reason: a diff sees one table gone and another arrived, and nothing
+// but the schema can say they are the same table.
+//
+//	var Users = mysql.NewTable("people").RenamedFrom("users")
+func (t *Table) RenamedFrom(previous string) *Table {
+	t.renamedFrom = previous
+	return t
+}
+
+// PreviousName returns the name the table was declared to have been
+// renamed from, or empty when it was not.
+func (t *Table) PreviousName() string { return t.renamedFrom }
 
 // NewTable creates a table in the connection's default database.
 func NewTable(name string) *Table {
 	mustIdent("table", name)
-	return &Table{name: name, byName: map[string]*Column{}, scope: &tableScope{}}
+	return &Table{name: name, byName: map[string]*Column{}, relations: map[string]*Relation{}}
 }
 
 // NewDatabaseTable scopes the table to an explicit database, which is
@@ -49,10 +71,10 @@ func NewDatabaseTable(database, name string) *Table {
 	mustIdent("database", database)
 	mustIdent("table", name)
 	return &Table{
-		database: database,
-		name:     name,
-		byName:   map[string]*Column{},
-		scope:    &tableScope{},
+		database:  database,
+		name:      name,
+		byName:    map[string]*Column{},
+		relations: map[string]*Relation{},
 	}
 }
 
@@ -61,16 +83,6 @@ func (t *Table) Database() string { return t.database }
 func (t *Table) Alias() string    { return t.alias }
 
 // As returns a copy of the table under an alias, for self-joins.
-//
-// An alias is a second handle on ONE table, and the rule the four
-// dialects state in the same words has two halves: the alias SHARES the
-// table's whole scope — both filter lists, the write-side tenant column
-// and the lifecycle hooks — and it REBINDS its columns. Sharing is what
-// stops the alias disagreeing with its table about which rows may be
-// seen; rebinding is what stops it disagreeing with the statement about
-// which relation a reference names. Neither half is optional, and each
-// was got wrong on its own in some dialect before this was written
-// down.
 //
 // The copy carries its own columns, bound to the aliased table, so a
 // reference reached through it — u := users.As("u"); u.Col("id") —
@@ -89,51 +101,28 @@ func (t *Table) Alias() string    { return t.alias }
 // INSERT, whose INTO clause has no AS to carry. Aliasing changes how a
 // reference renders and nothing else.
 //
-// The automatic predicates a table carries are SHARED with the alias
-// rather than copied, and shared rather than snapshotted because the
-// alias is the same table: a filter or a lifecycle hook registered on
-// either handle at any time applies to both, in whichever order the two
-// happen. That ordering is not hypothetical. Go initialises
-// package-level variables before it runs init, so an alias declared
-// beside its table is taken before any init or constructor that
-// declares the scoping — and while the lists were copied, that alias
-// was unscoped for ever. It rendered DELETE `u` FROM `users` AS `u`
-// with no predicate at all, on a ctx carrying no tenant, without
-// refusing; and it lost a soft-delete guard registered after it was
-// taken, so it read rows the application had deleted.
+// What is not rewritten is anything the caller built and drops only
+// re-emits: a predicate, and the expression inside a [SetExpr]. Both
+// are closed over the handles they were given. A default filter
+// registered against the declared columns therefore still qualifies
+// with the table name, and against a query whose only FROM entry is
+// the alias MySQL answers 1054 — so scope an aliased query with
+// Unscoped and an explicit predicate built from the alias's own
+// handles.
 //
-// BOTH filter lists are shared, on the same terms, because the argument
-// does not distinguish them: a [Table.DefaultFilter] registered after
-// As was taken went missing exactly as a [Table.ContextFilter] did, and
-// the difference between the two failures is only how bad it is.
+// Relations are copied too, with their near side — the column that
+// belongs to this table — rebound to the alias and the far side left
+// alone. On a self-referential relation that is the whole point: the
+// two ends of the edge are two instances of one table, and only one of
+// them is the aliased one.
 //
-// The predicates cannot be rewritten, being closures over the handles
-// they were given, so they are rendered inside a relation rename
-// instead: see resolveFilterExprs. Without it an aliased query against
-// a scoped table could not run at all — `users`.`deletedAt` against
-// FROM `users` AS `u` is MySQL 1054, not a widened result — which made
-// the one table shape that must never lose its tenant axis the one
-// shape that could not be queried under an alias.
-//
-// The consequence in the other direction is that registering on an
-// alias registers on the table, and so on every other alias of it,
-// which is what "the same table" has to mean. Where two genuinely
-// different scopings are wanted, they are two tables — so register over
-// the DECLARED column handles even when the call goes through an alias,
-// since the base table renders the same predicate and an alias handle
-// would qualify with a relation its statement never names.
-//
-// What is still not rewritten is anything the caller built and drops
-// only re-emits: a predicate, and the expression inside a [SetExpr].
-// Both are closed over the handles they were given, so build them from
-// the handles of the relation the statement names.
-//
-// The SHAPE of the table is still a snapshot, and only the shape: a
-// column, index or check added to the base table after As returned does
-// not reach the alias, for the same package-level-var reason described
-// above. Take the alias at the query site, or after the schema is
-// complete. Scoping is exempt from that caveat because scoping is the
-// half where being a snapshot destroys data.
+// The copy is a snapshot. A column, relation, index, default filter or
+// check added to the base table after As returned does not reach the
+// alias, and none added to the alias reaches the table. That matters
+// because Go initialises package-level variables before it runs init:
+// an alias declared as a var beside its table is taken before any init
+// that declares relations. Take the alias at the query site, or after
+// the schema is complete.
 func (t *Table) As(alias string) *Table {
 	mustIdent("alias", alias)
 	cp := *t
@@ -151,19 +140,41 @@ func (t *Table) As(alias string) *Table {
 		cp.columns[i] = &aliased
 		cp.byName[aliased.name] = &aliased
 	}
+	// rebind maps a column declared on t to the aliased copy's handle
+	// for it, and leaves any column belonging to another table alone.
+	rebind := func(c *Column) *Column {
+		if c != nil && c.table == t {
+			if aliased := cp.byName[c.name]; aliased != nil {
+				return aliased
+			}
+		}
+		return c
+	}
+	cp.relations = make(map[string]*Relation, len(t.relations))
+	for name, rel := range t.relations {
+		r := *rel
+		r.From = &cp
+		if r.Kind == BelongsToKind {
+			// The inverse edge holds its own key in ChildKey; ParentKey
+			// names the far table.
+			r.ChildKey = rebind(r.ChildKey)
+		} else {
+			r.ParentKey = rebind(r.ParentKey)
+		}
+		cp.relations[name] = &r
+	}
 	if t.checks != nil {
 		cp.checks = make(map[string]string, len(t.checks))
 		for name, expr := range t.checks {
 			cp.checks[name] = expr
 		}
 	}
-	// The index list is shared by value but not by array: a copy taken
-	// at full capacity would let an append through the alias land in
-	// the base table's spare capacity, and the next append through
-	// another handle overwrite it. It is the last slice here that is
-	// copied at all — both filter lists live in the shared tableScope,
-	// which cp already points at.
+	// The remaining slices are shared by value but not by array: a
+	// copy taken at full capacity would let an append through the
+	// alias land in the base table's spare capacity, and the next
+	// append through another handle overwrite it.
 	cp.indexes = append([]*Index(nil), t.indexes...)
+	cp.filters = append([]tableFilter(nil), t.filters...)
 	return &cp
 }
 
@@ -171,6 +182,11 @@ func (t *Table) As(alias string) *Table {
 // alias copy onto the table it was declared as. It is Column.key for
 // the *Table handles, and for the same reason: an alias is a second
 // handle on one table.
+//
+// It is deliberately not what As's own rebind consults. That one asks
+// which columns belong to the instance being aliased, and collapsing
+// origins there would rebind the far side of a self-referential
+// relation — erasing the distinction the alias exists to draw.
 func (t *Table) key() *Table {
 	if t.origin != nil {
 		return t.origin
@@ -200,18 +216,54 @@ func (t *Table) Collate(name string) *Table { t.collation = name; return t }
 // Comment attaches a COMMENT to the table.
 func (t *Table) Comment(text string) *Table { t.comment = text; return t }
 
-// DefaultFilter registers a predicate AND-ed onto every SELECT from
-// this table — a soft-delete or tenant guard. Bypass it with
-// (*SelectBuilder).Unscoped.
+// DefaultFilter registers an anonymous predicate AND-ed onto every
+// SELECT from this table — a soft-delete or tenant guard.
 //
-// It is registered on the shared scope, so it reaches every alias of
-// the table however early the alias was taken, and registering it
-// through an alias registers it on the table. See [Table.As].
+// Anonymous means only (*SelectBuilder).Unscoped can bypass it, and
+// Unscoped bypasses every other filter on the table at the same time.
+// Prefer AddFilter, which names the predicate so one query can step
+// around it and keep the rest.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.scope.mu.Lock()
-	defer t.scope.mu.Unlock()
-	t.scope.defaultFilters = appendShared(t.scope.defaultFilters, e)
+	t.filters = append(t.filters, tableFilter{pred: e})
 	return t
+}
+
+// AddFilter registers a predicate under name, applied exactly as
+// DefaultFilter's is except that a query can bypass this one alone:
+//
+//	posts.AddFilter(mysql.FilterSoftDelete, deletedAt.IsNull())
+//	db.Select().From(posts).IgnoreFilters(mysql.FilterSoftDelete)
+//
+// An empty name panics: it would read as named at the call site and
+// behave as anonymous at the query.
+func (t *Table) AddFilter(name string, e drops.Expression) *Table {
+	if name == "" {
+		panic("drops/mysql: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
+	}
+	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	return t
+}
+
+// Filters returns the table's global-filter predicates in registration
+// order, named and anonymous alike.
+func (t *Table) Filters() []drops.Expression {
+	out := make([]drops.Expression, len(t.filters))
+	for i, f := range t.filters {
+		out[i] = f.pred
+	}
+	return out
+}
+
+// FilterNames returns the names of the table's named filters in
+// registration order. Anonymous filters contribute nothing.
+func (t *Table) FilterNames() []string {
+	var out []string
+	for _, f := range t.filters {
+		if f.name != "" {
+			out = append(out, f.name)
+		}
+	}
+	return out
 }
 
 // Col looks a column up by name, returning nil when absent.
@@ -219,6 +271,31 @@ func (t *Table) Col(name string) *Column { return t.byName[name] }
 
 // Columns returns the columns in declaration order.
 func (t *Table) Columns() []*Column { return t.columns }
+
+// Relation returns the named relation, or nil.
+func (t *Table) Relation(name string) *Relation { return t.relations[name] }
+
+// Rel returns the named relation, panicking if it was never declared.
+// It is how a relation becomes a compile-checked Go identifier rather
+// than a string literal at every query site.
+func (t *Table) Rel(name string) *Relation {
+	r := t.relations[name]
+	if r == nil {
+		declared := make([]string, 0, len(t.relations))
+		for n := range t.relations {
+			declared = append(declared, n)
+		}
+		sort.Strings(declared)
+		// An alias carries the relations its table had at the moment As
+		// was called, so a relation declared afterwards reaches the base
+		// handle and not this one. Naming the alias is what separates
+		// that from "the relation was never declared at all" — the two
+		// look identical from the empty list.
+		panic(fmt.Sprintf("drops/mysql: %s has no relation %q; declared: %s",
+			t.subject(), name, strings.Join(declared, ", ")))
+	}
+	return r
+}
 
 // Add registers a column with the table and returns it, so a
 // declaration reads as one expression:
@@ -253,35 +330,12 @@ func (t *Table) PrimaryKeyColumns() []*Column {
 // writeRef writes the reference used in FROM / column qualification:
 // the alias when there is one, otherwise the (database-qualified)
 // name.
-//
-// A handle on the declared table also renders as an alias while the
-// builder is inside a fragment that renamed the relation: that is how
-// an automatic predicate built from the package-level columns follows
-// the table into an aliased query. See resolveFilterExprs.
 func (t *Table) writeRef(b *drops.Builder) {
 	if t.alias != "" {
 		b.WriteIdent(t.alias)
 		return
 	}
-	if renamed := b.RelationAlias(t.relRef()); renamed != "" {
-		b.WriteIdent(renamed)
-		return
-	}
 	t.writeName(b)
-}
-
-// relRef names the relation a column belonging to this table qualifies
-// with when the table is not aliased, in the spelling
-// [drops.Builder.RelationAlias] keys renames by.
-//
-// A database-qualified table is keyed by "database.table", because
-// that is what it renders as and because two databases may each have a
-// "users" — MySQL's database being what PostgreSQL calls a schema.
-func (t *Table) relRef() string {
-	if t.database == "" {
-		return t.name
-	}
-	return t.database + "." + t.name
 }
 
 // writeName writes the database-qualified table name, no alias.

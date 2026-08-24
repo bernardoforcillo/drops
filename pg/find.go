@@ -19,6 +19,12 @@ type FindBuilder struct {
 	sel    *SelectBuilder
 	roots  []*relNode
 	relErr error // first deferred path-parse error, surfaced from All
+
+	// strict / waived drive the strict-loading check in strict.go:
+	// whether an unloaded relation field refuses the query, and which
+	// root-level relations the caller has said it will not read.
+	strict bool
+	waived []string
 }
 
 // relNode is one node in the parsed eager-load tree. A path such as
@@ -32,12 +38,13 @@ type relNode struct {
 	// limit / offset are per-parent caps applied via a
 	// ROW_NUMBER() OVER (PARTITION BY <parentKey>) rewrite.
 	// Without them the relation loader fetches every related row.
-	limit  int
-	offset int
-	// unscoped drops the target table's DefaultFilters and
-	// ContextFilters from this edge alone — see RelConfig.Unscoped.
-	unscoped bool
+	limit    int
+	offset   int
 	children []*relNode
+	// waived are relations on this edge's target struct that the
+	// caller declared it will not read — the nested half of the
+	// strict-loading waiver. See strict.go.
+	waived []string
 }
 
 // mergeRelPath inserts a dot-separated path into a relNode forest,
@@ -79,9 +86,11 @@ type RelConfig struct {
 }
 
 // Where AND-s predicates into this relation's batched query, filtering
-// the related rows (e.g. only published posts).
+// the related rows (e.g. only published posts). Nil predicates are
+// ignored, as in [SelectBuilder.Where]; the related table's own global
+// filters apply either way.
 func (c *RelConfig) Where(preds ...drops.Expression) *RelConfig {
-	c.node.wheres = append(c.node.wheres, preds...)
+	c.node.wheres = append(c.node.wheres, dropNilPreds(preds)...)
 	return c
 }
 
@@ -105,37 +114,9 @@ func (c *RelConfig) OrderBy(exprs ...drops.Expression) *RelConfig {
 // configured ORDER BY), not the first N rows globally. Mirrors
 // drizzle's with: { posts: { limit: 5 } } shape.
 //
-// Limit applies to HasMany, MorphMany and ManyToMany. Single-row
-// relations (HasOne / BelongsTo) already cap at one row per parent, so
-// it has nothing to do there. Limit ≤ 0 disables the cap.
-//
-// # The many-to-many edge caps somewhere else
-//
-// The window rewrite needs one query it can partition by the parent
-// key, and this edge has two: the junction is read first, and the
-// target rows then come back keyed by their own id, with no parent
-// column to partition by. So the cap is applied to each parent's
-// assembled slice, in Go, after the target query has returned — the
-// same rows the query fetched before, minus the ones the caller said
-// they did not want. Nothing got slower, but nothing got narrower
-// either: an edge with a large fan-out still reads the whole fan-out
-// and discards most of it, so Limit here shapes the result and does
-// not bound the query. Where that matters, query the junction
-// yourself.
-//
-// It caps rather than ignoring because the alternative is the one
-// thing this package has already ruled out. drops/mysql's relation
-// declaration API was deleted rather than deprecated in this same
-// phase, on the grounds that an API which silently does nothing is
-// worse than one that is not there, because nothing tells the caller.
-// A Limit honoured on the HasMany edge and dropped on the ManyToMany
-// edge beside it is that failure wearing a coat: the two call sites
-// read identically, the two result sets do not, and nothing in between
-// says so.
-//
-// The ordering is the caller's to pin, on this edge as on the others.
-// Without an OrderBy the cap keeps the first N in the order the
-// junction rows came back, which no server promises to repeat.
+// Limit only applies to HasMany / MorphMany / ManyToMany —
+// single-row relations (HasOne / BelongsTo) already cap at 1.
+// Limit ≤ 0 disables the cap.
 func (c *RelConfig) Limit(n int) *RelConfig {
 	c.node.limit = n
 	return c
@@ -147,22 +128,6 @@ func (c *RelConfig) Limit(n int) *RelConfig {
 // combine Offset with a very large Limit).
 func (c *RelConfig) Offset(n int) *RelConfig {
 	c.node.offset = n
-	return c
-}
-
-// Unscoped drops the target table's automatic predicates — its
-// DefaultFilters and its ContextFilters — for this edge only.
-//
-// The root query's scoping is untouched, and so is every other edge:
-// an Unscoped edge under a filtered parent is a local widening, and a
-// deliberate one. It is how a caller reads the soft-deleted revisions
-// of a document they are already allowed to see, without having to run
-// the parent query unscoped as well and hand-write the scope back.
-//
-// On a many-to-many edge it widens the junction query too, since the
-// junction rows are how the edge is traversed at all.
-func (c *RelConfig) Unscoped() *RelConfig {
-	c.node.unscoped = true
 	return c
 }
 
@@ -218,7 +183,7 @@ func (c *RelConfig) LoadRel(rel *Relation, fn func(*RelConfig)) *RelConfig {
 // All/One determines what columns are scanned (via the same struct-field
 // mapping rules as Select.All).
 func (db *DB) Find(t *Table) *FindBuilder {
-	return &FindBuilder{db: db, table: t, sel: db.Select().From(t)}
+	return &FindBuilder{db: db, table: t, sel: db.Select().From(t), strict: db.strictLoading}
 }
 
 // Where appends predicates joined by AND.
@@ -239,11 +204,26 @@ func (f *FindBuilder) Limit(n int64) *FindBuilder { f.sel.Limit(n); return f }
 // Offset sets the OFFSET.
 func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
 
-// Unscoped opts out of the root table's DefaultFilter and
-// ContextFilter predicates for the root SELECT. Eager-loaded relations
-// inherit their own table's scopes independently — widen one of those
-// with [RelConfig.Unscoped].
+// Unscoped opts out of every global filter on the table for the root
+// SELECT — the blunt instrument; see [SelectBuilder.Unscoped].
+// Eager-loaded relations inherit their own table's scopes
+// independently.
 func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
+
+// IgnoreFilters bypasses the named global filters on the root table
+// and leaves every other one standing — see
+// [SelectBuilder.IgnoreFilters]. Eager-loaded relations keep their own
+// table's filters either way.
+func (f *FindBuilder) IgnoreFilters(names ...string) *FindBuilder {
+	f.sel.IgnoreFilters(names...)
+	return f
+}
+
+// ignoresFilter reports whether this query named filter in an
+// IgnoreFilters call. Read by the entity layer for the filters it
+// builds per query rather than registering on the table — the tenant
+// guard — which nothing on the table can carry.
+func (f *FindBuilder) ignoresFilter(name string) bool { return f.sel.scope.ignores(name) }
 
 // HasEagerLoads reports whether any relations have been queued for
 // eager loading via With / WithRel. Used by Entity[T] to decide
@@ -349,6 +329,12 @@ func (f *FindBuilder) All(ctx context.Context, dest any) error {
 	// Validate the whole tree up front so a typo in any path — at any
 	// depth — fails fast, before a single query runs.
 	if err := validateRelTree(f.table, f.roots); err != nil {
+		return err
+	}
+	// Likewise the strict-loading check: a relation the destination
+	// struct declares and this query never loads is refused here,
+	// before the SELECT, not discovered as a nil field downstream.
+	if err := f.checkStrictLoading(destStructType(dest)); err != nil {
 		return err
 	}
 	if err := f.sel.All(ctx, dest); err != nil {
@@ -518,8 +504,8 @@ func (f *FindBuilder) loadRelation(
 
 	expectsSlice := rel.Kind == HasManyKind || rel.Kind == MorphManyKind
 	if expectsSlice && relFieldType.Kind() != reflect.Slice {
-		return none, nil, fmt.Errorf("drops/pg: relation %q is HasMany — expected slice field, got %s",
-			rel.Name, relFieldType.Kind())
+		return none, nil, fmt.Errorf("drops/pg: relation %q is %s — expected slice field, got %s",
+			rel.Name, relationKindName(rel.Kind), relFieldType.Kind())
 	}
 
 	var childElemType reflect.Type
@@ -551,15 +537,16 @@ func (f *FindBuilder) loadRelation(
 	// at most node.limit children — drizzle's
 	// "with: { posts: { limit: N } }" shape.
 	if expectsSlice && node.limit > 0 {
-		ranked, err := f.buildPerParentLimited(ctx, rel, targetKeyCol, rowKeys, node)
+		sql, args := f.buildPerParentLimitedSQL(rel, targetKeyCol, rowKeys, node)
+		rows, err := f.db.Query(ctx, sql, args...)
 		if err != nil {
 			return none, nil, err
 		}
-		if err := ranked.All(ctx, childSlice.Addr().Interface()); err != nil {
+		if err := scanAll(rows, childSlice.Addr().Interface()); err != nil {
 			return none, nil, err
 		}
 	} else {
-		childQuery := f.childSelect(rel.To, node).Where(In(targetKeyCol, rowKeys...))
+		childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
 		if rel.Kind == MorphManyKind {
 			childQuery.Where(Eq(rel.MorphTypeCol, rel.MorphType))
 		}
@@ -680,7 +667,8 @@ func (f *FindBuilder) loadManyToMany(
 
 	// Step 1: junction query. Defer Close so every exit path frees the
 	// cursor, including panics and the targetKeyField lookup below.
-	junctionRows, err := f.childSelect(rel.Through, node, rel.ThroughFK1, rel.ThroughFK2).
+	junctionRows, err := f.db.Select(rel.ThroughFK1, rel.ThroughFK2).
+		From(rel.Through).
 		Where(In(rel.ThroughFK1, rowKeys...)).
 		Rows(ctx)
 	if err != nil {
@@ -729,7 +717,7 @@ func (f *FindBuilder) loadManyToMany(
 	}
 
 	// Step 2: target query, narrowed/sorted by the node's constraints.
-	targetQuery := f.childSelect(rel.To, node).Where(In(rel.ChildKey, remoteKeys...))
+	targetQuery := f.db.Select().From(rel.To).Where(In(rel.ChildKey, remoteKeys...))
 	if len(node.wheres) > 0 {
 		targetQuery.Where(node.wheres...)
 	}
@@ -769,11 +757,12 @@ func (f *FindBuilder) loadManyToMany(
 		k := parent.FieldByIndex(rowKeyField).Interface()
 		target := parent.FieldByIndex(relField)
 		remotes := remoteByLocal[k]
-		kept := make([]any, 0, len(remotes))
+		result := reflect.MakeSlice(relFieldType, 0, len(remotes))
 		if ordered {
 			// Keep only this parent's linked targets, in target order. A
 			// Where on the target may have dropped some; targetOrder only
 			// holds rows that survived, so missing keys are skipped.
+			kept := make([]any, 0, len(remotes))
 			seen := map[any]struct{}{}
 			for _, rk := range remotes {
 				if _, ok := targetOrder[rk]; !ok {
@@ -788,52 +777,20 @@ func (f *FindBuilder) loadManyToMany(
 			sort.SliceStable(kept, func(a, b int) bool {
 				return targetOrder[kept[a]] < targetOrder[kept[b]]
 			})
+			for _, rk := range kept {
+				result = appendTarget(result, targetByKey[rk])
+			}
 		} else {
 			// Default: preserve junction-row order.
 			for _, rk := range remotes {
-				if _, ok := targetByKey[rk]; ok {
-					kept = append(kept, rk)
+				if tv, ok := targetByKey[rk]; ok {
+					result = appendTarget(result, tv)
 				}
 			}
-		}
-		kept = perParentWindow(kept, node)
-		result := reflect.MakeSlice(relFieldType, 0, len(kept))
-		for _, rk := range kept {
-			result = appendTarget(result, targetByKey[rk])
 		}
 		target.Set(result)
 	}
 	return collectChildPtrs(parentSlice, parentIsPtr, relField, childStructType, needChildren), childStructType, nil
-}
-
-// perParentWindow applies a many-to-many edge's Limit and Offset to one
-// parent's list of linked keys.
-//
-// This is the same window buildPerParentLimited renders as
-// ROW_NUMBER() OVER (PARTITION BY fk) for the edges that have a column
-// to partition by, applied in Go for the edge that does not — see
-// RelConfig.Limit for why this edge cannot have it in SQL, and for what
-// it costs that the rows are fetched before they are dropped.
-//
-// Offset without a Limit is not a window and is ignored, exactly as it
-// is on the SQL path: RelConfig.Offset says it requires Limit, and
-// "every row past N" is not what a caller who forgot the Limit meant.
-func perParentWindow(keys []any, node *relNode) []any {
-	if node.limit <= 0 {
-		return keys
-	}
-	off := node.offset
-	if off < 0 {
-		off = 0
-	}
-	if off >= len(keys) {
-		return keys[:0]
-	}
-	end := off + node.limit
-	if end > len(keys) {
-		end = len(keys)
-	}
-	return keys[off:end]
 }
 
 func parentValue(v reflect.Value, isPtr bool) reflect.Value {
@@ -930,62 +887,44 @@ func coerceSlice(src reflect.Value, dstType reflect.Type) reflect.Value {
 	return out
 }
 
-// childSelect begins the query for one relation edge against table,
-// honouring the edge's own Unscoped.
-//
-// Every relation loader goes through it for the same reason the
-// executors resolve context filters at all: a child query built by hand
-// is a child query that silently misses whatever scoping the target
-// table declares, and the only way to keep that from happening again as
-// loaders are added is to leave one place where a child query is built.
-func (f *FindBuilder) childSelect(table *Table, node *relNode, cols ...drops.Expression) *SelectBuilder {
-	q := f.db.Select(cols...).From(table)
-	if node.unscoped {
-		q.Unscoped()
-	}
-	return q
-}
-
-// buildPerParentLimited composes the window-function rewrite used when
-// a relation has node.limit > 0:
+// buildPerParentLimitedSQL renders the window-function rewrite used
+// when a relation has node.limit > 0. The query has shape:
 //
 //	SELECT * FROM (
 //	  SELECT <cols>, ROW_NUMBER() OVER (
 //	    PARTITION BY <fk> ORDER BY <orderBy or fallback>
 //	  ) AS _rn
 //	  FROM <child>
-//	  WHERE <scopes> AND <fk> IN (...) [AND morph guard] [AND <wheres>]
+//	  WHERE <fk> IN (...) [AND <wheres>] [AND morph guard]
 //	) AS _ranked
 //	WHERE _rn > <offset> AND _rn <= <offset + limit>
 //
-// Each parent's slice gets at most limit children, skipping the first
-// offset. Mirrors drizzle's "with: { posts: { limit } }" semantics. The
-// extra _rn column is discarded by scanAll since no struct field
-// matches the name.
-//
-// The inner query is a SelectBuilder over the child table rather than a
-// hand-written string, and that is the whole fix for the bug this
-// replaced: the string spelled out its own WHERE clause, so the target
-// table's DefaultFilters never reached it and adding .Limit(5) to a
-// soft-deleted relation resurrected the deleted rows. bun does not have
-// this class of bug because its relation queries are ordinary query
-// builders; expressing the rewrite as one buys the same immunity for
-// every scope drops has now and every one it adds later.
-//
-// The inner builder is resolved against ctx explicitly before being
-// embedded, because it is reached as a subquery expression and a
-// subquery is rendered by WriteSQL with no ctx to hand.
-func (f *FindBuilder) buildPerParentLimited(
-	ctx context.Context, rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
-) (*SelectBuilder, error) {
+// Each parent's slice gets at most limit children, skipping the
+// first offset. Mirrors drizzle's "with: { posts: { limit } }"
+// semantics. The extra _rn column is discarded by scanAll since
+// no struct field matches the name.
+func (f *FindBuilder) buildPerParentLimitedSQL(
+	rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
+) (sql string, args []any) {
+	b := drops.NewBuilder()
+	b.WriteString("SELECT * FROM (SELECT ")
 	cols := rel.To.Columns()
-	projection := make([]drops.Expression, 0, len(cols)+1)
-	for _, c := range cols {
-		projection = append(projection, c)
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		c.WriteSQL(b)
 	}
-	win := WindowSpec().PartitionBy(targetKeyCol)
+	b.WriteString(", ROW_NUMBER() OVER (PARTITION BY ")
+	targetKeyCol.WriteSQL(b)
+	b.WriteString(" ORDER BY ")
 	if len(node.orderBys) > 0 {
-		win.OrderBy(node.orderBys...)
+		for i, e := range node.orderBys {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			e.WriteSQL(b)
+		}
 	} else {
 		// Default: order by PK so partitioning is stable.
 		var pk *Column
@@ -996,41 +935,38 @@ func (f *FindBuilder) buildPerParentLimited(
 			}
 		}
 		if pk != nil {
-			win.OrderBy(pk)
+			pk.WriteSQL(b)
 		} else {
-			win.OrderBy(targetKeyCol)
+			targetKeyCol.WriteSQL(b)
 		}
 	}
-	ranked := Over(drops.Raw("ROW_NUMBER()"), win)
-	projection = append(projection, drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(ranked)
-		b.WriteString(" AS _rn")
-	}))
-
-	inner := f.childSelect(rel.To, node, projection...).Where(In(targetKeyCol, rowKeys...))
+	b.WriteString(") AS _rn FROM ")
+	rel.To.writeFrom(b)
+	b.WriteString(" WHERE ")
+	In(targetKeyCol, rowKeys...).WriteSQL(b)
 	if rel.Kind == MorphManyKind {
-		inner.Where(Eq(rel.MorphTypeCol, rel.MorphType))
+		b.WriteString(" AND ")
+		Eq(rel.MorphTypeCol, rel.MorphType).WriteSQL(b)
 	}
-	if len(node.wheres) > 0 {
-		inner.Where(node.wheres...)
+	// The child table's global filters, which the uncapped path gets
+	// for free from Select().From(rel.To). This writer builds its SQL
+	// by hand, so it has to spell them out — and without them, adding
+	// a per-parent cap to a load quietly widened it, handing back the
+	// soft-deleted and out-of-tenant children the same load returns
+	// correctly when it is uncapped.
+	for _, w := range rel.To.Filters() {
+		b.WriteString(" AND ")
+		w.WriteSQL(b)
 	}
-	resolved, err := inner.resolveCtx(ctx)
-	if err != nil {
-		return nil, err
+	for _, w := range node.wheres {
+		b.WriteString(" AND ")
+		w.WriteSQL(b)
 	}
-	return f.db.Select().
-		FromExpr(resolved.AsSubquery("_ranked")).
-		Where(rnBound("_rn > ", node.offset), rnBound("_rn <= ", node.offset+node.limit)), nil
-}
-
-// rnBound renders one side of the row-number window, e.g. "_rn > $3".
-// The bound is bound as an argument rather than formatted into the text
-// so the two integers travel the same path as every other value.
-func rnBound(op string, n int) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(op)
-		b.AddArg(n)
-	})
+	b.WriteString(") AS _ranked WHERE _rn > ")
+	b.AddArg(node.offset)
+	b.WriteString(" AND _rn <= ")
+	b.AddArg(node.offset + node.limit)
+	return b.SQL()
 }
 
 // relationKeyField returns the index path of the struct field that maps
@@ -1047,6 +983,25 @@ func relationKeyField(structT reflect.Type, col *Column) ([]int, bool) {
 // relationTargetField returns the index path of the struct field that
 // receives the relation. Lookup order: dropRel:"<name>" tag, then a
 // case-insensitive name match.
+//
+// The name fallback is a hazard, not a convenience to lean on. It
+// claims a field because of what the field is *called*, and a field
+// that only happens to share a relation's name has said nothing about
+// wanting to be one: an untagged Posts []Post is filled by
+// With("posts") whether the caller meant it as a relation or as a
+// cache they had already populated, and the walk reaches through
+// embedded structs, so a promoted field of the embedded row struct is
+// claimable too. What that usually produces is a confusing refusal —
+// a scalar column field is not a relation target and the query fails
+// naming a type nobody wrote down — and what it produces in the worst
+// case is a silent overwrite.
+//
+// It stays because removing it would break every struct written
+// against the earlier rule, and because a relation field named after
+// its relation is the overwhelmingly common spelling. Tag the field
+// anyway: `dropsgen -rels` writes the tag on every relation field it
+// emits, which is what makes the binding a thing the struct states
+// rather than a thing its field names happen to imply.
 func relationTargetField(structT reflect.Type, name string) ([]int, bool) {
 	var found []int
 	var byName []int
@@ -1161,7 +1116,7 @@ func (f *FindBuilder) loadMorphTo(
 			return none, nil, fmt.Errorf("drops/pg: relation %q: morph target table %q has no PRIMARY KEY",
 				rel.Name, b.entry.table.Name())
 		}
-		q := f.childSelect(b.entry.table, node).Where(In(targetPK, ids...))
+		q := f.db.Select().From(b.entry.table).Where(In(targetPK, ids...))
 		if len(node.wheres) > 0 {
 			q.Where(node.wheres...)
 		}
@@ -1206,4 +1161,27 @@ func (f *FindBuilder) loadMorphTo(
 	// fan out manually.
 	_ = node.children
 	return reflect.Value{}, nil, nil
+}
+
+// relationKindName renders a kind the way the declaration API spells
+// it, so an error about a mis-bound relation names the kind the
+// relation actually has. The guard on a slice field accepts more than
+// one kind, and hardcoding the commonest of them told a MorphMany
+// author to go looking for a HasMany they never wrote.
+func relationKindName(k RelationKind) string {
+	switch k {
+	case HasManyKind:
+		return "HasMany"
+	case HasOneKind:
+		return "HasOne"
+	case BelongsToKind:
+		return "BelongsTo"
+	case ManyToManyKind:
+		return "ManyToMany"
+	case MorphToKind:
+		return "MorphTo"
+	case MorphManyKind:
+		return "MorphMany"
+	}
+	return "an unknown kind"
 }

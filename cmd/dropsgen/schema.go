@@ -65,6 +65,7 @@ var knownOptions = map[string]bool{
 	"primaryKey":    true,
 	"autoIncrement": true,
 	"notNull":       true,
+	"null":          true,
 	"unique":        true,
 	"version":       true,
 	"pii":           true,
@@ -83,7 +84,61 @@ func checkOptions(column string, opts []colOption) error {
 			return fmt.Errorf("column %q: `%s` option requires a value: %s=<sql>", column, o.Key, o.Key)
 		}
 	}
+	if hasOption(opts, "notNull") && hasOption(opts, "null") {
+		return fmt.Errorf("column %q is tagged both notNull and null; drop one or the other", column)
+	}
 	return nil
+}
+
+// nullWrappers maps the database/sql null wrappers to the Go type
+// they carry. A field declared as one of these says two things — the
+// column is optional, and its SQL type is the payload's — and the
+// generator has to hear both: emitting pg.Custom[sql.NullString]
+// would make the *operators* take the wrapper, which is the mistake
+// this whole design exists to avoid.
+//
+// The list is closed in database/sql and hardcoding it is what an AST
+// generator can do, so a test asserts it agrees with what reflection
+// sees — see TestNullWrappersAgreeWithReflection.
+var nullWrappers = map[string]string{
+	"sql.NullBool":    "bool",
+	"sql.NullByte":    "byte",
+	"sql.NullFloat64": "float64",
+	"sql.NullInt16":   "int16",
+	"sql.NullInt32":   "int32",
+	"sql.NullInt64":   "int64",
+	"sql.NullString":  "string",
+	"sql.NullTime":    "time.Time",
+}
+
+// nullPayload strips a database/sql null wrapper off goType and
+// reports whether there was one. sql.Null[T] is read generically; the
+// legacy family comes from the table above.
+func nullPayload(goType string) (string, bool) {
+	if inner, ok := strings.CutPrefix(goType, "sql.Null["); ok {
+		if inner, ok := strings.CutSuffix(inner, "]"); ok {
+			return inner, true
+		}
+	}
+	if payload, ok := nullWrappers[goType]; ok {
+		return payload, true
+	}
+	return "", false
+}
+
+// inferNullable reports the nullability the generator should declare
+// for a field of the given type. It is the textual twin of
+// drift.InferNullable, which pg.AutoTable applies over reflect.Type:
+// a leading "*", or a database/sql null wrapper. Everything else is
+// NOT NULL, with the `null` tag as the escape hatch — dropsgen reads
+// source, so it cannot see that a user's named type implements
+// sql.Scanner.
+func inferNullable(goType string) bool {
+	if strings.HasPrefix(goType, "*") {
+		return true
+	}
+	_, ok := nullPayload(goType)
+	return ok
 }
 
 // columnExpr renders the constructor chain for one field.
@@ -106,13 +161,23 @@ func columnExpr(goType, column string, opts []colOption) (string, error) {
 		return "", false
 	}
 
+	// The declared type says two separate things: what the column
+	// holds, and whether it is optional. Strip the wrappers that only
+	// carry the second — a pointer, an sql.Null[T] — before choosing
+	// the constructor, or Col[T]'s T would become the wrapper and
+	// every comparison on the column would take one too.
+	valueType := strings.TrimPrefix(goType, "*")
+	if payload, ok := nullPayload(valueType); ok {
+		valueType = payload
+	}
+
 	// An explicit type= wins: it is the escape hatch for columns the
 	// Go type cannot describe (uuid, citext, a domain type).
 	var ctor string
 	if t, ok := value("type"); ok {
-		ctor = fmt.Sprintf("pg.Custom[%s](%q, %q)", strings.TrimPrefix(goType, "*"), column, t)
+		ctor = fmt.Sprintf("pg.Custom[%s](%q, %q)", valueType, column, t)
 	} else {
-		c, err := constructorFor(goType, column, has("autoIncrement"))
+		c, err := constructorFor(valueType, column, has("autoIncrement"))
 		if err != nil {
 			return "", err
 		}
@@ -126,11 +191,19 @@ func columnExpr(goType, column string, opts []colOption) (string, error) {
 	}
 	// A pointer field is nullable by nature, so notNull on one is a
 	// contradiction worth refusing rather than silently resolving.
-	if has("notNull") {
-		if strings.HasPrefix(goType, "*") {
-			return "", fmt.Errorf("column %q is a pointer field tagged notNull; drop one or the other", column)
+	if has("notNull") && strings.HasPrefix(goType, "*") {
+		return "", fmt.Errorf("column %q is a pointer field tagged notNull; drop one or the other", column)
+	}
+	// Every generated column states its nullability, so nothing the
+	// generator emits can be the unstated shape pg.NewEntity now
+	// rejects. PrimaryKey already said NOT NULL, so saying it again
+	// would be noise.
+	if !has("primaryKey") {
+		if has("null") || (inferNullable(goType) && !has("notNull")) {
+			b.WriteString(".Nullable()")
+		} else {
+			b.WriteString(".NotNull()")
 		}
-		b.WriteString(".NotNull()")
 	}
 	if has("unique") {
 		b.WriteString(".Unique()")
@@ -152,7 +225,7 @@ func columnExpr(goType, column string, opts []colOption) (string, error) {
 // or a project that uses both would get two different schemas from one
 // struct.
 func constructorFor(goType, column string, autoInc bool) (string, error) {
-	base := strings.TrimPrefix(goType, "*")
+	base := goType
 	q := fmt.Sprintf("%q", column)
 	switch base {
 	case "bool":

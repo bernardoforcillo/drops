@@ -9,9 +9,12 @@ import (
 	"github.com/bernardoforcillo/drops/pg"
 )
 
-// pgxLikeError mimics the pgx / pgconn surface — SQLState() and
-// ConstraintName() methods — so the classifier picks it up via
-// errors.As.
+// pgxLikeError exercises the *method* branch of the classifier. Note
+// that no real driver has this shape: pgconn.PgError exposes only
+// Error() and SQLState(), and carries the constraint name as a plain
+// field. The driver-shaped fakes are pgconnLikeError and pqLikeError
+// below; this one only pins that a wrapper which does expose accessors
+// is still preferred to reflection.
 type pgxLikeError struct {
 	code       string
 	constraint string
@@ -22,14 +25,64 @@ func (e *pgxLikeError) Error() string          { return e.msg }
 func (e *pgxLikeError) SQLState() string       { return e.code }
 func (e *pgxLikeError) ConstraintName() string { return e.constraint }
 
-// lib/pq-style error: exposes Code() returning a 5-char SQLSTATE.
-type pqLikeError struct {
+// An error exposing Code() returning a 5-char SQLSTATE — the older
+// convention, still followed by some wrappers. (Real lib/pq spells it
+// SQLState(); see pqLikeError.)
+type coderError struct {
 	code string
 	msg  string
 }
 
-func (e *pqLikeError) Error() string { return e.msg }
-func (e *pqLikeError) Code() string  { return e.code }
+func (e *coderError) Error() string { return e.msg }
+func (e *coderError) Code() string  { return e.code }
+
+// pgconnLikeError has the shape of the driver most callers actually
+// use: pgconn.PgError has exactly two methods, Error() and SQLState(),
+// and reports the constraint and column as plain struct fields. A fake
+// with a ConstraintName() method would prove only that a branch no
+// driver reaches works.
+type pgconnLikeError struct {
+	Code           string
+	ConstraintName string
+	ColumnName     string
+	Message        string
+}
+
+func (e *pgconnLikeError) Error() string    { return e.Message }
+func (e *pgconnLikeError) SQLState() string { return e.Code }
+
+// pqLikeError is lib/pq's shape: SQLState() reading a named-string-type
+// Code field, with Constraint and Column as plain fields.
+type pqErrorCode string
+
+type pqLikeError struct {
+	Code       pqErrorCode
+	Constraint string
+	Column     string
+	Message    string
+}
+
+func (e *pqLikeError) Error() string    { return e.Message }
+func (e *pqLikeError) SQLState() string { return string(e.Code) }
+
+// A driver exposing SQLState() and nothing else — no fields to read,
+// so only the message can name the constraint.
+type sqlStateOnlyError struct {
+	code string
+	msg  string
+}
+
+func (e *sqlStateOnlyError) Error() string    { return e.msg }
+func (e *sqlStateOnlyError) SQLState() string { return e.code }
+
+// An application error that has nothing to do with PostgreSQL but
+// carries a five-character Code field.
+type appCodeError struct {
+	Code string
+	Msg  string
+}
+
+func (e *appCodeError) Error() string { return e.Msg }
 
 // pqLikeShortCode returns a non-5-char code so we can assert the
 // classifier skips it (the lib/pq Code interface is overloaded for
@@ -81,7 +134,7 @@ func TestPgErrorExposesConstraintName(t *testing.T) {
 }
 
 func TestPgErrorHandlesLibpqStyle(t *testing.T) {
-	raw := &pqLikeError{code: "23505", msg: "dup"}
+	raw := &coderError{code: "23505", msg: "dup"}
 	drv := &errDriver{err: raw}
 	db := pg.New(drv)
 	_, err := db.Exec(context.Background(), "INSERT INTO users ...")
@@ -126,3 +179,112 @@ func (d *errDriver) Query(_ context.Context, _ string, _ ...any) (drops.Rows, er
 	return nil, d.err
 }
 func (d *errDriver) Begin(_ context.Context) (drops.Tx, error) { return nil, d.err }
+
+// The fix these pin was a real production bug: the classifier looked
+// only for a ConstraintName() method, while pgconn and lib/pq both
+// report the name as a plain struct field and neither has ever had an
+// accessor — so PgError.Constraint came back empty for every caller of
+// either driver.
+//
+// There are two mechanisms in the fix and the live suite cannot tell
+// them apart, because pgx's message happens to contain the name too and
+// the message fallback alone satisfies it. So each case here starves
+// the mechanism it is not testing: the field cases carry a message with
+// no name in it, and the message cases carry no fields.
+func TestPgErrorReadsConstraintAndColumnFromDriverStructFields(t *testing.T) {
+	cases := []struct {
+		name           string
+		raw            error
+		wantConstraint string
+		wantColumn     string
+	}{
+		{
+			// The name is in the field and nowhere else, so only
+			// reflection over the struct can find it.
+			name: "pgconn field, message says nothing",
+			raw: &pgconnLikeError{
+				Code:           "23505",
+				ConstraintName: "users_email_key",
+				Message:        "ERROR: duplicate key value (SQLSTATE 23505)",
+			},
+			wantConstraint: "users_email_key",
+		},
+		{
+			name: "pgconn not-null names a column, not a constraint",
+			raw: &pgconnLikeError{
+				Code:       "23502",
+				ColumnName: "email",
+				Message:    "ERROR: null value violates not-null constraint (SQLSTATE 23502)",
+			},
+			wantColumn: "email",
+		},
+		{
+			name: "lib/pq field, message says nothing",
+			raw: &pqLikeError{
+				Code:       "23503",
+				Constraint: "accounts_team_id_fkey",
+				Message:    "ERROR: foreign key violation (SQLSTATE 23503)",
+			},
+			wantConstraint: "accounts_team_id_fkey",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := pg.New(&errDriver{err: tc.raw})
+			_, err := db.Exec(context.Background(), "INSERT INTO users ...")
+			var pe *pg.PgError
+			if !errors.As(err, &pe) {
+				t.Fatalf("err = %v (%T), want a *pg.PgError", err, err)
+			}
+			if pe.Constraint != tc.wantConstraint {
+				t.Errorf("Constraint = %q, want %q", pe.Constraint, tc.wantConstraint)
+			}
+			if pe.Column != tc.wantColumn {
+				t.Errorf("Column = %q, want %q", pe.Column, tc.wantColumn)
+			}
+		})
+	}
+}
+
+// The other half of the fix, starved of fields: a driver that only
+// formats the name into its text is still read, which is what keeps
+// the classifier working for wrappers that flatten the error to a
+// string before drops ever sees it.
+func TestPgErrorFallsBackToTheMessageWhenThereIsNoField(t *testing.T) {
+	raw := &sqlStateOnlyError{
+		code: "23505",
+		msg:  `ERROR: duplicate key value violates unique constraint "users_email_key" (SQLSTATE 23505)`,
+	}
+	db := pg.New(&errDriver{err: raw})
+	_, err := db.Exec(context.Background(), "INSERT INTO users ...")
+	var pe *pg.PgError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v (%T), want a *pg.PgError", err, err)
+	}
+	if pe.Constraint != "users_email_key" {
+		t.Errorf("Constraint = %q, want it read out of the message", pe.Constraint)
+	}
+}
+
+// A SQLSTATE is what proves an error came from PostgreSQL, so it is
+// only ever read from a method a driver chose to expose. Guessing at a
+// struct field named Code claims unrelated errors: this one would be
+// classified as a serialization failure and then silently retried by
+// the default RetryPolicy, turning someone else's failure into a
+// repeated non-idempotent write.
+func TestPgErrorIgnoresAnUnrelatedCodeField(t *testing.T) {
+	raw := &appCodeError{Code: "40001", Msg: "payment gateway rejected: code 40001"}
+	db := pg.New(&errDriver{err: raw})
+	_, err := db.Exec(context.Background(), "SELECT 1")
+
+	var pe *pg.PgError
+	if errors.As(err, &pe) {
+		t.Fatalf("an unrelated error was classified as %v", pe)
+	}
+	if errors.Is(err, pg.ErrSerializationFailure) {
+		t.Fatal("an unrelated error would be retried as a serialization failure")
+	}
+	if !errors.Is(err, raw) {
+		t.Fatalf("err = %v, want the original error unchanged", err)
+	}
+}

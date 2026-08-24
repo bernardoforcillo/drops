@@ -23,14 +23,6 @@ type Migration struct {
 	Name    string // human-readable label, used only for status output
 	Up      func(ctx context.Context, db *DB) error
 	Down    func(ctx context.Context, db *DB) error
-
-	// upSQL and downSQL are the raw statements, kept only when the
-	// migration was registered through AddSQL or AddFS. A migration
-	// registered as a Go function has no SQL to read, so the safety
-	// gate has nothing to analyse and lets it through — the same
-	// exemption TreeMigrator makes for tamper checking, and for the
-	// same reason: drops can inspect text, not closures.
-	upSQL, downSQL string
 }
 
 // Status is a single row produced by Migrator.Status.
@@ -89,12 +81,13 @@ type MigrationHook func(ctx context.Context, tx *DB, mig Migration, dir Migratio
 
 // Migrator runs database migrations and tracks their history in a table.
 type Migrator struct {
-	db         *DB
-	table      string
-	migrations []Migration
-	before     []MigrationHook
-	after      []MigrationHook
-	gate       safetyGate
+	db          *DB
+	table       string
+	migrations  []Migration
+	before      []MigrationHook
+	after       []MigrationHook
+	lockTimeout time.Duration
+	noLock      bool
 }
 
 // NewMigrator returns a migrator bound to db. Add migrations with Add /
@@ -107,26 +100,104 @@ func NewMigrator(db *DB) *Migrator {
 // DefaultMigrationsTable).
 func (m *Migrator) WithTable(name string) *Migrator { m.table = name; return m }
 
-// WithSafetyGate refuses to apply a migration whose SQL the analyser
-// grades at min or worse, returning an UnsafeMigrationError that names
-// the migration and lists what it found. It wraps ErrUnsafeMigration.
+// ErrMigrationLocked is returned by Up and Down when another run holds
+// the migration lock and the wait configured by [Migrator.WithLockTimeout]
+// expired. It is a distinct sentinel so a deploy script can tell "someone
+// else is already migrating" — which is usually fine, and usually means
+// exit 0 — from a migration that actually failed.
+var ErrMigrationLocked = errors.New("drops/pg: another run holds the migration lock")
+
+// WithLockTimeout caps how long Up and Down wait for the migration lock
+// before giving up with [ErrMigrationLocked]. Zero, the default, waits
+// as long as the other run takes; the wait still ends when ctx does.
 //
-// Without it, AnalyzeMigration is a report a caller has to remember to
-// ask for; with it, the rules run at the moment the answer can still
-// change anything. SeverityError is the setting for production —
-// full-table rewrites, exclusive locks, unrecoverable loss — and
-// SeverityWarn or SeverityInfo suit CI, where the cost of being told
-// twice is nothing.
-//
-// The whole run is checked before any of it is applied: a set with an
-// unsafe migration in the middle applies none of the safe ones ahead
-// of it, so the fix — an Ignore in the migration, a different shape,
-// a scheduled window — lands against the schema the set was written
-// for. A migration registered as a Go function carries no SQL and is
-// not analysed; see Migration.
-func (m *Migrator) WithSafetyGate(min SafetySeverity) *Migrator {
-	m.gate = safetyGate{min: min, on: true}
+// Set it when a deploy would rather fail fast than block behind a
+// migration it cannot see. Leave it alone when every replica running
+// the migrator is expected to converge, which is the usual shape: the
+// winner applies, the losers wait a moment and find nothing to do.
+func (m *Migrator) WithLockTimeout(d time.Duration) *Migrator {
+	if d > 0 {
+		m.lockTimeout = d
+	}
 	return m
+}
+
+// WithoutLock runs Up and Down without taking the migration lock.
+//
+// The lock needs a connection of its own for the duration of the run
+// (see [Migrator.LockKey] for why), so a pool capped at one connection
+// would deadlock against it. That is the case this exists for. It is
+// not a way to run two migrators at once: without the lock they race,
+// and the loser fails somewhere inside PostgreSQL's catalogue.
+func (m *Migrator) WithoutLock() *Migrator { m.noLock = true; return m }
+
+// LockKey returns the advisory-lock key this migrator serialises on,
+// so an operator can find the holder in pg_locks:
+//
+//	SELECT * FROM pg_locks WHERE locktype = 'advisory' AND
+//	       (classid::bigint << 32 | objid::bigint) = <key>
+//
+// The key is derived from the history table name, so two migrators
+// with different histories in one database do not block each other.
+func (m *Migrator) LockKey() int64 { return lockKey("drops/pg:migrate:" + m.table) }
+
+// withLock runs fn while holding this migrator's lock.
+func (m *Migrator) withLock(ctx context.Context, fn func() error) error {
+	if m.noLock {
+		return fn()
+	}
+	return withMigrationLock(ctx, m.db, m.LockKey(), m.table, m.lockTimeout, fn)
+}
+
+// withMigrationLock runs fn while holding the advisory lock keyed by
+// key, waiting at most timeout (zero waits indefinitely). name appears
+// in the [ErrMigrationLocked] message so an operator reading a failed
+// deploy can tell which history table is contended.
+//
+// The lock lives in a transaction of its own. It cannot be scoped to a
+// migration's transaction, because each migration gets one of those
+// and the point is to hold the lock across the whole run; and it
+// cannot be a session lock, because a drops.Driver is a pool and hands
+// out whichever connection is free per statement, so there is no
+// session to pin one to. So the run costs one extra connection, held
+// idle, and released by the rollback below — there is nothing to
+// commit, the transaction exists only to give the lock a lifetime.
+func withMigrationLock(ctx context.Context, db *DB, key int64, name string, timeout time.Duration, fn func() error) error {
+	holder, tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rctx, cancel := rollbackCtx(ctx)
+		defer cancel()
+		_ = tx.Rollback(rctx)
+	}()
+	if timeout > 0 {
+		// SET LOCAL is scoped to this transaction, and lock_timeout
+		// bounds the wait on an advisory lock like on any other.
+		ms := timeout.Milliseconds()
+		if ms < 1 {
+			ms = 1
+		}
+		if _, err := holder.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = %d", ms)); err != nil {
+			return err
+		}
+	}
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", key); err != nil {
+		if isLockTimeout(err) {
+			return fmt.Errorf("drops/pg: waited %s for the migration lock on %s (key %d): %w",
+				timeout, name, key, ErrMigrationLocked)
+		}
+		return err
+	}
+	return fn()
+}
+
+// isLockTimeout reports whether err is PostgreSQL's lock_not_available
+// (55P03), which is what lock_timeout raises.
+func isLockTimeout(err error) bool {
+	var pgErr *PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }
 
 // Add registers a single migration.
@@ -170,7 +241,7 @@ func (m *Migrator) runHooks(ctx context.Context, tx *DB, hooks []MigrationHook, 
 // AddSQL registers a migration whose Up and Down are raw SQL. downSQL may
 // be empty.
 func (m *Migrator) AddSQL(version, name, upSQL, downSQL string) *Migrator {
-	mig := Migration{Version: version, Name: name, upSQL: upSQL, downSQL: downSQL}
+	mig := Migration{Version: version, Name: name}
 	if upSQL != "" {
 		mig.Up = func(ctx context.Context, db *DB) error {
 			_, err := db.Exec(ctx, upSQL)
@@ -270,13 +341,34 @@ func parseMigrationName(filename string) (version, name, kind string, ok bool) {
 }
 
 // ensureTable creates the migrations history table if it does not exist.
+//
+// IF NOT EXISTS is not atomic against a concurrent CREATE: the two
+// sessions both find the table absent, both insert into pg_type, and
+// the loser reports a duplicate key on pg_type_typname_nsp_index — a
+// catalogue index that names nothing an operator has ever heard of.
+// Up and Down hold the migration lock, so they never see it; Status
+// does not, and neither does a caller reaching this through an
+// unlocked path. The failure means the table now exists, which is what
+// was asked for, so it is retried once rather than reported.
 func (m *Migrator) ensureTable(ctx context.Context) error {
 	stmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		version VARCHAR(255) PRIMARY KEY,
 		name TEXT NOT NULL,
 		appliedAt TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`, quoteIdent(m.table))
-	_, err := m.db.Exec(ctx, stmt)
+	return execIgnoringConcurrentCreate(ctx, m.db, stmt)
+}
+
+// execIgnoringConcurrentCreate runs a CREATE ... IF NOT EXISTS,
+// retrying once when it loses the catalogue race described above. The
+// retry is safe because IF NOT EXISTS makes the statement a no-op the
+// second time round, and it is bounded at one because after the first
+// failure the object provably exists.
+func execIgnoringConcurrentCreate(ctx context.Context, db *DB, stmt string) error {
+	_, err := db.Exec(ctx, stmt)
+	if err != nil && errors.Is(err, ErrUniqueViolation) {
+		_, err = db.Exec(ctx, stmt)
+	}
 	return err
 }
 
@@ -315,7 +407,19 @@ func (m *Migrator) sorted() ([]Migration, error) {
 
 // Up applies every registered migration that hasn't been applied yet, in
 // version order. Each migration runs in its own transaction.
+//
+// The whole run is serialised against other runs by a PostgreSQL
+// advisory lock, so the ordinary rolling deploy — one migrator per
+// replica, all starting at the same second — converges: the first one
+// applies, the rest wait, then find the history already up to date and
+// do nothing. See [Migrator.WithLockTimeout] to bound the wait,
+// [Migrator.WithoutLock] to skip it, and [Migrator.LockKey] to find
+// the holder.
 func (m *Migrator) Up(ctx context.Context) error {
+	return m.withLock(ctx, func() error { return m.up(ctx) })
+}
+
+func (m *Migrator) up(ctx context.Context) error {
 	if err := m.ensureTable(ctx); err != nil {
 		return err
 	}
@@ -326,16 +430,6 @@ func (m *Migrator) Up(ctx context.Context) error {
 	applied, err := m.applied(ctx)
 	if err != nil {
 		return err
-	}
-	// Every pending migration is analysed before the first one runs;
-	// see WithSafetyGate.
-	for _, mig := range migs {
-		if _, ok := applied[mig.Version]; ok {
-			continue
-		}
-		if err := m.gate.check(mig.Version+"_"+mig.Name, mig.upSQL); err != nil {
-			return err
-		}
 	}
 	for _, mig := range migs {
 		if _, ok := applied[mig.Version]; ok {
@@ -367,8 +461,13 @@ func (m *Migrator) Up(ctx context.Context) error {
 }
 
 // Down rolls back the most recently applied migration. Returns
-// ErrNoMigrationsApplied if there are none.
+// ErrNoMigrationsApplied if there are none. It takes the same lock Up
+// does, for the same reason.
 func (m *Migrator) Down(ctx context.Context) error {
+	return m.withLock(ctx, func() error { return m.down(ctx) })
+}
+
+func (m *Migrator) down(ctx context.Context) error {
 	if err := m.ensureTable(ctx); err != nil {
 		return err
 	}
@@ -393,11 +492,6 @@ func (m *Migrator) Down(ctx context.Context) error {
 	}
 	if target.Down == nil {
 		return fmt.Errorf("drops/pg: migration %s_%s is irreversible (no Down)", target.Version, target.Name)
-	}
-	// A rollback is DDL like any other, and the statement that undoes
-	// an ADD COLUMN is a DROP COLUMN.
-	if err := m.gate.check(target.Version+"_"+target.Name, target.downSQL); err != nil {
-		return err
 	}
 	return m.db.InTx(ctx, func(tx *DB) error {
 		if err := m.runHooks(ctx, tx, m.before, *target, DirectionDown); err != nil {

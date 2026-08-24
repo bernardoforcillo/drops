@@ -155,7 +155,12 @@ func (db *DB) Update(t *Table) *UpdateBuilder { return &UpdateBuilder{db: db, ta
 func (db *DB) Delete(t *Table) *DeleteBuilder { return &DeleteBuilder{db: db, table: t} }
 
 // Exec runs a statement that returns no rows.
+//
+// Query tags on ctx (see [drops.WithQueryTags]) are appended to sql as
+// a trailing comment before anything else looks at it, so the hook and
+// the server both report the same statement text.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	sql = drops.TagStatement(ctx, sql)
 	start := time.Now()
 	res, err := db.drv.Exec(ctx, sql, args...)
 	// Classify before the hook sees it, so a log line and a caller's
@@ -165,8 +170,10 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 	return res, err
 }
 
-// Query runs a statement that returns rows.
+// Query runs a statement that returns rows. Query tags on ctx are
+// appended as a trailing comment, as in [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	sql = drops.TagStatement(ctx, sql)
 	start := time.Now()
 	rows, err := db.drv.Query(ctx, sql, args...)
 	err = classifyError(err)

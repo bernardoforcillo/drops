@@ -14,23 +14,15 @@ type DeleteBuilder struct {
 	wheres   []drops.Expression
 	orderBys []drops.Expression
 	limit    *int64
-	unscoped bool
-
-	// defaults carries the DefaultFilters of the target table, resolved
-	// for one execution — see resolvedDefaults. Set by resolveCtx on the
-	// per-execution copy and read by WriteSQL through defaults.of, which
-	// falls back to the unresolved list so the ToSQL path renders
-	// unchanged.
-	defaults resolvedDefaults
-
-	// resolved marks a builder resolveCtx has already produced; see
-	// [UpdateBuilder] for why resolving twice is not harmless.
-	resolved bool
+	scope    filterScope
 }
 
-// Where appends predicates joined by AND.
+// Where appends predicates joined by AND. Nil predicates are ignored,
+// so a filter that is only sometimes present can be passed straight in
+// — but a DELETE all of whose predicates were nil is a DELETE with no
+// WHERE, and removes every row the table's filters still admit.
 func (d *DeleteBuilder) Where(preds ...drops.Expression) *DeleteBuilder {
-	d.wheres = append(d.wheres, preds...)
+	d.wheres = append(d.wheres, dropNilPreds(preds)...)
 	return d
 }
 
@@ -52,13 +44,16 @@ func (d *DeleteBuilder) OrderBy(exprs ...drops.Expression) *DeleteBuilder {
 
 func (d *DeleteBuilder) Limit(n int64) *DeleteBuilder { d.limit = &n; return d }
 
-// Unscoped opts out of the table's automatic predicates — its
-// DefaultFilter list and its ContextFilter list alike. On a
-// tenant-scoped table this is the difference between deleting one
-// tenant's rows and deleting everybody's, so it says so at the call
-// site; see [SelectBuilder.Unscoped] for why it is both lists or
-// neither.
-func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.unscoped = true; return d }
+// Unscoped opts out of every global filter on the table — the blunt
+// instrument; see [SelectBuilder.Unscoped].
+func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.scope.unscoped = true; return d }
+
+// IgnoreFilters bypasses the named global filters on the table and
+// leaves every other one standing — see [SelectBuilder.IgnoreFilters].
+func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
+	d.scope.ignore(names...)
+	return d
+}
 
 // WriteSQL renders the DELETE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
@@ -76,10 +71,7 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString("DELETE FROM ")
 		d.table.writeName(b)
 	}
-	wheres := d.wheres
-	if dfs := d.autoWheres(); len(dfs) > 0 {
-		wheres = append(append([]drops.Expression(nil), dfs...), wheres...)
-	}
+	wheres := d.scope.apply(d.table, d.wheres)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)
@@ -106,120 +98,11 @@ var ErrAliasedDeleteBounded = errors.New(
 // thousand rows into the whole table.
 func (d *DeleteBuilder) ToSQL() (string, []any) { return render(d) }
 
-// autoWheres gathers the render-time predicates the statement carries
-// on its own account — the DefaultFilters of the target table — ahead
-// of the caller's own, so a statement reads scoping first and intent
-// second.
-//
-// PostgreSQL's twin also gathers the USING tables' filters, because
-// DELETE … USING states its join condition in the WHERE clause and an
-// unfiltered joined relation there lets another tenant's rows decide
-// which of this tenant's rows are destroyed. MySQL has that shape too,
-// as DELETE t FROM t JOIN u ON …, but this builder does not expose it:
-// a DELETE here names exactly one relation, which the multi-table form
-// below names twice. If it ever gains a second, its tables belong in
-// this list and in resolveCtx.
-func (d *DeleteBuilder) autoWheres() []drops.Expression {
-	if d.unscoped {
-		return nil
-	}
-	return d.defaults.of(d.table)
-}
-
-// ToSQLCtx renders the complete statement for ctx, with every context
-// filter on the target table resolved into the WHERE clause.
-//
-// The alias interaction is this dialect's own. An aliased DELETE is
-// written in the multi-table form, which names the alias as the target
-// and again in the FROM — there is no un-aliased spelling to fall back
-// on — so a tenant axis built from the declared column handles would
-// name a relation the statement does not have, and MariaDB and MySQL
-// both answer 1054. Table.resolveFilterExprs renames the relation for
-// the length of each predicate, which is what keeps a scoped table
-// deletable under an alias at all.
-func (d *DeleteBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
-	r, err := d.resolveCtx(ctx)
-	if err != nil {
-		return "", nil, err
-	}
-	sql, args = r.ToSQL()
-	return sql, args, nil
-}
-
-// resolveCtx returns the builder to render for one execution — this one
-// when there was nothing to resolve, otherwise a shallow copy carrying
-// the resolved predicates and the resolved subqueries. The copy is what
-// keeps a builder executable twice; see [SelectBuilder.resolveCtx].
-func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) {
-	if d.resolved {
-		return d, nil
-	}
-	cp := *d
-	changed := false
-
-	lists := []struct {
-		src []drops.Expression
-		dst *[]drops.Expression
-	}{
-		{d.wheres, &cp.wheres},
-		{d.orderBys, &cp.orderBys},
-	}
-	for _, l := range lists {
-		resolved, err := resolveExprs(ctx, l.src)
-		if err != nil {
-			return nil, err
-		}
-		if resolved != nil {
-			*l.dst, changed = resolved, true
-		}
-	}
-
-	if !d.unscoped {
-		defaults, err := resolveTableDefaults(ctx, d.table)
-		if err != nil {
-			return nil, err
-		}
-		if defaults != nil {
-			cp.defaults, changed = defaults, true
-		}
-		preds, err := d.table.resolveContextFilters(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if len(preds) > 0 {
-			cp.wheres = append(append([]drops.Expression(nil), cp.wheres...), preds...)
-			changed = true
-		}
-	}
-
-	if !changed {
-		return d, nil
-	}
-	cp.resolved = true
-	return &cp, nil
-}
-
-// resolveStatement implements [ctxResolvable]: it is resolveCtx behind
-// the interface resolveExpr dispatches on, so a DELETE written as a
-// CTE body or a subquery operand is resolved as the statement it is
-// rather than rendered blind — which for a DELETE is the difference
-// between removing one tenant's rows and removing everybody's.
-func (d *DeleteBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
-	r, err := d.resolveCtx(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	return r, r != d, nil
-}
-
 // Exec runs the DELETE.
 func (d *DeleteBuilder) Exec(ctx context.Context) (drops.Result, error) {
 	if d.table.alias != "" && (len(d.orderBys) > 0 || d.limit != nil) {
 		return nil, ErrAliasedDeleteBounded
 	}
-	sql, args, err := d.ToSQLCtx(ctx)
-	if err != nil {
-		return nil, err
-	}
+	sql, args := d.ToSQL()
 	return d.db.Exec(ctx, sql, args...)
 }

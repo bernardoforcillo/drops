@@ -7,7 +7,12 @@ var UserEntity = pg.NewEntity[User](Users)
 ```
 
 It precomputes the column-to-field mapping once, at startup, and checks
-it — see [schema.md](schema.md#drift).
+it — see [schema.md](schema.md#drift). Two things make it panic there:
+a column no field binds to, and a column that admits NULL bound to a
+field that cannot receive one. Both name the column, the likely cause
+and the escape hatch —
+[`AllowUnmappedColumns`](schema.md#drift) and
+[`AllowNullableColumns`](schema.md#nullability-drift).
 
 ## The operations
 
@@ -16,56 +21,12 @@ err := UserEntity.Create(db, ctx, &u)          // INSERT, populates generated ke
 u, err := UserEntity.Get(db, ctx, id)          // SELECT by primary key
 err = UserEntity.Update(db, ctx, &u)           // UPDATE by primary key
 err = UserEntity.Save(db, ctx, &u)             // INSERT or UPDATE, on whether the key is set
-res, err := UserEntity.Delete(db, ctx, id)     // DELETE by primary key — an UPDATE, where a soft-delete hook is installed
+res, err := UserEntity.Delete(db, ctx, id)     // DELETE by primary key
 res, err = UserEntity.CreateMany(db, ctx, us)  // one multi-row INSERT
 res, err = UserEntity.UpsertMany(db, ctx, us)  // INSERT … ON CONFLICT UPDATE
 ```
 
 `Get` returns `pg.ErrNoRows` when nothing matches.
-
-## Zero values and DEFAULT columns
-
-`Create` builds the INSERT from the struct, and a column whose field is
-at the Go zero value is left out of the statement when that column has
-a `DEFAULT` or is the primary key — the server fills it in. That is
-what you want for `createdAt` and for a serial key, where the field
-genuinely has no value yet.
-
-It is also the one place drops infers intent, and the inference has a
-cost worth naming: Go cannot tell a field nobody assigned from a field
-assigned its zero value. So `Active: false` on a column declared
-`DEFAULT true` is omitted, and the row comes back `true`. Same for `""`
-on a column defaulting to `'pending'`, and for a zero `time.Time`. No
-error is raised anywhere.
-
-Three ways to say the value is meant. None of them guesses:
-
-```go
-// 1. On the column, when the zero value is always meaningful there.
-var UserActive = pg.Add(Users, pg.Boolean("active").NotNull().Default("true").AlwaysInsert())
-// AutoTable models spell the same marker in the tag:
-//     Active bool `drop:"active,notNull,default=true,alwaysInsert"`
-
-// 2. On the field, when "unset" and "false" are two different states.
-type User struct {
-    Notify *bool `drop:"notify"`   // nil → omitted, &false → written as false
-}
-
-// 3. On the call, when this one write knows exactly what it owns.
-err := UserEntity.CreateCols(db, ctx, &u, UserName, UserEmail, UserActive)
-```
-
-The pointer form is the convention `encoding/json` established, and it
-reads the same way here: a non-nil `*bool` is not the zero value, so a
-pointer to `false` is bound. `CreateCols` binds exactly the columns you
-name, whatever they hold, and consults no rule at all; columns you do
-not name are left out of the statement entirely. It errors — rather
-than writing a partial row — if a column is not on the entity's table,
-has no struct field, or is the tenant column of a scoped entity and
-you left it out.
-
-`Update` is not affected by any of this: it sets every mapped non-key
-column, zero values included.
 
 ## Querying
 
@@ -122,17 +83,9 @@ to a struct: `One` already reports emptiness as an error, and a nil
 Which to reach for:
 
 - the entity's `Query` when the rows *are* the table — it goes through
-  the fast-scan path, the entity cache and eager loading, none of which
-  an ad-hoc query has;
+  the fast-scan path, the entity cache, tenant scoping and eager
+  loading, none of which an ad-hoc query has;
 - `drops.All` / `drops.One` when they are not.
-
-Tenant scoping is not on that list, and it used to be. The axis is
-declared on the *table*, so a statement built straight from
-`db.Select()` carries the same automatic predicates the entity's `Query`
-does — and refuses with `pg.ErrTenantMissing` the same way when the ctx
-has no tenant. That is what makes the ad-hoc query safe to reach for:
-while the predicate was injected by the entity methods, every query
-written without an entity was a query written without a tenant.
 
 The two report an empty `One` with different sentinels today —
 `pg.ErrNoRows` from the entity, `drops.ErrNoRows` from `drops.One` —
@@ -170,16 +123,6 @@ variadic, so the composite form is `PatchKey` with the key as a slice:
 ```go
 MembershipEntity.PatchKey(db, ctx, []any{orgID, userID}, pg.Set(MemberRole, "admin"))
 ```
-
-An op naming the entity's tenant column is `ErrTenantMismatch`, in
-`pg`, `sqlite` and `mysql` alike — `clickhouse` has no `Patch`. The
-tenant column is what *addresses* a row, not something a patch assigns,
-and `Patch` is the one write in the package that never reads the row
-first, so nothing downstream would notice: `Set(TenantID, 999)` beside
-a `WHERE` clause that still carries the ctx tenant is one statement
-handing the row away, reported as one row affected. The refusal covers
-an op assigning the ctx tenant's own value too, since that is a no-op
-only by coincidence of the value.
 
 ## Relations
 
@@ -233,21 +176,41 @@ UserEntity.Query(db).LoadRel(UserPosts, func(p *pg.RelConfig) {
 })
 ```
 
-`Limit` and `Offset` on an edge cap the rows attached to *each parent*,
-not the query as a whole:
+### The relation you forgot to load
+
+Go has no lazy loading, which is a feature — a field read never fires a
+query behind your back. But forget `Load(UserPosts)` and `user.Posts`
+is `nil`, which reads exactly like "this user has no posts". The wrong
+answer is silent.
+
+Nothing in Go can intercept a struct field read, so drops refuses the
+*query* instead:
 
 ```go
-UserEntity.Query(db).LoadRel(UserPosts, func(p *pg.RelConfig) {
-    p.OrderBy(PostCreatedAt.Desc()).Limit(5)   // five posts per user
-})
+db := pg.New(drv)
+if devMode {
+    db = db.StrictLoading()
+}
+
+users, err := UserEntity.Query(db).All(ctx)
+// error: relation not loaded: "posts" on struct main.User — this query
+// never loaded it … Load it with .Load(users.Rel("posts")) …, or say
+// the query does not need it with .NoLoad(users.Rel("posts")) …
 ```
 
-On `HasMany` and `MorphMany` that becomes a `ROW_NUMBER()` window and
-the server returns five rows per parent. A many-to-many edge has no
-single query to partition — its junction table is read first — so the
-cap is applied to each parent's slice once the target query has
-returned: the result is the same, the query is not narrower. Neither
-edge accepts a `Limit` and quietly does nothing with it.
+The check is structural: it walks the destination struct against the
+table's declared relations and refuses before the SELECT runs, so it
+costs no round trip. A query that genuinely does not need the relation
+says so, and is let through:
+
+```go
+UserEntity.Query(db).Load(UserPosts).NoLoad(UserProfile).All(ctx)
+```
+
+Turn it on in development and in tests, where the mistake surfaces as a
+failing test rather than a failing request. It is off by default and
+changes nothing when off. `Entity.Get` is exempt: it addresses a row by
+primary key and has no way to load a relation at all.
 
 ### Catching N+1 anyway
 
@@ -294,80 +257,59 @@ These attach to an entity and then apply to every operation:
 UserEntity.
     WithCache(cache, time.Minute).   // read-through, single-flight on misses
     WithAudit(auditLog).             // who-changed-what, same transaction
-    ScopeByTenant(UserTenantID).     // registers the tenant axis on the table
+    ScopeByTenant(UserTenantID).     // every query filtered by ctx tenant
     AuthorizeWith(guard).            // every query filtered by ctx subject
     WithBudget(budget)               // caps rows, args and duration
 ```
 
-Each is documented in its own file in the `pg` package. Two of them
-reach further than the entity they are spelled on:
+Each is documented in its own file in the `pg` package. They are
+PostgreSQL and SQLite only today.
 
-- `ScopeByTenant` registers the axis as a filter on the table, so every
-  statement that reads or writes it takes the tenant from ctx — a bare
-  `db.Select()`, an eager-loaded edge, a CTE body, a subquery — and
-  refuses when the ctx carries none. Widen one statement with
-  `Unscoped()`, one relation edge with `RelConfig.Unscoped()`.
+## Stepping around a global filter
 
-  The handle it is given is normalised to the entity's own: a column
-  taken off `Table.As` names the same axis as the declared one, and
-  what is stored is the declared handle, because the predicate has to
-  qualify with the table the entity queries rather than with an alias
-  no such query names.
+A table can carry filters drops AND-s into every statement without the
+call site asking — a soft-delete guard, a tenancy axis. They are named,
+and a query bypasses them one at a time:
 
-  It is not the isolation boundary, and the `pg` package doc says so
-  under "The predicates are not the boundary". PostgreSQL row-level
-  security is the boundary; these predicates are the layer that makes
-  the common path fast, legible and correct on top of it. `drops.Raw`
-  is an escape hatch by design, `Unscoped()` exists and has to, and the
-  source checks that keep the axis honest are a lint over one package —
-  so declare RLS with `EnableRLS` / `AddPolicy` on every table that
-  holds more than one tenant's rows, and read this bullet as defence in
-  depth. Then run the request through `db.InTxAs(ctx, session, fn)`,
-  which is the other half of that: it establishes the role and the
-  settings a policy reads back with `current_setting` for exactly the
-  lifetime of one transaction, and aborts rather than running the body
-  as the pool's own user when it cannot.
-- `AuthorizeWith` AND-s the guard's predicate into every Get / Query /
-  Update / Delete. A `MembershipGuard`'s junction subquery is a
-  statement drops composed rather than SQL text, so the junction table's
-  own filters apply to it: a revoked — soft-deleted — membership row
-  stops authorising, and in `pg`, where a table can carry a tenant
-  filter, so does a membership row belonging to another tenant.
+```go
+Posts.AddFilter("archived", PostArchived.Eq(false))
 
-`WithBudget` is PostgreSQL only. `WithCache`, `WithAudit` and
-`AuthorizeWith` exist in `sqlite` too — its `WithAudit` is a package
-function rather than a method — and not in `mysql` or `clickhouse`.
+// deleted rows too, and still only this tenant's, still not archived
+PostEntity.Query(db).IgnoreFilters(pg.FilterSoftDelete).All(ctx)
+```
 
-`ScopeByTenant` is in all four. It is the same mechanism in each: the
-axis is declared on the *table*, resolved by the *executors*, and
-reaches every statement drops composed to any depth, refusing rather
-than running when the ctx carries no tenant. `sqlite`'s old
-entity-injected predicate — the shape `pg` had before the axis moved
-onto the table, which a bare `db.Select()` and a relation loader went
-around — is gone. What differs between the four is surface rather than
-mechanism: `clickhouse` in particular has no UPDATE, no DELETE, no
-upsert and no relations for an axis to reach into. See
-[dialects.md](dialects.md#tenant-scoping) for the per-dialect table,
-and each package's `tenant.go` for what the scoping does not reach.
+`pg.FilterSoftDelete` is the name `SoftDeleteMixin` registers its guard
+under; `pg.FilterTenant` names the predicate `ScopeByTenant` injects,
+which a deliberate cross-tenant report can drop the same way.
 
-The rules themselves are written down once. Each dialect's `tenant.go`
-carries a block delimited `THE TENANT POLICIES — NORMATIVE` that is
-byte-identical in all four, and a root-level test fails when one of
-them drifts by a word — over a set of dialects derived from the source
-rather than listed, so a fifth one carrying no block fails too. It states what counts as the same tenant, what
-may assign the axis, and what `Unscoped` gives up at each level, and it
-names the dialect differences inside the shared text so one set of
-words is true in four packages. Read it there rather than here: this
-page summarises, that block is the reference.
+`Unscoped()` still exists and is the blunt instrument: it drops every
+filter the table carries at once, which is what a migration or a
+backfill wants and almost never what a query does. It does not reach
+the `ScopeByTenant` guard — that one comes from the context rather than
+the table, and losing customer isolation as a side effect of asking for
+soft-deleted rows is exactly the accident `IgnoreFilters` exists to
+prevent.
 
-Three of its rules are worth carrying to the call site, because they
-are the same in all four. `Unscoped` on an **entity query** drops the
-declaration-time default filters — a soft-delete guard — and *keeps*
-the tenant axis and the authorization guard. `Unscoped` on a **raw
-builder** is statement-wide and drops both; a query that genuinely has
-to span tenants is written there, where a reviewer reads the whole of
-what was given up. And at every level `Unscoped` stops at the edge of
-the statement it was said on: a CTE body, a subquery operand, a
-subquery bound as an INSERT value is a statement of its own and keeps
-its own scoping, which is also how one part of a query is unscoped and
-no other.
+### How far a filter reaches
+
+A statement carries the filters of the table it is *about* — the
+`FROM` of a SELECT, the target of an UPDATE or DELETE. Two consequences
+are worth knowing before you rely on one:
+
+- **A joined table contributes nothing.** `db.Select().From(Authors).
+  Join(Books, …)` applies `Authors`' filters and not `Books`', so a
+  join onto a soft-deleted table sees the deleted rows. A filter is a
+  statement about which rows of a table are *the* rows; on the far side
+  of a join the query is already saying which rows it wants, and drops
+  will not quietly narrow it further. Say it yourself in the `ON`
+  clause or a `Where`.
+- **An eager-loaded relation does.** Each edge of a `Load` /`With` tree
+  is its own SELECT against the related table, so it carries that
+  table's filters — including when `RelConfig.Limit` caps the rows per
+  parent. A relation is loaded *as* that table, not joined onto this
+  one, which is why the two answers differ.
+
+`IgnoreFilters` and `Unscoped` speak only for the statement they are
+called on. Neither reaches into an eager-loaded relation's query, and
+there is no per-edge bypass: a relation's guards always apply. Load the
+related rows with their own query when you need to step around one.

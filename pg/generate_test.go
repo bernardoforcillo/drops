@@ -99,6 +99,11 @@ func TestSnapshotJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// A new table renders as column definitions and nothing else — the
+// PRIMARY KEY included, however few columns it spans. It used to be
+// inlined on the column when it spanned one, which made the key the
+// only constraint with two ways of reaching the server and left Diff
+// unable to compare a key that changed width.
 func TestDiffFromEmptyEmitsCreateTable(t *testing.T) {
 	users := pg.NewTable("users")
 	pg.Add(users, pg.BigSerial("id").PrimaryKey())
@@ -106,12 +111,15 @@ func TestDiffFromEmptyEmitsCreateTable(t *testing.T) {
 
 	cur := pg.BuildSnapshot(pg.NewSchema(users))
 	stmts := pg.Diff(pg.EmptySnapshot(), cur)
-	if len(stmts) != 1 {
-		t.Fatalf("got %d statements, want 1: %v", len(stmts), stmts)
+	if len(stmts) != 2 {
+		t.Fatalf("got %d statements, want 2 (CREATE TABLE + ALTER TABLE): %v", len(stmts), stmts)
 	}
-	want := "CREATE TABLE \"users\" (\n\t\"id\" bigserial PRIMARY KEY NOT NULL,\n\t\"name\" text NOT NULL\n);"
+	want := "CREATE TABLE \"users\" (\n\t\"id\" bigserial NOT NULL,\n\t\"name\" text NOT NULL\n);"
 	if stmts[0] != want {
 		t.Errorf("CREATE TABLE mismatch:\n--- got ---\n%s\n--- want ---\n%s", stmts[0], want)
+	}
+	if got := stmts[1]; got != `ALTER TABLE "users" ADD CONSTRAINT "usersIdPk" PRIMARY KEY ("id");` {
+		t.Errorf("the key was not stated as its own ALTER TABLE: %s", got)
 	}
 }
 
@@ -127,20 +135,23 @@ func TestDiffFromEmptyEmitsUniqueAsSeparateAlter(t *testing.T) {
 	cur := pg.BuildSnapshot(pg.NewSchema(users))
 	stmts := pg.Diff(pg.EmptySnapshot(), cur)
 
-	if len(stmts) != 2 {
-		t.Fatalf("got %d statements, want 2 (CREATE TABLE + ALTER TABLE):\n%s",
+	if len(stmts) != 3 {
+		t.Fatalf("got %d statements, want 3 (CREATE TABLE + two ALTER TABLEs):\n%s",
 			len(stmts), strings.Join(stmts, "\n"))
 	}
 	create := stmts[0]
 	if !strings.HasPrefix(create, `CREATE TABLE "users"`) {
 		t.Errorf("first statement should be CREATE TABLE, got: %s", create)
 	}
-	if strings.Contains(create, "UNIQUE") || strings.Contains(create, "CONSTRAINT") {
-		t.Errorf("CREATE TABLE must not inline the UNIQUE constraint:\n%s", create)
+	if strings.Contains(create, "UNIQUE") || strings.Contains(create, "CONSTRAINT") || strings.Contains(create, "PRIMARY KEY") {
+		t.Errorf("CREATE TABLE must not inline a constraint:\n%s", create)
 	}
 	want := `ALTER TABLE "users" ADD CONSTRAINT "usersEmailUnique" UNIQUE("email");`
 	if stmts[1] != want {
 		t.Errorf("second statement mismatch:\n  got: %s\n want: %s", stmts[1], want)
+	}
+	if got := stmts[2]; got != `ALTER TABLE "users" ADD CONSTRAINT "usersIdPk" PRIMARY KEY ("id");` {
+		t.Errorf("third statement mismatch:\n  got: %s", got)
 	}
 }
 

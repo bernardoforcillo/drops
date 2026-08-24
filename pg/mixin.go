@@ -5,8 +5,8 @@ import "github.com/bernardoforcillo/drops"
 // Mixin is the richer companion of the plain template functions in
 // template.go. While a template function (Timestamps, SoftDelete, ...)
 // only contributes columns, a Mixin can also register indexes,
-// foreign keys, lifecycle hooks, default filters and context filters in
-// a single Apply call.
+// foreign keys, lifecycle hooks, and default filters in a single
+// Apply call.
 //
 // The two styles compose freely:
 //
@@ -65,22 +65,16 @@ func (m *TimestampsMixin) Apply(t *Table) {
 	}))
 }
 
-// SoftDeleteMixin registers a "deletedAt" column, a DefaultFilter
-// (deletedAt IS NULL), and a DeleteHook that rewrites DELETE
-// statements as UPDATE deletedAt = now() — i.e. the row stays in
-// the table but is hidden by default. Use Unscoped() on any builder
-// to bypass the guard and operate on every row (including the
-// already-deleted ones).
+// SoftDeleteMixin registers a "deletedAt" column, a filter named
+// [FilterSoftDelete] (deletedAt IS NULL), and a DeleteHook that
+// rewrites DELETE statements as UPDATE deletedAt = now() — i.e. the
+// row stays in the table but is hidden by default.
 //
-// The filter is registered on the table, so it applies wherever the
-// table is read from and not only where somebody remembered it: an
-// eager-loaded relation whose target is soft-deleted is filtered on the
-// same terms as a direct query, including the ROW_NUMBER() rewrite that
-// a per-parent Limit switches on. That last path used to write its own
-// SQL and skip the filter, which meant adding .Limit(5) to a relation
-// resurrected its deleted rows. Widen a single edge — to read the
-// deleted revisions of a document you are already allowed to see —
-// with [RelConfig.Unscoped].
+// To read the hidden rows, name the guard:
+// IgnoreFilters(pg.FilterSoftDelete). That leaves every other filter
+// on the table — a tenancy axis, an authorisation rule — in force.
+// Unscoped() also works and drops all of them, which is what you want
+// for a migration and almost never what you want for a query.
 type SoftDeleteMixin struct {
 	Cols SoftDeleteCols
 }
@@ -89,7 +83,7 @@ type SoftDeleteMixin struct {
 func (m *SoftDeleteMixin) Apply(t *Table) {
 	m.Cols = SoftDelete(t)
 	deletedAt := m.Cols.DeletedAt.Column
-	t.DefaultFilter(IsNull(deletedAt))
+	t.AddFilter(FilterSoftDelete, IsNull(deletedAt))
 	t.OnDelete(DeleteHookFunc(func(d *DeleteBuilder) drops.Expression {
 		upd := d.DB().Update(d.Table()).
 			Set(&exprBinding{col: deletedAt, expr: drops.Raw("now()")})

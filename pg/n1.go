@@ -29,6 +29,13 @@ import (
 // The detector is opt-in per context. Without WithN1Detector the
 // hook is a no-op, so attaching it to a global DB carries no cost
 // for untracked traffic.
+//
+// This is the backstop for the queries a caller did write — it counts
+// SQL that already ran and reports a repeated skeleton. Its
+// counterpart is [DB.StrictLoading] in strict.go, the backstop for the
+// query a caller forgot to write, which refuses an under-specified
+// relation load before it executes. They look at different evidence
+// and never contradict each other; run both.
 
 type n1ContextKey int
 

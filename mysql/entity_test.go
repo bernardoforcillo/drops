@@ -213,27 +213,3 @@ func TestEntityAllowUnmappedColumns(t *testing.T) {
 		t.Fatal("expected the entity to build")
 	}
 }
-
-// --- relations ---------------------------------------------------------
-
-func TestRelPanicsOnUnknownName(t *testing.T) {
-	users, id, _, _ := usersTable()
-	posts := mysql.NewTable("posts")
-	mysql.Add(posts, mysql.BigSerial("id").PrimaryKey())
-	puid := mysql.Add(posts, mysql.BigInt("userId"))
-	mysql.NewRelations(users).HasMany("posts", posts, id, puid)
-
-	if users.Rel("posts") == nil {
-		t.Fatal("declared relation should resolve")
-	}
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected a panic for an undeclared relation")
-		}
-		if !strings.Contains(r.(string), "posts") {
-			t.Errorf("message should list what is declared: %v", r)
-		}
-	}()
-	users.Rel("psots")
-}

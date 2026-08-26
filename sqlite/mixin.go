@@ -61,6 +61,15 @@ type SoftDeleteMixin struct {
 }
 
 // Apply implements Mixin.
+//
+// The guard is registered by [SoftDelete] and not again here. It used
+// to be registered twice — once there, once at this line — so every
+// SELECT, UPDATE and DELETE against a mixin-soft-deleted table carried
+// "deletedAt IS NULL" twice. That was only ever noise in a query log
+// while the filter list was a plain slice; now that the list is walked
+// per execution for the statements written inside it, a duplicate
+// filter is a duplicate walk, and a duplicated predicate is one more
+// thing a reader of a rendered statement has to decide is harmless.
 func (m *SoftDeleteMixin) Apply(t *Table) {
 	// SoftDelete has already registered the FilterSoftDelete guard;
 	// the mixin only adds the DELETE rewrite on top of it.

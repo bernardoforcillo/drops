@@ -250,11 +250,21 @@ func TestOwnedByLeavesForeignTablesAlone(t *testing.T) {
 	declared := EmptySnapshot()
 	declared.Tables["mine"] = newTableSnapshot("mine")
 
-	narrowed := ownedBy(live, declared)
+	narrowed, withheld := ownedBy(live, declared)
 	if _, ok := narrowed.Tables["someone_elses"]; ok {
 		t.Fatalf("a table the schema never declared reached the diff and would be dropped")
 	}
 	if stmts := Diff(narrowed, declared); len(stmts) != 0 {
 		t.Fatalf("diff over the narrowed side = %v", stmts)
+	}
+	if len(withheld) != 1 || withheld[0] != "someone_elses" {
+		t.Fatalf("withheld = %v, want [someone_elses]", withheld)
+	}
+	notices := unmanagedTableNotices(live, withheld, PushOptions{})
+	if len(notices) != 1 || notices[0].Rule != "unmanaged-table" || notices[0].Table != "someone_elses" {
+		t.Fatalf("notices = %v, want one unmanaged-table notice for someone_elses", notices)
+	}
+	if notices[0].SQL != `DROP TABLE `+"`someone_elses`"+`;` {
+		t.Fatalf("notice SQL = %v, want the DROP it withheld", notices[0].SQL)
 	}
 }

@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -373,11 +374,14 @@ func TestMySQLAliasReachesUpdateAndDelete(t *testing.T) {
 	}
 }
 
-// A relation reached through an alias must rebind its near side to that
-// alias. The failure is not a syntax error the server would catch: the
-// un-rebound predicate is still valid SQL, it just compares one
-// instance of the table to itself and quietly returns the wrong rows.
-func TestMySQLRelationThroughAnAliasJoinsTheRightInstance(t *testing.T) {
+// A self-join has to reach two instances of one table, and the alias
+// is what separates them. The failure is not a syntax error the server
+// would catch: a predicate built from the un-aliased handles on both
+// sides is still valid SQL, it just compares one instance of the table
+// to itself and quietly returns the wrong rows.
+//
+// mysql has no relations, so the edge is spelled at the query site.
+func TestMySQLAliasedSelfJoinJoinsTheRightInstance(t *testing.T) {
 	db := openMySQL(t)
 	ctx := context.Background()
 	tbl := mysql.NewTable(integration.UniqueName(t, "staff"))
@@ -386,7 +390,6 @@ func TestMySQLRelationThroughAnAliasJoinsTheRightInstance(t *testing.T) {
 	id := mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
 	name := mysql.Add(tbl, mysql.Varchar("name", 64).NotNull())
 	managerID := mysql.Add(tbl, mysql.BigInt("managerId"))
-	mysql.NewRelations(tbl).BelongsTo("manager", tbl, managerID, id)
 	execMySQL(t, db, mysql.CreateTable(tbl))
 
 	for _, r := range []struct {
@@ -404,25 +407,25 @@ func TestMySQLRelationThroughAnAliasJoinsTheRightInstance(t *testing.T) {
 	}
 
 	// The employee is the aliased instance; the manager is reached
-	// through the un-aliased handles, which is what the relation's far
-	// side still names.
+	// through the un-aliased handles. Both ends have to come from the
+	// handle that names the instance meant, which is the whole of what
+	// the alias buys.
 	emp := tbl.As("e")
-	rel := emp.Rel("manager")
 	var rows []struct {
 		Staff   string `drop:"staff"`
 		Manager string `drop:"manager"`
 	}
 	err := db.Select(emp.Col("name").As("staff"), name.As("manager")).
 		From(emp).
-		Join(tbl, mysql.Eq(rel.ChildKey, rel.ParentKey)).
+		Join(tbl, mysql.Eq(emp.Col(managerID.Name()), id)).
 		OrderBy(emp.Col("name").Asc()).
 		All(ctx, &rows)
 	if err != nil {
-		t.Fatalf("relation join: %v", err)
+		t.Fatalf("self join: %v", err)
 	}
 	want := map[string]string{"Alan": "Ada", "Grace": "Ada"}
 	if len(rows) != len(want) {
-		t.Fatalf("relation join returned %d rows, want %d: %+v", len(rows), len(want), rows)
+		t.Fatalf("self join returned %d rows, want %d: %+v", len(rows), len(want), rows)
 	}
 	for _, r := range rows {
 		if want[r.Staff] != r.Manager {
@@ -2008,9 +2011,8 @@ func TestMySQLOutboxEmitDrainPublish(t *testing.T) {
 	if e.Headers["traceparent"] != "00-abc" {
 		t.Errorf("headers = %v", e.Headers)
 	}
-	if string(e.Payload) != `{"id":7}` {
-		t.Errorf("payload = %s", e.Payload)
-	}
+	_, _, mariadb := mysqlServerVersion(t, db)
+	assertJSONRoundTrip(t, mariadb, e.Payload, `{"id": 7}`, `{"id":7}`)
 	if time.Since(e.CreatedAt) > time.Minute || time.Since(e.CreatedAt) < -time.Minute {
 		t.Errorf("createdAt = %v, which is not close to now — a time zone is being applied somewhere", e.CreatedAt)
 	}
@@ -2569,9 +2571,11 @@ func TestMySQLSnapshotUpsertReplacesInPlace(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("load: ok=%v, err=%v", ok, err)
 	}
-	if got.Version != 9 || string(got.State) != `{"score":9}` {
-		t.Errorf("snapshot = %+v", got)
+	if got.Version != 9 {
+		t.Errorf("snapshot version = %d, want the second save to have replaced the first", got.Version)
 	}
+	_, _, mariadb := mysqlServerVersion(t, db)
+	assertJSONRoundTrip(t, mariadb, got.State, `{"score": 9}`, `{"score":9}`)
 	if _, ok, err := store.LoadSnapshot(ctx, snaps.Name(), "match", "missing"); err != nil || ok {
 		t.Errorf("a missing snapshot should report ok=false, got ok=%v err=%v", ok, err)
 	}
@@ -3027,8 +3031,27 @@ func TestMySQLOutboxAggregateLockSurvivesACancelledContext(t *testing.T) {
 	}
 
 	cancelCtx, cancel := context.WithCancel(ctx)
-	err := ob.DrainAggregate(cancelCtx, "cart", "9", 10, func(*mysql.DB, []mysql.OutboxEvent) error {
+	err := ob.DrainAggregate(cancelCtx, "cart", "9", 10, func(tx *mysql.DB, _ []mysql.OutboxEvent) error {
 		cancel()
+		// database/sql watches a transaction's context in a goroutine
+		// and rolls the transaction back the moment it is cancelled.
+		// Cancelling and returning straight away races that goroutine,
+		// so this test reached the state it is about only sometimes —
+		// about two runs in three under -race and almost never
+		// without it. Waiting until the rollback has actually landed
+		// makes it the same test on every run: from here on the
+		// session is one drops can no longer send anything down, which
+		// is exactly the situation the lock has to survive.
+		deadline := time.Now().Add(200 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if _, qerr := tx.Exec(context.Background(), "SELECT 1"); qerr != nil {
+				// The watcher won: this session can no longer be sent
+				// anything from here, which is the state the lock has
+				// to survive. Nothing is left to wait for.
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
 		return nil
 	})
 	if err == nil {
@@ -3099,6 +3122,79 @@ func mysqlValue(t *testing.T, db *mysql.DB, e drops.Expression) string {
 	return mysqlText(v)
 }
 
+// assertJSONRoundTrip checks a value read back out of a JSON column
+// against both what it has to mean and exactly how the family that
+// answered spells it.
+//
+// The two families store JSON differently and it shows on the way out.
+// MySQL 8.0.46 has a real JSON type: it parses on write and
+// re-serialises on read, so `{"id":7}` comes back as `{"id": 7}` — a
+// space after every colon, insignificant whitespace gone, object keys
+// in the server's order. MariaDB 10.11.14's JSON is an alias for
+// LONGTEXT with a CHECK constraint, so the bytes come back exactly as
+// they went in. Two assertions in this file compared the bytes to what
+// was written and so could only ever have held on MariaDB.
+//
+// Both spellings are pinned, and the two are also checked to be the
+// same JSON, so this cannot quietly become a test that accepts any
+// well-formed answer.
+func assertJSONRoundTrip(t *testing.T, mariadb bool, got []byte, wantMySQL, wantMariaDB string) {
+	t.Helper()
+	var a, b bytes.Buffer
+	if err := json.Compact(&a, []byte(wantMySQL)); err != nil {
+		t.Fatalf("wantMySQL is not JSON: %v", err)
+	}
+	if err := json.Compact(&b, []byte(wantMariaDB)); err != nil {
+		t.Fatalf("wantMariaDB is not JSON: %v", err)
+	}
+	if a.String() != b.String() {
+		t.Fatalf("the two expected spellings are different JSON, not one value spelled twice: %s vs %s", &a, &b)
+	}
+	want := wantMySQL
+	if mariadb {
+		want = wantMariaDB
+	}
+	if string(got) != want {
+		t.Errorf("JSON column round-tripped as %s, want %s", got, want)
+	}
+}
+
+// mysqlStreamErr runs a statement and returns the error it fails with,
+// from whichever stage produces it, plus whether that stage was the
+// cursor rather than the call.
+//
+// MySQL reports a runtime error inside a SELECT's result *stream*, not
+// in the reply to the query: the driver hands back a live cursor and
+// the server's error surfaces at rows.Err() once iteration reaches the
+// point that raised it. A test that checks only the error Rows returns
+// therefore sees nil for a statement the server rejected, which is
+// exactly how two tests in this file came to report that MySQL does
+// not raise errors 3636 and 3141 when it raises both. Returning the
+// stage as well as the error keeps the shape of the failure pinned and
+// not only its text.
+func mysqlStreamErr(t *testing.T, run func() (drops.Rows, error)) (err error, fromCursor bool) {
+	t.Helper()
+	rows, err := run()
+	if err != nil {
+		return err, false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		cols, cerr := rows.Columns()
+		if cerr != nil {
+			return cerr, true
+		}
+		dest := make([]any, len(cols))
+		for i := range dest {
+			dest[i] = new(any)
+		}
+		if serr := rows.Scan(dest...); serr != nil {
+			return serr, true
+		}
+	}
+	return rows.Err(), true
+}
+
 // mysqlValueErr is mysqlValue for the cases that are meant to fail on
 // one server and not the other.
 func mysqlValueErr(t *testing.T, db *mysql.DB, e drops.Expression) (string, error) {
@@ -3131,6 +3227,35 @@ func runExprCases(t *testing.T, db *mysql.DB, cases []exprCase) {
 			if got := mysqlValue(t, db, tc.expr); got != tc.want {
 				text, args := drops.StringWithDialect(mysql.Dialect, tc.expr)
 				t.Errorf("value = %q, want %q\n%s\nargs: %v", got, tc.want, text, args)
+			}
+		})
+	}
+}
+
+// exprCaseFamily is [exprCase] for an expression the two families
+// answer differently. It carries one exact string per family rather
+// than accepting either, so a server that changes its mind is still a
+// failure — the point of pinning a divergence is to notice when it
+// stops being one.
+type exprCaseFamily struct {
+	name        string
+	expr        drops.Expression
+	wantMySQL   string
+	wantMariaDB string
+}
+
+func runExprCasesByFamily(t *testing.T, db *mysql.DB, cases []exprCaseFamily) {
+	t.Helper()
+	_, _, mariadb := mysqlServerVersion(t, db)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.wantMySQL
+			if mariadb {
+				want = tc.wantMariaDB
+			}
+			if got := mysqlValue(t, db, tc.expr); got != want {
+				text, args := drops.StringWithDialect(mysql.Dialect, tc.expr)
+				t.Errorf("value = %q, want %q\n%s\nargs: %v", got, want, text, args)
 			}
 		})
 	}
@@ -3234,6 +3359,46 @@ func TestMySQLCollateForcesCaseSensitivity(t *testing.T) {
 	}
 }
 
+// The five values whose text depends on which family answers, and all
+// of them for one reason. MySQL fixes a function's result scale while
+// it prepares the statement, and a placeholder has no scale to fix it
+// from, so MySQL falls back to the widest form the function can
+// return: the first argument's scale for ROUND and TRUNCATE, six
+// fractional digits for MAKETIME and UNIX_TIMESTAMP, and no
+// div_precision_increment for /. MariaDB gives a parameter the same
+// answer it gives a literal in every one of these.
+//
+// drops binds values, so every one of these calls hits the parameter
+// path. The numbers agree on both servers — 2.350 is 2.35 — so code
+// that scans into a numeric type sees nothing here and code that scans
+// into a string sees all of it. That is the whole hazard, and it is
+// why these are pinned per family rather than to whichever server the
+// author happened to have.
+//
+// Measured on MySQL 8.0.46 and MariaDB 10.11.14.
+func TestMySQLPlaceholderScaleDivergence(t *testing.T) {
+	db := openMySQL(t)
+	runExprCasesByFamily(t, db, []exprCaseFamily{
+		{"Div does not truncate", mysql.Div(5, 2), "2.5", "2.5000"},
+		{"Round to digits", mysql.Round(drops.Raw("2.345"), 2), "2.350", "2.35"},
+		{"Truncate cuts rather than rounds", mysql.Truncate(drops.Raw("2.349"), 2), "2.340", "2.34"},
+		{"MakeTime", mysql.MakeTime(1, 2, 3), "01:02:03.000000", "01:02:03"},
+		{"UnixTimestamp", mysql.UnixTimestamp("1970-01-01 00:00:00"), "0.000000", "0"},
+	})
+
+	// The same five with their arguments written into the SQL instead
+	// of bound, which is what the paragraph above claims is the
+	// difference. Both families answer identically here, so the
+	// divergence really is the placeholder and not the function.
+	runExprCases(t, db, []exprCase{
+		{"Div of literals", drops.Raw("5 / 2"), "2.5000"},
+		{"Round to a literal digit count", drops.Raw("ROUND(2.345, 2)"), "2.35"},
+		{"Truncate to a literal digit count", drops.Raw("TRUNCATE(2.349, 2)"), "2.34"},
+		{"MakeTime of literals", drops.Raw("MAKETIME(1, 2, 3)"), "01:02:03"},
+		{"UnixTimestamp of a literal", drops.Raw("UNIX_TIMESTAMP('1970-01-01 00:00:00')"), "0"},
+	})
+}
+
 func TestMySQLMathFunctionValues(t *testing.T) {
 	db := openMySQL(t)
 	runExprCases(t, db, []exprCase{
@@ -3247,7 +3412,8 @@ func TestMySQLMathFunctionValues(t *testing.T) {
 		{"LogBase reads base first", mysql.LogBase(2, 8), "3"},
 
 		// The second: integer division. MySQL's / never truncates.
-		{"Div does not truncate", mysql.Div(5, 2), "2.5000"},
+		// The exact scale it comes back with is a family divergence;
+		// see [TestMySQLPlaceholderScaleDivergence].
 		{"IntDiv truncates", mysql.IntDiv(5, 2), "2"},
 		{"IntDiv truncates toward zero", mysql.IntDiv(-5, 2), "-2"},
 
@@ -3260,8 +3426,6 @@ func TestMySQLMathFunctionValues(t *testing.T) {
 		{"Mod", mysql.Mod(5, 2), "1"},
 		{"Round half away from zero", mysql.Round(drops.Raw("2.5")), "3"},
 		{"Round negative half away from zero", mysql.Round(drops.Raw("-2.5")), "-3"},
-		{"Round to digits", mysql.Round(drops.Raw("2.345"), 2), "2.35"},
-		{"Truncate cuts rather than rounds", mysql.Truncate(drops.Raw("2.349"), 2), "2.34"},
 
 		{"Greatest", mysql.Greatest(1, 5, 3), "5"},
 		{"Least", mysql.Least(1, 5, 3), "1"},
@@ -3308,7 +3472,6 @@ func TestMySQLDateTimeFunctionValues(t *testing.T) {
 		{"Weekday numbers Monday 0", mysql.Weekday("2024-03-11"), "0"},
 		{"DayOfYear", mysql.DayOfYear("2024-03-15"), "75"},
 
-		{"MakeTime", mysql.MakeTime(1, 2, 3), "01:02:03"},
 		// Not MySQL's MAKEDATE(year, dayofyear), which would answer
 		// 2024-01-03 for these arguments.
 		{"MakeDate keeps y/m/d", mysql.MakeDate(2024, 3, 15), "2024-03-15 00:00:00"},
@@ -3322,7 +3485,6 @@ func TestMySQLDateTimeFunctionValues(t *testing.T) {
 
 		{"LastDay", mysql.LastDay("2024-02-05"), "2024-02-29 00:00:00"},
 		{"Quarter", mysql.Quarter("2024-05-01"), "2"},
-		{"UnixTimestamp", mysql.UnixTimestamp("1970-01-01 00:00:00"), "0"},
 		{"FromUnixTime", mysql.FromUnixTime(0), "1970-01-01 00:00:00"},
 	})
 }
@@ -4658,8 +4820,8 @@ func TestMySQLRecursionCapDiffersBetweenTheServers(t *testing.T) {
 		drops.Raw("SELECT 1 UNION ALL SELECT `n` + 1 FROM `t` WHERE `n` < 2000"), "n")
 	sel := db.Select(mysql.Max(deep.Col("n"))).WithRecursive(deep).FromExpr(deep.Ref())
 
-	rows, err := sel.Rows(ctx)
 	if info.MariaDB {
+		rows, err := sel.Rows(ctx)
 		if err != nil {
 			t.Fatalf("MariaDB is documented to truncate silently, not to fail: %v", err)
 		}
@@ -4677,13 +4839,24 @@ func TestMySQLRecursionCapDiffersBetweenTheServers(t *testing.T) {
 		if mysqlText(v) != "1001" {
 			t.Logf("MariaDB truncated at %s rather than 1001; the cap is set, the number is the server's", mysqlText(v))
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("MariaDB truncated and then reported an error after all: %v", err)
+		}
 	} else {
+		err, fromCursor := mysqlStreamErr(t, func() (drops.Rows, error) { return sel.Rows(ctx) })
 		if err == nil {
-			rows.Close()
 			t.Fatal("MySQL is documented to raise error 3636 past cte_max_recursion_depth")
 		}
 		if !strings.Contains(err.Error(), "3636") && !strings.Contains(strings.ToLower(err.Error()), "recursi") {
 			t.Fatalf("unexpected error past the recursion cap: %v", err)
+		}
+		// Which stage the error arrives at is the part a caller has to
+		// build around: the recursion runs while rows are being read,
+		// so Rows() itself succeeds and only rows.Err() ever says the
+		// answer is short. Anything that stops at the error Rows
+		// returns treats a capped recursion as a complete result.
+		if !fromCursor {
+			t.Error("error 3636 came back from Rows(); if MySQL now reports it eagerly, the caller advice above is out of date")
 		}
 	}
 
@@ -5286,14 +5459,13 @@ func TestMySQLJSONContainsRejectsNonJSONDifferently(t *testing.T) {
 	_, _, mariadb := mysqlServerVersion(t, db)
 
 	e := mysql.JSONContains(doc, "notjson")
-	rows, err := db.Select(e).From(tbl).Rows(context.Background())
-	if err == nil {
-		defer rows.Close()
-	}
+	run := func() (drops.Rows, error) { return db.Select(e).From(tbl).Rows(context.Background()) }
 	if mariadb {
+		rows, err := run()
 		if err != nil {
 			t.Fatalf("MariaDB is documented to answer NULL rather than to fail: %v", err)
 		}
+		defer rows.Close()
 		if !rows.Next() {
 			t.Fatal("no row")
 		}
@@ -5304,12 +5476,25 @@ func TestMySQLJSONContainsRejectsNonJSONDifferently(t *testing.T) {
 		if got := mysqlText(v); got != "<nil>" {
 			t.Errorf("JSON_CONTAINS with a non-JSON candidate = %s, want NULL", got)
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("MariaDB answered NULL and then reported an error after all: %v", err)
+		}
 	} else {
+		err, fromCursor := mysqlStreamErr(t, run)
 		if err == nil {
 			t.Fatal("MySQL is documented to raise error 3141 for a candidate that is not JSON")
 		}
 		if !strings.Contains(err.Error(), "3141") && !strings.Contains(strings.ToLower(err.Error()), "invalid json") {
 			t.Fatalf("want the invalid-JSON error, got %v", err)
+		}
+		// As with the recursion cap: the argument is only found to be
+		// invalid while a row is being evaluated, so the statement
+		// starts successfully and the rejection reaches the caller at
+		// rows.Err(). The divergence in this test's name is therefore
+		// sharper than it looks — MariaDB's silent NULL and MySQL's
+		// error both come back from a call that succeeded.
+		if !fromCursor {
+			t.Error("error 3141 came back from Rows(); if MySQL now rejects the argument eagerly, the caller advice above is out of date")
 		}
 	}
 

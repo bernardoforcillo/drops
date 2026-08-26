@@ -39,3 +39,19 @@ func (e *exprBinding) writeValue(b *drops.Builder) { e.expr.WriteSQL(b) }
 func Bind(col ColRef, v any) ColumnValue {
 	return &valueBinding[any]{col: col.col(), val: v}
 }
+
+// boundExpr and withBoundExpr implement exprBound, so the resolver can
+// walk to a statement written into a column's value and hand back a
+// binding carrying the scoped copy.
+//
+// withBoundExpr copies rather than assigning through the receiver: a
+// caller may hold the binding and use it in a second statement, and a
+// resolved body written back into it would pin the first request's
+// tenant into every later use.
+func (e *exprBinding) boundExpr() drops.Expression { return e.expr }
+
+func (e *exprBinding) withBoundExpr(next drops.Expression) ColumnValue {
+	cp := *e
+	cp.expr = next
+	return &cp
+}

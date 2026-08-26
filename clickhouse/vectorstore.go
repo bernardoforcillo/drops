@@ -214,17 +214,12 @@ func (s *VectorStore) cursorGuard(dist drops.Expression, cur vector.Cursor) (dro
 		return nil, fmt.Errorf("%w: keyset cursor carries no id", vector.ErrInvalidCursor)
 	}
 	lastDist, lastID := *cur.Distance, id
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		b.Append(dist)
-		b.WriteString(", ")
-		s.id.WriteSQL(b)
-		b.WriteString(") > (")
-		b.AddArg(lastDist)
-		b.WriteString(", ")
-		b.AddArg(lastID)
-		b.WriteByte(')')
-	}), nil
+	return &opExpr{
+		parts: []string{"(", ", ", ") > (", ", ", ")"},
+		operands: []drops.Expression{
+			dist, s.id, drops.Param{Value: lastDist}, drops.Param{Value: lastID},
+		},
+	}, nil
 }
 
 // distanceExpr renders the ClickHouse distance function for the

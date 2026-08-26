@@ -39,6 +39,13 @@ type Entity[T any] struct {
 	table      *Table
 	colFields  []entityColField
 	validators []Validator[T]
+
+	// tenantCol and tenantField are the column and struct field
+	// [Entity.ScopeByTenant] named, and are the write-side half of the
+	// axis: the read-side half lives on the table as a ContextFilter.
+	// See tenant.go.
+	tenantCol   *Column
+	tenantField []int
 }
 
 // Validator is called before Create / CreateMany with a pointer to
@@ -227,6 +234,23 @@ func (e *Entity[T]) runValidators(r *T) error {
 // so r is not refreshed — any DEFAULT-driven values (timestamps,
 // UUIDs) stay zero on the Go side.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) (drops.Result, error) {
+	// The tenant is stamped onto the STRUCT, before the bindings are
+	// collected, so the caller's own value comes back carrying the
+	// tenant it was written under — and a row that already names a
+	// different tenant is refused rather than silently rewritten. The
+	// builder stamps the binding as well (see InsertBuilder.resolveCtx);
+	// doing it here too is what makes r agree with the row.
+	//
+	// It runs BEFORE the validators, which is section 2 of the policy
+	// block and used to be the other way round here: a validator saw
+	// the tenant field as the caller left it, which on the ordinary
+	// path — a struct decoded from a request body — is zero. So a
+	// validator that checked the row's tenant checked nothing, and one
+	// that required the field to be set rejected every legitimate
+	// Create.
+	if err := e.stampTenant(ctx, r); err != nil {
+		return nil, err
+	}
 	if err := e.runValidators(r); err != nil {
 		return nil, err
 	}
@@ -248,6 +272,17 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
+		// Every row, before any SQL is built. A batch is the normal
+		// size of a write here, so a stamp applied to some rows and not
+		// others is the outcome worth ruling out: half a million rows
+		// land owned and the rest owned by nobody, in one statement
+		// reported as a success.
+		//
+		// And before this row's validators, for the reason [Entity.Create]
+		// spells out: a validator reads the row as it will be written.
+		if err := e.stampTenant(ctx, &rs[i]); err != nil {
+			return nil, err
+		}
 		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
@@ -315,8 +350,44 @@ func (q *EntityQuery[T]) Limit(n int64) *EntityQuery[T] { q.sb.Limit(n); return 
 // Offset sets the OFFSET.
 func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); return q }
 
-// Unscoped opts out of the table's DefaultFilter predicates.
-func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+// Unscoped opts out of the table's DEFAULT filters for this query —
+// the declaration-time ones, a soft-delete guard above all. Without it
+// a soft-deleted row is unreachable through the entity at all, which
+// makes an audit or a restore flow impossible to write.
+//
+// It does NOT drop the table's context filters: the tenant axis and the
+// authorization guard survive it, and a ctx with no tenant is still
+// refused. That is a deliberate difference from
+// [SelectBuilder.Unscoped], which is statement-wide, and it is the
+// difference the four dialects state in the same words. The two lists
+// are not the same kind of thing — a default filter is a default scope,
+// a context filter is a row-visibility boundary — and the failures of
+// conflating them are not symmetric. Widening a default scope when the
+// caller asked to widen it costs nothing. Dropping the boundary hands
+// this request every tenant's rows, or every subject's, and it does so
+// on the one method a caller reaches for while thinking about
+// soft-deleted rows rather than about tenancy.
+//
+// A query that genuinely has to span tenants is written on the raw
+// builder, db.Select().From(t).Unscoped(), where a reviewer reading the
+// call sees the whole of what was given up.
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.unscopeDefaults(); return q }
+
+// GroupBy / Having / Limit-free chaining is available on the
+// underlying builder.
+func (q *EntityQuery[T]) Builder() *SelectBuilder { return q.sb }
+
+// ToSQLCtx renders the statement this query would send for ctx, with
+// every context filter resolved. It is what a test asserts on: a
+// round-trip against a single-tenant fixture passes while leaking, and
+// the rendered SQL is the only place the guard is visible.
+func (q *EntityQuery[T]) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	return q.sb.ToSQLCtx(ctx)
+}
+
+// Count returns the number of rows the query matches, scoped the same
+// way All is.
+func (q *EntityQuery[T]) Count(ctx context.Context) (int64, error) { return q.sb.Count(ctx) }
 
 // All executes the query and returns the matching rows as a typed
 // slice.

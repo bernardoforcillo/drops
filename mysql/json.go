@@ -39,11 +39,17 @@ import (
 // the file leaving it out, because MariaDB users have a use for it.
 //
 // MySQL's own -> and ->> operators are deliberately not exposed:
-// MariaDB does not implement them at all — 10.11 answers a syntax
-// error even against a JSON column — so [JSONGet] and [JSONGetText]
+// MariaDB does not implement them at all — 10.11.14 answers error 1064
+// even against a JSON column, measured — so [JSONGet] and [JSONGetText]
 // render JSON_EXTRACT and JSON_UNQUOTE(JSON_EXTRACT(…)), which are the
 // forms both servers take and exactly what the operators are shorthand
 // for.
+//
+// One function is a family divergence in its ARGUMENTS rather than in
+// its existence. MySQL parses JSON_VALUE's path as part of the
+// statement, so a bound path is a syntax error there and accepted by
+// MariaDB; [JSONValue] writes the path in as a literal, which both
+// take. Every other path in this file binds.
 //
 // # Left out, and why
 //
@@ -143,11 +149,33 @@ func JSONExtract(e any, paths ...any) drops.Expression {
 	return funcCall("json_extract", append([]any{e}, paths...))
 }
 
-// JSONValue renders JSON_VALUE(<e>, <path>) — extract and unquote in
+// JSONValue renders JSON_VALUE(<e>, '<path>') — extract and unquote in
 // one call, and unlike JSON_UNQUOTE(JSON_EXTRACT(…)) it can carry a
 // RETURNING type. MySQL 8.0.21+ and MariaDB 10.2.3+; [JSONGetText] is
 // the form that works further back.
-func JSONValue(e, path any) drops.Expression { return funcCall("json_value", []any{e, path}) }
+//
+// A string path is written into the SQL as a literal rather than
+// bound, for the reason [JSONTable] gives: MySQL takes JSON_VALUE's
+// path in its grammar, not as an argument, so json_value(doc, ?) is
+// error 1064 — a syntax error, not a late-bound value. MariaDB accepts
+// the placeholder, so binding it produced a statement that ran on one
+// family and could not parse on the other. Because the path is
+// interpolated it is checked at the door, exactly as JSON_TABLE's is.
+//
+// Anything that is not a string is passed through as an operand, which
+// is the escape hatch for a caller who has measured what their server
+// accepts there. On MySQL that is only ever a literal.
+func JSONValue(e, path any) drops.Expression {
+	if s, ok := path.(string); ok {
+		mustJSONPath(s)
+		var o opBuilder
+		o.text("json_value(")
+		o.value(e)
+		o.text(", '" + quoteLiteral(s) + "')")
+		return o.done()
+	}
+	return funcCall("json_value", []any{e, path})
+}
 
 // JSONQuery renders JSON_QUERY(<e>, <path>) — like JSON_VALUE but for
 // an object or array result rather than a scalar.
@@ -359,25 +387,25 @@ func JSONTable(doc any, rowPath string, alias string, cols ...JSONColumn) drops.
 	for _, c := range cols {
 		mustJSONPath(c.path)
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("JSON_TABLE(")
-		writeOperand(b, doc)
-		b.WriteString(", ")
-		b.WriteString("'" + quoteLiteral(rowPath) + "'")
-		b.WriteString(" COLUMNS (")
-		for i, c := range cols {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteIdent(c.name)
-			b.WriteByte(' ')
-			b.WriteString(c.typ)
-			b.WriteString(" PATH ")
-			b.WriteString("'" + quoteLiteral(c.path) + "'")
+	// Only the document is an operand — a caller can hand that one a
+	// scalar subquery, and it is walked like any other operand. The
+	// COLUMNS list is text: every part of it is an identifier or a JSON
+	// path this function has already validated, and none of it is a
+	// place a statement can be written.
+	var o opBuilder
+	o.text("JSON_TABLE(")
+	o.value(doc)
+	o.text(", '" + quoteLiteral(rowPath) + "' COLUMNS (")
+	for i, c := range cols {
+		if i > 0 {
+			o.text(", ")
 		}
-		b.WriteString(")) AS ")
-		b.WriteIdent(alias)
-	})
+		o.text(quoteIdent(c.name) + " " + c.typ + " PATH '" + quoteLiteral(c.path) + "'")
+	}
+	o.text("))")
+	node := o.done()
+	node.alias = alias
+	return node
 }
 
 // mustJSONPath rejects anything that is not shaped like a JSON path.

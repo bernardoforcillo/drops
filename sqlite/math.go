@@ -50,9 +50,7 @@ func Greatest(args ...any) drops.Expression { return funcCall("max", args) }
 func Least(args ...any) drops.Expression    { return funcCall("min", args) }
 
 // Random renders random() — a signed 64-bit integer in SQLite.
-func Random() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("random()") })
-}
+func Random() drops.Expression { return drops.Raw("random()") }
 
 // Trigonometric helpers — pass radians (require the math extension).
 func Sin(e any) drops.Expression  { return funcCall("sin", []any{e}) }

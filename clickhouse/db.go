@@ -20,7 +20,14 @@ func (chDialect) Placeholder(int) string { return "?" }
 // QuoteIdent uses standard double quotes. ClickHouse accepts
 // backticks too, but double quotes are what its own dumps emit and
 // what the rest of drops renders.
-func (chDialect) QuoteIdent(name string) string { return drops.StdQuoteIdent(name) }
+//
+// It goes through the package's own quoteIdent rather than
+// drops.StdQuoteIdent because ClickHouse's lexer also honours
+// backslash escapes inside a quoted token, so the standard doubling is
+// not sufficient here — see quoteIdent for what that costs. The DDL
+// helpers and the query builders have to agree on the answer, or a
+// name is one identifier in the CREATE TABLE and two in the SELECT.
+func (chDialect) QuoteIdent(name string) string { return quoteIdent(name) }
 
 // SupportsReturning reports false: ClickHouse has no RETURNING, which
 // is also why [ErrReturningUnsupported] exists.
@@ -129,8 +136,24 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 }
 
 // ExecExpr renders e to SQL and runs it. Convenience for DDL helpers.
+//
+// It renders e FOR ctx rather than blind, which matters because "a DDL
+// helper" is what this method is for and not what it accepts: its
+// parameter is drops.Expression, so an [InsertBuilder] or a predicate
+// with a SELECT inside it goes through here exactly as a CREATE TABLE
+// does. It used to take a ctx and hand it only to the driver, so a
+// builder passed to it went out with none of its tables' context
+// filters and refused nothing on a ctx carrying no tenant — the one
+// executor in this package that had a ctx and threw it away.
+//
+// A genuinely opaque expression — every DDL helper in ddl.go, a
+// [drops.Raw] — has nothing to resolve and renders byte for byte what
+// it always did. See renderForCtx.
 func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, error) {
-	sql, args := ToSQL(e)
+	sql, args, err := renderForCtx(ctx, e)
+	if err != nil {
+		return nil, err
+	}
 	return db.Exec(ctx, sql, args...)
 }
 
@@ -191,11 +214,20 @@ func (db *DB) emit(ctx context.Context, e drops.QueryEvent) {
 	drops.CallHook(db.hook, ctx, e)
 }
 
-// ToSQL renders an Expression with the ClickHouse placeholder style.
-// Use it when you need to inspect generated SQL outside of the
-// builders (logging, snapshotting, tests).
+// ToSQL renders an Expression as ClickHouse SQL. Use it when you need
+// to inspect generated SQL outside of the builders (logging,
+// snapshotting, tests).
+//
+// It installs the whole [Dialect], not just [Placeholder]. The
+// placeholder style is the same either way, but identifier quoting is
+// not: a Builder with no Dialect falls back to drops.StdQuoteIdent,
+// which doubles the quote and leaves backslashes alone. ClickHouse's
+// lexer reads backslash escapes inside a double-quoted token, so that
+// fallback renders a different name than the one asked for — "a\b"
+// arrives as an 'a' followed by a backspace — and every later
+// reference to the object fails to resolve.
 func ToSQL(e drops.Expression) (sql string, args []any) {
-	b := drops.NewBuilder(Placeholder)
+	b := drops.NewBuilder(drops.WithDialect(Dialect))
 	b.Append(e)
 	return b.SQL()
 }

@@ -42,4 +42,34 @@
 // Docker should still be able to run the SQLite half and get real
 // signal, and a suite that fails when a service is absent is a suite
 // people stop running.
+//
+// # Both MySQL families through one DSN
+//
+// DROPS_MYSQL_DSN takes a MySQL server or a MariaDB one, and the tests
+// ask the server which family it is rather than being told. The
+// compose file brings up both — MySQL on 3307 and MariaDB on 3308 —
+// and the suite is meant to be run twice, once against each:
+//
+//	DROPS_MYSQL_DSN='drops:drops@tcp(localhost:3307)/drops?parseTime=true' go test ./...
+//	DROPS_MYSQL_DSN='drops:drops@tcp(localhost:3308)/drops?parseTime=true' go test ./...
+//
+// Running only one of them is running half of this dialect's tests:
+// drops/mysql is built around a list of places where the two families
+// answer differently, and a test that pins one of those can only be
+// half-checked by one server. Where they differ, a test asserts one
+// exact answer per family rather than accepting either — see
+// TestMySQLFamilyDivergences and TestMySQLPlaceholderScaleDivergence.
+//
+// The suite has been run whole against MySQL 8.0.46 and MariaDB
+// 10.11.14 with nothing failing on either. Nothing skips for the
+// family on MariaDB; on MySQL exactly two tests report a skip, and
+// both are cases whose MySQL half has already been asserted by the
+// time they reach a MariaDB-only tail — DROP CHECK, which only
+// MariaDB rejects, and ADD COLUMN IF NOT EXISTS, which only MariaDB
+// has. Run both servers and every assertion here has been made.
+//
+// 8.0.46 and 10.11.14 are the versions the "measured on" notes
+// throughout drops/mysql name; the compose file pins 8.4 and 10.11,
+// which are what a contributor gets rather than what those notes
+// recorded.
 package integration

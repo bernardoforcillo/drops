@@ -18,11 +18,12 @@ import (
 //
 // An optional drops.Hook can be attached via WithHook to observe every
 // driver operation — query logging, slow-query alerts, tracing, metrics.
-// The hook is propagated into the transaction-bound DBs returned by
-// Begin and InTx, and InTx emits "begin"/"commit"/"rollback" events for
-// the transaction lifecycle. For full lifecycle observability prefer
-// InTx; with an explicit Begin you must call Commit/Rollback yourself,
-// and those bypass the hook unless you wrap them.
+// The hook and the [Tracer] are both propagated into the transaction-
+// bound DBs returned by Begin and InTx — see bind — and InTx emits
+// "begin"/"commit"/"rollback" events for the transaction lifecycle. For
+// full lifecycle observability prefer InTx; with an explicit Begin you
+// must call Commit/Rollback yourself, and those bypass the hook unless
+// you wrap them.
 type DB struct {
 	drv    drops.Driver
 	hook   drops.Hook
@@ -95,7 +96,43 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return &DB{drv: tx, hook: db.hook}, tx, nil
+	return db.bind(tx), tx, nil
+}
+
+// bind returns the *DB every statement inside a transaction goes out
+// through: this DB's configuration, with the transaction handle where
+// the pool used to be.
+//
+// It exists because there were two of these literals — one in Begin,
+// one in inTxOnce — and both were spelled &DB{drv: tx, hook: db.hook},
+// which carried the hook and dropped the rest by omission. A field
+// added to DB is dropped by both of them and by neither on purpose,
+// which is the defect the tracer already was: WithTracer produced a
+// span for every statement outside a transaction and none for any
+// statement inside one, so a trace went dark at exactly the boundary a
+// latency investigation follows it across, and the two statements
+// [DB.InTxAs] sends — the SET LOCAL ROLE and the set_config that say
+// which identity the work ran under — were the first to vanish. The
+// hook was propagated throughout, so the audit trail was intact and
+// nothing was ever unobservable twice: this is observability, not a
+// leak.
+//
+// A field a transaction-bound DB must NOT carry is dropped here, once,
+// with the reason, rather than at two call sites by not being typed:
+//
+//   - retry. A [RetryPolicy] re-runs a whole transaction, and this DB
+//     is already inside one. A nested InTx that retried would re-run
+//     its body against a transaction the failed attempt had already
+//     aborted, where PostgreSQL answers every further statement with
+//     25P02 until the outer transaction ends — so the retry could not
+//     succeed, and would spend its attempts finding that out. Retrying
+//     belongs to the outermost InTx, which has the policy.
+//
+// pg/db_bind_internal_test.go holds both halves to that: every field
+// of DB has a disposition here, and each disposition is what bind
+// does.
+func (db *DB) bind(tx drops.Tx) *DB {
+	return &DB{drv: tx, hook: db.hook, tracer: db.tracer}
 }
 
 // InTx runs fn inside a transaction. The transaction is committed if fn
@@ -108,6 +145,13 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 // installed via WithRetry, transient failures (those the policy marks
 // retryable) cause the transaction to be re-opened and fn re-run, up
 // to MaxAttempts times.
+//
+// A transaction that has to run under a particular PostgreSQL identity
+// — a role, or the session settings a row-level security policy reads
+// with current_setting — wants [DB.InTxAs] instead. It is this method
+// with the identity established inside the transaction and reverted
+// with it, and with a failure to establish it aborting rather than
+// falling back to the pool's own user.
 func (db *DB) InTx(ctx context.Context, fn func(*DB) error) error {
 	if db.retry == nil {
 		return db.inTxOnce(ctx, fn)
@@ -148,7 +192,7 @@ func (db *DB) inTxOnce(ctx context.Context, fn func(*DB) error) (err error) {
 	if berr != nil {
 		return berr
 	}
-	inner := &DB{drv: tx, hook: db.hook}
+	inner := db.bind(tx)
 	rollback := func() error {
 		rctx, cancel := rollbackCtx(ctx)
 		defer cancel()
@@ -268,10 +312,47 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 	return rows, err
 }
 
-// ExecExpr renders e to SQL and runs it as a statement. Convenience for
-// DDL helpers like CreateTable.
+// ExecExpr renders e to SQL and runs it as a statement. It is the
+// convenience path for the expressions that have no executor of their
+// own — the DDL helpers, CreateTable and CreateIndex and
+// CreateExtensionIfNotExists.
+//
+// The ctx reaches the render, which is the rule this package holds
+// every ctx-taking method to: a method that accepts a context.Context
+// resolves the statement against it, or its doc says why it cannot.
+// This one used to be the counter-example. It rendered through
+// drops.String — the context-free path — and handed the result to Exec
+// together with the ctx it had just discarded. All four builders
+// satisfy drops.Expression, so a caller could pass one and be told
+// nothing was wrong: on a table whose every read carries a tenant
+// predicate, db.ExecExpr(ctx, db.Delete(Posts)) sent DELETE FROM
+// "posts" with no WHERE clause and reported the destruction of every
+// tenant's rows as a success. "Convenience for DDL helpers" described
+// how the method was meant to be called; it did not stop the other
+// call, and a description is not a guard.
+//
+// What the ctx can contribute depends on what e is, and the third case
+// is as deliberate as the first two:
+//
+//   - A statement drops can render per request — the Select, Insert,
+//     Update and Delete builders, or any type carrying the same
+//     ToSQLCtx method — goes through ToSQLCtx, so the context filters
+//     of every table it names are resolved into it, and a filter that
+//     refuses ([ErrTenantMissing]) stops the statement instead of
+//     scoping it.
+//   - An expression with a statement inside it — [Subquery] and the
+//     other operands built on opExpr — is walked to that statement and
+//     resolved there.
+//   - Anything genuinely opaque — a DDL helper, a [drops.Raw], a
+//     caller's own [drops.ExprFunc] — has nothing drops can resolve:
+//     no builder under the closure, no table to ask. It renders exactly
+//     as it did before, byte for byte, and stays the caller's to scope.
+//     That is the documented escape hatch, and it is still open.
 func (db *DB) ExecExpr(ctx context.Context, e drops.Expression) (drops.Result, error) {
-	sql, args := drops.String(e)
+	sql, args, err := renderForCtx(ctx, e)
+	if err != nil {
+		return nil, err
+	}
 	return db.Exec(ctx, sql, args...)
 }
 

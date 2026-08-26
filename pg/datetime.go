@@ -33,28 +33,29 @@ func LocalTimestamp() drops.Expression {
 
 // DateTrunc renders date_trunc('field', <ts>) — e.g. DateTrunc("day", col).
 func DateTrunc(field string, ts any) drops.Expression {
-	return funcCall("date_trunc", []any{field, ts})
+	return funcExpr("date_trunc", []any{field, ts})
 }
 
 // Extract renders extract(<field> FROM <ts>).
+//
+// field is raw SQL — it names a keyword the grammar takes unquoted, not
+// a value — while ts is an operand and is held, so a scalar subquery
+// there is scoped as the statement it is.
 func Extract(field string, ts any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("extract(")
-		b.WriteString(field)
-		b.WriteString(" FROM ")
-		writeOperand(b, ts)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"extract(" + field + " FROM ", ")"},
+		operands: []drops.Expression{operandExpr(ts)},
+	}
 }
 
 // DatePart renders date_part('field', <ts>) — the function form of EXTRACT.
 func DatePart(field string, ts any) drops.Expression {
-	return funcCall("date_part", []any{field, ts})
+	return funcExpr("date_part", []any{field, ts})
 }
 
 // Age renders age(<a>, <b>) — the interval between two timestamps. Pass
 // only one timestamp to compute age(now(), ts).
-func Age(args ...any) drops.Expression { return funcCall("age", args) }
+func Age(args ...any) drops.Expression { return funcExpr("age", args) }
 
 // IntervalLit renders an INTERVAL literal — e.g. IntervalLit("1 day"),
 // IntervalLit("2 hours 30 minutes"). The value is wrapped in
@@ -79,33 +80,31 @@ func Month(n int) drops.Expression  { return IntervalLit(fmt.Sprintf("%d month",
 func Year(n int) drops.Expression   { return IntervalLit(fmt.Sprintf("%d year", n)) }
 
 // MakeDate renders make_date(<y>, <m>, <d>).
-func MakeDate(y, m, d any) drops.Expression { return funcCall("make_date", []any{y, m, d}) }
+func MakeDate(y, m, d any) drops.Expression { return funcExpr("make_date", []any{y, m, d}) }
 
 // MakeTime renders make_time(<h>, <m>, <s>).
-func MakeTime(h, m, s any) drops.Expression { return funcCall("make_time", []any{h, m, s}) }
+func MakeTime(h, m, s any) drops.Expression { return funcExpr("make_time", []any{h, m, s}) }
 
 // MakeTimestamp renders make_timestamp(y, mo, d, h, mi, s).
-func MakeTimestamp(args ...any) drops.Expression { return funcCall("make_timestamp", args) }
+func MakeTimestamp(args ...any) drops.Expression { return funcExpr("make_timestamp", args) }
 
 // MakeTimestampTZ is the TZ-aware variant.
-func MakeTimestampTZ(args ...any) drops.Expression { return funcCall("make_timestamptz", args) }
+func MakeTimestampTZ(args ...any) drops.Expression { return funcExpr("make_timestamptz", args) }
 
 // ToDate / ToTimestamp / ToNumber — text conversion helpers.
-func ToDate(text, pattern any) drops.Expression { return funcCall("to_date", []any{text, pattern}) }
+func ToDate(text, pattern any) drops.Expression { return funcExpr("to_date", []any{text, pattern}) }
 func ToTimestamp(text, pattern any) drops.Expression {
-	return funcCall("to_timestamp", []any{text, pattern})
+	return funcExpr("to_timestamp", []any{text, pattern})
 }
 func ToNumber(text, pattern any) drops.Expression {
-	return funcCall("to_number", []any{text, pattern})
+	return funcExpr("to_number", []any{text, pattern})
 }
 
-// AtTimeZone renders <ts> AT TIME ZONE <zone>.
+// AtTimeZone renders <ts> AT TIME ZONE <zone>. Both operands are held,
+// so either may be a statement and is scoped as one.
 func AtTimeZone(ts, zone any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, ts)
-		b.WriteString(" AT TIME ZONE ")
-		writeOperand(b, zone)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " AT TIME ZONE ", ")"},
+		operands: []drops.Expression{operandExpr(ts), operandExpr(zone)},
+	}
 }

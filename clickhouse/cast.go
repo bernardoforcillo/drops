@@ -7,13 +7,10 @@ import "github.com/bernardoforcillo/drops"
 // "String" or "DateTime". ClickHouse also accepts the toType() function
 // family (toInt32, toString, …); use Func for those.
 func CastAs(e any, typeSQL string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CAST(")
-		writeOperand(b, e)
-		b.WriteString(" AS ")
-		b.WriteString(typeSQL)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"CAST(", " AS " + typeSQL + ")"},
+		operands: []drops.Expression{operandExpr(e)},
+	}
 }
 
 // Cast is an alias for CastAs, provided for source-level parity with the
@@ -52,23 +49,29 @@ func (c *CaseExpr) When(cond, value any) *CaseExpr {
 func (c *CaseExpr) Else(value any) *CaseExpr { c.elseValue = value; c.hasElse = true; return c }
 
 // End finalises the CASE expression.
+//
+// It assembles a node holding every branch rather than a closure that
+// decides the text while rendering, so a subquery written as a
+// condition, a THEN value or the ELSE is reachable to the resolver —
+// see opBuilder, which exists for exactly the shapes whose text is not
+// a fixed template.
 func (c *CaseExpr) End() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CASE")
-		if c.hasValue {
-			b.WriteByte(' ')
-			writeOperand(b, c.value)
-		}
-		for _, w := range c.whens {
-			b.WriteString(" WHEN ")
-			writeOperand(b, w.cond)
-			b.WriteString(" THEN ")
-			writeOperand(b, w.value)
-		}
-		if c.hasElse {
-			b.WriteString(" ELSE ")
-			writeOperand(b, c.elseValue)
-		}
-		b.WriteString(" END")
-	})
+	var o opBuilder
+	o.text("CASE")
+	if c.hasValue {
+		o.text(" ")
+		o.value(c.value)
+	}
+	for _, w := range c.whens {
+		o.text(" WHEN ")
+		o.value(w.cond)
+		o.text(" THEN ")
+		o.value(w.value)
+	}
+	if c.hasElse {
+		o.text(" ELSE ")
+		o.value(c.elseValue)
+	}
+	o.text(" END")
+	return o.done()
 }

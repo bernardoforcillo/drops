@@ -529,7 +529,10 @@ func (r *Reseeder) backfill() *pg.Backfill {
 // over exactly the rows it emits: a lock taken here would be released
 // the moment this statement's implicit transaction ended.
 func (r *Reseeder) fetchKeys(ctx context.Context, lastKey int64, limit int) ([]int64, int64, error) {
-	sql, args := r.keysSQL(lastKey, limit)
+	sql, args, err := r.keysSQL(ctx, lastKey, limit)
+	if err != nil {
+		return nil, lastKey, err
+	}
 	rows, err := r.db.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, lastKey, fmt.Errorf("drops/mirror: reseed %s: reading keys of %q: %w", r.name, r.src.Name(), err)
@@ -612,7 +615,10 @@ func (r *Reseeder) processChunk(ctx context.Context, tx *pg.DB, keys []int64) er
 // picked up as well, which costs one redundant seed and no
 // correctness: their own change is in the stream and outranks it.
 func (r *Reseeder) readRange(ctx context.Context, tx *pg.DB, lo, hi int64) ([]Change, error) {
-	sql, args := r.rowsSQL(lo, hi)
+	sql, args, err := r.rowsSQL(ctx, lo, hi)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := tx.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("drops/mirror: reseed %s: reading rows %d..%d of %q: %w", r.name, lo, hi, r.src.Name(), err)
@@ -685,69 +691,79 @@ func (r *Reseeder) seedVersion() uint64 {
 }
 
 // keysSQL renders the cursor-advancing scan.
-func (r *Reseeder) keysSQL(lastKey int64, limit int) (string, []any) {
-	b := drops.NewBuilder()
-	b.WriteString("SELECT ")
-	b.Append(r.key)
-	b.WriteString(" FROM ")
-	b.Append(r.src)
-	b.WriteString(" WHERE ")
-	b.Append(r.key)
-	b.WriteString(" > ")
-	b.AddArg(lastKey)
-	r.appendWhere(b)
-	b.WriteString(" ORDER BY ")
-	b.Append(r.key)
-	b.WriteString(" LIMIT ")
-	b.AddArg(int64(limit))
-	return b.SQL()
+func (r *Reseeder) keysSQL(ctx context.Context, lastKey int64, limit int) (string, []any, error) {
+	q := r.read(r.key).
+		Where(pg.Gt(r.key, lastKey)).
+		Where(r.where...).
+		OrderBy(r.key).
+		Limit(int64(limit))
+	sql, args, err := q.ToSQLCtx(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("drops/mirror: reseed %s: rendering the key scan of %q: %w", r.name, r.src.Name(), err)
+	}
+	return sql, args, nil
 }
 
 // rowsSQL renders the chunk's row read.
-//
-// Both statements are built here rather than through pg's SelectBuilder
-// because that builder renders FOR UPDATE and not FOR SHARE, and the
-// difference matters: FOR UPDATE would block every writer touching the
-// chunk for as long as the chunk takes, where FOR SHARE only makes the
-// seed wait for writers already in flight — which is all the ordering
-// argument in [NewRepairReseeder] needs.
-func (r *Reseeder) rowsSQL(lo, hi int64) (string, []any) {
-	b := drops.NewBuilder()
-	b.WriteString("SELECT ")
+func (r *Reseeder) rowsSQL(ctx context.Context, lo, hi int64) (string, []any, error) {
+	cols := make([]drops.Expression, len(r.cols))
 	for i, c := range r.cols {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.Append(c)
+		cols[i] = c
 	}
-	b.WriteString(" FROM ")
-	b.Append(r.src)
-	b.WriteString(" WHERE ")
-	b.Append(r.key)
-	b.WriteString(" >= ")
-	b.AddArg(lo)
-	b.WriteString(" AND ")
-	b.Append(r.key)
-	b.WriteString(" <= ")
-	b.AddArg(hi)
-	r.appendWhere(b)
-	// Key order twice over: the sinks see the batch in key order, and
-	// two reseeds that were never meant to overlap take their locks in
-	// the same order instead of deadlocking against each other.
-	b.WriteString(" ORDER BY ")
-	b.Append(r.key)
+	q := r.read(cols...).
+		Where(pg.Gte(r.key, lo), pg.Lte(r.key, hi)).
+		Where(r.where...).
+		// Key order twice over: the sinks see the batch in key order,
+		// and two reseeds that were never meant to overlap take their
+		// locks in the same order instead of deadlocking against each
+		// other.
+		OrderBy(r.key)
+	sql, args, err := q.ToSQLCtx(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("drops/mirror: reseed %s: rendering the row read of %q: %w", r.name, r.src.Name(), err)
+	}
 	if r.mode == reseedRepair {
-		b.WriteString(" FOR SHARE")
+		// Appended rather than asked of the builder because
+		// [pg.SelectBuilder.ForUpdate] is the only locking clause pg
+		// renders, and FOR UPDATE is the wrong one here: it would block
+		// every writer touching the chunk for as long as the chunk
+		// takes, where FOR SHARE only makes the seed wait for writers
+		// already in flight — which is all the ordering argument in
+		// [NewRepairReseeder] needs. A locking clause is last in a
+		// SELECT, after LIMIT, so there is nothing for it to land in
+		// front of.
+		sql += " FOR SHARE"
 	}
-	return b.SQL()
+	return sql, args, nil
 }
 
-func (r *Reseeder) appendWhere(b *drops.Builder) {
-	for _, p := range r.where {
-		b.WriteString(" AND (")
-		b.Append(p)
-		b.WriteString(")")
-	}
+// read starts one of the two source reads, and is where this package
+// states — once, at the only call site that can — that a reseed reads
+// past the source table's own scoping on purpose.
+//
+// Unscoped is the answer because of what a mirror IS. A reseed rebuilds
+// the whole mirror of the whole table: narrowing it to the ctx tenant
+// would leave every other tenant's rows out of a mirror that goes on
+// reporting itself complete, which is a worse lie than the one scoping
+// prevents, and it would make a reseed impossible to run from a
+// maintenance ctx that has no tenant at all. So the mirror is a copy of
+// the source table, tenants and all, and whoever reads the mirror scopes
+// their own reads of it — the sink tables carry the tenant column for
+// exactly that.
+//
+// What is NOT unscoped is anything a caller wrote into [Reseeder.Where].
+// [pg.SelectBuilder.Unscoped] is statement-wide and deliberately does
+// not reach into a subquery, so a predicate that reads some other
+// scoped table still carries that table's axis and still refuses when
+// the ctx has no tenant. Before these reads went through pg's builder
+// they were assembled straight onto a drops.Builder, which resolves
+// nothing: the source relation was read unscoped by accident rather
+// than by decision — the two are identical in the SQL — and a subquery
+// in a caller's predicate reached the server with none of its own
+// scoping, which is a cross-tenant read with no reading of it that is
+// correct.
+func (r *Reseeder) read(cols ...drops.Expression) *pg.SelectBuilder {
+	return r.db.Select(cols...).From(r.src).Unscoped()
 }
 
 // reseedKeyText renders a scanned primary key the way [Change.Key]

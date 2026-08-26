@@ -27,6 +27,12 @@ type Builder struct {
 	placeholder func(n int) string
 	dialect     Dialect
 	bareIdents  bool
+
+	// relRenameFrom / relRenameTo carry the one relation rename in
+	// force while the current fragment is being written. See
+	// RelationAlias.
+	relRenameFrom string
+	relRenameTo   string
 }
 
 // BuilderOption configures a Builder at construction time.
@@ -85,6 +91,53 @@ func (b *Builder) SetBareIdents(on bool) bool {
 	prev := b.bareIdents
 	b.bareIdents = on
 	return prev
+}
+
+// RelationAlias reports the identifier that references to the relation
+// called name must render as while the current fragment is being
+// written, or "" when that relation is not being renamed. name is the
+// relation as it was declared — "table", or "schema.table" when the
+// table is schema-qualified.
+//
+// It exists for the reason BareIdents does, and answers the mirror
+// image of the same question. A predicate reaches a Builder as an
+// opaque tree of closures, so a renderer that needs one relation inside
+// it to qualify differently has no way to reach in and rewrite the
+// column references — the problem SetBareIdents names, one degree
+// further along. Where it bites is a table's automatic predicates: a
+// default scope, a tenant axis. They are built once from the declared
+// column handles and then rendered into statements whose FROM entry may
+// be an *alias* of that table, and "users"."tenantId" against
+// FROM "users" AS "u" names a relation the statement never mentions —
+// PostgreSQL answers 42P01 and the query cannot run at all. The rename
+// lets the fragment carrying such a predicate say, for the length of
+// that fragment, that references to users are references to u.
+//
+// Only a relation reference is renamed, never a column name, and only
+// while the fragment that installed it is rendering — so a predicate
+// that embeds a subquery selecting from the renamed relation in its own
+// right is rewritten too, which is the one shape the rename gets wrong.
+func (b *Builder) RelationAlias(name string) string {
+	if name == "" || name != b.relRenameFrom {
+		return ""
+	}
+	return b.relRenameTo
+}
+
+// SetRelationAlias installs a relation rename and returns the pair it
+// displaced, so a renderer can scope it to one fragment exactly the way
+// SetBareIdents is scoped:
+//
+//	defer b.SetRelationAlias(b.SetRelationAlias("users", "u"))
+//
+// One rename is in force at a time rather than a stack of them. The
+// renames a statement needs do not overlap — each automatic predicate
+// belongs to exactly one table instance, and is rendered on its own —
+// and the save/restore pair composes without a stack anyway.
+func (b *Builder) SetRelationAlias(name, alias string) (prevName, prevAlias string) {
+	prevName, prevAlias = b.relRenameFrom, b.relRenameTo
+	b.relRenameFrom, b.relRenameTo = name, alias
+	return prevName, prevAlias
 }
 
 // NewBuilder returns an empty Builder.

@@ -3,6 +3,7 @@ package pg_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -117,5 +118,89 @@ func TestSupportsCopy(t *testing.T) {
 	}
 	if pg.SupportsCopy(pg.New(&fakeDriver{})) {
 		t.Error("SupportsCopy should be false for non-Copier driver")
+	}
+}
+
+// CopyFrom ran the validators and nothing else: it wrote whatever
+// tenant the struct happened to carry, which for a freshly decoded
+// payload is the zero value — the case Entity.CreateMany's own doc
+// names as "rows landed outside every tenant, reported as a successful
+// insert", here at a hundred thousand rows a batch. The assertions are
+// on the values handed to the driver, because that is where a COPY's
+// payload is: there is no statement to read.
+
+func TestCopyFromStampsTheCtxTenant(t *testing.T) {
+	ent := bulkSchema()
+	drv := &copyingDriver{returns: 2}
+	db := pg.New(drv)
+
+	rs := []bulkRow{{Name: "a"}, {Name: "b"}}
+	n, err := pg.CopyFrom(db, pg.WithTenant(context.Background(), int64(3)), ent, rs)
+	if err != nil {
+		t.Fatalf("CopyFrom: %v", err)
+	}
+	if got, want := n, int64(2); got != want {
+		t.Errorf("rows accepted: got = %v, want %v", got, want)
+	}
+	at := -1
+	for i, c := range drv.cols {
+		if c == "tenantId" {
+			at = i
+		}
+	}
+	if at < 0 {
+		t.Fatalf("copied columns name the tenant: got = %v", drv.cols)
+	}
+	for i, row := range drv.rows {
+		if got, want := row[at], any(int64(3)); !reflect.DeepEqual(got, want) {
+			t.Errorf("row %d tenant on the wire: got = %v, want %v", i, got, want)
+		}
+	}
+	// rs is written through on Entity.CreateMany's terms, so the caller
+	// holds the rows as they were stored.
+	for i := range rs {
+		if got, want := rs[i].TenantID, int64(3); got != want {
+			t.Errorf("rs[%d].TenantID after CopyFrom: got = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestCopyFromWithoutATenantFailsClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  context.Context
+		rows []bulkRow
+		want error
+	}{
+		{
+			name: "no tenant on ctx",
+			ctx:  context.Background(),
+			rows: []bulkRow{{Name: "a"}},
+			want: pg.ErrTenantMissing,
+		},
+		{
+			name: "a row owned by another tenant",
+			ctx:  pg.WithTenant(context.Background(), int64(3)),
+			rows: []bulkRow{{Name: "a"}, {TenantID: 9, Name: "b"}},
+			want: pg.ErrTenantMismatch,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ent := bulkSchema()
+			drv := &copyingDriver{}
+			db := pg.New(drv)
+
+			_, err := pg.CopyFrom(db, tt.ctx, ent, tt.rows)
+			if !errors.Is(err, tt.want) {
+				t.Errorf("error: got = %v, want %v", err, tt.want)
+			}
+			// A COPY that fails halfway is worse than one that never
+			// starts: the refusal has to land before any bytes go on
+			// the wire.
+			if got, want := drv.calls.Load(), int32(0); got != want {
+				t.Errorf("Copy calls: got = %v, want %v", got, want)
+			}
+		})
 	}
 }

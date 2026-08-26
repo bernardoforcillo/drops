@@ -59,3 +59,26 @@ func ExampleTable_DefaultFilter() {
 	// SELECT * FROM "tasks" WHERE ("tasks"."done" = ?)
 	// SELECT * FROM "tasks"
 }
+
+// A tenant guard renders the triggers that hold a table's tenant axis
+// against SQL drops did not build.
+//
+// What is NOT in these statements is the point of them: they say
+// nothing about who may read the file, because SQLite has no principal
+// to say it about. They refuse a write that would leave a row with no
+// tenant or move one between tenants, whoever sends it. Read the file
+// comment in tenantguard.go for where that stops.
+func ExampleCreateTenantGuard() {
+	docs := sqlite.NewTable("docs")
+	sqlite.Add(docs, sqlite.Integer("id").PrimaryKey())
+	tenant := sqlite.Add(docs, sqlite.Text("tenantId").NotNull())
+	docs.ScopeWritesByTenant(tenant)
+
+	for _, stmt := range sqlite.CreateTenantGuard(sqlite.TenantGuardFor(docs)) {
+		sql, _ := drops.StringWithDialect(sqlite.Dialect, stmt)
+		fmt.Println(sql)
+	}
+	// Output:
+	// CREATE TRIGGER "docs_tenantGuard_ins" BEFORE INSERT ON "docs" FOR EACH ROW WHEN NEW."tenantId" IS NULL BEGIN SELECT RAISE(ABORT, 'drops/sqlite: "docs"."tenantId" is null; the row would belong to no tenant'); END
+	// CREATE TRIGGER "docs_tenantGuard_upd" BEFORE UPDATE OF "tenantId" ON "docs" FOR EACH ROW WHEN NEW."tenantId" IS NOT OLD."tenantId" BEGIN SELECT RAISE(ABORT, 'drops/sqlite: "docs"."tenantId" is immutable; this statement would move a row between tenants'); END
+}

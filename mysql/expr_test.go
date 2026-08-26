@@ -250,3 +250,32 @@ func TestCollateRejectsAnythingButACollationName(t *testing.T) {
 		})
 	}
 }
+
+// MySQL parses JSON_VALUE's path while parsing the statement, so the
+// path has to be a literal in the text — a placeholder there is not a
+// value MySQL binds late, it is a syntax error. Verified against MySQL
+// 8.0.46, which answers error 1064 for json_value(doc, ?); MariaDB
+// 10.11.14 accepts the placeholder, so this is also the spelling that
+// works on both.
+func TestJSONValueWritesThePathAsALiteral(t *testing.T) {
+	sql, args := render(mysql.JSONValue(mysql.JSON("doc"), mysql.JSONPath("b", "c")))
+	if sql != "json_value(`doc`, '$.\"b\".\"c\"')" {
+		t.Errorf("SQL = %s", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v; the path must not be bound", args)
+	}
+}
+
+// The same door JSON_TABLE guards: a path that is written into the SQL
+// rather than bound has to be checked at the door, or a caller who
+// builds one from input has handed the caller of *their* API a way to
+// close the literal and continue the statement.
+func TestJSONValueRejectsAPathThatIsNotOne(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected a panic: the JSON_VALUE path is interpolated, not bound")
+		}
+	}()
+	mysql.JSONValue(mysql.JSON("doc"), "'); DROP TABLE users; --")
+}

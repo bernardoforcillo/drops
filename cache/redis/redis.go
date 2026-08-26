@@ -267,6 +267,15 @@ func (c *Cache) Stats() PoolStats {
 }
 
 // warmUp pre-dials MinIdleConns connections.
+//
+// It checks closeCh before each dial and c.closing after each one,
+// because the dial is the slow part: Close can run to completion while
+// this goroutine is inside DialTimeout, and a connection parked in the
+// pool afterwards is one nothing will ever close — Close has already
+// drained the pool and every later put sees closing and discards. The
+// socket then stays open until the process exits, which on a service
+// that opens a cache per test or per tenant is a file-descriptor leak
+// with no counter attached to it.
 func (c *Cache) warmUp() {
 	for i := 0; i < c.opts.MinIdleConns; i++ {
 		select {
@@ -287,6 +296,12 @@ func (c *Cache) warmUp() {
 				continue
 			}
 			c.statsTotalConns.Add(1)
+			if c.closing.Load() {
+				_ = cn.nc.Close()
+				c.statsTotalConns.Add(-1)
+				c.pool <- nil
+				return
+			}
 			c.pool <- cn
 		}
 	}

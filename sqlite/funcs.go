@@ -7,22 +7,20 @@ import "github.com/bernardoforcillo/drops"
 // clause. Names mirror drops/pg where SQLite has an equivalent; SQLite's
 // own spellings (total, group_concat, ifnull) are exposed alongside.
 
-// funcCall is the shared renderer for "<name>(<args>)" expressions. args
-// is a pre-flattened slice so callers avoid variadic-of-variadic
+// funcCall is the shared constructor for "<name>(<args>)" expressions.
+// args is a pre-flattened slice so callers avoid variadic-of-variadic
 // awkwardness. Each argument may be a drops.Expression or a Go value
 // (bound as a parameter).
+//
+// Nearly every helper in this file, strings.go, math.go, json.go,
+// datetime.go and window.go is one call to it, so the operand position
+// a caller hands a scalar subquery to becomes walkable in all of them
+// at once: Coalesce(Subquery(sel), 0) in a projection is an ordinary
+// idiom, and while this built a drops.ExprFunc the statement inside it
+// rendered through WriteSQL — every tenant's rows, on a ctx with no
+// tenant, without refusing. See opExpr.
 func funcCall(name string, args []any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(name)
-		b.WriteByte('(')
-		for i, a := range args {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			writeOperand(b, a)
-		}
-		b.WriteByte(')')
-	})
+	return funcExpr(name, operandExprs(args))
 }
 
 // Func renders an arbitrary function call <name>(<args...>). Escape
@@ -35,9 +33,7 @@ func Func(name string, args ...any) drops.Expression { return funcCall(name, arg
 func Count(e drops.Expression) drops.Expression { return funcCall("count", []any{e}) }
 
 // CountAll renders count(*).
-func CountAll() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("count(*)") })
-}
+func CountAll() drops.Expression { return drops.Raw("count(*)") }
 
 // CountDistinct renders count(DISTINCT <e>).
 func CountDistinct(e drops.Expression) drops.Expression { return distinctAgg("count", e) }
@@ -71,22 +67,16 @@ func GroupConcat(e any, sep ...any) drops.Expression {
 //
 //	sqlite.Filter(sqlite.Count(UserID), UserStatus.Eq("active"))
 func Filter(agg, pred drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(agg)
-		b.WriteString(" FILTER (WHERE ")
-		b.Append(pred)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"", " FILTER (WHERE ", ")"},
+		operands: []drops.Expression{agg, pred},
+	}
 }
 
-// distinctAgg renders <name>(DISTINCT <e>).
+// distinctAgg renders <name>(DISTINCT <e>). The operand is held for the
+// reason funcCall's are.
 func distinctAgg(name string, e drops.Expression) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString(name)
-		b.WriteString("(DISTINCT ")
-		b.Append(e)
-		b.WriteByte(')')
-	})
+	return &opExpr{parts: []string{name + "(DISTINCT ", ")"}, operands: []drops.Expression{e}}
 }
 
 // Scalar helpers -------------------------------------------------------
@@ -105,10 +95,4 @@ func IfNull(a, b any) drops.Expression { return funcCall("ifnull", []any{a, b}) 
 func NullIf(a, b any) drops.Expression { return funcCall("nullif", []any{a, b}) }
 
 // As renames an arbitrary expression: "<expr> AS <alias>".
-func As(e drops.Expression, alias string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(e)
-		b.WriteString(" AS ")
-		b.WriteIdent(alias)
-	})
-}
+func As(e drops.Expression, alias string) drops.Expression { return aliasExpr(e, alias) }

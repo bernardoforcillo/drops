@@ -114,3 +114,29 @@ func nthIndex(s, sep string, start int) int {
 	}
 	return -1
 }
+
+// ExampleCreateRowPolicy declares the server-side read boundary a
+// multi-tenant ClickHouse deployment puts under drops' predicates.
+//
+// The identity is the account the connection authenticated as: one
+// role per tenant, and the application connects as the role for the
+// request it is serving. There is no per-request identity to hand a
+// policy at runtime — see rowpolicy.go for why drops does not pretend
+// otherwise — and the policy covers SELECT alone.
+func ExampleCreateRowPolicy() {
+	docs := clickhouse.NewDatabaseTable("analytics", "docs")
+	tenant := clickhouse.Add(docs, clickhouse.String("tenantId").LowCardinality())
+	clickhouse.Add(docs, clickhouse.String("body"))
+	docs.Engine(clickhouse.MergeTree()).OrderBy(tenant)
+
+	docs.AddRowPolicy(clickhouse.NewRowPolicy("docs_acme").
+		UsingEq(tenant, "acme").
+		To("tenant_acme"))
+
+	for _, p := range docs.RowPolicies() {
+		sql, _ := clickhouse.ToSQL(clickhouse.CreateOrReplaceRowPolicy(p))
+		fmt.Println(sql)
+	}
+	// Output:
+	// CREATE ROW POLICY OR REPLACE "docs_acme" ON "analytics"."docs" FOR SELECT USING ("tenantId" = 'acme') TO "tenant_acme"
+}

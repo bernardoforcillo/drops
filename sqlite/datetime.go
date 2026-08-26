@@ -8,21 +8,13 @@ import "github.com/bernardoforcillo/drops"
 // "+1 day", "start of month" or "utc".
 
 // Now renders CURRENT_TIMESTAMP — "YYYY-MM-DD HH:MM:SS" in UTC.
-func Now() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("CURRENT_TIMESTAMP") })
-}
+func Now() drops.Expression { return drops.Raw("CURRENT_TIMESTAMP") }
 
 // CurrentDate / CurrentTime / CurrentTimestamp render the SQL standard
 // keywords, which SQLite supports directly.
-func CurrentDate() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("CURRENT_DATE") })
-}
-func CurrentTime() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("CURRENT_TIME") })
-}
-func CurrentTimestamp() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) { b.WriteString("CURRENT_TIMESTAMP") })
-}
+func CurrentDate() drops.Expression      { return drops.Raw("CURRENT_DATE") }
+func CurrentTime() drops.Expression      { return drops.Raw("CURRENT_TIME") }
+func CurrentTimestamp() drops.Expression { return drops.Raw("CURRENT_TIMESTAMP") }
 
 // DateOf renders date(<timeval>, modifiers...) — the date portion.
 func DateOf(timeval any, modifiers ...any) drops.Expression {

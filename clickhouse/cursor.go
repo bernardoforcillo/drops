@@ -388,20 +388,17 @@ func (s *SelectBuilder) BeforeCursor(spec CursorSpec, c Cursor) *SelectBuilder {
 // cursorOrderKeyExpr renders one ORDER BY fragment honouring direction
 // and NULLS placement.
 func cursorOrderKeyExpr(k OrderKey) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		k.Col.WriteSQL(b)
-		if k.Desc {
-			b.WriteString(" DESC")
-		} else {
-			b.WriteString(" ASC")
-		}
-		switch k.Nulls {
-		case NullsFirst:
-			b.WriteString(" NULLS FIRST")
-		case NullsLast:
-			b.WriteString(" NULLS LAST")
-		}
-	})
+	suffix := " ASC"
+	if k.Desc {
+		suffix = " DESC"
+	}
+	switch k.Nulls {
+	case NullsFirst:
+		suffix += " NULLS FIRST"
+	case NullsLast:
+		suffix += " NULLS LAST"
+	}
+	return suffixExpr(k.Col, suffix)
 }
 
 // keysetWhere produces the row-wise expansion of the lexicographic
@@ -543,6 +540,4 @@ func nullsFirst(k OrderKey) bool {
 // falseExpr is a guaranteed-false predicate emitted when a cursor
 // decode error is stored on the builder. It contains no dynamic
 // content so malformed cursor payloads cannot inject SQL.
-var falseExpr = drops.ExprFunc(func(b *drops.Builder) {
-	b.WriteString("FALSE")
-})
+var falseExpr drops.Expression = drops.Raw("FALSE")

@@ -537,6 +537,29 @@ func lockingClause(m DrainLocking) string {
 // on every path including a failing callback. If the process dies
 // mid-callback the server releases the lock when the connection drops,
 // which is the same backstop pg relies on.
+//
+// # Why the transaction is opened on a context of its own
+//
+// The release has to run on the session that took the lock, and that
+// session is reachable only through the transaction. database/sql
+// watches a transaction's context in a goroutine and rolls the
+// transaction back the instant it is cancelled — so a caller whose
+// context was cancelled during fn raced that goroutine, and when it
+// won, the deferred RELEASE_LOCK below got "sql: transaction has
+// already been committed or rolled back" and the lock went back into
+// the pool still held. Every later drain of that aggregate then took
+// the silent skip branch forever. Measured on MySQL 8.0.46: it lost
+// the race about two runs in three under -race.
+//
+// So the transaction is begun on a context stripped of cancellation
+// (values are kept, so hooks and tracing still see the caller's), and
+// cancellation is enforced here instead: every statement still runs on
+// the caller's context and stops when it does, and a cancellation seen
+// before the commit is returned rather than committed. The window that
+// leaves is the one every detached commit has — a cancellation that
+// arrives between that check and the commit lands as a commit — and it
+// is the trade this method makes, because the alternative is losing an
+// aggregate permanently rather than committing work that was finished.
 func (o *Outbox) DrainAggregate(ctx context.Context, aggregateType, aggregateID string, limit int, fn func(tx *DB, events []OutboxEvent) error) error {
 	if aggregateID == "" {
 		return errors.New("drops/mysql: Outbox.DrainAggregate requires non-empty aggregateID")
@@ -544,7 +567,7 @@ func (o *Outbox) DrainAggregate(ctx context.Context, aggregateType, aggregateID 
 	if limit <= 0 {
 		limit = 50
 	}
-	return o.db.InTx(ctx, func(tx *DB) error {
+	return o.db.InTx(context.WithoutCancel(ctx), func(tx *DB) error {
 		name := outboxLockName(o.table, aggregateType, aggregateID)
 		got, err := tryNamedLock(tx, ctx, name)
 		if err != nil {
@@ -597,7 +620,15 @@ func (o *Outbox) DrainAggregate(ctx context.Context, aggregateType, aggregateID 
 		if len(events) == 0 {
 			return nil
 		}
-		return fn(tx, events)
+		if err := fn(tx, events); err != nil {
+			return err
+		}
+		// The caller's cancellation is honoured here rather than left
+		// to the commit, which now runs on a context that cannot see
+		// it. Returning it rolls the transaction back, which is what a
+		// cancelled caller got before — the difference is only that
+		// the lock is still releasable when it happens.
+		return ctx.Err()
 	})
 }
 

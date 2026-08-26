@@ -28,6 +28,22 @@ type exprBinding struct {
 func (e *exprBinding) column() *Column             { return e.col }
 func (e *exprBinding) writeValue(b *drops.Builder) { e.expr.WriteSQL(b) }
 
+// boundExpr and withBoundExpr implement [exprValue], which lives in
+// resolve.go beside the walk that uses it: this is the one binding
+// kind in the package whose value is an expression, so it is the one
+// the resolver has anything to walk into. See resolveSets.
+func (e *exprBinding) boundExpr() drops.Expression { return e.expr }
+
+// withBoundExpr returns a copy carrying x, never this binding with x
+// written into it: a caller may hold the binding and use it in a second
+// statement, and a resolved body stored back would pin the first
+// request's tenant into every later use.
+func (e *exprBinding) withBoundExpr(x drops.Expression) ColumnValue {
+	cp := *e
+	cp.expr = x
+	return &cp
+}
+
 // sqlDefault renders the literal token DEFAULT — used for omitted
 // columns in INSERT batches and via (*Col[T]).SetDefault.
 type sqlDefault struct{}

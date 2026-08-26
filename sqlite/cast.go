@@ -6,13 +6,10 @@ import "github.com/bernardoforcillo/drops"
 // SQLite has no "::type" shorthand; the CAST form is the only spelling.
 // typeSQL is a SQLite type name such as "INTEGER", "REAL" or "TEXT".
 func CastAs(e any, typeSQL string) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CAST(")
-		writeOperand(b, e)
-		b.WriteString(" AS ")
-		b.WriteString(typeSQL)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"CAST(", " AS " + typeSQL + ")"},
+		operands: []drops.Expression{operandExpr(e)},
+	}
 }
 
 // Cast is an alias for CastAs, provided for source-level parity with
@@ -63,23 +60,30 @@ func (c *CaseExpr) When(cond, value any) *CaseExpr {
 func (c *CaseExpr) Else(value any) *CaseExpr { c.elseValue = value; c.hasElse = true; return c }
 
 // End finalises the CASE expression.
+//
+// Every branch is an operand held in the node rather than closed over,
+// so a condition or a result may be a statement and is scoped as one:
+// CASE WHEN EXISTS (SELECT … FROM posts) THEN … is a shape a caller
+// writes, and a closure here rendered that EXISTS with none of the
+// posts table's context filters. See opExpr, and opBuilder for why a
+// variable-length shape needs a builder to stay a held node.
 func (c *CaseExpr) End() drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("CASE")
-		if c.hasValue {
-			b.WriteByte(' ')
-			writeOperand(b, c.value)
-		}
-		for _, w := range c.whens {
-			b.WriteString(" WHEN ")
-			writeOperand(b, w.cond)
-			b.WriteString(" THEN ")
-			writeOperand(b, w.value)
-		}
-		if c.hasElse {
-			b.WriteString(" ELSE ")
-			writeOperand(b, c.elseValue)
-		}
-		b.WriteString(" END")
-	})
+	var o opBuilder
+	o.text("CASE")
+	if c.hasValue {
+		o.text(" ")
+		o.value(c.value)
+	}
+	for _, w := range c.whens {
+		o.text(" WHEN ")
+		o.value(w.cond)
+		o.text(" THEN ")
+		o.value(w.value)
+	}
+	if c.hasElse {
+		o.text(" ELSE ")
+		o.value(c.elseValue)
+	}
+	o.text(" END")
+	return o.done()
 }

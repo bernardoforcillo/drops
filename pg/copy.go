@@ -49,15 +49,35 @@ type Copier interface {
 var ErrCopyNotSupported = errors.New("drops/pg: driver does not implement Copier — fall back to CreateMany")
 
 // CopyFrom bulk-loads rs into the entity's table via the driver's
-// COPY path. Returns the number of rows accepted. Validators run
-// per row before any bytes hit the wire — bad input aborts the
-// whole batch before the server is touched.
+// COPY path. Returns the number of rows accepted.
 //
-// Bypasses the cache (COPY-loaded rows never populate it), the
-// audit log (audit per row would defeat the bandwidth advantage),
-// and the per-row INSERT hooks. Use Entity.CreateMany /
-// UpsertMany when those guarantees matter; use CopyFrom when
-// raw throughput is the point.
+// The tenant is stamped onto every row and validators run per row
+// before any bytes hit the wire — bad input, a missing tenant or a
+// row owned by another tenant aborts the whole batch before the
+// server is touched. A COPY that fails halfway is worse than one
+// that never starts: the rows already streamed are in the table,
+// the caller has an error and no count, and nothing says where the
+// batch stopped.
+//
+// The stamping is [Entity.CreateMany]'s, on the same terms and for
+// the same reason. rs is written through, so a row whose tenant
+// field is zero comes back carrying the ctx tenant; no tenant on
+// ctx is [ErrTenantMissing] and no COPY at all; a row carrying a
+// different tenant than ctx is [ErrTenantMismatch]. Skipping it
+// wrote whatever the struct happened to hold, which for a freshly
+// decoded payload is the zero value — and a row written with
+// tenantId = 0 belongs to no tenant, so it is invisible to the very
+// next SELECT, including the one made by the tenant whose request
+// loaded it, while COPY reports it as accepted. That is the failure
+// CreateMany's doc names, at a hundred thousand rows a batch.
+//
+// What it still bypasses: the cache (COPY-loaded rows never
+// populate it), the audit log (audit per row would defeat the
+// bandwidth advantage), and the per-row INSERT hooks — so a column
+// a hook fills in, createdAt among them, gets its server-side
+// default or NULL rather than the hook's value. Use
+// Entity.CreateMany / UpsertMany when those guarantees matter; use
+// CopyFrom when raw throughput is the point.
 func CopyFrom[T any](db *DB, ctx context.Context, ent *Entity[T], rs []T) (int64, error) {
 	if len(rs) == 0 {
 		return 0, ErrNoRowsToInsert
@@ -67,6 +87,9 @@ func CopyFrom[T any](db *DB, ctx context.Context, ent *Entity[T], rs []T) (int64
 		return 0, ErrCopyNotSupported
 	}
 	for i := range rs {
+		if err := ent.stampTenant(ctx, &rs[i]); err != nil {
+			return 0, err
+		}
 		if err := ent.runValidators(&rs[i]); err != nil {
 			return 0, err
 		}

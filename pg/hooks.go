@@ -38,30 +38,32 @@ func (f InsertHookFunc) BeforeInsert(ctx *InsertHookCtx) { f(ctx) }
 // statement and append hook-supplied values. Hook-added expressions
 // apply uniformly to every row in the INSERT.
 //
-// bound is keyed by Column.key. A hook closes over the handle it was
-// declared with — every built-in mixin closes over the package-level
-// one — while the caller may have bound the same column through a
-// table alias. Keying by the handle would make Has answer false for a
-// column that is already in the statement, and the hook would add it a
-// second time: PostgreSQL then rejects the INSERT with 42701, and the
-// documented rule that user-supplied values win is inverted.
+// bound is keyed by [boundKey] — the name the column RENDERS as — and
+// not by the handle. A hook closes over the handle it was declared
+// with, every built-in mixin closes over the package-level one, and
+// the caller may have bound the same column through a table alias or
+// through another table's handle for the same name. Asked by handle,
+// Has answered false for a column that is already in the statement and
+// the hook added it a second time: PostgreSQL then rejects the INSERT
+// with 42701, and the documented rule that user-supplied values win is
+// inverted.
 type InsertHookCtx struct {
-	bound    map[*Column]bool
+	bound    map[string]bool
 	addCols  []*Column
 	addExprs []drops.Expression
 }
 
 // Has reports whether c is already bound on the INSERT — either by
 // the user or by an earlier hook.
-func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[col.key()] }
+func (c *InsertHookCtx) Has(col *Column) bool { return c.bound[boundKey(col)] }
 
 // SetExpr binds expr to col across every row, unless col is already
 // bound. Use this for DB-evaluated defaults (e.g. drops.Raw("now()")).
 func (c *InsertHookCtx) SetExpr(col *Column, expr drops.Expression) {
-	if c.bound[col.key()] {
+	if c.bound[boundKey(col)] {
 		return
 	}
-	c.bound[col.key()] = true
+	c.bound[boundKey(col)] = true
 	c.addCols = append(c.addCols, col)
 	c.addExprs = append(c.addExprs, expr)
 }
@@ -69,12 +71,38 @@ func (c *InsertHookCtx) SetExpr(col *Column, expr drops.Expression) {
 // Set binds a typed ColumnValue, e.g. the result of (*Col[T]).Val(v).
 // Equivalent to SetExpr with the binding's writer.
 func (c *InsertHookCtx) Set(v ColumnValue) {
-	if c.bound[v.column().key()] {
+	if c.bound[boundKey(v.column())] {
 		return
 	}
-	c.bound[v.column().key()] = true
+	c.bound[boundKey(v.column())] = true
 	c.addCols = append(c.addCols, v.column())
 	c.addExprs = append(c.addExprs, bindingExpr(v))
+}
+
+// boundKey returns the key a hook context records a column under: the
+// form its rendered name shares with every other handle the server
+// resolves to the same column — see [identKey].
+//
+// Keying the set by what the statement WRITES rather than by the
+// handle that wrote it is the same rule [namesAxis] states for the
+// axis, applied to every column a hook may touch. The two handles a
+// hook and a caller hold for one column need not be the same pointer:
+// an alias copy is one case, a codegen'd OtherTable.TenantID naming a
+// column of this table's name is the other, and both render the one
+// name the server reads. A hook that cannot see the caller's binding
+// adds a second assignment for it — a duplicate column on the INSERT,
+// a duplicate assignment on the UPDATE — which PostgreSQL refuses
+// (42701, 42601) and a dialect with laxer rules resolves by keeping
+// whichever of the two it prefers.
+//
+// Nil-safe, because Has takes a handle from the caller and a nil one
+// is a declaration mistake this should report as "not bound" rather
+// than panic inside a hook.
+func boundKey(col *Column) string {
+	if col == nil {
+		return ""
+	}
+	return identKey(col.Name())
 }
 
 // ----------------------------------------------------------------------
@@ -95,34 +123,48 @@ func (f UpdateHookFunc) BeforeUpdate(ctx *UpdateHookCtx) { f(ctx) }
 // UpdateHookCtx is the controlled handle a hook uses to add SET
 // assignments without clobbering user-supplied values.
 //
-// bound is keyed by Column.key, for the reason spelled out on
+// bound is keyed by [boundKey], for the reason spelled out on
 // InsertHookCtx: the hook and the caller may hold two handles on one
-// column, and a duplicate assignment is rejected with 42601.
+// column, and a duplicate assignment is rejected with 42601. On this
+// statement the duplicate is worse than a rejection, because the axis
+// can be one of the two. A hook holding another table's handle for
+// "tenantId" saw a SET list that already assigned the axis as
+// assigning nothing, and appended its own —
+//
+//	UPDATE "zp" SET "tenantId" = $1, "tenantId" = $2   args [77 999]
+//
+// which PostgreSQL refuses and MySQL, where a duplicate SET is legal
+// and the last one wins, executes as the transfer.
 type UpdateHookCtx struct {
-	bound map[*Column]bool
+	bound map[string]bool
 	add   []ColumnValue
 }
 
 // Has reports whether col is already bound on the UPDATE.
-func (c *UpdateHookCtx) Has(col *Column) bool { return c.bound[col.key()] }
+func (c *UpdateHookCtx) Has(col *Column) bool { return c.bound[boundKey(col)] }
 
 // Set appends v to the UPDATE's SET list, unless its column is
 // already bound.
 func (c *UpdateHookCtx) Set(v ColumnValue) {
-	if c.bound[v.column().key()] {
+	if c.bound[boundKey(v.column())] {
 		return
 	}
-	c.bound[v.column().key()] = true
+	c.bound[boundKey(v.column())] = true
 	c.add = append(c.add, v)
 }
 
 // SetExpr is the raw-expression variant of Set — useful for hooks
 // that want to assign e.g. drops.Raw("now()") to a column.
+//
+// What it assigns is checked like the caller's own: a hook is
+// registered on the table and reaches every UPDATE against it, so an
+// axis assignment made here is the same statement as one made at the
+// call site — see checkAxisAssignment.
 func (c *UpdateHookCtx) SetExpr(col *Column, expr drops.Expression) {
-	if c.bound[col.key()] {
+	if c.bound[boundKey(col)] {
 		return
 	}
-	c.bound[col.key()] = true
+	c.bound[boundKey(col)] = true
 	c.add = append(c.add, &exprBinding{col: col, expr: expr})
 }
 

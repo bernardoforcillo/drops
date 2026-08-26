@@ -8,6 +8,56 @@
 // schema at SQLite instead of PostgreSQL is a matter of swapping the
 // package (and the underlying driver) — the builder chain is otherwise
 // identical.
+//
+// # Multi-tenancy
+//
+// A table can declare who owns its rows, and drops carries that
+// declaration into every statement it composes:
+//
+//	Posts.ContextFilter(sqlite.TenantFilter(PostTenantID)).
+//	    ScopeWritesByTenant(PostTenantID)
+//
+//	ctx = sqlite.WithTenant(ctx, currentTenant)
+//
+// The predicate is resolved by the EXECUTORS rather than by the
+// renderer, so one declaration covers a root query, a joined table, a
+// CTE body, a subquery operand, an eager-loaded edge, an UPDATE and a
+// DELETE — everything that goes through All / One / Rows / Exec. It
+// fails closed: a ctx with no tenant is [ErrTenantMissing] and no
+// statement at all. The cost is that [SelectBuilder.ToSQL] no longer
+// shows the whole statement; ToSQLCtx is the ctx-aware twin, and the
+// one to log and to assert on. [Table.ContextFilter], [TenantFilter]
+// and [Entity.ScopeByTenant] carry the reasoning, and tenant.go lists
+// what the predicates do not reach.
+//
+// tenant.go also carries the block delimited THE TENANT POLICIES —
+// NORMATIVE: what counts as the same tenant, what may assign the axis,
+// and what Unscoped means at each level. It is byte-identical in all
+// four dialects and a root-level test fails when one of them drifts, so
+// it is the reference rather than this package's own account of the
+// rules.
+//
+// It is the same mechanism drops/pg, drops/mysql and drops/clickhouse
+// carry — normalise the dialect name and diff sqlite/resolve.go against
+// any of theirs and the same file comes back. What differs here is
+// surface, and it differs where the SQL does: this package exposes
+// INNER and LEFT JOIN and nothing else, so the join-placement shapes
+// the other three have to answer cannot arise.
+//
+// What does NOT come across from drops/pg is the boundary underneath.
+// PostgreSQL row-level security is what those predicates sit on top of,
+// and SQLite has no equivalent: no roles, no policies, and a process
+// that can open the file reads every byte in it. That is what makes
+// tenant.go's list of where the predicates stop load-bearing rather
+// than a footnote.
+//
+// It does not make the predicates the whole of what there is, which is
+// what this comment used to say. SQLite has triggers, they are inside
+// the database, and they run for the statements on that list;
+// tenantguard.go renders them from the same axis and states plainly why
+// that is a guard against mistakes rather than a boundary against a
+// principal. The boundary this dialect has is one database file per
+// tenant.
 package sqlite
 
 import "github.com/bernardoforcillo/drops"

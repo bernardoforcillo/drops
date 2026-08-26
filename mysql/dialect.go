@@ -99,16 +99,106 @@
 // while MariaDB returns a short answer and no warning. See cte.go and
 // [SetRecursionLimit].
 //
+// # Where the two families part company
+//
+// The suite has now been run against MySQL 8.0.46 and MariaDB
+// 10.11.14, and every entry below is pinned on both —
+// integration.TestMySQLFamilyDivergences for all of them but the
+// last, which is integration.TestMySQLPlaceholderScaleDivergence. They are listed here because each one shapes what
+// this package renders, or whether a helper exists at all:
+//
+//   - MariaDB has no -> or ->> accessor, on a JSON column or anywhere
+//     else, so [JSONGet] and [JSONGetText] render JSON_EXTRACT and
+//     JSON_UNQUOTE(JSON_EXTRACT(…)).
+//   - MariaDB's JSON is an alias for LONGTEXT with a CHECK, so
+//     CAST(x AS JSON) is a syntax error there and pg's ToJSON has no
+//     port. It also means a JSON value read back is the bytes that
+//     were written, where MySQL parses on write and re-serialises on
+//     read — a space after every colon and the server's key order.
+//   - JSON_QUERY is MariaDB's alone; MySQL answers error 1305. It is
+//     the one helper in json.go that does not work on both, and
+//     [JSONQuery] says so.
+//   - MySQL takes JSON_VALUE's path in its GRAMMAR, so a bound path is
+//     error 1064 there and accepted by MariaDB. [JSONValue] writes the
+//     path in as a literal, which both take.
+//   - MySQL 8.0.19's VALUES row alias — INSERT … AS new ON DUPLICATE
+//     KEY UPDATE — is a syntax error on MariaDB, so the upserts here
+//     use the older VALUES(col) spelling. See [NewValueOf].
+//   - a user-level lock name may be 64 characters on MySQL and 192 on
+//     MariaDB, both rejecting past their own limit, so 64 is the
+//     portable ceiling and [Outbox.DrainAggregate] folds a longer name
+//     back under it.
+//   - MySQL fixes a function's result scale while preparing a
+//     statement and a PLACEHOLDER has no scale to fix it from, so
+//     ROUND and TRUNCATE keep the first argument's scale, MAKETIME and
+//     UNIX_TIMESTAMP reserve six fractional digits, and / loses
+//     div_precision_increment. MariaDB answers a parameter exactly as
+//     it answers a literal. drops binds values, so every call here
+//     takes the parameter path: the numbers agree on both servers and
+//     the number of trailing digits does not.
+//
 // # Scope
 //
 // This is the schema, query and migration surface: types, tables, DDL,
 // SELECT / INSERT / UPDATE / DELETE, operators, Entity CRUD with the
-// drift check, composite keys and relations, and schema migrations;
-// plus the outbox, the event store, the idempotency store, keyset
-// pagination, the typed error surface, and the expression library
-// above. The remaining cross-cutting packages that pg and sqlite have
-// grown — saga, audit, tenancy — are not ported yet, and this doc will
-// say so until they are.
+// drift check and composite keys, and schema migrations; plus the
+// outbox, the event store, the idempotency store, keyset pagination,
+// the typed error surface, and the expression library above. The
+// remaining cross-cutting packages that pg and sqlite have grown —
+// saga and audit — are not ported yet, and this doc will say so until
+// they are.
+//
+// # Multi-tenancy
+//
+// A table can declare who owns its rows, and drops carries that
+// declaration into every statement it composes:
+//
+//	Posts.ContextFilter(mysql.TenantFilter(PostTenantID)).
+//	    ScopeWritesByTenant(PostTenantID)
+//
+//	ctx = mysql.WithTenant(ctx, currentTenant)
+//
+// The predicate is resolved by the EXECUTORS rather than by the
+// renderer, so one declaration covers a root query, a joined table, a
+// CTE body, a subquery operand, an UPDATE and a DELETE — everything
+// that goes through All / One / Rows / Exec. It fails closed: a ctx
+// with no tenant is [ErrTenantMissing] and no statement at all. The
+// cost is that [SelectBuilder.ToSQL] no longer shows the whole
+// statement; ToSQLCtx is the ctx-aware twin, and the one to log and to
+// assert on. [Table.ContextFilter], [TenantFilter] and
+// [Entity.ScopeByTenant] carry the reasoning, and tenant.go lists what
+// the predicates do not reach.
+//
+// tenant.go also carries the block delimited THE TENANT POLICIES —
+// NORMATIVE: what counts as the same tenant, what may assign the axis,
+// and what Unscoped means at each level. It is byte-identical in all
+// four dialects and a root-level test fails when one of them drifts, so
+// it is the reference rather than this package's own account of the
+// rules.
+//
+// It is the same mechanism drops/pg, drops/sqlite and
+// drops/clickhouse carry — normalise the dialect name and diff
+// mysql/resolve.go against any of theirs and the same file comes back.
+// What does NOT come across from drops/pg is the boundary underneath:
+// PostgreSQL row-level security is what those predicates sit on top of,
+// and MySQL's nearest equivalent is a definer-rights view, a schema
+// object drops does not manage. Here the predicates are the whole of
+// what there is, which makes tenant.go's list of where they stop
+// load-bearing rather than a footnote.
+//
+// Two of the answers are this dialect's own. A join places the
+// predicate by kind — INNER in the WHERE clause, LEFT in the ON clause,
+// and a RIGHT JOIN inverts both sides — see
+// [SelectBuilder.RightJoin]. And ON DUPLICATE KEY UPDATE, which names
+// no conflict target and takes no WHERE clause, is gated inside its
+// assignments so a collision with another tenant's row rewrites
+// nothing: see [InsertBuilder.ToSQLCtx].
+//
+// There are no relations here. The declaration API existed and nothing
+// consumed it: mysql has no eager loader, so a HasMany compiled, ran,
+// and did nothing at all — which is worse than its absence, because a
+// caller who declares one has no way to find out. Join the tables
+// explicitly until there is a loader to declare them for.
 package mysql
 
 import "github.com/bernardoforcillo/drops"

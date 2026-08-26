@@ -2,6 +2,7 @@ package pg_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -695,25 +696,33 @@ func TestAliasSlicesDoNotShareSpareCapacity(t *testing.T) {
 	}
 }
 
-// The hook lists and the default filters share the same hazard, and
-// unlike the indexes they are read on every statement the builder
-// renders: a hook the base table appends after the alias was taken
-// would silently displace the alias's own.
-func TestAliasHookAndFilterSlicesDoNotShareSpareCapacity(t *testing.T) {
+// The hook lists and the default filters are SHARED with the base
+// table rather than copied, so this is the same hazard read the other
+// way round: an append through either handle has to be visible from
+// both, and has to displace nothing already there.
+//
+// The sharing is the point. While these lists were copied, an alias was
+// a snapshot of the table's scoping at the instant As was called — and
+// an alias declared as a package-level var beside its table is taken
+// before any init that scopes it, so it stayed unscoped for ever. Three
+// entries of each are registered before the alias is taken, so the copy
+// this test used to pin would have exactly one spare slot for a later
+// append to collide in; each side then registers one more, against a
+// column of its own so that "user values win" cannot hide a loss.
+func TestAliasSharesHookAndFilterListsWithItsTable(t *testing.T) {
 	base := pg.NewTable("cap_hooks")
 	id := pg.Add(base, pg.BigSerial("id").PrimaryKey())
-	name := pg.Add(base, pg.Text("name"))
+	viaAlias := pg.Add(base, pg.Text("viaAlias"))
+	viaBase := pg.Add(base, pg.Text("viaBase"))
 
-	// Three of each, so the copy has exactly one spare slot to
-	// collide in.
-	mark := func(tag string) pg.InsertHook {
+	mark := func(c *pg.Col[string], tag string) pg.InsertHook {
 		return pg.InsertHookFunc(func(ctx *pg.InsertHookCtx) {
-			ctx.SetExpr(name.Column, drops.Raw("'"+tag+"'"))
+			ctx.SetExpr(c.Column, drops.Raw("'"+tag+"'"))
 		})
 	}
-	markUpd := func(tag string) pg.UpdateHook {
+	markUpd := func(c *pg.Col[string], tag string) pg.UpdateHook {
 		return pg.UpdateHookFunc(func(ctx *pg.UpdateHookCtx) {
-			ctx.SetExpr(name.Column, drops.Raw("'"+tag+"'"))
+			ctx.SetExpr(c.Column, drops.Raw("'"+tag+"'"))
 		})
 	}
 	for i := 0; i < 3; i++ {
@@ -723,32 +732,54 @@ func TestAliasHookAndFilterSlicesDoNotShareSpareCapacity(t *testing.T) {
 		base.DefaultFilter(pg.IsNotNull(id))
 	}
 
+	// Registered THROUGH the alias, but over the DECLARED handles: the
+	// list is shared, so the base table renders these too, and an
+	// alias handle would qualify with a relation its statement never
+	// names. That is the rule TenantFilter already states.
 	u := base.As("u")
-	u.OnInsert(mark("alias"))
-	u.OnUpdate(markUpd("alias"))
-	u.DefaultFilter(pg.Eq(u.Col("name"), "alias"))
-	base.OnInsert(mark("base"))
-	base.OnUpdate(markUpd("base"))
-	base.DefaultFilter(pg.Eq(name, "base"))
+	u.OnInsert(mark(viaAlias, "alias"))
+	u.OnUpdate(markUpd(viaAlias, "alias"))
+	u.DefaultFilter(pg.Eq(viaAlias, "alias"))
+	base.OnInsert(mark(viaBase, "base"))
+	base.OnUpdate(markUpd(viaBase, "base"))
+	base.DefaultFilter(pg.Eq(viaBase, "base"))
 
 	db := pg.New(nil)
-	sql, _ := db.Insert(u).Row(id.Val(1)).ToSQL()
-	if !strings.Contains(sql, "'alias'") {
-		t.Errorf("the base table's OnInsert displaced the alias's: %s", sql)
+	// Both handles run both hooks: neither append displaced the other,
+	// and the alias sees the registration that came after it.
+	for _, tc := range []struct {
+		name  string
+		table *pg.Table
+	}{{"alias", u}, {"base", base}} {
+		t.Run(tc.name, func(t *testing.T) {
+			sql, _ := db.Insert(tc.table).Row(id.Val(1)).ToSQL()
+			for _, want := range []string{"'alias'", "'base'"} {
+				if !strings.Contains(sql, want) {
+					t.Errorf("INSERT lost the %s OnInsert: %s", want, sql)
+				}
+			}
+			sql, _ = db.Update(tc.table).Set(id.Val(1)).ToSQL()
+			for _, want := range []string{"'alias'", "'base'"} {
+				if !strings.Contains(sql, want) {
+					t.Errorf("UPDATE lost the %s OnUpdate: %s", want, sql)
+				}
+			}
+		})
 	}
-	sql, _ = db.Update(u).Set(id.Val(1)).ToSQL()
-	if !strings.Contains(sql, "'alias'") {
-		t.Errorf("the base table's OnUpdate displaced the alias's: %s", sql)
+	// A DefaultFilter registered through either handle reaches both,
+	// and each renders it qualified with the relation ITS statement
+	// names — the rename resolveFilterExprs applies.
+	sql, _ := db.Select(id).From(u).ToSQL()
+	for _, want := range []string{`"u"."viaAlias"`, `"u"."viaBase"`} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("SELECT from the alias lost the filter on %s: %s", want, sql)
+		}
 	}
-	sql, _ = db.Select(id).From(u).ToSQL()
-	if !strings.Contains(sql, `"u"."name"`) {
-		t.Errorf("the base table's DefaultFilter displaced the alias's: %s", sql)
-	}
-	// And nothing the alias appended reaches the base table's own
-	// statements.
-	sql, _ = db.Insert(base).Row(id.Val(1)).ToSQL()
-	if !strings.Contains(sql, "'base'") {
-		t.Errorf("the base table lost its own OnInsert: %s", sql)
+	sql, _ = db.Select(id).From(base).ToSQL()
+	for _, want := range []string{`"cap_hooks"."viaAlias"`, `"cap_hooks"."viaBase"`} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("SELECT from the base table lost the filter on %s: %s", want, sql)
+		}
 	}
 }
 
@@ -856,4 +887,210 @@ func TestAliasRejectsEmptyIdentifier(t *testing.T) {
 		}
 	}()
 	users.As("")
+}
+
+// ----------------------------------------------------------------------
+// Scoping declared AFTER the alias was taken
+// ----------------------------------------------------------------------
+
+// An alias used to be a snapshot of its table's SCOPING as well as of
+// its shape, and the ordering that loses is the one this package
+// invites: Go initialises package-level variables before it runs init,
+// so an alias declared beside its table is taken before any init or
+// constructor that scopes the table. The alias stayed unscoped for ever
+// — and the worst reachable shape was a DELETE, rendered on
+// context.Background() through the exported API with no predicate at
+// all and no refusal:
+//
+//	DELETE FROM "users" AS "u"
+//
+// Every kind of automatic predicate is covered below because each is
+// registered by a different call and a fix for one is not a fix for the
+// others: DefaultFilter is render-time, ContextFilter is request-time,
+// Entity.ScopeByTenant and Entity.AuthorizeWith go through the keyed
+// registration, and ScopeWritesByTenant is a column rather than a
+// predicate.
+
+// aliasLateScoped builds a table, takes an alias of it, and only then
+// runs decl — the ordering a package-level var pair produces.
+func aliasLateScoped(name string, decl func(*pg.Table)) (base, alias *pg.Table) {
+	base = pg.NewTable(name)
+	pg.Add(base, pg.BigSerial("id").PrimaryKey())
+	pg.Add(base, pg.BigInt("orgId").NotNull())
+	pg.Add(base, pg.Text("name"))
+	alias = base.As("u")
+	decl(base)
+	return base, alias
+}
+
+type aliasLate struct {
+	ID    int64  `drop:"id"`
+	OrgID int64  `drop:"orgId"`
+	Name  string `drop:"name"`
+}
+
+// The severe case, stated on its own: a DELETE against the alias of a
+// table scoped after the alias was taken must not render, because what
+// it rendered was an unpredicated cross-tenant delete.
+func TestAliasDeleteRefusesWhenTheTableWasScopedLater(t *testing.T) {
+	_, u := aliasLateScoped("late_delete", func(base *pg.Table) {
+		base.ContextFilter(pg.TenantFilter(base.Col("orgId")))
+	})
+
+	db := pg.New(nil)
+	sql, _, err := db.Delete(u).ToSQLCtx(context.Background())
+	if !errors.Is(err, pg.ErrTenantMissing) {
+		t.Fatalf("got = %v (sql %q), want %v", err, sql, pg.ErrTenantMissing)
+	}
+	if sql != "" {
+		t.Errorf("got sql = %q, want no statement at all", sql)
+	}
+	checkCtx(t, pg.WithTenant(context.Background(), int64(7)), db.Delete(u),
+		`DELETE FROM "late_delete" AS "u" WHERE ("u"."orgId" = $1)`, int64(7))
+}
+
+// The same table, the four ways a predicate is declared on it, across
+// the three statements that carry one.
+func TestAliasCarriesScopingDeclaredAfterAs(t *testing.T) {
+	db := pg.New(nil)
+	subject := int64(11)
+	tenant := int64(7)
+
+	tests := []struct {
+		name string
+		decl func(*pg.Table)
+		ctx  context.Context
+		// want is the predicate the alias's statements must carry.
+		want string
+		arg  any
+		// missing is the error a ctx without the value must produce,
+		// or nil for a render-time filter that needs no ctx.
+		missing error
+	}{
+		{
+			name: "Table.ContextFilter",
+			decl: func(base *pg.Table) {
+				base.ContextFilter(pg.TenantFilter(base.Col("orgId")))
+			},
+			ctx:     pg.WithTenant(context.Background(), tenant),
+			want:    `("u"."orgId" = $?)`,
+			arg:     tenant,
+			missing: pg.ErrTenantMissing,
+		},
+		{
+			name: "Entity.ScopeByTenant",
+			decl: func(base *pg.Table) {
+				pg.NewEntity[aliasLate](base).ScopeByTenant(base.Col("orgId"))
+			},
+			ctx:     pg.WithTenant(context.Background(), tenant),
+			want:    `("u"."orgId" = $?)`,
+			arg:     tenant,
+			missing: pg.ErrTenantMissing,
+		},
+		{
+			name: "Entity.AuthorizeWith",
+			decl: func(base *pg.Table) {
+				pg.NewEntity[aliasLate](base).
+					AuthorizeWith(pg.OwnerGuard{Owner: base.Col("orgId")})
+			},
+			ctx:     pg.WithSubject(context.Background(), subject),
+			want:    `("u"."orgId" = $?)`,
+			arg:     subject,
+			missing: pg.ErrSubjectMissing,
+		},
+		{
+			name: "Table.DefaultFilter",
+			decl: func(base *pg.Table) {
+				base.DefaultFilter(pg.IsNull(base.Col("name")))
+			},
+			ctx:  context.Background(),
+			want: `("u"."name" IS NULL)`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, u := aliasLateScoped("late_"+strings.ToLower(strings.ReplaceAll(tc.name, ".", "_")), tc.decl)
+			uid := wbind[int64](u.Col("id"))
+
+			stmts := map[string]ctxSQLable{
+				"SELECT": db.Select(u.Col("id")).From(u),
+				"UPDATE": db.Update(u).Set(uid.Val(1)),
+				"DELETE": db.Delete(u),
+			}
+			for kind, q := range stmts {
+				gotSQL, gotArgs, err := q.ToSQLCtx(tc.ctx)
+				if err != nil {
+					t.Fatalf("%s: ToSQLCtx: %v", kind, err)
+				}
+				if !strings.Contains(normalisePlaceholders(gotSQL), tc.want) {
+					t.Errorf("%s: got = %q, want it to contain %q", kind, gotSQL, tc.want)
+				}
+				if tc.arg != nil && !containsArg(gotArgs, tc.arg) {
+					t.Errorf("%s: args = %v, want them to bind %v", kind, gotArgs, tc.arg)
+				}
+			}
+			if tc.missing == nil {
+				return
+			}
+			// And with nothing on the ctx the alias refuses, rather
+			// than sending the statement with the guard missing.
+			for kind, q := range map[string]ctxSQLable{
+				"SELECT": db.Select(u.Col("id")).From(u),
+				"UPDATE": db.Update(u).Set(uid.Val(1)),
+				"DELETE": db.Delete(u),
+			} {
+				sql, _, err := q.ToSQLCtx(context.Background())
+				if !errors.Is(err, tc.missing) {
+					t.Errorf("%s: got = %v (sql %q), want %v", kind, err, sql, tc.missing)
+				}
+				if sql != "" {
+					t.Errorf("%s: got sql = %q, want no statement at all", kind, sql)
+				}
+			}
+		})
+	}
+}
+
+// The write-side half of the axis is a column rather than a predicate,
+// so it is registered by a different call and was lost by the same
+// snapshot: an INSERT through the alias stamped nothing and refused
+// nothing, writing a row that belongs to no tenant.
+func TestAliasStampsTenantDeclaredAfterAs(t *testing.T) {
+	_, u := aliasLateScoped("late_insert", func(base *pg.Table) {
+		base.ScopeWritesByTenant(base.Col("orgId"))
+	})
+	db := pg.New(nil)
+	name := wbind[string](u.Col("name"))
+
+	checkCtx(t, pg.WithTenant(context.Background(), int64(7)),
+		db.Insert(u).Row(name.Val("a")),
+		`INSERT INTO "late_insert" AS "u" ("name", "orgId") VALUES ($1, $2)`,
+		"a", int64(7))
+
+	sql, _, err := db.Insert(u).Row(name.Val("a")).ToSQLCtx(context.Background())
+	if !errors.Is(err, pg.ErrTenantMissing) {
+		t.Fatalf("got = %v (sql %q), want %v", err, sql, pg.ErrTenantMissing)
+	}
+	if sql != "" {
+		t.Errorf("got sql = %q, want no statement at all", sql)
+	}
+}
+
+// A soft-delete mixin applied after the alias was taken registers both
+// a DefaultFilter and a DeleteHook, and losing the hook is the louder
+// half: the DELETE stopped being rewritten into an UPDATE and removed
+// the rows for good.
+func TestAliasSoftDeleteAppliedAfterAsStillRewritesTheDelete(t *testing.T) {
+	base := pg.NewTable("late_soft")
+	pg.Add(base, pg.BigSerial("id").PrimaryKey())
+	u := base.As("u")
+	pg.ApplyMixins(base, &pg.SoftDeleteMixin{})
+
+	db := pg.New(nil)
+	check(t, db.Delete(u),
+		`UPDATE "late_soft" AS "u" SET "deletedAt" = now() WHERE ("u"."deletedAt" IS NULL)`)
+	// Unscoped is still the way to a hard DELETE, and it takes the
+	// filter with it.
+	check(t, db.Delete(u).Unscoped(), `DELETE FROM "late_soft" AS "u"`)
 }

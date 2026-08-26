@@ -35,14 +35,14 @@ import "github.com/bernardoforcillo/drops"
 // A nil window renders OVER (), the whole result set as one partition,
 // which is what both servers mean by an empty specification.
 func Over(fn drops.Expression, win *Window) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.Append(fn)
-		b.WriteString(" OVER (")
-		if win != nil {
-			win.writeBody(b)
-		}
-		b.WriteByte(')')
-	})
+	var o opBuilder
+	o.operand(fn)
+	o.text(" OVER (")
+	if win != nil {
+		win.appendBody(&o)
+	}
+	o.text(")")
+	return o.done()
 }
 
 // Window describes the contents of an OVER (...) clause.
@@ -74,26 +74,34 @@ func (w *Window) OrderBy(exprs ...drops.Expression) *Window {
 // and MariaDB does not, and neither takes PostgreSQL's EXCLUDE clause.
 func (w *Window) Frame(spec string) *Window { w.frame = spec; return w }
 
-func (w *Window) writeBody(b *drops.Builder) {
+// appendBody writes the window specification into the node being built,
+// holding the PARTITION BY and ORDER BY expressions as operands.
+//
+// They are operands rather than text because a partition key is a place
+// a caller can write a scalar subquery — PARTITION BY (SELECT …) is
+// ordinary — and an expression closed over in a drops.ExprFunc is one
+// the resolver cannot walk. The frame is a raw string the caller wrote,
+// with nothing inside it for drops to resolve.
+func (w *Window) appendBody(o *opBuilder) {
 	first := true
 	if len(w.partition) > 0 {
-		b.WriteString("PARTITION BY ")
-		b.AppendList(", ", w.partition)
+		o.text("PARTITION BY ")
+		o.list(w.partition)
 		first = false
 	}
 	if len(w.order) > 0 {
 		if !first {
-			b.WriteByte(' ')
+			o.text(" ")
 		}
-		b.WriteString("ORDER BY ")
-		b.AppendList(", ", w.order)
+		o.text("ORDER BY ")
+		o.list(w.order)
 		first = false
 	}
 	if w.frame != "" {
 		if !first {
-			b.WriteByte(' ')
+			o.text(" ")
 		}
-		b.WriteString(w.frame)
+		o.text(w.frame)
 	}
 }
 

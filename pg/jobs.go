@@ -218,9 +218,9 @@ func (q *JobQueue) Enqueue(ctx context.Context, j NewJob) (int64, error) {
 		payload = b
 	}
 	rows, err := q.db.Query(ctx, fmt.Sprintf(`
-		INSERT INTO %s (kind, key, payload, total)
+		INSERT INTO %s ("kind", "key", "payload", "total")
 		VALUES ($1, $2, $3, $4)
-		RETURNING id`, quoteIdent(q.table)),
+		RETURNING "id"`, quoteIdent(q.table)),
 		j.Kind, j.Key, []byte(payload), j.Total)
 	if err != nil {
 		if errors.Is(err, ErrUniqueViolation) {
@@ -255,23 +255,23 @@ func (q *JobQueue) Claim(ctx context.Context, worker string, kinds ...string) (J
 	if worker == "" {
 		return Job{}, false, errors.New("drops/pg: Claim needs a worker name")
 	}
-	where := "state = 'pending'"
+	where := `"state" = 'pending'`
 	args := []any{worker}
 	if len(kinds) > 0 {
-		where += " AND kind = ANY($2)"
+		where += ` AND "kind" = ANY($2)`
 		args = append(args, kinds)
 	}
 	rows, err := q.db.Query(ctx, fmt.Sprintf(`
 		UPDATE %[1]s SET
-			state       = 'running',
-			worker      = $1,
-			startedAt   = now(),
-			heartbeatAt = now(),
-			attempts    = attempts + 1
-		WHERE id = (
-			SELECT id FROM %[1]s
+			"state"       = 'running',
+			"worker"      = $1,
+			"startedAt"   = now(),
+			"heartbeatAt" = now(),
+			"attempts"    = "attempts" + 1
+		WHERE "id" = (
+			SELECT "id" FROM %[1]s
 			WHERE %[2]s
-			ORDER BY id
+			ORDER BY "id"
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)
@@ -302,14 +302,14 @@ func (q *JobQueue) Claim(ctx context.Context, worker string, kinds ...string) (J
 //	    return nil  // somebody canceled us
 //	}
 func (q *JobQueue) Heartbeat(ctx context.Context, id int64, progress ...int64) error {
-	set := "heartbeatAt = now()"
+	set := `"heartbeatAt" = now()`
 	args := []any{id}
 	if len(progress) > 0 && progress[0] >= 0 {
-		set += ", progress = $2"
+		set += `, "progress" = $2`
 		args = append(args, progress[0])
 	}
 	res, err := q.db.Exec(ctx, fmt.Sprintf(
-		`UPDATE %s SET %s WHERE id = $1 AND state = 'running'`,
+		`UPDATE %s SET %s WHERE "id" = $1 AND "state" = 'running'`,
 		quoteIdent(q.table), set), args...)
 	if err != nil {
 		return err
@@ -320,8 +320,8 @@ func (q *JobQueue) Heartbeat(ctx context.Context, id int64, progress ...int64) e
 // Complete marks the job done.
 func (q *JobQueue) Complete(ctx context.Context, id int64) error {
 	res, err := q.db.Exec(ctx, fmt.Sprintf(`
-		UPDATE %s SET state = 'done', finishedAt = now(), lastError = ''
-		WHERE id = $1 AND state = 'running'`, quoteIdent(q.table)), id)
+		UPDATE %s SET "state" = 'done', "finishedAt" = now(), "lastError" = ''
+		WHERE "id" = $1 AND "state" = 'running'`, quoteIdent(q.table)), id)
 	if err != nil {
 		return err
 	}
@@ -340,8 +340,8 @@ func (q *JobQueue) Fail(ctx context.Context, id int64, cause error) error {
 		msg = cause.Error()
 	}
 	res, err := q.db.Exec(ctx, fmt.Sprintf(`
-		UPDATE %s SET state = 'failed', finishedAt = now(), lastError = $2
-		WHERE id = $1 AND state = 'running'`, quoteIdent(q.table)), id, msg)
+		UPDATE %s SET "state" = 'failed', "finishedAt" = now(), "lastError" = $2
+		WHERE "id" = $1 AND "state" = 'running'`, quoteIdent(q.table)), id, msg)
 	if err != nil {
 		return err
 	}
@@ -358,8 +358,8 @@ func (q *JobQueue) Fail(ctx context.Context, id int64, cause error) error {
 // convenient.
 func (q *JobQueue) Cancel(ctx context.Context, id int64) error {
 	res, err := q.db.Exec(ctx, fmt.Sprintf(`
-		UPDATE %s SET state = 'canceled', finishedAt = now()
-		WHERE id = $1 AND state IN ('pending','running')`, quoteIdent(q.table)), id)
+		UPDATE %s SET "state" = 'canceled', "finishedAt" = now()
+		WHERE "id" = $1 AND "state" IN ('pending','running')`, quoteIdent(q.table)), id)
 	if err != nil {
 		return err
 	}
@@ -384,11 +384,11 @@ func (q *JobQueue) Reap(ctx context.Context, stale time.Duration) (int64, error)
 	}
 	res, err := q.db.Exec(ctx, fmt.Sprintf(`
 		UPDATE %s SET
-			state     = 'pending',
-			worker    = '',
-			lastError = 'reaped: heartbeat stopped'
-		WHERE state = 'running'
-		  AND heartbeatAt < now() - $1::interval`, quoteIdent(q.table)),
+			"state"     = 'pending',
+			"worker"    = '',
+			"lastError" = 'reaped: heartbeat stopped'
+		WHERE "state" = 'running'
+		  AND "heartbeatAt" < now() - $1::interval`, quoteIdent(q.table)),
 		fmt.Sprintf("%d milliseconds", stale.Milliseconds()))
 	if err != nil {
 		return 0, err
@@ -402,7 +402,7 @@ func (q *JobQueue) Reap(ctx context.Context, stale time.Duration) (int64, error)
 // Get returns one job by id.
 func (q *JobQueue) Get(ctx context.Context, id int64) (Job, error) {
 	rows, err := q.db.Query(ctx, fmt.Sprintf(
-		`SELECT %s FROM %s WHERE id = $1`, jobColumns, quoteIdent(q.table)), id)
+		`SELECT %s FROM %s WHERE "id" = $1`, jobColumns, quoteIdent(q.table)), id)
 	if err != nil {
 		return Job{}, err
 	}
@@ -427,14 +427,14 @@ func (q *JobQueue) Get(ctx context.Context, id int64) (Job, error) {
 // the database rather than in the one that happens to be running the
 // loop.
 func (q *JobQueue) Live(ctx context.Context, kinds ...string) ([]Job, error) {
-	where := "state IN ('pending','running')"
+	where := `"state" IN ('pending','running')`
 	var args []any
 	if len(kinds) > 0 {
-		where += " AND kind = ANY($1)"
+		where += ` AND "kind" = ANY($1)`
 		args = append(args, kinds)
 	}
 	rows, err := q.db.Query(ctx, fmt.Sprintf(
-		`SELECT %s FROM %s WHERE %s ORDER BY id`,
+		`SELECT %s FROM %s WHERE %s ORDER BY "id"`,
 		jobColumns, quoteIdent(q.table), where), args...)
 	if err != nil {
 		return nil, err
@@ -460,8 +460,8 @@ func (q *JobQueue) Cleanup(ctx context.Context, retain time.Duration) (int64, er
 	}
 	res, err := q.db.Exec(ctx, fmt.Sprintf(`
 		DELETE FROM %s
-		WHERE state NOT IN ('pending','running')
-		  AND finishedAt < now() - $1::interval`, quoteIdent(q.table)),
+		WHERE "state" NOT IN ('pending','running')
+		  AND "finishedAt" < now() - $1::interval`, quoteIdent(q.table)),
 		fmt.Sprintf("%d milliseconds", retain.Milliseconds()))
 	if err != nil {
 		return 0, err
@@ -474,10 +474,17 @@ func (q *JobQueue) Cleanup(ctx context.Context, retain time.Duration) (int64, er
 
 // jobColumns is the projection every job read shares, in the order
 // scanJob expects.
-const jobColumns = `id, kind, key, state, coalesce(payload, 'null'::jsonb), worker,
-	progress, total, attempts, lastError, createdAt,
-	coalesce(startedAt, to_timestamp(0)), coalesce(heartbeatAt, to_timestamp(0)),
-	coalesce(finishedAt, to_timestamp(0))`
+//
+// Every identifier is quoted, including the ones that would not need
+// it. [NewJobTable] declares camelCase columns and CREATE TABLE quotes
+// them, so the columns really are named "lastError" and "heartbeatAt"
+// — while an unquoted lastError in a statement folds to lasterror and
+// finds nothing. Quoting the lowercase ones too keeps the two lists
+// from drifting into that trap one column at a time.
+const jobColumns = `"id", "kind", "key", "state", coalesce("payload", 'null'::jsonb), "worker",
+	"progress", "total", "attempts", "lastError", "createdAt",
+	coalesce("startedAt", to_timestamp(0)), coalesce("heartbeatAt", to_timestamp(0)),
+	coalesce("finishedAt", to_timestamp(0))`
 
 func scanJob(rows drops.Rows) (Job, error) {
 	var j Job

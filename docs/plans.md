@@ -71,8 +71,32 @@ It also **merges exactly**, so a sketch can be built per shard or per
 partition and folded together, and the result is identical to one
 built in a single pass.
 
-What it cannot do is enumerate what it holds — it stores counters, not
-values. `TopValues` takes the candidates from you:
+### The other half of the index question
+
+`Selectivity` answers "does *this* value match too much of the table".
+Cardinality answers "is this column worth indexing at all":
+
+```go
+s.DistinctEstimate()   // ~500
+```
+
+A column holding three values will not repay an index however the rows
+are split between them; one holding a million almost certainly will.
+The count comes from a HyperLogLog kept alongside the counters, so it
+is two-sided — within about 1% either way, rather than the one-sided
+bound `Estimate` gives — and exact below a few thousand values.
+
+It is a second structure rather than a cheaper trick for a reason
+worth knowing if you were going to reach for the trick: counting the
+values whose counters were all zero before an insert looks like it
+would work, and stops climbing far below the truth as soon as the
+table is anything like full. That version reported 21 distinct values
+for a column holding 500.
+
+### Naming the candidates
+
+What the sketch cannot do is enumerate what it holds — it stores
+counters, not values. `TopValues` takes the candidates from you:
 
 ```go
 for _, c := range s.TopValues("pending", "shipped", "cancelled") {

@@ -26,9 +26,15 @@ the same reasoning that wrote the code:
 | Composite `PRIMARY KEY` rendered inline on each column | "multiple primary keys for table are not allowed" |
 | SQLite `PRIMARY KEY` without `NOT NULL` | a `TEXT PRIMARY KEY` accepts and stores a NULL key |
 | A table with no `CHECK` constraints diffing against itself | a full table rebuild on every deploy |
+| `JobQueue` naming camelCase columns unquoted | every statement in it: "column lasterror does not exist" |
+| `Rollback` after `StatementRegistry.CancelAll` | an error on the one outcome that is correct |
+| The sketch's cardinality estimate | eleven times too low, from a hash whose high bits barely moved |
 
 In three of those cases the unit test had pinned the *broken* output as
-the expectation.
+the expectation. The job queue is the clearest of the lot: its unit
+tests asserted that the SQL contained `state = 'running'`, which it
+did, and said nothing about the quoting that decided whether the
+column existed.
 
 No amount of care fixes this from inside the same head. The only test
 that cannot make the mistake is one where a server parses the
@@ -50,6 +56,10 @@ go test -C integration ./...
 ```
 
 The rest needs servers:
+
+The PostgreSQL service is started with `wal_level = logical`, which is
+what lets the change-data-capture tests create a replication slot;
+without it they skip.
 
 ```sh
 docker compose -f integration/docker-compose.yml up -d

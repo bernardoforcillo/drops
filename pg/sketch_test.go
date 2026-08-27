@@ -204,3 +204,77 @@ func TestExpectedError(t *testing.T) {
 		t.Errorf("ExpectedError() = %v, want 10", got)
 	}
 }
+
+// The cardinality estimate has to be close, or it cannot be acted on.
+// The counter-based version this replaced reported 21 for a column
+// holding 500 — a true lower bound, and useless.
+func TestSketchDistinctEstimate(t *testing.T) {
+	for _, want := range []int{0, 1, 10, 500, 5000, 100000} {
+		s := pg.NewSketch(pg.SketchOptions{})
+		for i := 0; i < want; i++ {
+			// Each value many times over: a cardinality estimate
+			// that moved with the row count would be counting the
+			// wrong thing.
+			s.Add("v"+strconv.Itoa(i), 1)
+			s.Add("v"+strconv.Itoa(i), 1)
+			s.Add("v"+strconv.Itoa(i), 1)
+		}
+		got := float64(s.DistinctEstimate())
+		if want == 0 {
+			if got != 0 {
+				t.Errorf("empty sketch reported %v distinct values", got)
+			}
+			continue
+		}
+		// 5% covers the estimator's own error with room for the
+		// hash's behaviour on this particular value set.
+		lo, hi := float64(want)*0.95, float64(want)*1.05
+		if got < lo || got > hi {
+			t.Errorf("DistinctEstimate() = %v for %d distinct values, want within 5%%", got, want)
+		}
+	}
+}
+
+// Merging has to be exact for cardinality too, or a sketch built per
+// shard is not the same as one built in a pass.
+func TestSketchDistinctMergesExactly(t *testing.T) {
+	opts := pg.SketchOptions{Width: 512, Depth: 4}
+	whole := pg.NewSketch(opts)
+	a := pg.NewSketch(opts)
+	b := pg.NewSketch(opts)
+	for i := 0; i < 3000; i++ {
+		v := "v" + strconv.Itoa(i)
+		whole.Add(v, 1)
+		if i%2 == 0 {
+			a.Add(v, 1)
+		} else {
+			b.Add(v, 1)
+		}
+	}
+	if err := a.Merge(b); err != nil {
+		t.Fatal(err)
+	}
+	if a.DistinctEstimate() != whole.DistinctEstimate() {
+		t.Errorf("merged cardinality %d, single-pass %d",
+			a.DistinctEstimate(), whole.DistinctEstimate())
+	}
+}
+
+func TestSketchDistinctSurvivesARoundTrip(t *testing.T) {
+	s := pg.NewSketch(pg.SketchOptions{})
+	for i := 0; i < 2000; i++ {
+		s.Add("v"+strconv.Itoa(i), 1)
+	}
+	blob, err := s.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back pg.Sketch
+	if err := back.UnmarshalBinary(blob); err != nil {
+		t.Fatal(err)
+	}
+	if back.DistinctEstimate() != s.DistinctEstimate() {
+		t.Errorf("cardinality after a round trip = %d, want %d",
+			back.DistinctEstimate(), s.DistinctEstimate())
+	}
+}

@@ -116,7 +116,7 @@ func TestClaimIsOneStatementWithSkipLocked(t *testing.T) {
 	if strings.Count(sql, "UPDATE") != 2 { // the UPDATE and FOR UPDATE
 		t.Errorf("claim issues more than one update:\n%s", sql)
 	}
-	if !strings.Contains(sql, "kind = ANY") {
+	if !strings.Contains(sql, `"kind" = ANY`) {
 		t.Errorf("claim does not filter by kind:\n%s", sql)
 	}
 }
@@ -127,7 +127,7 @@ func TestClaimWithoutKindsTakesAny(t *testing.T) {
 	if _, _, err := q.Claim(context.Background(), "worker-1"); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(drv.last(), "kind = ANY") {
+	if strings.Contains(drv.last(), `"kind" = ANY`) {
 		t.Errorf("claim with no kinds filtered by kind anyway:\n%s", drv.last())
 	}
 }
@@ -159,7 +159,7 @@ func TestHeartbeatReportsNotRunning(t *testing.T) {
 	if !errors.Is(err, pg.ErrJobNotRunning) {
 		t.Errorf("got %v, want ErrJobNotRunning", err)
 	}
-	if !strings.Contains(drv.last(), "state = 'running'") {
+	if !strings.Contains(drv.last(), `"state" = 'running'`) {
 		t.Errorf("heartbeat does not require the job to still be running:\n%s", drv.last())
 	}
 }
@@ -170,14 +170,14 @@ func TestHeartbeatRecordsProgress(t *testing.T) {
 	if err := q.Heartbeat(context.Background(), 42, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(drv.last(), "progress = $2") {
+	if !strings.Contains(drv.last(), `"progress" = $2`) {
 		t.Errorf("progress was not recorded:\n%s", drv.last())
 	}
 	// A heartbeat with no progress must not reset it to zero.
 	if err := q.Heartbeat(context.Background(), 42); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(drv.last(), "progress =") {
+	if strings.Contains(drv.last(), `"progress" =`) {
 		t.Errorf("a bare heartbeat touched progress:\n%s", drv.last())
 	}
 }
@@ -195,7 +195,7 @@ func TestCompleteFailCancelGuardTheState(t *testing.T) {
 		if err := run(q); !errors.Is(err, pg.ErrJobNotRunning) {
 			t.Errorf("%s: got %v, want ErrJobNotRunning", name, err)
 		}
-		if !strings.Contains(drv.last(), "state") {
+		if !strings.Contains(drv.last(), `"state"`) {
 			t.Errorf("%s does not guard on state:\n%s", name, drv.last())
 		}
 	}
@@ -235,7 +235,7 @@ func TestReapReturnsJobsToPending(t *testing.T) {
 		t.Errorf("Reap returned %d, want 3", n)
 	}
 	sql := drv.last()
-	if !strings.Contains(sql, "'pending'") || !strings.Contains(sql, "heartbeatAt <") {
+	if !strings.Contains(sql, "'pending'") || !strings.Contains(sql, `"heartbeatAt" <`) {
 		t.Errorf("reap does not return stale running jobs to pending:\n%s", sql)
 	}
 }
@@ -284,6 +284,45 @@ func TestJobStateLive(t *testing.T) {
 	for _, s := range []pg.JobState{pg.JobDone, pg.JobFailed, pg.JobCanceled} {
 		if s.Live() {
 			t.Errorf("%s should free the per-key slot", s)
+		}
+	}
+}
+
+// NewJobTable declares camelCase columns, so CREATE TABLE quotes them
+// and the columns really are named "lastError" and "heartbeatAt". An
+// unquoted lastError in a statement folds to lasterror and finds
+// nothing — which is how every statement in this file shipped broken
+// while its unit tests passed, because they only matched substrings.
+//
+// This is the assertion that would have caught it, and the reason the
+// integration suite exists is that even this one only holds because
+// somebody thought to write it.
+func TestJobStatementsQuoteEveryIdentifier(t *testing.T) {
+	mixedCase := []string{"lastError", "heartbeatAt", "startedAt", "finishedAt", "createdAt"}
+
+	drv := &jobDriver{affected: 1}
+	q := pg.NewJobQueue(pg.New(drv), "jobs")
+	ctx := context.Background()
+
+	_, _ = q.Enqueue(ctx, pg.NewJob{Kind: "k", Key: "v"})
+	_, _, _ = q.Claim(ctx, "w", "k")
+	_ = q.Heartbeat(ctx, 1, 5)
+	_ = q.Complete(ctx, 1)
+	_ = q.Fail(ctx, 1, errors.New("x"))
+	_ = q.Cancel(ctx, 1)
+	_, _ = q.Reap(ctx, time.Minute)
+	_, _ = q.Get(ctx, 1)
+	_, _ = q.Live(ctx)
+	_, _ = q.Cleanup(ctx, time.Hour)
+
+	for _, sql := range drv.stmts {
+		for _, col := range mixedCase {
+			for _, unquoted := range []string{" " + col, "(" + col, "," + col} {
+				if strings.Contains(sql, unquoted) {
+					t.Errorf("%q appears unquoted; PostgreSQL will fold it to %q and fail:\n%s",
+						col, strings.ToLower(col), sql)
+				}
+			}
 		}
 	}
 }

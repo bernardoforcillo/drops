@@ -217,11 +217,13 @@ func (r *StatementRegistry) Quiesced() bool {
 // a [Quiesce] on a short context to wait for that to happen.
 //
 // A cancelled statement fails with [ErrQueryCanceled] on the caller's
-// side. A cancelled *transaction* is rolled back by the server when
-// its connection goes, so no committed work is lost — but a caller
-// mid-transaction sees its next statement fail, which is the intended
-// outcome and not a gentle one. Prefer [Quiesce] and use this when it
-// has run out of time.
+// side. A cancelled *transaction* ends: cancelling the context it was
+// begun on is enough for the driver to roll it back, so no committed
+// work is lost, and a later tx.Rollback finds it already gone and
+// reports success rather than an error nobody can act on. A caller
+// mid-transaction still sees its next statement fail, which is the
+// intended outcome and not a gentle one — prefer [Quiesce] and use
+// this when it has run out of time.
 func (r *StatementRegistry) CancelAll() int {
 	return r.cancelWhere(func(*regEntry) bool { return true })
 }
@@ -458,13 +460,31 @@ func (t *registryTx) Commit(ctx context.Context) error {
 }
 
 func (t *registryTx) Rollback(ctx context.Context) error {
-	// Rollback deliberately does not run on the transaction's own
-	// context: that context is what [CancelAll] cancels, and a
-	// rollback issued on a cancelled context would be refused by the
-	// driver before reaching the server — leaving the transaction
-	// open on a connection nobody is going to clean up.
+	// Rollback runs on the caller's context rather than the
+	// transaction's. The transaction's is what [CancelAll] cancels,
+	// and a rollback issued on a cancelled context would be refused
+	// before reaching the server.
+	// Read before deregistering: deregistering releases the entry's
+	// context, so afterwards every transaction looks cancelled.
+	cancelled := t.ctx.Err() != nil
+
 	err := t.Tx.Rollback(ctx)
 	t.once.Do(func() { t.reg.deregister(t.entry) })
+
+	if err != nil && cancelled {
+		// The registry cancelled this transaction, and cancelling
+		// the context a transaction was begun on ends it:
+		// database/sql rolls it back itself, and pgx tears down the
+		// connection. So the transaction is over, and this Rollback
+		// is finding it already gone rather than failing to end it.
+		//
+		// Reporting that as an error is what the integration suite
+		// caught: every caller with a `defer tx.Rollback()` would log
+		// a failure for the one outcome that is entirely correct.
+		// A caller that wants to know its transaction was cancelled
+		// learns it from the statement that failed, not from here.
+		return nil
+	}
 	return err
 }
 

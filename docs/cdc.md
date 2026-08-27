@@ -359,11 +359,39 @@ A short checklist, all of it drawn from the failure modes above.
 - [ ] The consumer is idempotent, because delivery is at-least-once.
 - [ ] One source per mirror.
 
-## What is not tested against a live server yet
+## What the integration suite covers
 
-The slot statements, the snapshot handoff and the reassembly are
-covered by unit tests against fakes and by assertions on the SQL
-emitted. There is no case in [`integration/`](testing.md) exercising
-them against a PostgreSQL with `wal_level = logical`, so the logic is
-verified and the server's acceptance of it is not. Treat the streaming
-path as pre-1.0 in the way the rest of drops is, and a little more so.
+`integration/pglogical_test.go` runs against a real PostgreSQL with
+`wal_level = logical`:
+
+- slot lifecycle — create, ensure (twice), status, list, drop
+- `SlotLag` growing across unread writes
+- `InactiveSlots` and `DropInactiveSlots`, including the re-check that
+  spares an active slot
+- decoded output from real DML: transaction framing, whole
+  multi-statement transactions, insert/update/delete
+- `REPLICA IDENTITY FULL` changing what a delete carries
+- acknowledgement actually moving `confirmed_flush_lsn`, and
+  `ReassembleDeferred` moving nothing
+- `mirror.LogicalSource` driving a `Pump` end to end, with versions
+  ordered by commit position
+- the slot advancing past a table the mirror does not hold
+- `WithSnapshot` refusing to see a row committed after the instant,
+  and refusing a write
+
+Two things it does not cover, both because they need the replication
+sub-protocol rather than SQL:
+
+- **`StartReplication` over a replication connection.** The suite
+  implements `pg.ReplicationStream` over
+  `pg_logical_slot_peek_changes` and `pg_replication_slot_advance`,
+  which is the same decoding through a different door. The
+  [`LogicalStreamer`](#streaming) adapter a driver supplies is
+  yours to test.
+- **Snapshot *export*.** `pg_create_logical_replication_slot` cannot
+  do it, so the suite uses `pg_export_snapshot()` to produce a
+  snapshot of the same kind and holds `WithSnapshot`'s statements to
+  the property that matters.
+
+Set the server up with `wal_level = logical` or those tests skip —
+`docker-compose.yml` and `scripts/local-servers.sh` both do.

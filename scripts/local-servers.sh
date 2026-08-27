@@ -49,8 +49,13 @@ if [ ! -s "$PGDATA_IT/PG_VERSION" ]; then
 	chown postgres:postgres "$PGDATA_IT"
 	su postgres -c "$PGBIN/initdb -D $PGDATA_IT -U drops --auth=trust"
 fi
+# wal_level=logical is what lets the change-data-capture tests create a
+# replication slot at all. It costs a little extra WAL volume and
+# nothing else here, and without it those tests fail on slot creation
+# rather than exercising anything.
 su postgres -c "$PGBIN/pg_ctl -D $PGDATA_IT -l $PGDATA_IT/log \
-	-o '-p $PGPORT_IT -c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp' \
+	-o '-p $PGPORT_IT -c listen_addresses=127.0.0.1 -c unix_socket_directories=/tmp \
+	    -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10' \
 	-w start" || true
 
 psql "postgres://drops@127.0.0.1:$PGPORT_IT/postgres" \

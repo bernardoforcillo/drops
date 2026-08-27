@@ -17,6 +17,19 @@ services:
     # tests need the extension, and a plain image would make them skip
     # exactly where the risk is highest.
     image: pgvector/pgvector:pg16
+    # wal_level=logical is what lets the change-data-capture tests
+    # create a replication slot. Without it they fail at slot creation
+    # rather than exercising the decoding, the transaction framing or
+    # mirror.LogicalSource — which is the part a rendered SQL string
+    # cannot say anything about.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
     environment:
       POSTGRES_USER: drops
       POSTGRES_PASSWORD: drops

@@ -346,6 +346,56 @@ func TestCancelOlderThan(t *testing.T) {
 	}
 }
 
+// Cancelling the context a transaction was begun on ends it — the
+// driver rolls it back itself. So a caller's `defer tx.Rollback()`
+// finds it already gone, and that is success rather than a failure to
+// report: the integration suite caught this as an error on the one
+// outcome that is entirely correct.
+func TestRollbackAfterCancellationReportsSuccess(t *testing.T) {
+	drv := newBlockingDriver()
+	close(drv.release)
+	reg := pg.NewStatementRegistry()
+	wrapped := reg.Wrap(&rollbackFailsDriver{blockingDriver: drv})
+
+	tx, err := wrapped.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.CancelAll()
+	if err := tx.Rollback(context.Background()); err != nil {
+		t.Errorf("Rollback after CancelAll = %v, want nil", err)
+	}
+
+	// Without a cancellation, a driver's rollback error is the
+	// caller's to see.
+	tx2, err := wrapped.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.Rollback(context.Background()); err == nil {
+		t.Error("an uncancelled rollback swallowed the driver's error")
+	}
+}
+
+// rollbackFailsDriver hands out transactions whose Rollback always
+// fails, the way a driver reports one that has already ended.
+type rollbackFailsDriver struct {
+	*blockingDriver
+}
+
+func (d *rollbackFailsDriver) Begin(ctx context.Context) (drops.Tx, error) {
+	if err := d.wait(ctx); err != nil {
+		return nil, err
+	}
+	return &failingRollbackTx{}, nil
+}
+
+type failingRollbackTx struct{ regFakeTx }
+
+func (t *failingRollbackTx) Rollback(context.Context) error {
+	return errors.New("sql: transaction has already been committed or rolled back")
+}
+
 // A rollback has to reach the server even when the transaction's own
 // context was cancelled, or the transaction stays open on a
 // connection nobody will clean up.

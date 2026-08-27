@@ -115,6 +115,9 @@ func (e *Entity[T]) PatchKey(db *DB, ctx context.Context, key []any, ops ...Patc
 		// Invalidate the cached entry — the patched value is
 		// computed server-side and we don't have it locally.
 		e.invalidatePK(ctx, key)
+		// And for the same reason it cannot name the values it
+		// touched, so the topic invalidation is the wide one.
+		e.invalidateTopicsConservatively(ctx)
 	}
 	return res, err
 }

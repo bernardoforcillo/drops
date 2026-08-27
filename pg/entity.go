@@ -88,6 +88,16 @@ type Entity[T any] struct {
 	// query.
 	cache *EntityCache
 
+	// topics, when set via WithTopics, gives the query cache
+	// something better than a TTL: a query's key embeds the
+	// generations of the topics it declared, and a write invalidates
+	// the topics it touched. See pg/topics.go.
+	topics *TopicIndex
+
+	// topicCols names the columns a write reports value topics for —
+	// the ones queries scope by. Set with WithTopics.
+	topicCols []string
+
 	// budget, when configured via WithBudget, caps the cost of each
 	// Entity operation (max args, max rows, max duration). The zero
 	// Budget disables every limit.
@@ -711,6 +721,11 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 type EntityQuery[T any] struct {
 	e  *Entity[T]
 	fb *FindBuilder
+
+	// deps are the topics this query declared with DependsOn. Empty
+	// means the query cache falls back to TTL-only behaviour for it,
+	// which is what it did before topics existed.
+	deps []Topic
 }
 
 // Stream iterates the matching rows one at a time, invoking fn for
@@ -815,6 +830,11 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if err != nil {
 		return e.FieldError(err)
 	}
+	// A new row can only enter a list by its own values, so a create
+	// can name exactly what it touched. This is the one write that
+	// invalidates precisely; see invalidateTopicsConservatively for
+	// why the others cannot.
+	e.invalidateTopics(ctx, nil, e.topicRow(r))
 	if e.cache != nil {
 		// Populate the PK cache with the freshly-inserted row so the
 		// next Get hits immediately.
@@ -912,6 +932,9 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = doUpdate(db)
 	}
+	if err == nil {
+		e.invalidateTopicsConservatively(ctx)
+	}
 	if err == nil && e.cache != nil {
 		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
 	}
@@ -970,6 +993,7 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	}
 	if err == nil {
 		e.invalidatePK(ctx, key)
+		e.invalidateTopicsConservatively(ctx)
 	}
 	return res, e.FieldError(err)
 }
@@ -1258,7 +1282,17 @@ func (q *EntityQuery[T]) cacheable() bool {
 
 func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 	sql, args := q.fb.Select().ToSQL()
-	key := queryKey(q.e.table.Name(), sql, args)
+	key, ok, err := q.cacheKey(ctx, sql, args)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		var rs []T
+		if q.e.fastScan != nil {
+			return rs, q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &rs)
+		}
+		return rs, q.fb.All(ctx, &rs)
+	}
 	var out []T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
 		return out, nil
@@ -1289,7 +1323,18 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 
 func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
 	sql, args := q.fb.Select().ToSQL()
-	key := queryKey(q.e.table.Name(), sql, args) + ":one"
+	base, ok, err := q.cacheKey(ctx, sql, args)
+	if err != nil {
+		return *new(T), err
+	}
+	if !ok {
+		var t T
+		if q.e.fastScan != nil {
+			return t, q.e.scanOneFast(ctx, q.fb.Select(), &t)
+		}
+		return t, q.fb.One(ctx, &t)
+	}
+	key := base + ":one"
 	var out T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
 		return out, nil
@@ -1315,4 +1360,139 @@ func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
 		return out, err
 	}
 	return v.(T), nil
+}
+
+// DependsOn declares the topics whose invalidation must evict this
+// query's cached result.
+//
+// Without it a cached query expires on its TTL and nothing else,
+// which is what [EntityCache] has always done and is often the right
+// trade. With it the entry is also dropped the moment a write touches
+// one of the topics — see pg/topics.go for how to pick them, and for
+// the one rule that keeps it safe: a filtered query declares
+// [UnscopedTopic] plus its [ValueTopic]s, and an unfiltered one
+// declares [TableTopic].
+//
+//	Orders.Query().
+//	    Where(pg.Eq(OrderCustomer, id)).
+//	    DependsOn(
+//	        pg.UnscopedTopic("orders"),
+//	        pg.ValueTopic("orders", "customer_id", id),
+//	    ).
+//	    All(ctx)
+//
+// It has no effect unless the entity has both a cache
+// ([Entity.WithCache]) and an index ([Entity.WithTopics]).
+func (q *EntityQuery[T]) DependsOn(topics ...Topic) *EntityQuery[T] {
+	q.deps = append(q.deps, topics...)
+	return q
+}
+
+// cacheKey builds the key for a cached query, and reports whether the
+// query may be served from cache at all.
+//
+// ok is false when the query declared topics and their generations
+// could not be read. Serving from a key whose freshness cannot be
+// established is the one outcome that is worse than not caching, so
+// the read falls through to the database instead.
+func (q *EntityQuery[T]) cacheKey(ctx context.Context, sql string, args []any) (key string, ok bool, err error) {
+	base := queryKey(q.e.table.Name(), sql, args)
+	if len(q.deps) == 0 || q.e.topics == nil {
+		return base, true, nil
+	}
+	stamp, err := q.e.topics.Stamp(ctx, q.deps...)
+	if err != nil {
+		return "", false, nil
+	}
+	return base + ":" + stamp, true, nil
+}
+
+// WithTopics attaches a [TopicIndex] so queries on this entity can
+// declare dependencies with [EntityQuery.DependsOn] and writes
+// announce what they touched.
+//
+// columns names the columns a write reports value topics for: the
+// foreign keys, the tenant id, the columns queries are scoped by.
+// Naming a column that no query scopes by costs one wasted
+// invalidation per write; omitting one that a query does scope by
+// leaves that query's entry alive until its TTL, which is the failure
+// this is meant to prevent — so err towards naming more.
+//
+// Every write through the entity (Create, Update, Save, Delete) then
+// invalidates [TableTopic] plus the value topics of the named
+// columns, on both sides of the change. A statement that bypasses the
+// entity layer announces nothing, and owes the cache a
+// [TopicIndex.InvalidateTable].
+func (e *Entity[T]) WithTopics(idx *TopicIndex, columns ...string) *Entity[T] {
+	e.topics = idx
+	e.topicCols = append([]string(nil), columns...)
+	return e
+}
+
+// invalidateTopics announces a row change to the entity's topic
+// index. before and after may each be nil (an insert has no before,
+// a delete no after).
+//
+// Failures are swallowed the way the primary-key invalidation above
+// swallows them: a cache that could not be told about a write serves
+// stale rows until their TTL, and turning that into a failed write
+// would take the application down for a cache outage.
+func (e *Entity[T]) invalidateTopics(ctx context.Context, before, after map[string]any) {
+	if e.topics == nil {
+		return
+	}
+	_ = e.topics.InvalidateRow(ctx, e.table.Name(), before, after, e.topicCols...)
+}
+
+// topicRow renders the entity's topic columns out of a value, for the
+// invalidation announcement. Columns the struct does not map are
+// absent rather than nil — see [TopicIndex.InvalidateRow] for why the
+// difference matters.
+func (e *Entity[T]) topicRow(v *T) map[string]any {
+	if e.topics == nil || v == nil || len(e.topicCols) == 0 {
+		return nil
+	}
+	row := make(map[string]any, len(e.topicCols))
+	for _, name := range e.topicCols {
+		for _, cf := range e.colFields {
+			if cf.col.Name() != name {
+				continue
+			}
+			rv := reflect.Indirect(reflect.ValueOf(v))
+			if rv.Kind() == reflect.Struct {
+				row[name] = rv.FieldByIndex(cf.field).Interface()
+			}
+			break
+		}
+	}
+	return row
+}
+
+// invalidateTopicsConservatively announces a change to the entity's
+// table that cannot name the values it affected.
+//
+// Update, Save, Delete and Patch all land here, and the reason is the
+// same for each: drops does not read a row before writing it, so it
+// knows what the row became and not what it was. An update that moves
+// an order from customer 7 to customer 9 changes the answer to both
+// "orders of 7" and "orders of 9", and an invalidation built from the
+// new value alone would leave customer 7's cached list holding a row
+// that has left it. Reading the old row first would make every write
+// two round trips to buy precision most callers do not need.
+//
+// So these writes reach every query on the table, which is correct
+// and blunt. Two ways to get the precision back when it matters:
+//
+//   - Call [TopicIndex.InvalidateRow] directly with the before-image
+//     you already have.
+//   - Drive invalidation from the change stream instead. A logical
+//     replication consumer is handed both images by the server (see
+//     [ReplicaIdentityFull]), so it can be exact without any extra
+//     read — which is how InstantDB does it, and the reason its
+//     invalidation is precise where a write-path hook cannot be.
+func (e *Entity[T]) invalidateTopicsConservatively(ctx context.Context) {
+	if e.topics == nil {
+		return
+	}
+	_ = e.topics.InvalidateTable(ctx, e.table.Name())
 }

@@ -98,6 +98,37 @@ the primary key with a version column, so replaying a change converges
 rather than duplicating, and Qdrant's upsert is idempotent by
 construction.
 
+## Or read the log instead
+
+The outbox asks every writer to cooperate. PostgreSQL is already
+writing every change down for its own replication, and
+`mirror.LogicalSource` reads that record instead — nothing is asked of
+the writer, a path nobody remembered to instrument is mirrored anyway,
+and the ordering is the database's own commit order rather than a
+per-key one.
+
+```go
+stream, _ := pg.Stream(db, ctx, "mirror_docs", 0, nil)
+src, _ := mirror.NewLogicalSource(stream, mirror.LogicalOptions{
+    Tables: map[string]string{"docs": "id"},
+})
+go src.Run(ctx)
+```
+
+What it costs instead is operational: a replication slot is a
+server-side object that outlives the process, and an abandoned one
+retains WAL until the volume fills. [cdc.md](cdc.md) is that story in
+full, including the snapshot handoff that lets an initial fill and the
+stream that follows it join with no gap and no overlap — which is the
+seam the version bands below only make *survivable*.
+
+Take the outbox when the mirror carries something the row does not — a
+derived field, a join, an event the application invents. Take the log
+when the mirror is a copy of rows, which is the common case. **Do not
+point both at one mirror**: they number their changes independently in
+the same version band, so the higher number would win regardless of
+which was newer.
+
 ## Run it
 
 ```go

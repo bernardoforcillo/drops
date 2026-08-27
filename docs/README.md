@@ -21,6 +21,10 @@ ClickHouse and Qdrant.
 | [Choosing a dialect](dialects.md) | What each of the five backends gives you, and what it does not. Read this before porting a schema. |
 | [Vector search](vector-search.md) | One query vocabulary over pgvector, ClickHouse and Qdrant. |
 | [OLTP → OLAP → vector](mirror.md) | Keeping one table mirrored across all three, without three schema declarations. |
+| [Change data capture](cdc.md) | Reading the write-ahead log instead of asking every writer to write twice — and the slot that fills your disk if you look away. |
+| [Caching](caching.md) | Why a query cache needs more than a TTL, and the one rule that makes topic invalidation safe. |
+| [Query plans](plans.md) | Measuring how selective a predicate is, hinting the planner, and holding the plan to a test. |
+| [Running it](operations.md) | The SQLSTATEs that mean "do something else", draining a node for failover, durable jobs, and results that will not fit in memory. |
 | [Testing](testing.md) | The two suites, why the second exists, and which of your tests belongs in which. |
 | [`drops lint`](lint.md) | Three query mistakes caught at build time, and the false-positive story for each. |
 

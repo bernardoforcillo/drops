@@ -38,6 +38,11 @@
 // rather than built on [Hook], because a hook fires after the
 // operation and cannot change what was sent.
 //
+// [Hook] and the rest of the observability surface answer what ran.
+// What is running *now* — and how to stop it — is a different
+// question, and one a hook cannot answer because it fires after the
+// operation: see [github.com/bernardoforcillo/drops/pg.StatementRegistry].
+//
 // # Dialect packages
 //
 //   - [github.com/bernardoforcillo/drops/pg] — PostgreSQL. Full surface:
@@ -46,7 +51,12 @@
 //     eager-loaded relations (HasMany, HasOne, BelongsTo, ManyToMany,
 //     MorphTo, MorphMany). Includes opt-in ORM features: lifecycle
 //     hooks (OnInsert / OnUpdate / OnDelete), default scopes, typed
-//     Entity[T] with validators and optimistic locking.
+//     Entity[T] with validators and optimistic locking. Beyond the
+//     builders: change data capture from the write-ahead log, a query
+//     cache invalidated by topic rather than by TTL, pg_hint_plan
+//     directives and assertions on the resulting plan, an in-flight
+//     statement registry for failover and shutdown, a durable job
+//     queue, and Count-Min sketches for selectivity.
 //
 //   - [github.com/bernardoforcillo/drops/clickhouse] — ClickHouse. Typed
 //     columns (Array, Nullable, LowCardinality, Decimal, DateTime64, Tuple,

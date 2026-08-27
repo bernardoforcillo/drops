@@ -207,9 +207,11 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 //
 // Query tags on ctx (see [drops.WithQueryTags]) are appended to sql as
 // a trailing comment before anything else looks at it, so the span,
-// the hook and the server all report the same statement text.
+// the hook and the server all report the same statement text. Plan
+// hints on ctx (see [WithPlanHints]) are prepended for the same
+// reason and at the same point.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
-	sql = drops.TagStatement(ctx, sql)
+	sql = hintStatement(ctx, drops.TagStatement(ctx, sql))
 	spanCtx, span := db.startSpan(ctx, "drops.exec")
 	span.SetAttribute(AttrSystem, AttrSystemPG)
 	span.SetAttribute(AttrOperation, "exec")
@@ -239,9 +241,10 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 }
 
 // Query runs a raw SQL query. Query tags on ctx are appended as a
-// trailing comment, as in [DB.Exec].
+// trailing comment and plan hints prepended as a leading one, as in
+// [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
-	sql = drops.TagStatement(ctx, sql)
+	sql = hintStatement(ctx, drops.TagStatement(ctx, sql))
 	spanCtx, span := db.startSpan(ctx, "drops.query")
 	span.SetAttribute(AttrSystem, AttrSystemPG)
 	span.SetAttribute(AttrOperation, "query")

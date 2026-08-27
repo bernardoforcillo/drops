@@ -10,7 +10,10 @@ import (
 )
 
 // recordingDriver keeps the exact statement text it was handed, which
-// is the only thing worth asserting about a comment.
+// is the only thing worth asserting about a comment. It answers every
+// query with an empty cursor rather than a nil one, so callers that
+// iterate the result — everything in pg/logical.go does — reach their
+// "no rows" branch instead of a nil dereference.
 type recordingDriver struct {
 	sql string
 }
@@ -22,7 +25,7 @@ func (d *recordingDriver) Exec(_ context.Context, sql string, _ ...any) (drops.R
 
 func (d *recordingDriver) Query(_ context.Context, sql string, _ ...any) (drops.Rows, error) {
 	d.sql = sql
-	return nil, nil
+	return &stubRows{}, nil
 }
 
 func (d *recordingDriver) Begin(_ context.Context) (drops.Tx, error) { return nil, nil }

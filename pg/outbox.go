@@ -47,10 +47,48 @@ import (
 // follow-up UPDATE marking the row published will replay it. Make
 // the publisher idempotent on Kind+Payload — or use the per-event
 // id as the dedup key downstream.
+//
+// At-least-once is what a CRASH costs, and it is the only duplicate
+// this pattern owes you. A second worker polling at the same instant
+// is not one: [Outbox.Drain] claims the rows it returns, so a healthy
+// pool of workers publishes each event once. See there for the shape
+// that did not, and for the visibility timeout that bounds how long a
+// dead worker's claim holds its batch.
 type Outbox struct {
 	db            *DB
 	table         string
 	notifyChannel string
+
+	// visibility is how long a claimed row stays invisible to other
+	// workers. Zero means defaultVisibilityTimeout — see
+	// WithVisibilityTimeout.
+	visibility time.Duration
+}
+
+// defaultVisibilityTimeout is how long a drained row stays claimed
+// when the caller has not said.
+//
+// Thirty seconds is a publish attempt's ceiling rather than its
+// expectation: a broker call that has not returned in thirty seconds
+// is not about to. Too short and a claim expires while its handler is
+// still working, which is the double-publish [Outbox.Drain] exists to
+// stop; too long and a worker that dies mid-batch leaves its rows
+// unavailable for that long. Of the two, expiring early is the one
+// that is silent, so the default errs long and
+// [Outbox.WithVisibilityTimeout] is there for a deployment that knows
+// its own numbers.
+const defaultVisibilityTimeout = 30 * time.Second
+
+// WithVisibilityTimeout sets how long a row drained by this Outbox
+// stays claimed before another worker may take it.
+//
+// It has to outlive the publish attempt. A claim that expires while the
+// handler is still working hands the same event to a second worker,
+// which is exactly the failure the claim exists to prevent. Set it from
+// the timeout the publisher itself enforces, with room over.
+func (o *Outbox) WithVisibilityTimeout(d time.Duration) *Outbox {
+	o.visibility = d
+	return o
 }
 
 // OutboxEvent is one drained row.
@@ -201,25 +239,77 @@ func outboxNullableString(s string) any {
 	return s
 }
 
-// Drain fetches up to limit unpublished, non-failed, available events
-// for processing. Uses SKIP LOCKED so multiple workers can drain in
-// parallel without stepping on each other. Caller must mark rows
-// published via MarkPublished when the handler succeeds, or
-// MarkFailed when it errors.
+// Drain claims up to limit unpublished, non-failed, available events
+// and returns them for processing. Caller must mark rows published via
+// MarkPublished when the handler succeeds, or MarkFailed when it
+// errors.
+//
+// A claim rather than a read, and that distinction is the whole of it.
+// This used to be a bare SELECT ... FOR UPDATE SKIP LOCKED, on the
+// reasoning that SKIP LOCKED lets several workers drain in parallel
+// without stepping on each other. It does — INSIDE a transaction. A row
+// lock lives as long as the transaction that took it, and a statement
+// sent outside one runs in an implicit transaction that commits the
+// moment the statement finishes. So the locks were gone before Drain
+// returned, SKIP LOCKED had nothing left to skip, and the second worker
+// to poll read the same rows and published them again.
+//
+// Nothing about that shape reports itself. There is no error, no
+// contention, and no crash — the two workers agree; each publishes the
+// batch once. It shows up downstream, as duplicates in the topic, on
+// exactly the multi-worker deployment the old doc comment recommended.
+//
+// The claim is one statement, so it needs no transaction to hold
+// anything: it takes the rows, pushes their availableAt past now by the
+// visibility timeout, and hands them back. A second worker's WHERE
+// clause no longer matches them. Should this worker die between the
+// claim and MarkPublished, the timeout elapses and the rows become
+// visible again — which is the at-least-once replay this pattern
+// already promises, arriving now by a bounded wait instead of never.
+//
+// The visibility timeout is [Outbox.WithVisibilityTimeout]'s, and it
+// has to outlive the publish attempt: a claim that expires while the
+// handler is still working is the double-publish this fixes, coming
+// back through the front door.
 func (o *Outbox) Drain(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	return o.claim(ctx, limit, "")
+}
+
+// claim is Drain's body, shared with DrainUnaggregated, which adds one
+// clause to the same statement.
+func (o *Outbox) claim(ctx context.Context, limit int, extra string) ([]OutboxEvent, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	tbl := quoteIdent(o.table)
+	// The claimed ids are chosen in a subquery that still takes
+	// FOR UPDATE SKIP LOCKED, and there it is doing the job it is for:
+	// two workers running this statement at the same instant are two
+	// concurrent UPDATEs, and without SKIP LOCKED the second would
+	// BLOCK on the first's rows and then find them no longer matching
+	// — correct, but after a wait as long as the first worker's
+	// statement. Skipping is the same answer without the wait.
+	//
+	// The rows come back through a CTE so the ORDER BY is the SELECT's:
+	// UPDATE ... RETURNING promises no order, and a batch handler that
+	// reads its events in id order should not have to sort them.
 	sql := fmt.Sprintf(`
+		WITH claimed AS (
+			UPDATE %[1]s SET "availableAt" = now() + $2::interval
+			WHERE "id" IN (
+				SELECT "id" FROM %[1]s
+				WHERE "publishedAt" IS NULL
+				  AND "failedAt" IS NULL
+				  AND "availableAt" <= now()%[2]s
+				ORDER BY "id"
+				LIMIT $1
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING "id", "kind", "aggregateType", "aggregateID", "payload", "headers", "attempts", "lastError", "createdAt"
+		)
 		SELECT "id", "kind", "aggregateType", "aggregateID", "payload", "headers", "attempts", "lastError", "createdAt"
-		FROM %s
-		WHERE "publishedAt" IS NULL
-		  AND "failedAt" IS NULL
-		  AND "availableAt" <= now()
-		ORDER BY "id"
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED`, quoteIdent(o.table))
-	rows, err := o.db.Query(ctx, sql, limit)
+		FROM claimed ORDER BY "id"`, tbl, extra)
+	rows, err := o.db.Query(ctx, sql, limit, o.visibilityInterval())
 	if err != nil {
 		return nil, err
 	}
@@ -227,30 +317,27 @@ func (o *Outbox) Drain(ctx context.Context, limit int) ([]OutboxEvent, error) {
 	return scanOutboxRows(rows)
 }
 
+// visibilityInterval renders the visibility timeout in the form
+// PostgreSQL's interval input accepts, so the value is BOUND rather
+// than interpolated into the statement.
+func (o *Outbox) visibilityInterval() string {
+	d := o.visibility
+	if d <= 0 {
+		d = defaultVisibilityTimeout
+	}
+	return fmt.Sprintf("%d milliseconds", d.Milliseconds())
+}
+
 // DrainUnaggregated is Drain restricted to events that carry no
 // aggregate ID. Those are the events no ordering promise covers, so
 // they are the only ones the per-aggregate worker may drain outside an
 // aggregate's lock — see [OrderingPerAggregate].
+// It claims the rows exactly as Drain does, and for the same reason:
+// see there for what a bare FOR UPDATE outside a transaction did not
+// hold.
 func (o *Outbox) DrainUnaggregated(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	sql := fmt.Sprintf(`
-		SELECT "id", "kind", "aggregateType", "aggregateID", "payload", "headers", "attempts", "lastError", "createdAt"
-		FROM %s
-		WHERE "publishedAt" IS NULL
-		  AND "failedAt" IS NULL
-		  AND "availableAt" <= now()
-		  AND "aggregateID" IS NULL
-		ORDER BY "id"
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED`, quoteIdent(o.table))
-	rows, err := o.db.Query(ctx, sql, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanOutboxRows(rows)
+	return o.claim(ctx, limit, `
+				  AND "aggregateID" IS NULL`)
 }
 
 // DrainAggregate fetches events for a single aggregate in id order,

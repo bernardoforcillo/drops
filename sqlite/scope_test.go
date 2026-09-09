@@ -668,7 +668,7 @@ func TestSoftDeleteByIDStaysInsideTheTenant(t *testing.T) {
 	if _, err := ent.Restore(db, scopeCtx(), int64(4), sd); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	wantRestore := `UPDATE "sf_posts" SET "deletedAt" = NULL ` +
+	wantRestore := `UPDATE "sf_posts" SET "deletedAt" = ? ` +
 		`WHERE ("sf_posts"."id" = ?) AND ("sf_posts"."tenantId" = ?)`
 	if got := drv.LastSQL(); got != wantRestore {
 		t.Errorf("sql = %v, want %v", got, wantRestore)

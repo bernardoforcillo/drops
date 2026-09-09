@@ -440,6 +440,15 @@ func (t *Table) writeRef(b *drops.Builder) {
 		b.WriteIdent(t.alias)
 		return
 	}
+	// A table's automatic predicates are built from the declared
+	// column handles and may be rendering inside a statement whose
+	// FROM entry is an alias of this table. resolveFilterExprs
+	// installs the rename for the length of each such predicate; here
+	// is where it lands.
+	if renamed := b.RelationAlias(t.relRef()); renamed != "" {
+		b.WriteIdent(renamed)
+		return
+	}
 	b.WriteIdent(t.name)
 }
 

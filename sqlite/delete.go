@@ -74,6 +74,17 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 	if !d.scope.unscoped {
 		for _, h := range d.table.deleteHookList() {
 			if rep := h.BeforeDelete(d); rep != nil {
+				// The rewrite inherits this execution's resolution.
+				// The hook builds its UPDATE out of d.Wheres(), which
+				// already carries the resolved predicates — but the
+				// table's DEFAULT filters are not in that list, and a
+				// freshly built UpdateBuilder would re-derive them
+				// from the table, unwalked. A statement written inside
+				// one would then read every tenant's rows to decide
+				// which of this tenant's rows to mutate.
+				if upd, ok := rep.(*UpdateBuilder); ok && upd.defaults == nil {
+					upd.defaults = d.defaults
+				}
 				rep.WriteSQL(b)
 				return
 			}

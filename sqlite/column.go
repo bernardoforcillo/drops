@@ -419,3 +419,20 @@ type exprValue struct {
 
 func (v exprValue) column() *Column             { return v.col }
 func (v exprValue) writeValue(b *drops.Builder) { b.Append(v.expr) }
+
+// boundExpr and withBoundExpr implement exprBound, which is how the
+// resolver reaches a statement written into a SET list or an INSERT
+// row: SetExpr(col, Subquery(sel)) is an ordinary spelling, and while
+// this binding was invisible to resolveSets the statement inside it
+// rendered through WriteSQL — every tenant's rows, deciding what one
+// tenant's row becomes. See resolveSets.
+func (v exprValue) boundExpr() drops.Expression { return v.expr }
+
+// withBoundExpr returns a copy carrying x, never this binding with x
+// written into it: a caller may hold the binding and use it in a second
+// statement, and a resolved body stored back would pin the first
+// request's tenant into every later use.
+func (v exprValue) withBoundExpr(x drops.Expression) ColumnValue {
+	v.expr = x
+	return v
+}

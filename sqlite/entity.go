@@ -428,8 +428,12 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = do(db)
 	}
-	if err == nil && e.cache != nil {
-		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
+	if err == nil {
+		// Through refreshPK rather than straight into the cache: the PK
+		// namespace has no room for the scope, so a scoped entity must
+		// not put a row there — and deletes whatever is under the key.
+		// See refreshPK.
+		e.refreshPK(ctx, e.pkValuesOf(r), *r)
 	}
 	return err
 }
@@ -598,8 +602,8 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	} else {
 		err = do(db)
 	}
-	if err == nil && e.cache != nil {
-		_ = e.cache.writeKey(ctx, e.pkKey(pkVals), *r)
+	if err == nil {
+		e.refreshPK(ctx, pkVals, *r)
 	}
 	return err
 }
@@ -761,7 +765,14 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // concurrent load issues one query rather than one per caller — the
 // stampede protection the PK path already had.
 func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
-	sql, args := q.sb.ToSQL()
+	// The RESOLVED statement, because that is the one the server sees:
+	// the tenant axis and the authorisation guard arrive as context
+	// filters, so a key taken from ToSQL is the same key for every
+	// tenant — one customer's rows answered from another's entry.
+	sql, args, err := q.sb.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	key := queryKey(q.e.table.Name(), sql, args)
 	var out []T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
@@ -786,7 +797,11 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 }
 
 func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
-	sql, args := q.sb.ToSQL()
+	sql, args, err := q.sb.ToSQLCtx(ctx)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
 	key := queryKey(q.e.table.Name(), sql, args) + ":one"
 	var out T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {

@@ -111,8 +111,9 @@ Database commands (need --dsn, or DROPS_PG_DSN / DATABASE_URL):
   pull       Introspect a live database into a Go schema file
 
 Assistants:
-  mcp        Serve the schema, query plans and replication state over the
-             Model Context Protocol, read-only, on stdin/stdout
+  mcp        Serve the schema, query plans, drift, migration state and the
+             safety verdict on a set of statements over the Model Context
+             Protocol, read-only, on stdin/stdout
 
 Offline:
   lint       Report query mistakes the type checker can see: "drops lint ./..."

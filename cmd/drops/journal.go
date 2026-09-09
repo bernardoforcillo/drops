@@ -67,6 +67,32 @@ func unaccountedHashes(ctx context.Context, db *pg.DB, m *pg.DrizzleMigrator) ([
 	for _, e := range entries {
 		known[e.Hash] = true
 	}
+	applied, err := appliedHashes(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, h := range applied {
+		if !known[h] {
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
+// appliedHashes returns the migration hashes the database records as
+// applied, in the order they were applied.
+//
+// pg.DrizzleMigrator.Status answers a larger question that contains
+// this one, and creates the history table when it is missing on the
+// way — which is right for a command that is about to apply
+// migrations and wrong for one that only reports. `drops mcp` serves
+// this to an assistant and may not write, so the read is spelled out
+// here, and a missing table comes back as pg.ErrUndefinedTable — or,
+// on a database that has never been migrated at all, as
+// pg.ErrInvalidSchemaName for the missing schema around it — for the
+// caller to read as "nothing has been applied here".
+func appliedHashes(ctx context.Context, db *pg.DB) ([]string, error) {
 	rows, err := db.Query(ctx, fmt.Sprintf("SELECT hash FROM %s.%s ORDER BY id",
 		quoteIdent(pg.DrizzleSchema), quoteIdent(pg.DrizzleTable)))
 	if err != nil {
@@ -79,9 +105,7 @@ func unaccountedHashes(ctx context.Context, db *pg.DB, m *pg.DrizzleMigrator) ([
 		if err := rows.Scan(&h); err != nil {
 			return nil, err
 		}
-		if !known[h] {
-			out = append(out, h)
-		}
+		out = append(out, h)
 	}
 	return out, rows.Err()
 }

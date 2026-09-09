@@ -55,6 +55,32 @@ type PushOptions struct {
 	// default; see Push's doc comment.
 	DropUnmanagedIndexes bool
 
+	// DropUnmanagedTables lets Push drop a table that exists in the
+	// database and is declared by no table in the Go schema. It is off
+	// by default, and of the two this is the one that would hurt most:
+	// a database shares with a legacy application, another team's
+	// schema is full of tables that are nobody's to drop, and DROP
+	// TABLE takes the rows with it.
+	DropUnmanagedTables bool
+
+	// Allow authorises the changes that lose data, one named change at
+	// a time: {Op: OpDropColumn, Table: "users", Object: "email"} says
+	// that column may go, and says nothing about any other.
+	//
+	// It is a list of changes rather than a boolean for the reason the
+	// gate exists at all. A blanket permission is granted once, by
+	// somebody reasoning about the change in front of them that day,
+	// and then stands over every change the schema makes afterwards —
+	// so the flag that authorised dropping a column nobody wanted goes
+	// on authorising the drop of the column somebody did. A named
+	// consent expires by itself: when the change it names is applied,
+	// the entry stops matching and Push says so rather than leaving it
+	// to stand (see the "stale-consent" notice).
+	//
+	// A change on an empty table needs no entry: it destroys nothing,
+	// which Push establishes from the row count rather than assuming.
+	Allow []Destructive
+
 	// SplitAlters emits one ALTER TABLE per column change rather than
 	// batching a table's changes. See DiffOptions.SplitAlters.
 	SplitAlters bool
@@ -97,6 +123,19 @@ type PushResult struct {
 	// Statements list with a non-empty Notices list means the database
 	// and the schema disagree about something Push declined to change.
 	Notices []SchemaNotice
+
+	// DataLoss is what this push destroys, with the row count that
+	// makes it destruction rather than bookkeeping. On a successful
+	// push these are the changes [PushOptions.Allow] authorised; when
+	// Push returns [ErrDestructivePush] they are the ones nobody did,
+	// each carrying the statement withheld and the consent that would
+	// release it.
+	//
+	// Empty is the ordinary case, and it is a stronger statement than
+	// "nothing was dropped": it means nothing the plan does loses a
+	// row, either because it destroys nothing or because the tables it
+	// touches are empty.
+	DataLoss []Destructive
 }
 
 // SchemaNotice is a difference Push can see but will not act on.
@@ -256,7 +295,17 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}
 	desired := BuildSnapshot(schema)
 	answers := mergeDecisions(DeclaredRenames(schema), opt.Renames)
-	current := ownedBy(live, desired, renamedAwayTables(live, answers)...)
+	// The live side is narrowed to what the schema declares BEFORE the
+	// diff, so a table that is nobody's to drop never becomes a
+	// statement to withhold — see ownedBy. DropUnmanagedTables is what
+	// puts them back.
+	current, withheld := ownedBy(live, desired, renamedAwayTables(live, answers)...)
+	if opt.DropUnmanagedTables {
+		for _, key := range withheld {
+			current.Tables[key] = live.Tables[key]
+		}
+		withheld = nil
+	}
 
 	// Before the probe, not after it: a push that is going to refuse
 	// should not first create and drop a table on the server to answer
@@ -271,6 +320,7 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	if err != nil {
 		return nil, fmt.Errorf("drops/mysql: normalise declared expressions: %w", err)
 	}
+	notices = append(notices, unmanagedTableNotices(live, withheld, opt)...)
 	notices = append(notices, tableOptionNotices(current, desired)...)
 	notices = append(notices, unrepresentableIndexNotices(current)...)
 	notices = append(notices, indexMethodNotices(current, desired)...)
@@ -286,9 +336,31 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		stmts, withheld = withholdUnmanagedIndexDrops(stmts, current, desired)
 		notices = append(notices, withheld...)
 	}
+	// What in the plan loses data, what it would cost, and who said it
+	// could. Before the empty-diff exit, because a consent that has
+	// gone stale is MOST likely on the push that finds nothing to do —
+	// the change it authorised is the one already applied — and a
+	// notice nobody prints is a call site nobody revisits.
+	loss, err := withRowCounts(ctx, db, opt.Database, destructiveChanges(stmts))
+	if err != nil {
+		return nil, fmt.Errorf("drops/mysql: read row counts for the destructive changes: %w", err)
+	}
+	unconsented, consented, stale := splitConsent(loss, opt.Allow)
+	notices = append(notices, staleConsentNotices(stale)...)
 	sortNotices(notices)
 
-	res := &PushResult{Statements: stmts, Notices: notices}
+	if len(unconsented) > 0 {
+		// Nothing is applied — not the destructive statements and not
+		// the harmless ones beside them. MySQL commits each DDL
+		// statement of its own accord, so a push that ran half a plan
+		// would leave a schema no snapshot describes and no rollback
+		// reaches.
+		return &PushResult{
+			Statements: stmts, Notices: notices, DataLoss: unconsented,
+		}, &DestructivePushError{Changes: unconsented}
+	}
+
+	res := &PushResult{Statements: stmts, Notices: notices, DataLoss: consented}
 	if len(stmts) == 0 || opt.DryRun {
 		return res, nil
 	}
@@ -395,7 +467,7 @@ func currentDatabase(ctx context.Context, db *DB) (string, error) {
 //
 // alsoKeep names tables to keep whatever the Schema says now — see
 // renamedAwayTables.
-func ownedBy(live, declared *Snapshot, alsoKeep ...string) *Snapshot {
+func ownedBy(live, declared *Snapshot, alsoKeep ...string) (*Snapshot, []string) {
 	keep := make(map[string]bool, len(alsoKeep))
 	for _, n := range alsoKeep {
 		keep[n] = true
@@ -407,10 +479,46 @@ func ownedBy(live, declared *Snapshot, alsoKeep ...string) *Snapshot {
 		Dialect: live.Dialect,
 		Tables:  make(map[string]*TableSnapshot, len(live.Tables)),
 	}
+	var withheld []string
 	for name, ts := range live.Tables {
 		if _, ok := declared.Tables[name]; ok || keep[ts.Name] {
 			out.Tables[name] = ts
+			continue
 		}
+		withheld = append(withheld, name)
+	}
+	// Sorted, because the notices are rendered from this list and a
+	// map's order is not one: a preview that reorders itself between
+	// two runs of the same push is a diff nobody can read.
+	sort.Strings(withheld)
+	return out, withheld
+}
+
+// unmanagedTableNotices reports one notice per table ownedBy held back,
+// so "Push left it alone" is something the caller is told rather than
+// something they have to notice.
+//
+// Each carries the DROP TABLE that was withheld, which is the statement
+// to run by hand if the notice is describing what you wanted — and the
+// statement DropUnmanagedTables would have run.
+func unmanagedTableNotices(live *Snapshot, withheld []string, opt PushOptions) []SchemaNotice {
+	if len(withheld) == 0 {
+		return nil
+	}
+	out := make([]SchemaNotice, 0, len(withheld))
+	for _, key := range withheld {
+		t := live.Tables[key]
+		if t == nil {
+			continue
+		}
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-table",
+			Table:  t.Name,
+			Object: t.Name,
+			Message: fmt.Sprintf(
+				"table %q exists in the database and is declared by no table in the Go schema; Push left it alone", t.Name),
+			SQL: dropTableSQL(t, DiffOptions{Safe: opt.Safe}),
+		})
 	}
 	return out
 }

@@ -14,19 +14,18 @@ import (
 // every alias taken off it.
 
 // tableScope is the automatic-predicate state of a table: the two
-// filter lists and the write-side tenant column. It lives behind a
-// pointer so that a table and every alias taken off it share ONE of
-// them.
+// filter lists and the write-side tenant column.
+// It lives behind a pointer so that a table and every alias taken off
+// it share ONE of them.
 //
 // Sharing is the whole point, and it is the rule the four dialects
-// state in the same words: an alias shares the whole scope — both
-// filter lists — and rebinds its columns. While As copied a list, an
-// alias was a snapshot of the table's scoping at the instant As was
-// called, and the spelling this package invites is exactly the one that
-// loses:
+// state in the same words: an alias shares the whole scope and rebinds
+// its columns. While As copied these lists, an alias was a snapshot of
+// the table's scoping at the instant As was called, and the spelling
+// this package invites is exactly the one that loses:
 //
 //	var Users = mysql.NewTable("users")   // package scope
-//	var U     = Users.As("u")             // package scope, before init
+//	var U     = Users.As("u")          // package scope, before init
 //
 //	func init() { Users.ContextFilter(mysql.TenantFilter(UserTenantID)) }
 //
@@ -38,17 +37,16 @@ import (
 // The same snapshot dropped a soft-delete guard registered after the
 // alias was taken, so the alias read rows the application had deleted.
 //
-// The two lists are shared on the same terms because the argument does
-// not distinguish them: a default filter registered after As was taken
-// went missing exactly as a context filter did, and the difference
-// between the two failures is only how bad it is. Splitting them was
-// this dialect's local answer to a question nobody had written down.
+// The lists are shared on the same terms because the argument does not
+// distinguish them: a default filter registered after As was taken went
+// missing exactly as a context filter did, and the difference between
+// the two failures is only how bad it is.
 //
 // One consequence to state plainly, because it follows from sharing and
 // is not a bug: registering a filter ON an alias registers it on the
-// table, and so on every other alias of it. That is what "the same
-// table" means. Where two genuinely different scopings are wanted, they
-// are two tables.
+// table, and so on every other alias of it. That is what "the
+// same table" means. Where two genuinely different scopings are wanted,
+// they are two tables.
 //
 // The mutex guards every field, and it is the same mutex the base table
 // and all its aliases lock — which is the other half of what sharing
@@ -62,12 +60,12 @@ import (
 type tableScope struct {
 	mu sync.RWMutex
 
-	// defaultFilters are predicates applied automatically by
+	// defaultFilters are the predicates applied automatically by
 	// SelectBuilder / UpdateBuilder / DeleteBuilder unless the caller
-	// opts out with Unscoped(). Used to implement default scopes (e.g.
-	// a soft-delete "deletedAt IS NULL" guard). Declaration-time only —
-	// see Table.DefaultFilter.
-	defaultFilters []drops.Expression
+	// opts out — with Unscoped for all of them, or with IgnoreFilters
+	// for one by name. Declaration-time only: see Table.DefaultFilter
+	// and Table.AddFilter, and filters.go for why they carry names.
+	defaultFilters []tableFilter
 
 	// ctxFilters are the request-scoped twins of defaultFilters:
 	// predicates that cannot be built until a ctx is in hand. They are
@@ -83,6 +81,20 @@ type tableScope struct {
 	// WHERE clause for a predicate to reach: see
 	// InsertBuilder.ToSQLCtx.
 	tenantCol *Column
+}
+
+// appendShared appends v to a list other goroutines may be walking
+// right now, copying at exactly len rather than appending in place.
+//
+// The caller holds the write lock, but a reader does not: it took the
+// slice header under the read lock and released it before walking. An
+// in-place append into spare capacity would write an element that
+// reader's header already spans. Copying at length is what keeps the
+// list a value nobody else can see change under them.
+func appendShared[T any](list []T, v T) []T {
+	out := make([]T, len(list), len(list)+1)
+	copy(out, list)
+	return append(out, v)
 }
 
 // ctxFilter pairs a context filter with the key it was registered
@@ -103,7 +115,43 @@ type tableScope struct {
 // race in the plain sense.
 type ctxFilter struct {
 	key string
-	fn  ContextFilterFunc
+	// name is the public filter name this one can be bypassed by —
+	// [FilterTenant] for the axis [Entity.ScopeByTenant] registers, and
+	// empty for a filter registered through the exported ContextFilter,
+	// which nothing but Unscoped drops. It is separate from key because
+	// the key identifies the REGISTRATION (so re-declaring replaces)
+	// and the name identifies the GUARANTEE (so a query can step around
+	// that one and keep the rest).
+	name string
+	fn   ContextFilterFunc
+}
+
+// ignoredFiltersKey carries, on the ctx, the named filters the
+// statement being resolved is bypassing.
+//
+// It travels on the ctx rather than as an argument because
+// resolveContextFilters is reached through the tables a statement
+// names, and its signature is what the self-check pins. Each
+// statement's resolveCtx installs its OWN set at the top, so a nested
+// statement replaces its parent's rather than inheriting it — which is
+// what keeps IgnoreFilters statement-local, exactly as Unscoped is.
+type ignoredFiltersKey struct{}
+
+// withIgnoredFilters returns the ctx to resolve one statement's context
+// filters under.
+func withIgnoredFilters(ctx context.Context, s filterScope) context.Context {
+	return context.WithValue(ctx, ignoredFiltersKey{}, s.ignored)
+}
+
+// ignoresFilterName reports whether the statement being resolved named
+// this filter in IgnoreFilters.
+func ignoresFilterName(ctx context.Context, name string) bool {
+	if name == "" {
+		return false
+	}
+	ignored, _ := ctx.Value(ignoredFiltersKey{}).(map[string]struct{})
+	_, ok := ignored[name]
+	return ok
 }
 
 // ContextFilterFunc builds a predicate from the request context. It
@@ -112,20 +160,6 @@ type ctxFilter struct {
 // outright — which is how [TenantFilter] fails closed instead of
 // running unfiltered.
 type ContextFilterFunc func(context.Context) (drops.Expression, error)
-
-// appendShared appends v to a list other goroutines may be walking
-// right now, copying at exactly len rather than appending in place.
-//
-// The caller holds the write lock, but a reader does not: it took the
-// slice header under the read lock and released it before walking. An
-// in-place append into spare capacity would write an element that
-// reader's header already spans. Copying at length is what keeps the
-// list a value nobody else can see change under them.
-func appendShared[T any](list []T, v T) []T {
-	out := make([]T, len(list), len(list)+1)
-	copy(out, list)
-	return append(out, v)
-}
 
 // ContextFilter registers a predicate resolved at execution time and
 // AND-ed into every SELECT, UPDATE and DELETE against the table, unless
@@ -222,17 +256,15 @@ func (t *Table) ScopeWritesByTenant(col ColRef) *Table {
 // ScopeWritesByTenant and by Entity.ScopeByTenant, which registers the
 // read-side filter in the same breath.
 //
-// The column is stored as the DECLARED handle — Column.key — so that a
-// table and its aliases, whose columns are separate copies in this
-// dialect, name one axis between them. An INSERT built from an alias's
-// handles would otherwise stamp a second column that happens to have
-// the same name.
+// What it stores is whatever its two callers resolved: each looks the
+// handle up among the columns of the table it is declaring the axis on
+// — [Table.ScopeWritesByTenant] among t's own, [Entity.ScopeByTenant]
+// among the entity's — so an alias copy has already been collapsed onto
+// the declared column by the time it arrives here, and this function
+// makes no identity judgement of its own.
 func (t *Table) setTenantAxis(c *Column) {
 	t.scope.mu.Lock()
 	defer t.scope.mu.Unlock()
-	if c != nil {
-		c = c.key()
-	}
 	t.scope.tenantCol = c
 }
 
@@ -240,7 +272,7 @@ func (t *Table) setTenantAxis(c *Column) {
 // when the table declared none. Nil-safe so a builder can ask without
 // knowing whether it has a table at all.
 func (t *Table) tenantAxis() *Column {
-	if t == nil {
+	if t == nil || t.scope == nil {
 		return nil
 	}
 	t.scope.mu.RLock()
@@ -271,6 +303,23 @@ func (t *Table) setContextFilter(key string, fn ContextFilterFunc) {
 	t.scope.ctxFilters = appendShared(t.scope.ctxFilters, ctxFilter{key: key, fn: fn})
 }
 
+// setNamedContextFilter is setContextFilter for a filter a query may
+// bypass by name — the tenant axis, which [EntityQuery.IgnoreFilters]
+// drops with mysql.FilterTenant while leaving every other guard standing.
+func (t *Table) setNamedContextFilter(key, name string, fn ContextFilterFunc) {
+	t.setContextFilter(key, fn)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	next := make([]ctxFilter, len(t.scope.ctxFilters))
+	copy(next, t.scope.ctxFilters)
+	for i := range next {
+		if next[i].key == key {
+			next[i].name = name
+		}
+	}
+	t.scope.ctxFilters = next
+}
+
 // ctxFilterList returns the table's request-scoped filters through the
 // shared scope, so an alias resolves the axis its table carries now
 // rather than the one it carried when As was called. See [Table.As] for
@@ -292,7 +341,7 @@ func (t *Table) hasContextFilters() bool { return len(t.ctxFilterList()) > 0 }
 // shared scope, so an alias renders the guards its table carries now
 // rather than the ones it carried when As was called. Nil-safe so a
 // statement with no table can ask.
-func (t *Table) defaultFilterList() []drops.Expression {
+func (t *Table) defaultFilterList() []tableFilter {
 	if t == nil || t.scope == nil {
 		return nil
 	}
@@ -302,8 +351,17 @@ func (t *Table) defaultFilterList() []drops.Expression {
 }
 
 // hasDefaultFilters reports whether the table carries any render-time
-// default filter. Nil-safe, like hasContextFilters.
+// filter. Nil-safe, like hasContextFilters.
 func (t *Table) hasDefaultFilters() bool { return len(t.defaultFilterList()) > 0 }
+
+// addDefaultFilter registers a render-time filter, named or anonymous.
+// Shared-slice discipline as everywhere in this file: the list is
+// replaced rather than appended to in place.
+func (t *Table) addDefaultFilter(f tableFilter) {
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.defaultFilters = appendShared(t.scope.defaultFilters, f)
+}
 
 // resolveContextFilters builds every registered predicate against ctx,
 // walks the statements written inside those predicates, and restates
@@ -352,6 +410,13 @@ func (t *Table) resolveContextFilters(ctx context.Context) ([]drops.Expression, 
 	}
 	out := make([]drops.Expression, 0, len(filters))
 	for _, f := range filters {
+		// Named and bypassed by this statement: skipped BEFORE it is
+		// called, because a filter that refuses for want of a tenant
+		// would otherwise refuse the very cross-tenant read the caller
+		// asked for by name.
+		if ignoresFilterName(ctx, f.name) {
+			continue
+		}
 		e, err := f.fn(inner)
 		if err != nil {
 			return nil, err
@@ -380,18 +445,14 @@ func (t *Table) resolveContextFilters(ctx context.Context) ([]drops.Expression, 
 // see resolveDefaultFilterExprs. This function stays the answer on the
 // ToSQL path, which has no ctx to do better with.
 //
-// The restatement is a no-op on the common alias, whose default filters
-// were copied along with its columns and so already name it. It matters
-// for the filter registered on the base table before the alias was
-// taken: that one closes over the declared handles, and under
-// FROM `users` AS `u` those name a relation the statement has no FROM
-// entry for.
-func (t *Table) resolveDefaultFilters() []drops.Expression {
-	filters := t.defaultFilterList()
-	if len(filters) == 0 {
-		return nil
-	}
-	return t.resolveFilterExprs(filters)
+// The restatement is a no-op on a table that is not aliased, which is
+// every table a statement names by its own name. It matters for the
+// filter registered on the base table and rendered inside a statement
+// whose FROM entry is an alias of it: that one closes over the declared
+// handles, and under FROM `users` AS `u` those name a relation the
+// statement has no FROM entry for.
+func (t *Table) resolveDefaultFilters() []tableFilter {
+	return t.resolveNamedFilters(t.defaultFilterList())
 }
 
 // resolveDefaultFilterExprs walks the statements written inside the
@@ -412,23 +473,47 @@ func (t *Table) resolveDefaultFilters() []drops.Expression {
 // promise: a filter with no statement inside it is not rebuilt, is not
 // re-wrapped, and renders the bytes it always did — which is every
 // soft-delete guard there is, the shape this feature exists beside.
-func (t *Table) resolveDefaultFilterExprs(ctx context.Context) ([]drops.Expression, error) {
+func (t *Table) resolveDefaultFilterExprs(ctx context.Context) ([]tableFilter, error) {
 	filters := t.defaultFilterList()
-	if len(filters) == 0 || !mayHoldStatements(filters) {
+	if len(filters) == 0 {
+		return nil, nil
+	}
+	preds := filterPreds(filters)
+	if !mayHoldStatements(preds) {
 		return nil, nil
 	}
 	inner, err := enterFilterResolution(ctx, t)
 	if err != nil {
 		return nil, err
 	}
-	resolved, err := resolveExprs(inner, filters)
+	resolved, err := resolveExprs(inner, preds)
 	if err != nil {
 		return nil, err
 	}
 	if resolved == nil {
 		return nil, nil
 	}
-	return t.resolveFilterExprs(resolved), nil
+	return t.resolveNamedFilters(withPreds(filters, resolved)), nil
+}
+
+// filterPreds is the predicates of a named filter list, in order.
+func filterPreds(filters []tableFilter) []drops.Expression {
+	out := make([]drops.Expression, len(filters))
+	for i, f := range filters {
+		out[i] = f.pred
+	}
+	return out
+}
+
+// withPreds pairs the names back onto a resolved predicate list. The
+// resolver preserves order and length, which is what lets a filter keep
+// the name IgnoreFilters bypasses it by after its body was rewritten.
+func withPreds(filters []tableFilter, preds []drops.Expression) []tableFilter {
+	out := make([]tableFilter, len(filters))
+	for i, f := range filters {
+		out[i] = tableFilter{name: f.name, pred: preds[i]}
+	}
+	return out
 }
 
 // ErrContextFilterCycle is returned when resolving a table's automatic
@@ -478,7 +563,7 @@ type filterChain struct {
 // Tables are identified by relation reference rather than by pointer,
 // so an alias counts as the same relation it aliases. That is the
 // identity SQL uses, and the identity the recursion has: a filter on
-// `notes` that embeds SELECT … FROM `notes` AS `n` re-enters the same
+// "notes" that embeds SELECT … FROM `notes` AS `n` re-enters the same
 // filter list however the inner statement spells the table.
 func enterFilterResolution(ctx context.Context, t *Table) (context.Context, error) {
 	ref := t.relRef()
@@ -513,6 +598,23 @@ func renderFilterCycle(chain *filterChain, ref string) string {
 	return b.String()
 }
 
+// relRef names the relation a column belonging to this table qualifies
+// with when the table is not aliased, in the spelling
+// [drops.Builder.RelationAlias] keys renames by.
+//
+// A table may be database-qualified, and the qualified name is what an
+// un-aliased column reference renders, so that is the key: `users`
+// declared through NewTable and `billing`.`users` declared through
+// NewDatabaseTable are two relations, and a rename keyed on the bare
+// name would restate the predicates of one inside a statement over the
+// other.
+func (t *Table) relRef() string {
+	if t.database != "" {
+		return t.database + "." + t.name
+	}
+	return t.name
+}
+
 // resolveFilterExprs restates a table's automatic predicates against
 // the instance of the table the statement actually names.
 //
@@ -522,23 +624,17 @@ func renderFilterCycle(chain *filterChain, ref string) string {
 // TenantFilter over the column it was given, ScopeByTenant over the
 // entity's own. Against FROM `notes` AS `n` all of them render
 // `notes`.`tenantId`, which names a relation the statement has no FROM
-// entry for. MySQL answers that with error 1054, "Unknown column
-// 'notes.tenantId' in 'where clause'" — not a widened result, a query
-// that cannot run. So a tenant-scoped table, the one kind that must
-// never lose its axis, would be the one kind that could not be queried
-// under an alias at all, and every self-join of one with it.
-//
-// It bites hardest on a DELETE, and for a reason peculiar to this
-// dialect: an aliased DELETE has to be written in the multi-table form
-// (see [DeleteBuilder.WriteSQL]), which names the alias twice, so there
-// is no un-aliased spelling of the statement to fall back on.
+// entry for. PostgreSQL answers that with 42P01 — not a widened result,
+// a query that cannot run. So a tenant-scoped table, the one kind that
+// must never lose its axis, would be the one kind that could not be
+// queried under an alias at all, and every self-join of one with it.
 //
 // Since the tree cannot be rewritten it is rendered under a rename
 // instead: for the length of each predicate, references to the declared
 // relation resolve to this instance's alias. Aliasing was always a
-// query-scope rename of exactly that kind — Column.key says an aliased
-// handle is the same column — and this is the rename applied to the one
-// place the handles were out of reach.
+// query-scope rename of exactly that kind — [Column.key] says an
+// aliased handle is the same column — and this is the rename applied to
+// the one place the handles were out of reach.
 //
 // Two shapes stay the caller's: a filter that embeds a subquery
 // selecting from the base table in its own right (renamed along with
@@ -560,6 +656,15 @@ func (t *Table) resolveFilterExprs(exprs []drops.Expression) []drops.Expression 
 	return out
 }
 
+// resolveNamedFilters is resolveFilterExprs over a named list, keeping
+// each filter's name — the one IgnoreFilters bypasses it by.
+func (t *Table) resolveNamedFilters(filters []tableFilter) []tableFilter {
+	if t.alias == "" || len(filters) == 0 {
+		return filters
+	}
+	return withPreds(filters, t.resolveFilterExprs(filterPreds(filters)))
+}
+
 // resolvedDefaults holds, per table a statement names, the default
 // filters resolved for one execution of that statement.
 //
@@ -574,12 +679,12 @@ func (t *Table) resolveFilterExprs(exprs []drops.Expression) []drops.Expression 
 // The zero value is a nil map and answers every lookup with the
 // unresolved list, which is what the ToSQL path and every statement
 // with nothing to resolve get.
-type resolvedDefaults map[*Table][]drops.Expression
+type resolvedDefaults map[*Table][]tableFilter
 
 // of returns the default filters to render for t: the resolved list
 // when this execution produced one, and otherwise the render-time list,
 // unchanged and byte for byte.
-func (d resolvedDefaults) of(t *Table) []drops.Expression {
+func (d resolvedDefaults) of(t *Table) []tableFilter {
 	if t == nil {
 		return nil
 	}

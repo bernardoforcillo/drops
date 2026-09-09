@@ -628,23 +628,6 @@ func columnPath(c *Column) string {
 	return c.Name()
 }
 
-// namesAxis reports whether a bound column handle will RENDER as the
-// tenant axis in the statement being built.
-//
-// The comparison is on the rendered column name rather than on
-// [Column.key], because those two questions have different answers for
-// a handle obtained from a different table object — and the renderer
-// asks the first one. An INSERT column list, an UPDATE SET target and
-// an upsert assignment all write the bare name, so a foreign
-// OtherTable.TenantID and this table's tenant column are one column as
-// far as the server is concerned while key calls them strangers. A
-// check that compares by key therefore reads such a handle as "not the
-// axis" and lets the statement bind it anyway: on an INSERT the ctx
-// stamp was then APPENDED ALONGSIDE it, and a server that accepts a
-// duplicate column and keeps the first — SQLite does — wrote the row
-// under a tenant the ctx never named.
-//
-// Name equality is the weaker of the two tests and that is the point:
 // checkAxisAssignment refuses an UPDATE that assigns the table's tenant
 // axis to anything but the tenant the ctx already names.
 //
@@ -707,6 +690,23 @@ func checkAxisAssignment(ctx context.Context, t *Table, sets []ColumnValue) erro
 	return nil
 }
 
+// namesAxis reports whether a bound column handle will RENDER as the
+// tenant axis in the statement being built.
+//
+// The comparison is on the rendered column name rather than on
+// [Column.key], because those two questions have different answers for
+// a handle obtained from a different table object — and the renderer
+// asks the first one. An INSERT column list, an UPDATE SET target and
+// an upsert assignment all write the bare name, so a foreign
+// OtherTable.TenantID and this table's tenant column are one column as
+// far as the server is concerned while key calls them strangers. A
+// check that compares by key therefore reads such a handle as "not the
+// axis" and lets the statement bind it anyway: on an INSERT the ctx
+// stamp was then APPENDED ALONGSIDE it, and a server that accepts a
+// duplicate column and keeps the first — SQLite does — wrote the row
+// under a tenant the ctx never named.
+//
+// Name equality is the weaker of the two tests and that is the point:
 // key equality implies it, since an alias copy keeps the declared
 // name, so nothing that matched before stops matching. Within one
 // table names are unique, so a column of the entity's own table that

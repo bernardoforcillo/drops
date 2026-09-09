@@ -15,6 +15,14 @@ type DeleteBuilder struct {
 	orderBys []drops.Expression
 	limit    *int64
 	scope    filterScope
+
+	// defaults is what this execution resolved for the table's
+	// render-time filters, and nil when none of them held a statement.
+	defaults resolvedDefaults
+
+	// resolved marks the copy resolveCtx produced, so a statement
+	// nested in another is not resolved twice.
+	resolved bool
 }
 
 // Where appends predicates joined by AND. Nil predicates are ignored,
@@ -71,7 +79,7 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString("DELETE FROM ")
 		d.table.writeName(b)
 	}
-	wheres := d.scope.apply(d.table, d.wheres)
+	wheres := d.scope.apply(d.table, d.wheres, d.defaults)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)
@@ -98,11 +106,88 @@ var ErrAliasedDeleteBounded = errors.New(
 // thousand rows into the whole table.
 func (d *DeleteBuilder) ToSQL() (string, []any) { return render(d) }
 
-// Exec runs the DELETE.
+// ToSQLCtx renders the statement ctx would send: the table's context
+// filters built and AND-ed into the WHERE clause, and every statement
+// written inside the predicates resolved on the same terms.
+//
+// A filter that cannot decide what the request may see refuses, and
+// the refusal is returned instead of a statement. Nothing walks a
+// DELETE back.
+func (d *DeleteBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution: the
+// receiver when there was nothing to resolve, and a shallow copy
+// carrying the resolved lists when there was.
+func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) {
+	if d.resolved {
+		return d, nil
+	}
+	ctx = withIgnoredFilters(ctx, d.scope)
+
+	cp := *d
+	changed := false
+
+	wheres := d.wheres
+	if r, err := resolveExprs(ctx, d.wheres); err != nil {
+		return nil, err
+	} else if r != nil {
+		wheres, changed = r, true
+	}
+
+	if !d.scope.dropsContextFilters() {
+		preds, err := d.table.resolveContextFilters(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(preds) > 0 {
+			all := make([]drops.Expression, 0, len(wheres)+len(preds))
+			all = append(all, wheres...)
+			wheres, changed = append(all, preds...), true
+		}
+		defaults, err := resolveTableDefaults(ctx, d.table)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
+	}
+
+	if !changed {
+		return d, nil
+	}
+	cp.wheres = wheres
+	cp.resolved = true
+	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable], so a DELETE written as a
+// CTE body is scoped like a bare one.
+func (d *DeleteBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != d, nil
+}
+
+// Exec runs the DELETE, with the table's context filters resolved
+// against ctx first: a DELETE that loses them removes another tenant's
+// rows and reports success.
 func (d *DeleteBuilder) Exec(ctx context.Context) (drops.Result, error) {
 	if d.table.alias != "" && (len(d.orderBys) > 0 || d.limit != nil) {
 		return nil, ErrAliasedDeleteBounded
 	}
-	sql, args := d.ToSQL()
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return d.db.Exec(ctx, sql, args...)
 }

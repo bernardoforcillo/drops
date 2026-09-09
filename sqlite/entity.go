@@ -323,10 +323,16 @@ func (e *Entity[T]) pkIsZero(r *T) bool {
 	return true
 }
 
-// isKeyColumn reports whether c is part of the primary key.
+// isKeyColumn reports whether c is one of the entity's key columns,
+// through [Column.key] so a handle reached off an alias of the table
+// answers the same as the declared one. Entity builds e.pks and
+// e.colFields off the one *Table, so the two sides cannot disagree
+// today — but Entity.PK and Entity.PKs hand those pointers out, and
+// the first caller to route one back here would otherwise have an
+// UPDATE reassign the primary key.
 func (e *Entity[T]) isKeyColumn(c *Column) bool {
 	for _, k := range e.pks {
-		if k == c {
+		if k.key() == c.key() {
 			return true
 		}
 	}
@@ -514,15 +520,20 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 // DEFAULT, or NULL when it has none — which is what the server would
 // have stored had the row been inserted on its own.
 func (e *Entity[T]) alignBindings(rows [][]ColumnValue) [][]ColumnValue {
+	// Indexed by [Column.key] rather than by the handle, so a binding
+	// built off an alias of the table lands in the slot its declared
+	// column owns. By pointer the two are strangers: the binding is
+	// then dropped as belonging to no column of the list, and the row
+	// takes the DEFAULT fill in its place.
 	bound := map[*Column]bool{}
 	for _, r := range rows {
 		for _, cv := range r {
-			bound[cv.column()] = true
+			bound[cv.column().key()] = true
 		}
 	}
 	var cols []*Column
 	for _, cf := range e.colFields {
-		if bound[cf.col] {
+		if bound[cf.col.key()] {
 			cols = append(cols, cf.col)
 		}
 	}
@@ -533,11 +544,11 @@ func (e *Entity[T]) alignBindings(rows [][]ColumnValue) [][]ColumnValue {
 	for i, r := range rows {
 		byCol := make(map[*Column]ColumnValue, len(r))
 		for _, cv := range r {
-			byCol[cv.column()] = cv
+			byCol[cv.column().key()] = cv
 		}
 		wide := make([]ColumnValue, 0, len(cols))
 		for _, c := range cols {
-			if cv, ok := byCol[c]; ok {
+			if cv, ok := byCol[c.key()]; ok {
 				wide = append(wide, cv)
 				continue
 			}
@@ -560,7 +571,7 @@ func rowsMatchColumns(rows [][]ColumnValue, cols []*Column) bool {
 			return false
 		}
 		for i, cv := range r {
-			if cv.column() != cols[i] {
+			if cv.column().key() != cols[i].key() {
 				return false
 			}
 		}

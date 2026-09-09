@@ -268,7 +268,7 @@ func scopedEntity(t *testing.T) (*mysql.Entity[scopedRow], *mysql.Table) {
 	mysql.Add(tbl, mysql.BigSerial("id").PrimaryKey().AutoIncrement())
 	tenant := mysql.Add(tbl, mysql.BigInt("tenantId").NotNull())
 	mysql.Add(tbl, mysql.Text("title"))
-	ent := mysql.NewEntity[scopedRow](tbl).ScopeByTenant(tenant)
+	ent := mysql.NewEntity[scopedRow](tbl, mysql.AllowNullableColumns("title")).ScopeByTenant(tenant)
 	return ent, tbl
 }
 

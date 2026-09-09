@@ -38,7 +38,7 @@ func aliasTenantedEntity(t *testing.T, name string) *mysql.Entity[aliasTenanted]
 	mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
 	mysql.Add(tbl, mysql.BigInt("tenantId").NotNull())
 	mysql.Add(tbl, mysql.Text("title"))
-	return mysql.NewEntity[aliasTenanted](tbl).ScopeByTenant(tbl.As("u").Col("tenantId"))
+	return mysql.NewEntity[aliasTenanted](tbl, mysql.AllowNullableColumns("title")).ScopeByTenant(tbl.As("u").Col("tenantId"))
 }
 
 func TestScopeByTenantStoresTheEntitysOwnHandle(t *testing.T) {

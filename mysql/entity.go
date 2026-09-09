@@ -31,6 +31,20 @@ type Entity[T any] struct {
 	// MapConstraint; the names drops and MySQL generate are derived
 	// rather than stored — see (*Entity[T]).FieldError.
 	constraintFields map[string]string
+
+	// Tenant scoping (see tenant.go). tenantCol is nil unless
+	// ScopeByTenant was called; tenantField is the struct field it
+	// binds, so a write can stamp the ctx tenant onto the row.
+	tenantCol   *Column
+	tenantField []int
+
+	// rowType is T with its pointers stripped — the type NewEntity
+	// mapped the columns against. It is held rather than recomputed
+	// because it is the key an entity's row-scope filters are
+	// registered under: see rowScopeFilterKey, which needs the type's
+	// import path and name to keep two entities over one table from
+	// replacing each other's.
+	rowType reflect.Type
 }
 
 type entityColField struct {
@@ -147,7 +161,11 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	if err := checkDrift(rt, t, colFields, cfg); err != nil {
 		panic(err.Error())
 	}
-	return &Entity[T]{table: t, pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields}
+	return &Entity[T]{
+		table: t, pk: pk, pkField: pkField,
+		pks: pks, pkFields: pkFields, colFields: colFields,
+		rowType: rt,
+	}
 }
 
 // checkDrift reports columns bound to no struct field — see
@@ -331,7 +349,7 @@ func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); retur
 
 // Unscoped opts out of every global filter on the table — named and
 // anonymous alike; the blunt instrument. See [SelectBuilder.Unscoped].
-func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.UnscopedDefaults(); return q }
 
 // IgnoreFilters bypasses the named global filters and leaves every
 // other one standing — see [SelectBuilder.IgnoreFilters]. It is the
@@ -373,6 +391,14 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // leaves the field alone rather than failing: the row is inserted
 // either way, and silently reporting an id of 0 would be worse.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
+	// Stamped before the row is read into bindings, so the INSERT
+	// carries the ctx tenant rather than whatever the caller left in
+	// the struct — and refuses outright when the struct already
+	// carries somebody else's. Without it the zero the caller never
+	// set reaches the axis check as another tenant's value.
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	v := reflect.ValueOf(r).Elem()
 	ins := db.Insert(e.table)
 	ins.Row(e.bindings(v, false)...)
@@ -394,6 +420,13 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
+		// Per row, because the stamp fills a field of each: a batch
+		// stamped only on the first would bind values under the wrong
+		// names for the rest — the INSERT column list is derived from
+		// row zero.
+		if err := e.stampTenant(ctx, &rows[i]); err != nil {
+			return nil, err
+		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
 	res, err := ins.Exec(ctx)
@@ -414,6 +447,13 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
+		// Per row, because the stamp fills a field of each: a batch
+		// stamped only on the first would bind values under the wrong
+		// names for the rest — the INSERT column list is derived from
+		// row zero.
+		if err := e.stampTenant(ctx, &rows[i]); err != nil {
+			return nil, err
+		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
 	res, err := ins.OnDuplicateKeyUpdateAll().Exec(ctx)
@@ -423,6 +463,13 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 // Update writes every non-key column of r to the row its key
 // addresses.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
+	// Stamped first, for the reason Create is: an UPDATE writes every
+	// non-key column, and on a scoped entity the tenant column is one
+	// of them — an unstamped struct would write its zero over a row it
+	// is otherwise allowed to touch and hand it to no tenant at all.
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	if e.pkIsZero(r) {
 		return ErrPKNotSet
 	}

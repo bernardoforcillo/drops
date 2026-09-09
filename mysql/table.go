@@ -2,14 +2,11 @@ package mysql
 
 import (
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/bernardoforcillo/drops"
 )
 
-// Table is a MySQL table: a name, its columns, and the relations
-// declared against it.
+// Table is a MySQL table: a name and its columns.
 type Table struct {
 	database  string
 	name      string
@@ -20,12 +17,12 @@ type Table struct {
 	comment   string
 	columns   []*Column
 	byName    map[string]*Column
-	relations map[string]*Relation
 
-	// filters are AND-ed onto every SELECT from this table. A named
-	// one (AddFilter) can be bypassed on its own with IgnoreFilters;
-	// an anonymous one (DefaultFilter) only by Unscoped.
-	filters []tableFilter
+	// scope is the automatic-predicate state: the two filter lists and
+	// the write-side tenant column. It is a POINTER so that a table
+	// and every alias taken off it share one — see tableScope for what
+	// a copy cost.
+	scope *tableScope
 
 	// indexes and checks are what the migration layer needs and the
 	// query layer never looks at: the secondary indexes and CHECK
@@ -62,7 +59,7 @@ func (t *Table) PreviousName() string { return t.renamedFrom }
 // NewTable creates a table in the connection's default database.
 func NewTable(name string) *Table {
 	mustIdent("table", name)
-	return &Table{name: name, byName: map[string]*Column{}, relations: map[string]*Relation{}}
+	return &Table{name: name, byName: map[string]*Column{}, scope: &tableScope{}}
 }
 
 // NewDatabaseTable scopes the table to an explicit database, which is
@@ -71,10 +68,10 @@ func NewDatabaseTable(database, name string) *Table {
 	mustIdent("database", database)
 	mustIdent("table", name)
 	return &Table{
-		database:  database,
-		name:      name,
-		byName:    map[string]*Column{},
-		relations: map[string]*Relation{},
+		database: database,
+		name:     name,
+		byName:   map[string]*Column{},
+		scope:    &tableScope{},
 	}
 }
 
@@ -140,29 +137,6 @@ func (t *Table) As(alias string) *Table {
 		cp.columns[i] = &aliased
 		cp.byName[aliased.name] = &aliased
 	}
-	// rebind maps a column declared on t to the aliased copy's handle
-	// for it, and leaves any column belonging to another table alone.
-	rebind := func(c *Column) *Column {
-		if c != nil && c.table == t {
-			if aliased := cp.byName[c.name]; aliased != nil {
-				return aliased
-			}
-		}
-		return c
-	}
-	cp.relations = make(map[string]*Relation, len(t.relations))
-	for name, rel := range t.relations {
-		r := *rel
-		r.From = &cp
-		if r.Kind == BelongsToKind {
-			// The inverse edge holds its own key in ChildKey; ParentKey
-			// names the far table.
-			r.ChildKey = rebind(r.ChildKey)
-		} else {
-			r.ParentKey = rebind(r.ParentKey)
-		}
-		cp.relations[name] = &r
-	}
 	if t.checks != nil {
 		cp.checks = make(map[string]string, len(t.checks))
 		for name, expr := range t.checks {
@@ -174,7 +148,10 @@ func (t *Table) As(alias string) *Table {
 	// alias land in the base table's spare capacity, and the next
 	// append through another handle overwrite it.
 	cp.indexes = append([]*Index(nil), t.indexes...)
-	cp.filters = append([]tableFilter(nil), t.filters...)
+	// The scope is the exception, and deliberately: cp.scope is the
+	// same pointer, so the alias carries the filters and the axis the
+	// table has NOW rather than the ones it had when As was called.
+	// See tableScope.
 	return &cp
 }
 
@@ -224,7 +201,7 @@ func (t *Table) Comment(text string) *Table { t.comment = text; return t }
 // Prefer AddFilter, which names the predicate so one query can step
 // around it and keep the rest.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.filters = append(t.filters, tableFilter{pred: e})
+	t.addDefaultFilter(tableFilter{pred: e})
 	return t
 }
 
@@ -240,25 +217,21 @@ func (t *Table) AddFilter(name string, e drops.Expression) *Table {
 	if name == "" {
 		panic("drops/mysql: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
 	}
-	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	t.addDefaultFilter(tableFilter{name: name, pred: e})
 	return t
 }
 
 // Filters returns the table's global-filter predicates in registration
 // order, named and anonymous alike.
 func (t *Table) Filters() []drops.Expression {
-	out := make([]drops.Expression, len(t.filters))
-	for i, f := range t.filters {
-		out[i] = f.pred
-	}
-	return out
+	return filterPreds(t.defaultFilterList())
 }
 
 // FilterNames returns the names of the table's named filters in
 // registration order. Anonymous filters contribute nothing.
 func (t *Table) FilterNames() []string {
 	var out []string
-	for _, f := range t.filters {
+	for _, f := range t.defaultFilterList() {
 		if f.name != "" {
 			out = append(out, f.name)
 		}
@@ -272,30 +245,12 @@ func (t *Table) Col(name string) *Column { return t.byName[name] }
 // Columns returns the columns in declaration order.
 func (t *Table) Columns() []*Column { return t.columns }
 
-// Relation returns the named relation, or nil.
-func (t *Table) Relation(name string) *Relation { return t.relations[name] }
-
-// Rel returns the named relation, panicking if it was never declared.
-// It is how a relation becomes a compile-checked Go identifier rather
-// than a string literal at every query site.
-func (t *Table) Rel(name string) *Relation {
-	r := t.relations[name]
-	if r == nil {
-		declared := make([]string, 0, len(t.relations))
-		for n := range t.relations {
-			declared = append(declared, n)
-		}
-		sort.Strings(declared)
-		// An alias carries the relations its table had at the moment As
-		// was called, so a relation declared afterwards reaches the base
-		// handle and not this one. Naming the alias is what separates
-		// that from "the relation was never declared at all" — the two
-		// look identical from the empty list.
-		panic(fmt.Sprintf("drops/mysql: %s has no relation %q; declared: %s",
-			t.subject(), name, strings.Join(declared, ", ")))
-	}
-	return r
-}
+// This package declares no relations. A Table.Relation / Table.Rel pair
+// and a relations map lived here, against a *Relation type no file in
+// the package ever defined — so it had never compiled, nothing could
+// populate the map, and there is no loader here for an edge to feed.
+// See drops/pg's relations.go and find.go for the shape a dialect needs
+// before either is worth having.
 
 // Add registers a column with the table and returns it, so a
 // declaration reads as one expression:
@@ -333,6 +288,15 @@ func (t *Table) PrimaryKeyColumns() []*Column {
 func (t *Table) writeRef(b *drops.Builder) {
 	if t.alias != "" {
 		b.WriteIdent(t.alias)
+		return
+	}
+	// A table's automatic predicates are built from the declared
+	// column handles and may be rendering inside a statement whose
+	// FROM entry is an alias of this table. resolveFilterExprs
+	// installs the rename for the length of each such predicate; here
+	// is where it lands.
+	if renamed := b.RelationAlias(t.relRef()); renamed != "" {
+		b.WriteIdent(renamed)
 		return
 	}
 	t.writeName(b)

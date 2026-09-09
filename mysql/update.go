@@ -16,6 +16,19 @@ type UpdateBuilder struct {
 	orderBys []drops.Expression
 	limit    *int64
 	scope    filterScope
+
+	// ctxPreds are the table's context filters, built for one
+	// execution by resolveCtx. They are held rather than resolved
+	// while rendering because WriteSQL has no ctx to build them from.
+	ctxPreds []drops.Expression
+
+	// defaults is what this execution resolved for the table's
+	// render-time filters, and nil when none of them held a statement.
+	defaults resolvedDefaults
+
+	// resolved marks the copy resolveCtx produced, so a statement
+	// nested in another is not resolved twice.
+	resolved bool
 }
 
 // Set appends column assignments.
@@ -89,7 +102,11 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" = ")
 		s.writeValue(b)
 	}
-	wheres := u.scope.apply(u.table, u.wheres)
+	// Defaults first, then what the caller asked for, then the
+	// request-time predicates: the order the WHERE clause has always
+	// read in, scope first.
+	wheres := u.scope.apply(u.table, u.wheres, u.defaults)
+	wheres = append(append([]drops.Expression(nil), wheres...), u.ctxPreds...)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)
@@ -105,13 +122,110 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 }
 
 // ToSQL renders the statement and its arguments.
+//
+// It carries the table's DefaultFilters and none of its
+// ContextFilters, because a render has no ctx to build one from — so
+// on a tenant-scoped table it is not the statement that would be sent.
+// Prefer [UpdateBuilder.ToSQLCtx].
 func (u *UpdateBuilder) ToSQL() (string, []any) { return render(u) }
 
-// Exec runs the UPDATE.
+// ToSQLCtx renders the statement ctx would send: the table's context
+// filters built and AND-ed into the WHERE clause, and every statement
+// written inside the SET list or the predicates resolved on the same
+// terms.
+//
+// A filter that cannot decide what the request may see refuses, and
+// the refusal is returned instead of a statement: an UPDATE missing
+// the predicate that makes it safe rewrites rows that belong to
+// somebody else.
+func (u *UpdateBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := u.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution: the
+// receiver when there was nothing to resolve, and a shallow copy
+// carrying the resolved lists when there was. See
+// [SelectBuilder.resolveCtx] for why the identity matters.
+func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) {
+	if u.resolved {
+		return u, nil
+	}
+	ctx = withIgnoredFilters(ctx, u.scope)
+
+	cp := *u
+	changed := false
+
+	// The SET list is the half of an UPDATE a tenant predicate does not
+	// reach: the WHERE clause says which rows may be touched, and the
+	// assignment says what they become — including, if nobody checks,
+	// somebody else's tenant.
+	if !u.scope.dropsContextFilters() {
+		if err := checkAxisAssignment(ctx, u.table, u.sets); err != nil {
+			return nil, err
+		}
+	}
+
+	// The assigned value is an operand position like any other, and the
+	// one that decides what gets written rather than which rows do.
+	if r, err := resolveSets(ctx, u.sets); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.sets, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, u.wheres); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.wheres, changed = r, true
+	}
+
+	if !u.scope.dropsContextFilters() {
+		preds, err := u.table.resolveContextFilters(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(preds) > 0 {
+			cp.ctxPreds, changed = preds, true
+		}
+		defaults, err := resolveTableDefaults(ctx, u.table)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
+	}
+
+	if !changed {
+		return u, nil
+	}
+	cp.resolved = true
+	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable], so an UPDATE written as
+// a CTE body carries the same predicates a bare one would.
+func (u *UpdateBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := u.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != u, nil
+}
+
+// Exec runs the UPDATE, with the table's context filters resolved
+// against ctx first.
 func (u *UpdateBuilder) Exec(ctx context.Context) (drops.Result, error) {
 	if len(u.sets) == 0 {
 		return nil, ErrNoAssignments
 	}
-	sql, args := u.ToSQL()
+	sql, args, err := u.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return u.db.Exec(ctx, sql, args...)
 }

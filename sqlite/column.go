@@ -36,6 +36,33 @@ type Column struct {
 	// comparison of two schemas can recover — see rename.go — and the
 	// schema is where Push can find it.
 	renamedFrom string
+
+	// origin is the column this one is an alias copy of, and nil for a
+	// declared column. See key.
+	origin *Column
+}
+
+// key returns the identity a column is recognised by, collapsing every
+// alias copy onto the column it was declared as.
+//
+// Aliasing is a query-scope rename: it changes how a reference renders
+// and nothing else. So a handle taken off an alias has to answer the
+// same as the declared handle everywhere the question is "which column
+// is this" — the INSERT column list, a hook's Has, an Entity's key
+// columns, the tenant axis, a cursor's ordering column, the CREATE
+// TABLE body's key set. Comparing the two by pointer instead makes
+// them strangers, and most of the resulting failures are silent: the
+// row loses its values to the DEFAULT fill, the CREATE TABLE loses its
+// PRIMARY KEY, a snapshot records a key column as nullable.
+//
+// The identity is the declared column rather than the name because two
+// tables can both have a "name" column and they are not the same
+// column.
+func (c *Column) key() *Column {
+	if c.origin != nil {
+		return c.origin
+	}
+	return c
 }
 
 // FK describes a single-column foreign-key reference.
@@ -332,26 +359,34 @@ func nullCheck(c *Column, isNull bool) drops.Expression {
 func And(preds ...drops.Expression) drops.Expression { return boolChain(" AND ", "TRUE", preds) }
 func Or(preds ...drops.Expression) drops.Expression  { return boolChain(" OR ", "FALSE", preds) }
 
+// boolChain joins the predicates with sep, or renders empty when there
+// are none.
+//
+// It is a node rather than a closure because a conjunction is where the
+// automatic predicates END UP: a tenant axis AND-ed with a caller's
+// WHERE clause, a guard AND-ed with both. A closure here holds every
+// one of them where resolveExpr cannot walk to it, so a subquery in any
+// of them renders unscoped.
 func boolChain(sep, empty string, preds []drops.Expression) drops.Expression {
 	preds = dropNilPreds(preds)
-	return drops.ExprFunc(func(b *drops.Builder) {
-		if len(preds) == 0 {
-			b.WriteString(empty)
-			return
-		}
-		if len(preds) == 1 {
-			b.Append(preds[0])
-			return
-		}
-		b.WriteByte('(')
-		for i, p := range preds {
-			if i > 0 {
-				b.WriteString(sep)
-			}
-			b.Append(p)
-		}
-		b.WriteByte(')')
-	})
+	if len(preds) == 0 {
+		// The identity of the connective, not "()", which is what the
+		// empty case used to render and which no engine will parse.
+		// It is also what a join's ON falls back to — see orTrue.
+		return drops.Raw(empty)
+	}
+	if len(preds) == 1 {
+		// One predicate is itself, not a conjunction of one: And over
+		// a single term renders the term, in this dialect and in the
+		// other three, and a caller who passes a statement gets it
+		// back with its own resolution intact.
+		return preds[0]
+	}
+	bracketed := make([]drops.Expression, len(preds))
+	for i, p := range preds {
+		bracketed[i] = bracketOperand(p)
+	}
+	return listOp("(", sep, ")", bracketed)
 }
 
 // ColumnValue is a column bound to a value for INSERT/UPDATE.

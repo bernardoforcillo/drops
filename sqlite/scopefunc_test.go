@@ -524,11 +524,11 @@ func TestExpressionsRenderUnchanged(t *testing.T) {
 
 		// column.go — the connectives and the typed forms.
 		{"And", sqlite.And(drops.Raw("a"), drops.Raw("b")), `(a AND b)`, nil},
-		{"And of one", sqlite.And(drops.Raw("a")), `(a)`, nil},
-		{"And of nothing", sqlite.And(), `()`, nil},
+		{"And of one", sqlite.And(drops.Raw("a")), `a`, nil},
+		{"And of nothing", sqlite.And(), `TRUE`, nil},
 		{"Or", sqlite.Or(drops.Raw("a"), drops.Raw("b")), `(a OR b)`, nil},
-		{"Or of one", sqlite.Or(drops.Raw("a")), `(a)`, nil},
-		{"Or of nothing", sqlite.Or(), `()`, nil},
+		{"Or of one", sqlite.Or(drops.Raw("a")), `a`, nil},
+		{"Or of nothing", sqlite.Or(), `FALSE`, nil},
 
 		// subquery.go
 		{"Exists", sqlite.Exists(drops.Raw("SELECT 1")), `EXISTS (SELECT 1)`, nil},

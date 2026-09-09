@@ -34,7 +34,7 @@ func aliasTenantedEntity(t *testing.T, name string) *sqlite.Entity[aliasTenanted
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
 	sqlite.Add(tbl, sqlite.BigInt("tenantId").NotNull())
 	sqlite.Add(tbl, sqlite.Text("title"))
-	return sqlite.NewEntity[aliasTenanted](tbl).ScopeByTenant(tbl.As("u").Col("tenantId"))
+	return sqlite.NewEntity[aliasTenanted](tbl, sqlite.AllowNullableColumns("title")).ScopeByTenant(tbl.As("u").Col("tenantId"))
 }
 
 func TestScopeByTenantStoresTheEntitysOwnHandle(t *testing.T) {

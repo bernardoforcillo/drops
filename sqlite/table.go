@@ -22,16 +22,11 @@ type Table struct {
 
 	relations map[string]*Relation
 
-	// Lifecycle hooks (see hooks.go) and default filters. All are
-	// optional; a table with none renders SQL unchanged.
-	insertHooks []InsertHook
-	updateHooks []UpdateHook
-	deleteHooks []DeleteHook
-
-	// filters are the global-filter predicates. A named one
-	// (AddFilter) can be bypassed on its own with IgnoreFilters; an
-	// anonymous one (DefaultFilter) only by Unscoped. See filters.go.
-	filters []tableFilter
+	// scope is the automatic-predicate state: the two filter lists, the
+	// write-side tenant column and the lifecycle hooks. It is a POINTER
+	// so that a table and every alias taken off it share one — see
+	// tableScope for what a copy cost.
+	scope *tableScope
 
 	// renamedFrom is the name this table used to have, set by
 	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
@@ -56,20 +51,26 @@ func (t *Table) PreviousName() string { return t.renamedFrom }
 
 // OnInsert registers an INSERT hook, run before every INSERT renders.
 func (t *Table) OnInsert(h InsertHook) *Table {
-	t.insertHooks = append(t.insertHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.insertHooks = appendShared(t.scope.insertHooks, h)
 	return t
 }
 
 // OnUpdate registers an UPDATE hook, run before every UPDATE renders.
 func (t *Table) OnUpdate(h UpdateHook) *Table {
-	t.updateHooks = append(t.updateHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.updateHooks = appendShared(t.scope.updateHooks, h)
 	return t
 }
 
 // OnDelete registers a DELETE hook, run before every DELETE renders. A
 // hook may replace the DELETE with another statement (soft delete).
 func (t *Table) OnDelete(h DeleteHook) *Table {
-	t.deleteHooks = append(t.deleteHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.deleteHooks = appendShared(t.scope.deleteHooks, h)
 	return t
 }
 
@@ -81,8 +82,57 @@ func (t *Table) OnDelete(h DeleteHook) *Table {
 // which names the predicate so one query can step around it while the
 // table's remaining scoping stays in force.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.filters = append(t.filters, tableFilter{pred: e})
+	t.addDefaultFilter(tableFilter{pred: e})
 	return t
+}
+
+// ScopeWritesByTenant names the column an INSERT into this table
+// stamps from the ctx tenant.
+//
+// It is the write-side half of a tenant axis, and it is separate from
+// the read-side half because a ContextFilterFunc is a closure: it
+// answers with a predicate, and nothing can ask it which column owns a
+// row — so a table scoped with ContextFilter(TenantFilter(col)) and
+// nothing else keeps its guarantee on every read, every UPDATE and
+// every DELETE while its INSERTs stay the caller's to bind. Naming the
+// column here hands them to drops:
+//
+//	Posts.ContextFilter(sqlite.TenantFilter(PostTenantID)).
+//	    ScopeWritesByTenant(PostTenantID)
+//
+// [Entity.ScopeByTenant] calls this for you, so an entity-declared axis
+// covers both halves at once. Declaring it twice with the same column
+// is idempotent.
+//
+// The consequence worth stating plainly: from here on every INSERT into
+// this table needs a tenant on its ctx, including one built straight
+// from db.Insert() — see [InsertBuilder.ToSQLCtx]. A statement that
+// legitimately writes outside the ctx tenant says so with
+// [InsertBuilder.Unscoped].
+//
+// The handle has to be one of this table's own columns, and a handle
+// this table does not own is a panic at declaration time rather than a
+// statement at request time: what it is given ends up in the INSERT
+// column list and in every axis check the package makes.
+//
+// Ownership is asked by [Column.key], so a handle taken off a table
+// alias names the same axis as the declared one; what is STORED is this
+// table's own handle rather than the one passed in, because an alias
+// handle qualifies with an alias an INSERT into this table has no name
+// for.
+func (t *Table) ScopeWritesByTenant(col ColRef) *Table {
+	if col == nil {
+		return t
+	}
+	c := col.col()
+	for _, own := range t.columns {
+		if own.key() == c.key() {
+			t.setTenantAxis(own)
+			return t
+		}
+	}
+	panic("drops/sqlite: ScopeWritesByTenant column " + columnPath(c) +
+		" is not a column of " + t.Name())
 }
 
 // AddFilter appends a predicate under name, applied exactly as
@@ -97,25 +147,21 @@ func (t *Table) AddFilter(name string, e drops.Expression) *Table {
 	if name == "" {
 		panic("drops/sqlite: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
 	}
-	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	t.addDefaultFilter(tableFilter{name: name, pred: e})
 	return t
 }
 
 // DefaultFilters returns the table's global-filter predicates in
 // registration order, named and anonymous alike.
 func (t *Table) DefaultFilters() []drops.Expression {
-	out := make([]drops.Expression, len(t.filters))
-	for i, f := range t.filters {
-		out[i] = f.pred
-	}
-	return out
+	return filterPreds(t.defaultFilterList())
 }
 
 // FilterNames returns the names of the table's named filters in
 // registration order. Anonymous filters contribute nothing.
 func (t *Table) FilterNames() []string {
 	var out []string
-	for _, f := range t.filters {
+	for _, f := range t.defaultFilterList() {
 		if f.name != "" {
 			out = append(out, f.name)
 		}
@@ -123,8 +169,8 @@ func (t *Table) FilterNames() []string {
 	return out
 }
 
-func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
-func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
+func (t *Table) hasInsertHooks() bool { return len(t.insertHookList()) > 0 }
+func (t *Table) hasUpdateHooks() bool { return len(t.updateHookList()) > 0 }
 
 // Relation returns the named relation declared on t, or nil.
 func (t *Table) Relation(name string) *Relation { return t.relations[name] }
@@ -141,7 +187,7 @@ func (t *Table) setRelation(name string, r *Relation) {
 // panics at declaration time.
 func NewTable(name string) *Table {
 	mustIdent("table", name)
-	return &Table{name: name, byName: map[string]*Column{}}
+	return &Table{name: name, byName: map[string]*Column{}, scope: &tableScope{}}
 }
 
 // Add registers c on t and returns the same typed handle, so callers
@@ -168,9 +214,86 @@ func (t *Table) Columns() []*Column      { return t.columns }
 func (t *Table) Col(name string) *Column { return t.byName[name] }
 
 // As returns an aliased view of the table for use in joins.
+//
+// The copy rebinds the table's columns onto itself, so a handle taken
+// off the alias renders "u"."id" rather than "users"."id" — and
+// [Column.key] collapses it back onto the declared column everywhere
+// the question is "which column is this", so an alias is a rename and
+// never a stranger.
+//
+// What the copy does NOT copy is the scope: cp.scope is the same
+// pointer, so the alias carries the filters, the tenant axis and the
+// hooks the table has NOW rather than the ones it had when As was
+// called. See tableScope for the cross-tenant DELETE a snapshot cost.
 func (t *Table) As(alias string) *Table {
+	mustIdent("alias", alias)
 	cp := *t
 	cp.alias = alias
+	cp.columns = make([]*Column, len(t.columns))
+	cp.byName = make(map[string]*Column, len(t.byName))
+	for i, c := range t.columns {
+		aliased := *c
+		aliased.table = &cp
+		// The origin chains to the declared column rather than to c,
+		// so aliasing an alias does not make a stranger of the root.
+		aliased.origin = c.key()
+		cp.columns[i] = &aliased
+		cp.byName[aliased.name] = &aliased
+	}
+	// rebind maps a column declared on t to the aliased copy's handle
+	// for it, and leaves any column belonging to another table alone.
+	rebind := func(c *Column) *Column {
+		if c != nil && c.table == t {
+			if aliased := cp.byName[c.name]; aliased != nil {
+				return aliased
+			}
+		}
+		return c
+	}
+	rebindAll := func(cols []*Column) []*Column {
+		if cols == nil {
+			return nil
+		}
+		out := make([]*Column, len(cols))
+		for i, c := range cols {
+			out[i] = rebind(c)
+		}
+		return out
+	}
+	// Every map on the copy has to be its own, or a relation, check or
+	// unique declared against the alias writes through into the table
+	// it was aliased from.
+	if t.relations != nil {
+		cp.relations = make(map[string]*Relation, len(t.relations))
+		for name, rel := range t.relations {
+			r := *rel
+			// Only the near side — the end of the edge that belongs to
+			// this table — moves to the alias. On a self-referential
+			// relation both ends name this table and rebinding both
+			// would erase the distinction the alias exists to draw.
+			r.Local = rebind(r.Local)
+			cp.relations[name] = &r
+		}
+	}
+	cp.compositePK = rebindAll(t.compositePK)
+	if t.compositeUniques != nil {
+		cp.compositeUniques = make(map[string][]*Column, len(t.compositeUniques))
+		for name, cols := range t.compositeUniques {
+			cp.compositeUniques[name] = rebindAll(cols)
+		}
+	}
+	if t.checks != nil {
+		cp.checks = make(map[string]string, len(t.checks))
+		for name, expr := range t.checks {
+			cp.checks[name] = expr
+		}
+	}
+	cp.compositeFKs = make([]*CompositeFK, len(t.compositeFKs))
+	for i, fk := range t.compositeFKs {
+		f := *fk
+		f.Columns = rebindAll(fk.Columns)
+		cp.compositeFKs[i] = &f
+	}
 	return &cp
 }
 

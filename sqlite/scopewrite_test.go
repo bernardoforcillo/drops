@@ -243,7 +243,7 @@ func TestInsertAsACTEBodyIsStamped(t *testing.T) {
 // bound once and from the ctx.
 func TestEntityCreateStampsThroughTheBuilder(t *testing.T) {
 	posts, _, _ := writeTable("we_posts")
-	ent := sqlite.NewEntity[wePost](posts)
+	ent := sqlite.NewEntity[wePost](posts, sqlite.AllowNullableColumns("title"))
 	drv := dropstest.New().Rows([]string{"id"}, []any{int64(1)})
 	db := sqlite.New(drv)
 
@@ -267,7 +267,7 @@ func TestEntityCreateStampsThroughTheBuilder(t *testing.T) {
 // And it refuses without a tenant, before anything reaches the driver.
 func TestEntityCreateWithoutTenantSendsNothing(t *testing.T) {
 	posts, _, _ := writeTable("wf_posts")
-	ent := sqlite.NewEntity[wePost](posts)
+	ent := sqlite.NewEntity[wePost](posts, sqlite.AllowNullableColumns("title"))
 	drv := dropstest.New()
 	db := sqlite.New(drv)
 
@@ -285,7 +285,7 @@ func TestEntityCreateWithoutTenantSendsNothing(t *testing.T) {
 // batch is stamped before any bytes reach the driver.
 func TestEntityCreateManyStampsEveryRow(t *testing.T) {
 	posts, _, _ := writeTable("wm_posts")
-	ent := sqlite.NewEntity[wePost](posts)
+	ent := sqlite.NewEntity[wePost](posts, sqlite.AllowNullableColumns("title"))
 	drv := dropstest.New()
 	db := sqlite.New(drv)
 

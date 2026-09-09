@@ -33,7 +33,7 @@ func seEntity(name string) (*sqlite.Table, *sqlite.Entity[sePost], *sqlite.Col[s
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
 	tenant := sqlite.Add(tbl, sqlite.BigInt("tenantId").NotNull())
 	title := sqlite.Add(tbl, sqlite.Text("title"))
-	ent := sqlite.NewEntity[sePost](tbl).ScopeByTenant(tenant)
+	ent := sqlite.NewEntity[sePost](tbl, sqlite.AllowNullableColumns("title")).ScopeByTenant(tenant)
 	return tbl, ent, title
 }
 
@@ -149,7 +149,7 @@ func TestEntityQueryUnscopedKeepsTheTenantAndDropsTheDefaultFilter(t *testing.T)
 	tenant := sqlite.Add(tbl, sqlite.BigInt("tenantId").NotNull())
 	sqlite.Add(tbl, sqlite.Text("title"))
 	sqlite.SoftDelete(tbl)
-	ent := sqlite.NewEntity[sePost](tbl, sqlite.AllowUnmappedColumns("deletedAt")).
+	ent := sqlite.NewEntity[sePost](tbl, sqlite.AllowUnmappedColumns("deletedAt"), sqlite.AllowNullableColumns("title")).
 		ScopeByTenant(tenant)
 
 	drv := dropstest.New().AlwaysRows([]string{"id", "tenantId", "title"})

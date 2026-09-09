@@ -424,7 +424,7 @@ func TestSubqueryOperandsAreResolvedAtEveryDepth(t *testing.T) {
 			`(NOT EXISTS (` + body + `))`},
 		{"And of Or of Not of Exists", func() drops.Expression {
 			return sqlite.And(sqlite.Or(sqlite.Not(sqlite.Exists(sub()))), sqlite.Eq(plainID, int64(1)))
-		}, `(((NOT EXISTS (` + body + `))) AND ("scq_plain"."id" = ?))`},
+		}, `((NOT EXISTS (` + body + `)) AND ("scq_plain"."id" = ?))`},
 		{"In of a subquery", func() drops.Expression { return sqlite.In(plainID, sub()) },
 			`("scq_plain"."id" IN (` + body + `))`},
 		{"Eq of a scalar subquery", func() drops.Expression {

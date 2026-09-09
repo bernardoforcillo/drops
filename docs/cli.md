@@ -253,6 +253,48 @@ directory accounts for, which means a file was edited after it was
 applied or came from another branch. Pass `--schema` and it reports
 drift as well.
 
+### `drops check`
+
+Reads the schema against itself. No database is opened and no query
+source is parsed — it is about the declaration, and about the
+declarations that are legal SQL, that `push` will apply without a word,
+and that a production workload then pays for.
+
+```
+drops check --schema ./schema
+```
+
+The three offline-ish commands divide cleanly:
+
+| | reads | reports |
+|---|---|---|
+| `check` | the Go schema | declarations that cost at scale |
+| `lint` | the Go source | query mistakes the type checker can see |
+| `drift` | a live database | where it and the schema disagree |
+
+Seven rules, each of which says what it costs and what to change:
+
+| rule | what it finds |
+|---|---|
+| `unindexed-foreign-key` | a key whose own columns no index leads with. PostgreSQL indexes the *referenced* side for you and never this one — the side every delete of a parent row consults. |
+| `no-primary-key` | a table no entity can address, and whose UPDATE and DELETE logical replication cannot represent. |
+| `rls-without-policy` | row-level security on with nothing granted: the table returns no rows, as an empty result rather than a denial. |
+| `policy-without-rls` | the mirror image, and worse — the schema reads as protection and every row is visible. |
+| `nullable-unique` | a unique constraint over a nullable column. Two NULLs are distinct in PostgreSQL, so any number of rows may repeat the rest of the key. |
+| `redundant-index` | an index that is a leading prefix of another: maintained on every write, read by nothing. |
+| `foreign-key-type-mismatch` | a key compared through a cast, which stops the index on the referenced side being used. |
+
+Every rule is about a cost, never about taste — a schema check that
+reports preferences gets turned off wholesale within a week and takes
+the rules that mattered with it. `--off` skips rules by name (an
+unknown name is an error, not a silent no-op), and `--json` emits the
+findings as an array for CI. Exits 3 on a finding, as `drift` does.
+
+It found one on this repository's own example the first time it ran: a
+junction table whose comment said "the pair is the identity" and whose
+schema did not declare it, so the same tag could be attached to a post
+twice.
+
 ### `drops lint`
 
 Reads the source rather than the database: a DELETE or UPDATE executed

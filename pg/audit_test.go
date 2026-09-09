@@ -180,3 +180,83 @@ func TestActorContextRoundTrip(t *testing.T) {
 		t.Error("missing actor should return empty string")
 	}
 }
+
+// ----------------------------------------------------------------------
+// PII in the audit payload
+// ----------------------------------------------------------------------
+
+// A column flagged AsPII is redacted in the query log, in a tracer's
+// attributes and in any accidental fmt call. The audit trail was the
+// hole in that promise: its payload is json.Marshal of the whole
+// struct, so the value the log would not print was written verbatim
+// into a table kept for years, read by more people than the logs are,
+// and frequently exported to a system with different access rules.
+
+type piiUser struct {
+	ID    int64  `drop:"id"`
+	Name  string `drop:"name"`
+	Email string `drop:"email" json:"emailAddress"`
+}
+
+func piiUsersSchema() *pg.Entity[piiUser] {
+	tbl := pg.NewTable("users")
+	pg.Add(tbl, pg.BigSerial("id").PrimaryKey())
+	pg.Add(tbl, pg.Text("name").NotNull())
+	pg.Add(tbl, pg.Text("email").NotNull().AsPII())
+	return pg.NewEntity[piiUser](tbl)
+}
+
+func TestTheAuditPayloadRedactsAPIIColumn(t *testing.T) {
+	ent := piiUsersSchema()
+	drv := &auditDriver{returnID: 7}
+	db := pg.New(drv)
+	pg.WithAudit(ent, pg.NewAuditLog(db, "audit_events"))
+
+	u := piiUser{Name: "Alice", Email: "alice@example.com"}
+	if err := ent.Create(db, pg.WithActor(context.Background(), "admin-9"), &u); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(drv.audits) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(drv.audits))
+	}
+	payload := string(drv.audits[0].payload)
+
+	if strings.Contains(payload, "alice@example.com") {
+		t.Errorf("the audit payload carries the PII value:\n  %s", payload)
+	}
+	if !strings.Contains(payload, `"<redacted>"`) {
+		t.Errorf("the PII column was dropped rather than redacted; a reader cannot tell "+
+			"an absent column from a hidden one:\n  %s", payload)
+	}
+	// The key is the one encoding/json wrote, tag and all — a
+	// redaction keyed on the COLUMN name would have missed it.
+	if !strings.Contains(payload, `"emailAddress":"<redacted>"`) {
+		t.Errorf("the redaction did not follow the struct tag:\n  %s", payload)
+	}
+	// Everything else is untouched: an existing consumer parses the
+	// same document it always did.
+	if !strings.Contains(payload, `"Name":"Alice"`) {
+		t.Errorf("a non-PII field did not survive:\n  %s", payload)
+	}
+}
+
+// An entity with no PII column returns the bytes json.Marshal produced,
+// so the shape and the ordering of every existing payload are unchanged.
+func TestTheAuditPayloadIsUntouchedWithoutPII(t *testing.T) {
+	_, ent := entUsersSchema()
+	drv := &auditDriver{returnID: 7}
+	db := pg.New(drv)
+	pg.WithAudit(ent, pg.NewAuditLog(db, "audit_events"))
+
+	u := entUser{Name: "Alice", Email: "a@x"}
+	if err := ent.Create(db, context.Background(), &u); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	want, err := json.Marshal(&u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(drv.audits[0].payload); got != string(want) {
+		t.Errorf("payload = %s, want json.Marshal's own bytes %s", got, want)
+	}
+}

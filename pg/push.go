@@ -51,6 +51,24 @@ type PushOptions struct {
 	// visible to everyone the moment the push commits.
 	DropUnmanagedObjects bool
 
+	// Allow authorises the changes that lose data, one named change at
+	// a time: {Op: OpDropColumn, Table: "users", Object: "email"} says
+	// that column may go, and says nothing about any other.
+	//
+	// It is a list of changes rather than a boolean for the reason the
+	// gate exists at all. A blanket permission is granted once, by
+	// somebody reasoning about the change in front of them that day,
+	// and then stands over every change the schema makes afterwards —
+	// so the flag that authorised dropping a column nobody wanted goes
+	// on authorising the drop of the column somebody did. A named
+	// consent expires by itself: when the change it names is applied,
+	// the entry stops matching and Push says so rather than leaving it
+	// to stand (see the "stale-consent" notice).
+	//
+	// A change on an empty table needs no entry: it destroys nothing,
+	// which Push establishes from the row count rather than assuming.
+	Allow []Destructive
+
 	// Renames answers the rename questions this push raises, for one
 	// run. They are merged over what the schema itself declares — see
 	// DeclaredRenames — with these winning.
@@ -79,6 +97,19 @@ type PushResult struct {
 	// database and the schema disagree about something Push declined
 	// to change.
 	Notices []SchemaNotice
+
+	// DataLoss is what this push destroys, with the row count that
+	// makes it destruction rather than bookkeeping. On a successful
+	// push these are the changes [PushOptions.Allow] authorised; when
+	// Push returns [ErrDestructivePush] they are the ones nobody did,
+	// each carrying the statement withheld and the consent that would
+	// release it.
+	//
+	// Empty is the ordinary case, and it is a stronger statement than
+	// "nothing was dropped": it means nothing the plan does loses a
+	// row, either because it destroys nothing or because the tables it
+	// touches are empty.
+	DataLoss []Destructive
 }
 
 // SchemaNotice is a difference Push can see but will not act on.
@@ -339,13 +370,34 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 			return nil, err
 		}
 	}
+	// What in the plan loses data, what it would cost, and who said it
+	// could. Before the empty-diff exit, because a consent that has
+	// gone stale is MOST likely on the push that finds nothing to do —
+	// the change it authorised is the one already applied — and a
+	// notice nobody prints is a call site nobody revisits.
+	loss, err := withRowCounts(ctx, db, schemaName, destructiveChanges(stmts))
+	if err != nil {
+		return nil, fmt.Errorf("drops/pg: read row counts for the destructive changes: %w", err)
+	}
+	unconsented, consented, stale := splitConsent(loss, opt.Allow)
+	notices = append(notices, staleConsentNotices(stale)...)
 	sortNotices(notices)
+
+	if len(unconsented) > 0 {
+		// Nothing is applied — not the destructive statements and not
+		// the harmless ones beside them. A push that ran half a plan
+		// would leave a schema no snapshot describes, and the operator
+		// would be reasoning about the difference from memory.
+		return &PushResult{
+			Statements: stmts, Applied: false, Notices: notices, DataLoss: unconsented,
+		}, &DestructivePushError{Changes: unconsented}
+	}
 
 	if len(stmts) == 0 {
 		return &PushResult{Statements: nil, Applied: false, Notices: notices}, nil
 	}
 	if opt.DryRun {
-		return &PushResult{Statements: stmts, Applied: false, Notices: notices}, nil
+		return &PushResult{Statements: stmts, Applied: false, Notices: notices, DataLoss: consented}, nil
 	}
 
 	var deferred []string
@@ -368,7 +420,7 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 			return nil, fmt.Errorf("applying %q: %w", excerptSQL(s), err)
 		}
 	}
-	return &PushResult{Statements: stmts, Applied: true, Notices: notices}, nil
+	return &PushResult{Statements: stmts, Applied: true, Notices: notices, DataLoss: consented}, nil
 }
 
 // checkUndeclaredViewDependents refuses a push that would walk into

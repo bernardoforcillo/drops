@@ -39,7 +39,7 @@ func nilAxisEntity(name string) *pg.Entity[nilAxisRow] {
 	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
 	tenant := pg.Add(tbl, pg.Text("tenantId"))
 	pg.Add(tbl, pg.Text("title"))
-	return pg.NewEntity[nilAxisRow](tbl).ScopeByTenant(tenant)
+	return pg.NewEntity[nilAxisRow](tbl, pg.AllowNullableColumns("title")).ScopeByTenant(tenant)
 }
 
 // nilTenants are the shapes a nil arrives in. Each is a non-nil

@@ -34,6 +34,15 @@ func (d *DeleteBuilder) Wheres() []drops.Expression {
 	return append([]drops.Expression(nil), d.wheres...)
 }
 
+// UsingTables returns a copy of the USING list — exposed for the same
+// reason [DeleteBuilder.Wheres] is: a hook that rewrites the statement
+// has to carry them, and a rewrite that drops them leaves a WHERE
+// clause naming a relation the new statement no longer has (42P01), or
+// worse, one it silently no longer filters.
+func (d *DeleteBuilder) UsingTables() []*Table {
+	return append([]*Table(nil), d.using...)
+}
+
 // ReturningClauses returns a copy of the RETURNING projection list.
 func (d *DeleteBuilder) ReturningClauses() []drops.Expression {
 	return append([]drops.Expression(nil), d.returning...)
@@ -232,7 +241,12 @@ func (d *DeleteBuilder) ToSQL() (sql string, args []any) {
 
 // Exec runs the DELETE.
 func (d *DeleteBuilder) Exec(ctx context.Context) (drops.Result, error) {
-	sql, args := d.ToSQL()
+	// Through ToSQLCtx: a DELETE that loses its context filters removes
+	// another tenant's rows and reports success.
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return d.db.Exec(ctx, sql, args...)
 }
 
@@ -241,7 +255,10 @@ func (d *DeleteBuilder) All(ctx context.Context, dest any) error {
 	if len(d.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := d.ToSQL()
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := d.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err
@@ -254,7 +271,10 @@ func (d *DeleteBuilder) One(ctx context.Context, dest any) error {
 	if len(d.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := d.ToSQL()
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := d.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err

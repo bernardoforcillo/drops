@@ -45,6 +45,9 @@ type relNode struct {
 	// caller declared it will not read — the nested half of the
 	// strict-loading waiver. See strict.go.
 	waived []string
+	// unscoped drops the target table's automatic predicates for this
+	// edge and this edge only — see RelConfig.Unscoped.
+	unscoped bool
 }
 
 // mergeRelPath inserts a dot-separated path into a relNode forest,
@@ -91,6 +94,25 @@ type RelConfig struct {
 // filters apply either way.
 func (c *RelConfig) Where(preds ...drops.Expression) *RelConfig {
 	c.node.wheres = append(c.node.wheres, dropNilPreds(preds)...)
+	return c
+}
+
+// Unscoped drops the target table's automatic predicates for THIS edge
+// and leaves every other part of the query scoped.
+//
+// [SelectBuilder.Unscoped] is statement-local and reaches into no
+// eager-loaded edge, which is deliberate: a query that wants its own
+// soft-deleted rows almost never wants its children's. This is the
+// opposite knob, and the narrow one — "load every comment on these
+// posts, including the deleted ones" is a report, and it should not
+// have to widen the posts to say so.
+//
+// It is the blunt instrument at the edge, exactly as Unscoped is at the
+// statement: it drops the target's default filters AND its context
+// filters, the tenant axis among them. An edge that only wants past one
+// named guard says so with Where and the predicate that undoes it.
+func (c *RelConfig) Unscoped() *RelConfig {
+	c.node.unscoped = true
 	return c
 }
 
@@ -547,6 +569,9 @@ func (f *FindBuilder) loadRelation(
 		}
 	} else {
 		childQuery := f.db.Select().From(rel.To).Where(In(targetKeyCol, rowKeys...))
+		if node.unscoped {
+			childQuery.Unscoped()
+		}
 		if rel.Kind == MorphManyKind {
 			childQuery.Where(Eq(rel.MorphTypeCol, rel.MorphType))
 		}
@@ -718,6 +743,9 @@ func (f *FindBuilder) loadManyToMany(
 
 	// Step 2: target query, narrowed/sorted by the node's constraints.
 	targetQuery := f.db.Select().From(rel.To).Where(In(rel.ChildKey, remoteKeys...))
+	if node.unscoped {
+		targetQuery.Unscoped()
+	}
 	if len(node.wheres) > 0 {
 		targetQuery.Where(node.wheres...)
 	}
@@ -954,9 +982,11 @@ func (f *FindBuilder) buildPerParentLimitedSQL(
 	// a per-parent cap to a load quietly widened it, handing back the
 	// soft-deleted and out-of-tenant children the same load returns
 	// correctly when it is uncapped.
-	for _, w := range rel.To.Filters() {
-		b.WriteString(" AND ")
-		w.WriteSQL(b)
+	if !node.unscoped {
+		for _, w := range rel.To.Filters() {
+			b.WriteString(" AND ")
+			w.WriteSQL(b)
+		}
 	}
 	for _, w := range node.wheres {
 		b.WriteString(" AND ")

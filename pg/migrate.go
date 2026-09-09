@@ -23,6 +23,16 @@ type Migration struct {
 	Name    string // human-readable label, used only for status output
 	Up      func(ctx context.Context, db *DB) error
 	Down    func(ctx context.Context, db *DB) error
+
+	// upSQL and downSQL are the migration's text, retained when it was
+	// registered through AddSQL or AddFS. Up and Down are closures by
+	// then and a closure cannot be read back, so a migrator that kept
+	// only them had nothing to hand the analyser — see
+	// [Migrator.WithSafetyGate]. A migration a caller built as a Go
+	// function has neither, and is exempt for the honest reason that
+	// there is no text to grade.
+	upSQL   string
+	downSQL string
 }
 
 // Status is a single row produced by Migrator.Status.
@@ -88,6 +98,7 @@ type Migrator struct {
 	after       []MigrationHook
 	lockTimeout time.Duration
 	noLock      bool
+	gate        safetyGate
 }
 
 // NewMigrator returns a migrator bound to db. Add migrations with Add /
@@ -99,6 +110,34 @@ func NewMigrator(db *DB) *Migrator {
 // WithTable overrides the migrations history table (default
 // DefaultMigrationsTable).
 func (m *Migrator) WithTable(name string) *Migrator { m.table = name; return m }
+
+// WithSafetyGate refuses to run a migration whose SQL the analyser
+// grades at min or worse, returning an [UnsafeMigrationError] naming
+// the migration and listing what it found. It wraps
+// [ErrUnsafeMigration].
+//
+// The whole run is graded before any of it is applied. That is the
+// difference between this gate and the one on [TreeMigrator], and the
+// reason is the shape of the two migrators: a linear run is a plan
+// somebody wrote as a sequence, so stopping in the middle of it leaves
+// a database between two states that the next deploy has to reason
+// about. Grading first means a refused run changes nothing at all —
+// the migration ahead of the offending one stays pending, and the fix
+// is a code change rather than a database state to recover from.
+//
+// A migration registered as a Go function carries no text and is not
+// analysed; see [Migration]. Down grades the rollback direction, which
+// is where the destructive half of a reversible migration usually
+// lives.
+func (m *Migrator) WithSafetyGate(min SafetySeverity) *Migrator {
+	m.gate = safetyGate{min: min, on: true}
+	return m
+}
+
+// gateName is how a refusal identifies a migration: the version and the
+// name, which is what the operator reads in Status and what the file is
+// called on disk.
+func gateName(mig Migration) string { return mig.Version + "_" + mig.Name }
 
 // ErrMigrationLocked is returned by Up and Down when another run holds
 // the migration lock and the wait configured by [Migrator.WithLockTimeout]
@@ -241,7 +280,7 @@ func (m *Migrator) runHooks(ctx context.Context, tx *DB, hooks []MigrationHook, 
 // AddSQL registers a migration whose Up and Down are raw SQL. downSQL may
 // be empty.
 func (m *Migrator) AddSQL(version, name, upSQL, downSQL string) *Migrator {
-	mig := Migration{Version: version, Name: name}
+	mig := Migration{Version: version, Name: name, upSQL: upSQL, downSQL: downSQL}
 	if upSQL != "" {
 		mig.Up = func(ctx context.Context, db *DB) error {
 			_, err := db.Exec(ctx, upSQL)
@@ -431,6 +470,19 @@ func (m *Migrator) up(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The whole pending run is graded first — see WithSafetyGate for
+	// why this migrator refuses before it applies rather than at each
+	// step. The loop is a no-op when no gate is installed.
+	if m.gate.on {
+		for _, mig := range migs {
+			if _, ok := applied[mig.Version]; ok {
+				continue
+			}
+			if err := m.gate.check(gateName(mig), mig.upSQL); err != nil {
+				return err
+			}
+		}
+	}
 	for _, mig := range migs {
 		if _, ok := applied[mig.Version]; ok {
 			continue
@@ -492,6 +544,12 @@ func (m *Migrator) down(ctx context.Context) error {
 	}
 	if target.Down == nil {
 		return fmt.Errorf("drops/pg: migration %s_%s is irreversible (no Down)", target.Version, target.Name)
+	}
+	// The destructive half of a reversible migration is usually the
+	// rollback: the up added a column and the down drops it, with
+	// whatever went into it since.
+	if err := m.gate.check(gateName(*target), target.downSQL); err != nil {
+		return err
 	}
 	return m.db.InTx(ctx, func(tx *DB) error {
 		if err := m.runHooks(ctx, tx, m.before, *target, DirectionDown); err != nil {

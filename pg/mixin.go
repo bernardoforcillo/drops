@@ -87,6 +87,14 @@ func (m *SoftDeleteMixin) Apply(t *Table) {
 	t.OnDelete(DeleteHookFunc(func(d *DeleteBuilder) drops.Expression {
 		upd := d.DB().Update(d.Table()).
 			Set(&exprBinding{col: deletedAt, expr: drops.Raw("now()")})
+		// The USING tables come along as the UPDATE's FROM tables: the
+		// join condition inherited from the DELETE's WHERE names them,
+		// so an UPDATE without them cannot resolve the relation — and
+		// one that carries them unscoped is a write filtered by another
+		// tenant's rows.
+		if using := d.UsingTables(); len(using) > 0 {
+			upd = upd.From(using...)
+		}
 		for _, w := range d.Wheres() {
 			upd = upd.Where(w)
 		}

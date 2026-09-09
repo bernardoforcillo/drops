@@ -609,6 +609,68 @@ func columnPath(c *Column) string {
 // under a tenant the ctx never named.
 //
 // Name equality is the weaker of the two tests and that is the point:
+// checkAxisAssignment refuses an UPDATE that assigns the table's tenant
+// axis to anything but the tenant the ctx already names.
+//
+// It is the write-side half of what the context filter does for reads,
+// and the asymmetry it closes is stark: the WHERE clause decides which
+// rows a statement may touch, and the SET list decides what they
+// become. A statement scoped correctly in the half a reviewer checks
+// could hand the row to another tenant in the half they do not —
+// UPDATE gadgets SET "tenantId" = 999 WHERE id = 7 AND "tenantId" = 3
+// finds exactly one row, the caller's own, and gives it away. It
+// succeeds, it reports one row affected, and nothing walks it back.
+//
+// The rules are [stampTenantColumn]'s, because the two are the same
+// question asked of an INSERT and of an UPDATE:
+//
+//   - the column is matched by the name it RENDERS, so a handle from
+//     another table object for a column of the same name is caught;
+//   - a bound value equal to the ctx tenant is a restatement and
+//     renders — the shape [Entity.Update] composes, having stamped the
+//     field from ctx one call earlier;
+//   - a bound value naming another tenant is refused;
+//   - an expression is refused rather than trusted: what it evaluates
+//     to is the server's answer, and a transfer written as arithmetic
+//     is still a transfer.
+//
+// A ctx with no tenant refuses any assignment to the axis at all. A
+// table that names its write axis and scopes its reads some other way
+// has no context filter to fail closed for it, so the SET list is where
+// that statement has to be stopped.
+//
+// [UpdateBuilder.Unscoped] is the opt-out, and it is the whole
+// statement's authority that changes: the WHERE clause loses the tenant
+// predicate in the same breath, so a statement that moves a row between
+// tenants — a migration, a merge of two accounts, an admin tool — is
+// writable here and says so where a reviewer reads it.
+func checkAxisAssignment(ctx context.Context, t *Table, sets []ColumnValue) error {
+	axis := t.tenantAxis()
+	if axis == nil {
+		return nil
+	}
+	for _, s := range sets {
+		if !namesAxis(s.column(), axis) {
+			continue
+		}
+		tenant, ok := TenantFrom(ctx)
+		if !ok {
+			return fmt.Errorf("%w: %s is assigned by this UPDATE", ErrTenantMissing, columnPath(axis))
+		}
+		bound, kind := classifyBinding(s)
+		if kind == bindingLiteral && sameTenant(bound, tenant) {
+			continue
+		}
+		if kind == bindingLiteral {
+			return fmt.Errorf("%w: %s is assigned another tenant's value; say Unscoped if the statement is meant to move the row",
+				ErrTenantMismatch, columnPath(axis))
+		}
+		return fmt.Errorf("%w: %s is assigned an expression drops cannot compare with the ctx tenant; assign a value, leave the column out, or say Unscoped",
+			ErrTenantMismatch, columnPath(axis))
+	}
+	return nil
+}
+
 // key equality implies it, since an alias copy keeps the declared
 // name, so nothing that matched before stops matching. Within one
 // table names are unique, so a column of the entity's own table that

@@ -73,6 +73,15 @@ func pushDriver(tables []liveTable, estimates map[string]int64, empty map[string
 				data = append(data, []any{t.name, est})
 			}
 			return []string{"relname", "reltuples"}, data, true
+		case strings.Contains(q, "relrowsecurity"):
+			// Introspect lists base tables from pg_class rather than
+			// from information_schema.tables, because relrowsecurity
+			// and extension membership have no counterpart there.
+			data := [][]any{}
+			for _, t := range tables {
+				data = append(data, []any{"public", t.name, false, false})
+			}
+			return []string{"nspname", "relname", "relrowsecurity", "relforcerowsecurity"}, data, true
 		case strings.Contains(q, "information_schema.tables"):
 			data := [][]any{}
 			for _, t := range tables {

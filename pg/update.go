@@ -23,6 +23,13 @@ type UpdateBuilder struct {
 	// resolved marks a builder resolveCtx has already produced, so a
 	// statement is not scoped twice. See SelectBuilder.resolved.
 	resolved bool
+
+	// hooked marks a builder whose SET list already carries what the
+	// table's UpdateHooks added. resolveCtx runs them, because what a
+	// hook assigns is part of the statement the axis check has to see
+	// and part of what the resolver has to walk; running them again at
+	// render time would assign each of them twice.
+	hooked bool
 }
 
 // Set adds one or more assignments. Use (*Col[T]).Val(v) to bind a typed
@@ -78,10 +85,10 @@ func (u *UpdateBuilder) IgnoreFilters(names ...string) *UpdateBuilder {
 // WriteSQL renders the UPDATE.
 func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 	sets := u.sets
-	if u.table.hasUpdateHooks() {
+	if !u.hooked && u.table.hasUpdateHooks() {
 		sets = u.applyUpdateHooks()
 	}
-	wheres := u.scope.apply(u.table, u.wheres, u.defaults)
+	wheres := u.scope.applyAll(u.namedTables(), u.wheres, u.defaults)
 	b.WriteString("UPDATE ")
 	u.table.writeFrom(b)
 	b.WriteString(" SET ")
@@ -110,6 +117,18 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString(" RETURNING ")
 		b.AppendList(", ", u.returning)
 	}
+}
+
+// namedTables is the target and every FROM table, in the order the
+// statement names them — the tables whose automatic predicates this
+// UPDATE carries. A FROM table's rows choose which of the target's rows
+// are rewritten, so its guards are as load-bearing as the target's.
+func (u *UpdateBuilder) namedTables() []*Table {
+	tables := make([]*Table, 0, len(u.from)+1)
+	if u.table != nil {
+		tables = append(tables, u.table)
+	}
+	return append(tables, u.from...)
 }
 
 // ToSQLCtx renders the statement ctx would send: the context filters of
@@ -145,9 +164,28 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	cp := *u
 	changed := false
 
+	// What a hook assigns is part of this statement: it reaches every
+	// UPDATE against the table, so an axis assignment made there is the
+	// same statement as one made at the call site, and a subquery
+	// assigned there is as much a statement as one written here.
+	sets := u.sets
+	if u.table.hasUpdateHooks() {
+		sets, cp.sets, cp.hooked, changed = u.applyUpdateHooks(), u.applyUpdateHooks(), true, true
+	}
+
+	// The SET list is the half of an UPDATE a tenant predicate does not
+	// reach: the WHERE clause says which rows may be touched, and the
+	// assignment says what they become — including, if nobody checks,
+	// somebody else's tenant.
+	if !u.scope.unscoped {
+		if err := checkAxisAssignment(ctx, u.table, sets); err != nil {
+			return nil, err
+		}
+	}
+
 	// The assigned value is an operand position like any other, and the
 	// one that decides what gets written rather than which rows do.
-	if r, err := resolveSets(ctx, u.sets); err != nil {
+	if r, err := resolveSets(ctx, sets); err != nil {
 		return nil, err
 	} else if r != nil {
 		cp.sets, changed = r, true
@@ -165,11 +203,7 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	}
 
 	if !u.scope.unscoped {
-		tables := make([]*Table, 0, len(u.from)+1)
-		if u.table != nil {
-			tables = append(tables, u.table)
-		}
-		tables = append(tables, u.from...)
+		tables := u.namedTables()
 		var preds []drops.Expression
 		for _, t := range tables {
 			// A FROM table is joined into the statement and its rows
@@ -248,7 +282,13 @@ func (u *UpdateBuilder) Exec(ctx context.Context) (drops.Result, error) {
 	if len(u.sets) == 0 && !u.table.hasUpdateHooks() {
 		return nil, ErrNoUpdateAssignments
 	}
-	sql, args := u.ToSQL()
+	// Through ToSQLCtx: the axis check and the context filters are the
+	// statement, and a check only ToSQLCtx made would be a check every
+	// caller in the readme walks past.
+	sql, args, err := u.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return u.db.Exec(ctx, sql, args...)
 }
 
@@ -257,7 +297,10 @@ func (u *UpdateBuilder) All(ctx context.Context, dest any) error {
 	if len(u.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := u.ToSQL()
+	sql, args, err := u.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := u.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err
@@ -270,7 +313,10 @@ func (u *UpdateBuilder) One(ctx context.Context, dest any) error {
 	if len(u.returning) == 0 {
 		return ErrReturningRequired
 	}
-	sql, args := u.ToSQL()
+	sql, args, err := u.ToSQLCtx(ctx)
+	if err != nil {
+		return err
+	}
 	rows, err := u.db.Query(ctx, sql, args...)
 	if err != nil {
 		return err

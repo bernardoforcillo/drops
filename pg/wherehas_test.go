@@ -375,7 +375,7 @@ func TestWhereHasReachesTheEntityFastPath(t *testing.T) {
 	}
 	ent := pg.NewEntity[author](s.authors)
 	scanned := 0
-	ent.SetFastScan(func(rows pg.Scanner, a *author) error {
+	ent.SetFastScan([]string{"id", "name"}, func(rows pg.Scanner, a *author) error {
 		scanned++
 		return rows.Scan(&a.ID, &a.Name)
 	})

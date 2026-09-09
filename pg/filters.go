@@ -100,25 +100,38 @@ func (s filterScope) ignores(name string) bool {
 // — in which case the render-time list is used, unchanged and byte for
 // byte. See resolvedDefaults.
 func (s filterScope) apply(t *Table, wheres []drops.Expression, defaults resolvedDefaults) []drops.Expression {
-	if t == nil || s.unscoped || !t.hasDefaultFilters() {
+	kept := s.filtersOf(t, defaults)
+	if len(kept) == 0 {
 		return wheres
+	}
+	return append(kept, wheres...)
+}
+
+// filtersOf returns the default filters of t that survive this
+// statement's opt-outs, restated for the instance of the table the
+// statement names.
+//
+// It is the one place that answers "which of this table's render-time
+// predicates apply here", so the renderers that place them differently
+// — a joined table's go in its ON clause, the FROM table's in the
+// WHERE — ask the same question and get the same answer.
+func (s filterScope) filtersOf(t *Table, defaults resolvedDefaults) []drops.Expression {
+	if t == nil || s.unscoped || !t.hasDefaultFilters() {
+		return nil
 	}
 	// Through the table's scope rather than off the table, so an alias
 	// applies the guards its table carries now, and restated so that
 	// the handles they were declared with resolve to this alias — see
 	// tableScope and resolveFilterExprs.
 	filters := defaults.of(t)
-	kept := make([]drops.Expression, 0, len(filters)+len(wheres))
+	kept := make([]drops.Expression, 0, len(filters))
 	for _, f := range filters {
 		if s.ignores(f.name) {
 			continue
 		}
 		kept = append(kept, f.pred)
 	}
-	if len(kept) == 0 {
-		return wheres
-	}
-	return append(kept, wheres...)
+	return kept
 }
 
 // applyAll is apply over every table the statement names, in the order

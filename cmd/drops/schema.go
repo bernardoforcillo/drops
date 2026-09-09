@@ -70,10 +70,37 @@ type bridgeRequest struct {
 	WithDown             bool       `json:"withDown,omitempty"`
 	DryRun               bool       `json:"dryRun,omitempty"`
 	DropUnmanagedIndexes bool       `json:"dropUnmanagedIndexes,omitempty"`
+	DropUnmanagedTables  bool       `json:"dropUnmanagedTables,omitempty"`
 
 	// Renames answers the rename questions generate or push would
 	// otherwise stop on. See rename.go.
 	Renames []bridgeRename `json:"renames,omitempty"`
+
+	// Allow answers the OTHER question a push can stop on: which of
+	// the changes that destroy data may run. It is separate from
+	// Renames because the two are different questions — whether a
+	// column is being renamed or dropped is about what the change
+	// MEANS, and whether a change that destroys data may run is about
+	// what may be DONE. See pg.PushOptions.Allow, and runPush for why
+	// one flag must not answer both.
+	Allow []bridgeDestructive `json:"allow,omitempty"`
+}
+
+// bridgeDestructive is one change that loses data, in the shape
+// pg.Destructive matches on: the operation, the table and the object.
+//
+// Rows, SQL and Suggestion are what Push REPORTS about the change and
+// are no part of the match — requiring a caller to reproduce a row
+// count would make a consent expire on the next INSERT. They travel on
+// the reply and are ignored on the request, which is what lets the CLI
+// hand a finding straight back as a consent.
+type bridgeDestructive struct {
+	Op         string `json:"op"`
+	Table      string `json:"table"`
+	Object     string `json:"object,omitempty"`
+	Rows       int64  `json:"rows,omitempty"`
+	SQL        string `json:"sql,omitempty"`
+	Suggestion string `json:"suggestion,omitempty"`
 }
 
 // bridgeRename is one answer, in the shape pg.RenameDecision has. An
@@ -142,6 +169,17 @@ type bridgePushResult struct {
 	// way.
 	RenameCandidates []bridgeCandidate `json:"renameCandidates,omitempty"`
 	RenameMessage    string            `json:"renameMessage,omitempty"`
+
+	// DataLoss is what this push destroys. On a refusal it is what
+	// nobody consented to, each entry carrying the statement withheld
+	// and the consent that would release it; on a push that ran it is
+	// what the consent authorised, so a log says what WAS destroyed
+	// rather than only that something was.
+	DataLoss []bridgeDestructive `json:"dataLoss,omitempty"`
+	// DataLossMessage is what drops/pg said about the refusal, passed
+	// through whole so the CLI reports the library's wording rather
+	// than a second version of it.
+	DataLossMessage string `json:"dataLossMessage,omitempty"`
 }
 
 type bridgeNotice struct {
@@ -363,6 +401,7 @@ type request struct {
 	WithDown             bool   ` + "`json:\"withDown\"`" + `
 	DryRun               bool   ` + "`json:\"dryRun\"`" + `
 	DropUnmanagedIndexes bool   ` + "`json:\"dropUnmanagedIndexes\"`" + `
+	DropUnmanagedTables  bool   ` + "`json:\"dropUnmanagedTables\"`" + `
 	Renames              []struct {
 		Kind     string ` + "`json:\"kind\"`" + `
 		Table    string ` + "`json:\"table\"`" + `
@@ -370,6 +409,11 @@ type request struct {
 		To       string ` + "`json:\"to\"`" + `
 		IsRename bool   ` + "`json:\"rename\"`" + `
 	} ` + "`json:\"renames\"`" + `
+	Allow []struct {
+		Op     string ` + "`json:\"op\"`" + `
+		Table  string ` + "`json:\"table\"`" + `
+		Object string ` + "`json:\"object\"`" + `
+	} ` + "`json:\"allow\"`" + `
 }
 
 func main() {
@@ -445,7 +489,9 @@ func run() error {
 			Safe:                 req.Safe,
 			DryRun:               req.DryRun,
 			DropUnmanagedIndexes: req.DropUnmanagedIndexes,
+			DropUnmanagedTables:  req.DropUnmanagedTables,
 			Renames:              decisions(req),
+			Allow:                consents(req),
 		})
 		if err != nil {
 			// Same as generate: a rename drops cannot settle is a
@@ -453,24 +499,34 @@ func run() error {
 			// arrives before anything was applied, so there is no
 			// half-done push behind it.
 			var amb *pg.RenameAmbiguityError
-			if !errors.As(err, &amb) {
-				return err
+			if errors.As(err, &amb) {
+				reply["push"] = map[string]any{
+					"statements": []string{}, "applied": false, "notices": []any{},
+					"renameCandidates": candidates(amb.Candidates), "renameMessage": amb.Error(),
+				}
+				break
 			}
-			reply["push"] = map[string]any{
-				"statements": []string{}, "applied": false, "notices": []any{},
-				"renameCandidates": candidates(amb.Candidates), "renameMessage": amb.Error(),
+			// A change that destroys data nobody consented to is the
+			// same shape of answer: the push ran, found what it would
+			// destroy, applied nothing, and is asking. The result
+			// carries the findings alongside the error — see
+			// pg.PushResult.DataLoss — so the CLI can print what each
+			// one costs and what would release it, instead of the
+			// operator reading a sentence through two layers of
+			// "program exited 1".
+			if errors.Is(err, pg.ErrDestructivePush) && res != nil {
+				reply["push"] = map[string]any{
+					"statements": res.Statements, "applied": false,
+					"notices":  notices(res.Notices),
+					"dataLoss": destructives(res.DataLoss), "dataLossMessage": err.Error(),
+				}
+				break
 			}
-			break
-		}
-		notices := make([]map[string]any, 0, len(res.Notices))
-		for _, n := range res.Notices {
-			notices = append(notices, map[string]any{
-				"rule": n.Rule, "table": n.Table, "object": n.Object,
-				"message": n.Message, "sql": n.SQL,
-			})
+			return err
 		}
 		reply["push"] = map[string]any{
-			"statements": res.Statements, "applied": res.Applied, "notices": notices,
+			"statements": res.Statements, "applied": res.Applied, "notices": notices(res.Notices),
+			"dataLoss": destructives(res.DataLoss),
 		}
 
 	default:
@@ -493,6 +549,44 @@ func decisions(req request) []pg.RenameDecision {
 				To:    r.To,
 			},
 			IsRename: r.IsRename,
+		})
+	}
+	return out
+}
+
+// consents turns the request's Allow list into what pg.Push matches on.
+func consents(req request) []pg.Destructive {
+	out := make([]pg.Destructive, 0, len(req.Allow))
+	for _, a := range req.Allow {
+		out = append(out, pg.Destructive{
+			Op: pg.DestructiveOp(a.Op), Table: a.Table, Object: a.Object,
+		})
+	}
+	return out
+}
+
+// destructives renders what a push destroyed, or would have, for the
+// reply. The row count travels with each one: the CLI prints it, and
+// "~12 rows" is the difference between a change an operator waves
+// through and one they read twice.
+func destructives(in []pg.Destructive) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, d := range in {
+		out = append(out, map[string]any{
+			"op": string(d.Op), "table": d.Table, "object": d.Object,
+			"rows": d.Rows, "sql": d.SQL, "suggestion": d.Suggestion,
+		})
+	}
+	return out
+}
+
+// notices renders the schema notices for the reply.
+func notices(in []pg.SchemaNotice) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, n := range in {
+		out = append(out, map[string]any{
+			"rule": n.Rule, "table": n.Table, "object": n.Object,
+			"message": n.Message, "sql": n.SQL,
 		})
 	}
 	return out

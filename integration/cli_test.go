@@ -685,7 +685,11 @@ func Schema() *pg.Schema { return pg.NewSchema(Users, Posts) }
 		t.Fatalf("a second push wanted to change something:\n%s", stdout)
 	}
 
-	// Dropping a table from the schema is a destructive push.
+	// A table the schema stops naming is not dropped, and it is not
+	// silently ignored either: push says it is there and that it left
+	// it alone. Two gates stand between a schema edit and a dropped
+	// table, and they ask different questions — whether this table is
+	// drops' to manage at all, and whether the rows in it may go.
 	p.schema(`package schema
 
 import "github.com/bernardoforcillo/drops/pg"
@@ -699,6 +703,23 @@ var (
 func Schema() *pg.Schema { return pg.NewSchema(Users) }
 `)
 	stdout, _, code := p.run("push", "--schema", "./schema")
+	if code != 0 {
+		t.Fatalf("push exited %d, want 0: a table nobody declared is a notice, not a refusal", code)
+	}
+	if !strings.Contains(stdout, "unmanaged-table") || !strings.Contains(stdout, "posts") {
+		t.Errorf("push did not say it was leaving the table alone:\n%s", stdout)
+	}
+	// And it must not claim the two agree while saying that.
+	if strings.Contains(stdout, "already matches") {
+		t.Errorf("push reported a match and a difference in the same breath:\n%s", stdout)
+	}
+	if !tableExists(t, db, "posts") {
+		t.Fatal("a table the schema does not declare was dropped anyway")
+	}
+
+	// The first gate: this table IS drops' to manage. The second still
+	// stands, because the table holds rows.
+	stdout, _, code = p.run("push", "--schema", "./schema", "--drop-unmanaged-tables")
 	if code != 3 {
 		t.Fatalf("push exited %d, want 3 (refused)", code)
 	}
@@ -709,7 +730,8 @@ func Schema() *pg.Schema { return pg.NewSchema(Users) }
 		t.Fatal("the refused push dropped the table anyway")
 	}
 
-	p.mustRun("push", "--schema", "./schema", "--allow-destructive")
+	// Both answered.
+	p.mustRun("push", "--schema", "./schema", "--drop-unmanaged-tables", "--allow-destructive")
 	if tableExists(t, db, "posts") {
 		t.Fatal("posts survived a push that was allowed to drop it")
 	}

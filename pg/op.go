@@ -122,7 +122,11 @@ func joinPreds(sep, empty string, preds []drops.Expression) drops.Expression {
 		// intact.
 		return preds[0]
 	}
-	return listOp("(", sep, ")", preds)
+	bracketed := make([]drops.Expression, len(preds))
+	for i, p := range preds {
+		bracketed[i] = bracketOperand(p)
+	}
+	return listOp("(", sep, ")", bracketed)
 }
 
 // Not negates a predicate. A nil predicate is the empty conjunction,
@@ -131,7 +135,7 @@ func Not(p drops.Expression) drops.Expression {
 	if p == nil {
 		p = And()
 	}
-	return &opExpr{parts: []string{"(NOT ", ")"}, operands: []drops.Expression{p}}
+	return &opExpr{parts: []string{"(NOT ", ")"}, operands: []drops.Expression{bracketOperand(p)}}
 }
 
 // Set membership -------------------------------------------------------
@@ -191,6 +195,83 @@ func Between(left, low, high any) drops.Expression {
 			operandExpr(left), operandExpr(low), operandExpr(high),
 		},
 	}
+}
+
+// bracketOperand wraps e in parentheses when its rendering could
+// re-associate with what is written beside it.
+//
+// A conjunction joins its operands with a bare " AND ", and SQL binds
+// AND tighter than OR — so a caller's drops.Raw("a OR b") AND-ed with a
+// tenant guard rendered "a OR b AND (tenantId = $1)", which is
+// "a OR (b AND guard)": every row matching "a" came back, for every
+// tenant. NOT was worse, binding tighter than either, so NOT over the
+// same operand negated only its first term.
+//
+// What escapes is decided by rendering the operand and looking at the
+// shape, not by its Go type: every predicate this package builds is
+// already a bracketed term and renders unchanged, and everything a
+// caller can hand in — a Raw, an expression of their own — is bracketed
+// on the way in. The render is of the operand alone and its text is
+// thrown away; only the shape is read.
+func bracketOperand(e drops.Expression) drops.Expression {
+	if e == nil || !escapesItsBrackets(e) {
+		return e
+	}
+	return parens(e)
+}
+
+// escapesItsBrackets reports whether e's rendering can reach past
+// itself: a boolean operator at depth zero, which re-associates with
+// whatever is written beside it, or a comment or statement break, which
+// swallows it.
+//
+// Depth zero is the whole question. "(a OR b)" is one term and renders
+// unchanged; "a OR b" is two, and AND-ed with a guard it becomes
+// "a OR (b AND guard)". An EXISTS or a comparison has no boolean
+// operator of its own to re-associate with and is left exactly as it
+// was, which is what keeps every statement this package already
+// rendered rendering byte for byte.
+func escapesItsBrackets(e drops.Expression) bool {
+	sql, _ := drops.String(e)
+	depth, quote := 0, byte(0)
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ';':
+			return true
+		case '-':
+			if depth == 0 && i+1 < len(sql) && sql[i+1] == '-' {
+				return true
+			}
+		case '/':
+			if depth == 0 && i+1 < len(sql) && sql[i+1] == '*' {
+				return true
+			}
+		case ' ':
+			if depth != 0 {
+				continue
+			}
+			rest := sql[i:]
+			for _, op := range []string{" or ", " and "} {
+				if len(rest) >= len(op) && strings.EqualFold(rest[:len(op)], op) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // --- Nodes -------------------------------------------------------------

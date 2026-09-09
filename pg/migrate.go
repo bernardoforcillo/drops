@@ -224,7 +224,7 @@ func withMigrationLock(ctx context.Context, db *DB, key int64, name string, time
 	}
 	if _, err := holder.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", key); err != nil {
 		if isLockTimeout(err) {
-			return fmt.Errorf("drops/pg: waited %s for the migration lock on %s (key %d): %w",
+			return fmt.Errorf("waited %s for the migration lock on %s (key %d): %w",
 				timeout, name, key, ErrMigrationLocked)
 		}
 		return err

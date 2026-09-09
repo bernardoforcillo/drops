@@ -329,7 +329,7 @@ func (s *SelectBuilder) checkFullJoins() error {
 		if j.kind != fullJoin {
 			continue
 		}
-		for _, t := range append(s.fromTables(), j.table) {
+		for _, t := range append([]*Table{j.table}, s.fromTables()...) {
 			if !t.hasContextFilters() {
 				continue
 			}
@@ -385,6 +385,14 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 	if s.resolved {
 		return s, nil
 	}
+	// One WITH clause cannot declare a name twice, and a set operation
+	// hoists every operand's CTEs into one — so the conflict is checked
+	// here, at the step every executor goes through, rather than at
+	// render time, which cannot return an error.
+	if err := s.checkCTENames(); err != nil {
+		return nil, err
+	}
+
 	// The named filters this statement bypasses, for the length of
 	// this resolution: a nested statement installs its own at the top
 	// of its own resolveCtx, so IgnoreFilters reaches no further than
@@ -796,7 +804,13 @@ func writeAnd(b *drops.Builder, preds []drops.Expression) {
 		if i > 0 {
 			b.WriteString(" AND ")
 		}
-		b.Append(p)
+		if len(preds) == 1 {
+			// Nothing to re-associate with: a lone predicate renders
+			// exactly as it always did, brackets and all or neither.
+			b.Append(p)
+			continue
+		}
+		b.Append(bracketOperand(p))
 	}
 }
 

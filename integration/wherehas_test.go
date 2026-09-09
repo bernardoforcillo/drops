@@ -596,7 +596,12 @@ func TestPGWhereHasAndTheTenantAxis(t *testing.T) {
 	// dave   org 1, one book — belonging to org 2
 	// gil    org 1, one org-1 book, soft-deleted
 	// eve    org 2, one org-2 book
-	if _, err := db.Insert(authors).
+	// Unscoped, because the seed spans tenants on purpose: it builds
+	// the world the assertions then read through ONE of them. Every
+	// INSERT into a table with a write axis needs a tenant on its ctx
+	// — see Table.ScopeWritesByTenant — and saying Unscoped is how a
+	// cross-tenant write says so where a reviewer reads it.
+	if _, err := db.Insert(authors).Unscoped().
 		Row(authorOrg.Val(int64(1)), authorName.Val("alice")).
 		Row(authorOrg.Val(int64(1)), authorName.Val("dave")).
 		Row(authorOrg.Val(int64(1)), authorName.Val("gil")).
@@ -605,14 +610,14 @@ func TestPGWhereHasAndTheTenantAxis(t *testing.T) {
 		t.Fatalf("seed authors: %v", err)
 	}
 	var all []whTenantedAuthor
-	if err := db.Select().From(authors).OrderBy(authorID.Asc()).All(ctx, &all); err != nil {
+	if err := db.Select().From(authors).Unscoped().OrderBy(authorID.Asc()).All(ctx, &all); err != nil {
 		t.Fatalf("read authors: %v", err)
 	}
 	id := map[string]int64{}
 	for _, a := range all {
 		id[a.Name] = a.ID
 	}
-	if _, err := db.Insert(books).
+	if _, err := db.Insert(books).Unscoped().
 		Row(bookOrg.Val(int64(1)), bookAuthorID.Val(id["alice"]), bookTitle.Val("alice-1")).
 		Row(bookOrg.Val(int64(2)), bookAuthorID.Val(id["dave"]), bookTitle.Val("dave-other-org")).
 		Row(bookOrg.Val(int64(1)), bookAuthorID.Val(id["gil"]), bookTitle.Val("gil-doomed")).
@@ -620,7 +625,7 @@ func TestPGWhereHasAndTheTenantAxis(t *testing.T) {
 		Exec(ctx); err != nil {
 		t.Fatalf("seed books: %v", err)
 	}
-	if _, err := db.Update(books).
+	if _, err := db.Update(books).Unscoped().
 		Set(bookDeletedAt.Val(time.Now())).
 		Where(bookTitle.Eq("gil-doomed")).
 		Exec(ctx); err != nil {

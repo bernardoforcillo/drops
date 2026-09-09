@@ -83,7 +83,7 @@ func TestPGPushDropsEveryDependentShapeInOneMigration(t *testing.T) {
 	pg.Add(notesAfter, pg.BigInt("legacyId"))
 
 	pushDeps(t, db, pg.NewSchema(orgsAfter, usersAfter, membershipsAfter, notesAfter),
-		pg.PushOptions{DropUnmanagedObjects: true})
+		pg.PushOptions{DropUnmanagedObjects: true, DropUnmanagedTables: true})
 
 	if cols := columnsOf(t, db, "users"); cols["email"] != "" || cols["age"] != "" ||
 		cols["a"] != "" || cols["owner"] != "" || cols["orgCode"] != "" || cols["b"] == "" {

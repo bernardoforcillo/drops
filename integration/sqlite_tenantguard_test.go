@@ -171,8 +171,8 @@ func TestATenantGuardRefusesAPostWhoseAuthorBelongsToAnotherTenant(t *testing.T)
 
 	posts := sqlite.NewTable("gd_posts")
 	sqlite.Add(posts, sqlite.BigInt("id").PrimaryKey())
-	authorID := sqlite.Add(posts, sqlite.BigInt("authorId"))
-	sqlite.Add(posts, sqlite.Text("body"))
+	authorID := sqlite.Add(posts, sqlite.BigInt("authorId").NotNull())
+	sqlite.Add(posts, sqlite.Text("body").NotNull())
 	postTenant := sqlite.Add(posts, sqlite.Text("tenantId").NotNull())
 	posts.ScopeWritesByTenant(postTenant)
 

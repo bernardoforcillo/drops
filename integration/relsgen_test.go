@@ -92,8 +92,11 @@ func relsgenTables(t *testing.T, db *pg.DB) relsgenFixture {
 	f.TagID = pg.Add(f.Tags, pg.BigSerial("id").PrimaryKey())
 	f.TagLabel = pg.Add(f.Tags, pg.Text("label").NotNull())
 
-	f.PostTagPostID = pg.Add(f.PostTags, pg.BigInt("post_id").NotNull())
-	f.PostTagTagID = pg.Add(f.PostTags, pg.BigInt("tag_id").NotNull())
+	// The pair is the key, as it is in schemagen.PostTags — mustMirror
+	// below is what holds the two in step, and it is what noticed when
+	// the generated one gained the key and this had not.
+	f.PostTagPostID = pg.Add(f.PostTags, pg.BigInt("post_id").PrimaryKey())
+	f.PostTagTagID = pg.Add(f.PostTags, pg.BigInt("tag_id").PrimaryKey())
 
 	f.NoteID = pg.Add(f.Notes, pg.BigSerial("id").PrimaryKey())
 	f.NoteBody = pg.Add(f.Notes, pg.Text("body").NotNull())

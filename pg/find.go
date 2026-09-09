@@ -565,7 +565,10 @@ func (f *FindBuilder) loadRelation(
 	// at most node.limit children — drizzle's
 	// "with: { posts: { limit: N } }" shape.
 	if expectsSlice && node.limit > 0 {
-		sql, args := f.buildPerParentLimitedSQL(rel, targetKeyCol, rowKeys, node)
+		sql, args, err := f.buildPerParentLimitedSQL(ctx, rel, targetKeyCol, rowKeys, node)
+		if err != nil {
+			return none, nil, err
+		}
 		rows, err := f.db.Query(ctx, sql, args...)
 		if err != nil {
 			return none, nil, err
@@ -698,10 +701,16 @@ func (f *FindBuilder) loadManyToMany(
 
 	// Step 1: junction query. Defer Close so every exit path frees the
 	// cursor, including panics and the targetKeyField lookup below.
-	junctionRows, err := f.db.Select(rel.ThroughFK1, rel.ThroughFK2).
+	junction := f.db.Select(rel.ThroughFK1, rel.ThroughFK2).
 		From(rel.Through).
-		Where(In(rel.ThroughFK1, rowKeys...)).
-		Rows(ctx)
+		Where(In(rel.ThroughFK1, rowKeys...))
+	if node.unscoped {
+		// The junction is half of this edge: widening the edge and
+		// leaving the join table scoped would return the children the
+		// caller asked for through a membership they may not see.
+		junction.Unscoped()
+	}
+	junctionRows, err := junction.Rows(ctx)
 	if err != nil {
 		return none, nil, err
 	}
@@ -938,8 +947,21 @@ func coerceSlice(src reflect.Value, dstType reflect.Type) reflect.Value {
 // semantics. The extra _rn column is discarded by scanAll since
 // no struct field matches the name.
 func (f *FindBuilder) buildPerParentLimitedSQL(
-	rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
-) (sql string, args []any) {
+	ctx context.Context, rel *Relation, targetKeyCol *Column, rowKeys []any, node *relNode,
+) (sql string, args []any, err error) {
+	// The child table's context filters, resolved for this request.
+	// The uncapped path gets them from the executor it goes out
+	// through; this writer builds its statement by hand and reaches no
+	// executor, so adding a per-parent cap to a load used to widen it
+	// to every tenant's children — the one shape where asking for FEWER
+	// rows returned rows from further away.
+	var ctxPreds []drops.Expression
+	if !node.unscoped {
+		ctxPreds, err = rel.To.resolveContextFilters(ctx)
+		if err != nil {
+			return "", nil, err
+		}
+	}
 	b := drops.NewBuilder()
 	b.WriteString("SELECT * FROM (SELECT ")
 	cols := rel.To.Columns()
@@ -994,6 +1016,10 @@ func (f *FindBuilder) buildPerParentLimitedSQL(
 			w.WriteSQL(b)
 		}
 	}
+	for _, w := range ctxPreds {
+		b.WriteString(" AND ")
+		w.WriteSQL(b)
+	}
 	for _, w := range node.wheres {
 		b.WriteString(" AND ")
 		w.WriteSQL(b)
@@ -1002,7 +1028,8 @@ func (f *FindBuilder) buildPerParentLimitedSQL(
 	b.AddArg(node.offset)
 	b.WriteString(" AND _rn <= ")
 	b.AddArg(node.offset + node.limit)
-	return b.SQL()
+	sql, args = b.SQL()
+	return sql, args, nil
 }
 
 // relationKeyField returns the index path of the struct field that maps
@@ -1153,6 +1180,9 @@ func (f *FindBuilder) loadMorphTo(
 				rel.Name, b.entry.table.Name())
 		}
 		q := f.db.Select().From(b.entry.table).Where(In(targetPK, ids...))
+		if node.unscoped {
+			q.Unscoped()
+		}
 		if len(node.wheres) > 0 {
 			q.Where(node.wheres...)
 		}

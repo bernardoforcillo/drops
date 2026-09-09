@@ -271,7 +271,12 @@ func escapesItsBrackets(e drops.Expression) bool {
 			}
 		}
 	}
-	return false
+	// Quoting or bracketing this could not follow to the end: where
+	// the term stops is then a question about escape conventions the
+	// server settles and this does not, so it is bracketed. Being
+	// wrong in this direction costs a pair of parentheses; being wrong
+	// in the other costs the predicate beside it.
+	return depth != 0 || quote != 0
 }
 
 // --- Nodes -------------------------------------------------------------

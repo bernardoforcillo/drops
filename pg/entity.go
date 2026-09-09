@@ -745,6 +745,12 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
+		// Every row, as Create stamps its one: a bulk write is the
+		// same write repeated, and a row carrying somebody else's
+		// tenant is refused here rather than bound.
+		if err := e.stampTenant(ctx, &rs[i]); err != nil {
+			return nil, err
+		}
 		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
@@ -770,6 +776,12 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rs []T) (drops.Resul
 		return nil, ErrNoRowsToInsert
 	}
 	for i := range rs {
+		// Every row, as Create stamps its one: a bulk write is the
+		// same write repeated, and a row carrying somebody else's
+		// tenant is refused here rather than bound.
+		if err := e.stampTenant(ctx, &rs[i]); err != nil {
+			return nil, err
+		}
 		if err := e.runValidators(&rs[i]); err != nil {
 			return nil, err
 		}
@@ -1336,7 +1348,10 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 		applyBudgetLimit(q.fb.Select(), q.e.budget.MaxRows)
 	}
 	if q.e.budget.MaxArgs > 0 {
-		_, args := q.fb.Select().ToSQL()
+		_, args, err := q.fb.Select().ToSQLCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
 		if err := q.e.checkArgs(args); err != nil {
 			return nil, err
 		}
@@ -1385,7 +1400,14 @@ func (q *EntityQuery[T]) cacheable() bool {
 }
 
 func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
-	sql, args := q.fb.Select().ToSQL()
+	// The RESOLVED statement, because that is the one the server sees:
+	// the tenant axis and the authorisation guard arrive as context
+	// filters, so a key taken from ToSQL is the same key for every
+	// tenant — one customer's rows answered from another's entry.
+	sql, args, err := q.fb.Select().ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	key, ok, err := q.cacheKey(ctx, sql, args)
 	if err != nil {
 		return nil, err
@@ -1426,7 +1448,10 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 }
 
 func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
-	sql, args := q.fb.Select().ToSQL()
+	sql, args, err := q.fb.Select().ToSQLCtx(ctx)
+	if err != nil {
+		return *new(T), err
+	}
 	base, ok, err := q.cacheKey(ctx, sql, args)
 	if err != nil {
 		return *new(T), err

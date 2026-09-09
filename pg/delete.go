@@ -34,12 +34,12 @@ func (d *DeleteBuilder) Wheres() []drops.Expression {
 	return append([]drops.Expression(nil), d.wheres...)
 }
 
-// UsingTables returns a copy of the USING list — exposed for the same
+// usingTables returns a copy of the USING list — exposed for the same
 // reason [DeleteBuilder.Wheres] is: a hook that rewrites the statement
 // has to carry them, and a rewrite that drops them leaves a WHERE
 // clause naming a relation the new statement no longer has (42P01), or
 // worse, one it silently no longer filters.
-func (d *DeleteBuilder) UsingTables() []*Table {
+func (d *DeleteBuilder) usingTables() []*Table {
 	return append([]*Table(nil), d.using...)
 }
 

@@ -92,7 +92,7 @@ func (m *SoftDeleteMixin) Apply(t *Table) {
 		// so an UPDATE without them cannot resolve the relation — and
 		// one that carries them unscoped is a write filtered by another
 		// tenant's rows.
-		if using := d.UsingTables(); len(using) > 0 {
+		if using := d.usingTables(); len(using) > 0 {
 			upd = upd.From(using...)
 		}
 		for _, w := range d.Wheres() {

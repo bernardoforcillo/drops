@@ -67,9 +67,12 @@ func wantRefused(t *testing.T, err error, fragment string) {
 	}
 }
 
-// scalar reads a one-column, one-row result. drops has no QueryRow, and
-// every assertion below that counts rows needs one.
-func scalar(t *testing.T, db *sqlite.DB, sql string, dest any) {
+// scalarInto reads a one-column, one-row result into dest. drops has no
+// QueryRow, and every assertion below that counts rows needs one.
+//
+// It is not called scalar: cli_test.go declares one of that name over a
+// *pg.DB, in this same test package, and the two cannot both be it.
+func scalarInto(t *testing.T, db *sqlite.DB, sql string, dest any) {
 	t.Helper()
 	rows, err := db.Query(context.Background(), sql)
 	if err != nil {
@@ -143,7 +146,7 @@ func TestATenantGuardRefusesRawStatementsDropsNeverSaw(t *testing.T) {
 	wantRefused(t, err, `"gd_raw"."tenantId" is null`)
 
 	var rows int64
-	scalar(t, db, `SELECT count(*) FROM "gd_raw"`, &rows)
+	scalarInto(t, db, `SELECT count(*) FROM "gd_raw"`, &rows)
 	if rows != 1 {
 		t.Fatalf("table holds %d rows, want 1: a refused statement wrote something", rows)
 	}
@@ -410,7 +413,7 @@ func TestReplaceDestroysAnotherTenantsRowWithoutFiringTheDeleteGuard(t *testing.
 	ctx := context.Background()
 
 	var recursive int64
-	scalar(t, db, `PRAGMA recursive_triggers`, &recursive)
+	scalarInto(t, db, `PRAGMA recursive_triggers`, &recursive)
 	if recursive != 0 {
 		t.Fatalf("recursive_triggers = %d; this test is about the DEFAULT, which is off", recursive)
 	}
@@ -440,7 +443,7 @@ func TestReplaceDestroysAnotherTenantsRowWithoutFiringTheDeleteGuard(t *testing.
 			"must change: %v", err)
 	}
 	var tenant string
-	scalar(t, db, `SELECT "tenantId" FROM "gd_repl" WHERE "id" = 1`, &tenant)
+	scalarInto(t, db, `SELECT "tenantId" FROM "gd_repl" WHERE "id" = 1`, &tenant)
 	if tenant != "acme" {
 		t.Fatalf("tenant = %q, want acme: the REPLACE did not take the row over", tenant)
 	}
@@ -566,7 +569,7 @@ func TestAGuardAbortsTheStatementAndNotTheTransaction(t *testing.T) {
 	}
 
 	var n int64
-	scalar(t, db, `SELECT count(*) FROM "gd_abort"`, &n)
+	scalarInto(t, db, `SELECT count(*) FROM "gd_abort"`, &n)
 	if n != 2 {
 		t.Fatalf("committed %d rows, want 2 (the two that were not refused)", n)
 	}
@@ -639,7 +642,7 @@ func TestAlterTableAddsANamedCheckAndNothingElse(t *testing.T) {
 
 	// It adds no column, whatever the ADD COLUMN grammar would suggest.
 	var cols int64
-	scalar(t, db, `SELECT count(*) FROM pragma_table_info('gd_alter')`, &cols)
+	scalarInto(t, db, `SELECT count(*) FROM pragma_table_info('gd_alter')`, &cols)
 	if cols != 2 {
 		t.Fatalf("table has %d columns, want 2: ADD CONSTRAINT added one", cols)
 	}
@@ -753,7 +756,7 @@ func TestARebuildDropsTheGuardAndDiffReplaysIt(t *testing.T) {
 		t.Fatalf("drop: %v", err)
 	}
 	var left int64
-	scalar(t, db, `SELECT count(*) FROM sqlite_master WHERE "type" = 'trigger'`, &left)
+	scalarInto(t, db, `SELECT count(*) FROM sqlite_master WHERE "type" = 'trigger'`, &left)
 	if left != 0 {
 		t.Fatalf("%d triggers survived DROP TABLE, want 0", left)
 	}
@@ -828,7 +831,7 @@ func TestAGuardOverPreexistingViolationsIsAcceptedAndTheRowsCannotBeRepairedInPl
 		t.Fatalf("preflight bound args: %s %v", text, args)
 	}
 	var violating int64
-	scalar(t, db, text, &violating)
+	scalarInto(t, db, text, &violating)
 	if violating != 2 {
 		t.Fatalf("preflight counted %d violating rows, want 2", violating)
 	}
@@ -837,7 +840,7 @@ func TestAGuardOverPreexistingViolationsIsAcceptedAndTheRowsCannotBeRepairedInPl
 	applyGuard(t, db, sqlite.CreateTenantGuard(sqlite.TenantGuardFor(docs)))
 
 	var left int64
-	scalar(t, db, `SELECT count(*) FROM "gd_pre" WHERE "tenantId" IS NULL`, &left)
+	scalarInto(t, db, `SELECT count(*) FROM "gd_pre" WHERE "tenantId" IS NULL`, &left)
 	if left != 2 {
 		t.Fatalf("%d violating rows survived the guard, want 2", left)
 	}
@@ -856,7 +859,7 @@ func TestAGuardOverPreexistingViolationsIsAcceptedAndTheRowsCannotBeRepairedInPl
 		t.Fatalf("re-inserting the repaired row was refused: %v", err)
 	}
 
-	scalar(t, db, text, &violating)
+	scalarInto(t, db, text, &violating)
 	if violating != 1 {
 		t.Fatalf("preflight counts %d after one repair, want 1", violating)
 	}
@@ -912,7 +915,7 @@ func TestDroppingAGuardRepairingAndRecreatingItInOneTransaction(t *testing.T) {
 	}
 
 	var left int64
-	scalar(t, db, `SELECT count(*) FROM "gd_repair" WHERE "tenantId" IS NULL`, &left)
+	scalarInto(t, db, `SELECT count(*) FROM "gd_repair" WHERE "tenantId" IS NULL`, &left)
 	if left != 0 {
 		t.Fatalf("%d rows still violate the guard after the repair", left)
 	}
@@ -946,7 +949,7 @@ func TestTheViolationsThatCanBeRepairedInPlace(t *testing.T) {
 	pinChecks := sqlite.TenantGuardViolations(pin)
 	pinText, _ := drops.StringWithDialect(sqlite.Dialect, pinChecks[0].Count)
 	var violating int64
-	scalar(t, db, pinText, &violating)
+	scalarInto(t, db, pinText, &violating)
 	if violating != 2 {
 		t.Fatalf("preflight counted %d rows a pin would refuse, want 2", violating)
 	}
@@ -956,7 +959,7 @@ func TestTheViolationsThatCanBeRepairedInPlace(t *testing.T) {
 	if _, err := db.Exec(ctx, `UPDATE "gd_pin_repair" SET "tenantId" = 'acme'`); err != nil {
 		t.Fatalf("repairing under a pinned guard was refused: %v", err)
 	}
-	scalar(t, db, pinText, &violating)
+	scalarInto(t, db, pinText, &violating)
 	if violating != 0 {
 		t.Fatalf("%d rows still violate the pin after the repair", violating)
 	}
@@ -990,7 +993,7 @@ func TestTheViolationsThatCanBeRepairedInPlace(t *testing.T) {
 		t.Fatalf("rendered %d checks for a guard with a parent link, want 2", len(parentCheck))
 	}
 	parentText, _ := drops.StringWithDialect(sqlite.Dialect, parentCheck[1].Count)
-	scalar(t, db, parentText, &violating)
+	scalarInto(t, db, parentText, &violating)
 	if violating != 1 {
 		t.Fatalf("preflight counted %d disagreeing rows, want 1", violating)
 	}
@@ -1002,7 +1005,7 @@ func TestTheViolationsThatCanBeRepairedInPlace(t *testing.T) {
 	if _, err := db.Exec(ctx, `UPDATE "gd_par_posts" SET "authorId" = 1 WHERE "id" = 11`); err != nil {
 		t.Fatalf("repointing the foreign key at a parent in the same tenant was refused: %v", err)
 	}
-	scalar(t, db, parentText, &violating)
+	scalarInto(t, db, parentText, &violating)
 	if violating != 0 {
 		t.Fatalf("%d rows still disagree with their parent after the repair", violating)
 	}

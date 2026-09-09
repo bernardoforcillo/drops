@@ -161,6 +161,12 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	if u.resolved {
 		return u, nil
 	}
+	// The named filters this statement bypasses, for the length of
+	// this resolution: a nested statement installs its own at the top
+	// of its own resolveCtx, so IgnoreFilters reaches no further than
+	// the statement that said it.
+	ctx = withIgnoredFilters(ctx, u.scope)
+
 	cp := *u
 	changed := false
 
@@ -177,7 +183,7 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	// reach: the WHERE clause says which rows may be touched, and the
 	// assignment says what they become — including, if nobody checks,
 	// somebody else's tenant.
-	if !u.scope.unscoped {
+	if !u.scope.dropsContextFilters() {
 		if err := checkAxisAssignment(ctx, u.table, sets); err != nil {
 			return nil, err
 		}
@@ -202,7 +208,7 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 		cp.returning, changed = r, true
 	}
 
-	if !u.scope.unscoped {
+	if !u.scope.dropsContextFilters() {
 		tables := u.namedTables()
 		var preds []drops.Expression
 		for _, t := range tables {

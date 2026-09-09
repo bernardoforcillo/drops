@@ -728,7 +728,8 @@ func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 			// The filter closes over the entity, not over the column,
 			// so there is one source of truth: whatever tenantPredicate
 			// answers is what the statement carries.
-			e.table.setContextFilter(rowScopeFilterKey(e.rowType, "tenant"), e.tenantPredicate)
+			e.table.setNamedContextFilter(
+				rowScopeFilterKey(e.rowType, "tenant"), FilterTenant, e.tenantPredicate)
 			// The write-side half of the same axis. A predicate scopes
 			// the statements that have a WHERE clause; an INSERT has
 			// none, so what it needs is the column to stamp — see

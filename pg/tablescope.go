@@ -123,7 +123,43 @@ func appendShared[T any](list []T, v T) []T {
 // race in the plain sense.
 type ctxFilter struct {
 	key string
-	fn  ContextFilterFunc
+	// name is the public filter name this one can be bypassed by —
+	// [FilterTenant] for the axis [Entity.ScopeByTenant] registers, and
+	// empty for a filter registered through the exported ContextFilter,
+	// which nothing but Unscoped drops. It is separate from key because
+	// the key identifies the REGISTRATION (so re-declaring replaces)
+	// and the name identifies the GUARANTEE (so a query can step around
+	// that one and keep the rest).
+	name string
+	fn   ContextFilterFunc
+}
+
+// ignoredFiltersKey carries, on the ctx, the named filters the
+// statement being resolved is bypassing.
+//
+// It travels on the ctx rather than as an argument because
+// resolveContextFilters is reached through the tables a statement
+// names, and its signature is what the self-check pins. Each
+// statement's resolveCtx installs its OWN set at the top, so a nested
+// statement replaces its parent's rather than inheriting it — which is
+// what keeps IgnoreFilters statement-local, exactly as Unscoped is.
+type ignoredFiltersKey struct{}
+
+// withIgnoredFilters returns the ctx to resolve one statement's context
+// filters under.
+func withIgnoredFilters(ctx context.Context, s filterScope) context.Context {
+	return context.WithValue(ctx, ignoredFiltersKey{}, s.ignored)
+}
+
+// ignoresFilterName reports whether the statement being resolved named
+// this filter in IgnoreFilters.
+func ignoresFilterName(ctx context.Context, name string) bool {
+	if name == "" {
+		return false
+	}
+	ignored, _ := ctx.Value(ignoredFiltersKey{}).(map[string]struct{})
+	_, ok := ignored[name]
+	return ok
 }
 
 // ContextFilterFunc builds a predicate from the request context. It
@@ -217,6 +253,23 @@ func (t *Table) setContextFilter(key string, fn ContextFilterFunc) {
 	t.scope.ctxFilters = appendShared(t.scope.ctxFilters, ctxFilter{key: key, fn: fn})
 }
 
+// setNamedContextFilter is setContextFilter for a filter a query may
+// bypass by name — the tenant axis, which [EntityQuery.IgnoreFilters]
+// drops with pg.FilterTenant while leaving every other guard standing.
+func (t *Table) setNamedContextFilter(key, name string, fn ContextFilterFunc) {
+	t.setContextFilter(key, fn)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	next := make([]ctxFilter, len(t.scope.ctxFilters))
+	copy(next, t.scope.ctxFilters)
+	for i := range next {
+		if next[i].key == key {
+			next[i].name = name
+		}
+	}
+	t.scope.ctxFilters = next
+}
+
 // ctxFilterList returns the table's request-scoped filters through the
 // shared scope, so an alias resolves the axis its table carries now
 // rather than the one it carried when As was called. See [Table.As] for
@@ -307,6 +360,13 @@ func (t *Table) resolveContextFilters(ctx context.Context) ([]drops.Expression, 
 	}
 	out := make([]drops.Expression, 0, len(filters))
 	for _, f := range filters {
+		// Named and bypassed by this statement: skipped BEFORE it is
+		// called, because a filter that refuses for want of a tenant
+		// would otherwise refuse the very cross-tenant read the caller
+		// asked for by name.
+		if ignoresFilterName(ctx, f.name) {
+			continue
+		}
 		e, err := f.fn(inner)
 		if err != nil {
 			return nil, err

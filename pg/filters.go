@@ -60,8 +60,23 @@ type tableFilter struct {
 // names existed.
 type filterScope struct {
 	unscoped bool
-	ignored  map[string]struct{}
+	// keepCtx says that unscoped means the table's DECLARATION-time
+	// filters only, and that the request-time ones still apply.
+	//
+	// It is what separates [EntityQuery.Unscoped] from
+	// [SelectBuilder.Unscoped]. "Include the soft-deleted rows" is the
+	// thing callers reach for, and on the entity path it must not also
+	// mean "and every other tenant's": an entity is the typed, scoped
+	// surface, so the axis survives an opt-out aimed at the guards. The
+	// raw builder's Unscoped stays the blunt instrument it documents
+	// itself as.
+	keepCtx bool
+	ignored map[string]struct{}
 }
+
+// dropsContextFilters reports whether this statement's opt-out reaches
+// the request-time filters as well as the render-time ones.
+func (s filterScope) dropsContextFilters() bool { return s.unscoped && !s.keepCtx }
 
 // ignore records names this statement bypasses. An unknown name is
 // kept rather than rejected — the builder may not know its table yet,

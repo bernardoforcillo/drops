@@ -136,6 +136,12 @@ func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) 
 	if d.resolved {
 		return d, nil
 	}
+	// The named filters this statement bypasses, for the length of
+	// this resolution: a nested statement installs its own at the top
+	// of its own resolveCtx, so IgnoreFilters reaches no further than
+	// the statement that said it.
+	ctx = withIgnoredFilters(ctx, d.scope)
+
 	cp := *d
 	changed := false
 
@@ -151,7 +157,7 @@ func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) 
 		cp.returning, changed = r, true
 	}
 
-	if !d.scope.unscoped {
+	if !d.scope.dropsContextFilters() {
 		tables := d.namedTables()
 		var preds []drops.Expression
 		for _, t := range tables {

@@ -107,6 +107,15 @@ func (s *SelectBuilder) ForUpdate() *SelectBuilder { s.forUpdate = true; return 
 // stepping around with IgnoreFilters.
 func (s *SelectBuilder) Unscoped() *SelectBuilder { s.scope.unscoped = true; return s }
 
+// UnscopedDefaults drops the table's declaration-time filters and keeps
+// its request-time ones — see filterScope.keepCtx. It is what the typed
+// entity surface means by Unscoped, and it is not what the raw builder
+// means: here the blunt instrument stays blunt.
+func (s *SelectBuilder) UnscopedDefaults() *SelectBuilder {
+	s.scope.unscoped, s.scope.keepCtx = true, true
+	return s
+}
+
 // IgnoreFilters bypasses the named global filters on the FROM table
 // and leaves every other one in place:
 //
@@ -230,14 +239,48 @@ func (s *SelectBuilder) ExceptAll(other *SelectBuilder) *SelectBuilder {
 // WriteSQL renders the SELECT into a Builder. Wrapped in parentheses so
 // the same builder can be embedded as a subquery.
 func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
-	writeCTEs(b, s.ctes, s.recursiveCTE)
+	// Through hoistCTEs, so a CTE declared on an operand reaches the
+	// single WITH clause a set operation is allowed. Rendering only
+	// s.ctes left the operand referring to a name the statement never
+	// declared — and hoistCTEs, which already existed, was called by
+	// the name check and by nothing that renders.
+	ctes, recursive := s.hoistCTEs()
+	writeCTEs(b, ctes, recursive)
 	s.writeCore(b)
 	for _, op := range s.setOps {
 		b.WriteByte(' ')
 		b.WriteString(op.kind)
 		b.WriteByte(' ')
-		op.right.writeCore(b)
+		op.right.writeSetOperand(b)
 	}
+}
+
+// writeSetOperand renders one operand of a set operation.
+//
+// writeCore alone was wrong for two shapes and silently so.
+// A.Union(B.Union(C)) sent "A UNION B" — C simply missing from the
+// result, no error anywhere — because writeCore renders no set
+// operations of its own. And an operand carrying LIMIT rendered it
+// bare, where it binds to the whole set operation rather than to the
+// operand: "A UNION B LIMIT 10" caps the union, which is a different
+// query from the one that caps B.
+//
+// Parentheses are written only when there is something to contain, so
+// the ordinary two-operand union renders exactly as it always did.
+func (s *SelectBuilder) writeSetOperand(b *drops.Builder) {
+	if len(s.setOps) == 0 && s.limit == nil && s.offset == nil {
+		s.writeCore(b)
+		return
+	}
+	b.WriteByte('(')
+	s.writeCore(b)
+	for _, op := range s.setOps {
+		b.WriteByte(' ')
+		b.WriteString(op.kind)
+		b.WriteByte(' ')
+		op.right.writeSetOperand(b)
+	}
+	b.WriteByte(')')
 }
 
 // ErrFullJoinScoped is returned when a FULL JOIN would have to carry a
@@ -255,6 +298,28 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 // where a reviewer reads them next to the join.
 var ErrFullJoinScoped = errors.New("drops/pg: a FULL JOIN has nowhere to put a table's context filters")
 
+// fromTables is the FROM side of the statement: the table From named,
+// and every table comma-joined to it through FromExpr.
+//
+// A comma join is an inner join written another way, so a table there
+// carries its predicates exactly as the FROM table does — and takes the
+// same placement, since under a RIGHT JOIN the whole comma-joined
+// product is the preserved side. A FromExpr holding anything else — a
+// subquery, a CTE reference — is a statement or an opaque expression
+// and is reached by the resolver rather than by this.
+func (s *SelectBuilder) fromTables() []*Table {
+	out := make([]*Table, 0, len(s.fromExprs)+1)
+	if s.from != nil {
+		out = append(out, s.from)
+	}
+	for _, e := range s.fromExprs {
+		if t, ok := e.(*Table); ok {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // checkFullJoins refuses the shape ErrFullJoinScoped describes. Only
 // context filters count: a default filter is rendered by WriteSQL and
 // has been landing in the WHERE clause since long before this, so
@@ -264,7 +329,7 @@ func (s *SelectBuilder) checkFullJoins() error {
 		if j.kind != fullJoin {
 			continue
 		}
-		for _, t := range []*Table{s.from, j.table} {
+		for _, t := range append(s.fromTables(), j.table) {
 			if !t.hasContextFilters() {
 				continue
 			}
@@ -320,6 +385,12 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 	if s.resolved {
 		return s, nil
 	}
+	// The named filters this statement bypasses, for the length of
+	// this resolution: a nested statement installs its own at the top
+	// of its own resolveCtx, so IgnoreFilters reaches no further than
+	// the statement that said it.
+	ctx = withIgnoredFilters(ctx, s.scope)
+
 	cp := *s
 	changed := false
 
@@ -413,17 +484,20 @@ func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) 
 	// see [SelectBuilder.Unscoped], which is the blunt instrument. It
 	// is also the documented way past the FULL JOIN refusal, which is
 	// why that check lives inside this branch.
-	if !s.scope.unscoped {
+	if !s.scope.dropsContextFilters() {
 		if err := s.checkFullJoins(); err != nil {
 			return nil, err
 		}
-		tables := make([]*Table, 0, len(s.joins)+1)
-		if s.from != nil {
-			tables = append(tables, s.from)
-		}
-		ctxFrom, err := s.from.resolveContextFilters(ctx)
-		if err != nil {
-			return nil, err
+		tables := s.fromTables()
+		var ctxFrom []drops.Expression
+		for _, t := range tables {
+			// Every table on the FROM side, in the order the statement
+			// names them: From's own and each one comma-joined to it.
+			preds, err := t.resolveContextFilters(ctx)
+			if err != nil {
+				return nil, err
+			}
+			ctxFrom = append(ctxFrom, preds...)
 		}
 		if len(ctxFrom) > 0 {
 			cp.ctxFrom, changed = ctxFrom, true
@@ -559,10 +633,14 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 	}
 	// Where each table's automatic predicates go — see filterPlacement.
 	fromOn := s.filterPlacement()
-	fromPreds := append(s.scope.filtersOf(s.from, s.defaults), s.ctxFrom...)
+	var fromDefaults []drops.Expression
+	for _, t := range s.fromTables() {
+		fromDefaults = append(fromDefaults, s.scope.filtersOf(t, s.defaults)...)
+	}
+	fromPreds := append(append([]drops.Expression(nil), fromDefaults...), s.ctxFrom...)
 	var defaults, ctxPreds []drops.Expression
 	if fromOn < 0 {
-		defaults = append(defaults, s.scope.filtersOf(s.from, s.defaults)...)
+		defaults = append(defaults, fromDefaults...)
 		ctxPreds = append(ctxPreds, s.ctxFrom...)
 	}
 	for i, j := range s.joins {

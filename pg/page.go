@@ -117,20 +117,9 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 	// — the tenant axis and the authorisation guard both narrow which
 	// rows may appear on it, and a page that skipped them handed the
 	// caller another tenant's rows with a cursor to walk more of them.
-	tenantPred, err := p.e.tenantPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if tenantPred != nil {
-		sel.Where(tenantPred)
-	}
-	guardPred, err := p.e.guardPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if guardPred != nil {
-		sel.Where(guardPred)
-	}
+	// Both reach it as context filters on the table, resolved by the
+	// executor this SELECT goes out through: injecting them here as
+	// well would bind the tenant twice.
 	for _, w := range p.wheres {
 		sel.Where(w)
 	}

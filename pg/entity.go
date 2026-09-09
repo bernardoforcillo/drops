@@ -637,27 +637,17 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	}
 	ctx, cancel := e.budgetCtx(ctx)
 	defer cancel()
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return *new(T), err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return *new(T), err
-	}
-	if e.cache != nil && tenantPred == nil && guardPred == nil {
+	// The tenant axis and the authorisation guard are context filters
+	// on the table now, and the executors resolve them — nothing
+	// injects them here. Two places building the same predicate
+	// eventually disagree, and the way they disagree is that one of
+	// them stops being applied to a path somebody added later.
+	if e.cache != nil && !e.hasRowScope() {
 		return e.getCached(db, ctx, key, pred)
 	}
 	var out T
 	if e.fastScan != nil {
-		sel := db.Select().From(e.table).Where(pred)
-		if tenantPred != nil {
-			sel.Where(tenantPred)
-		}
-		if guardPred != nil {
-			sel.Where(guardPred)
-		}
-		err := e.scanOneFast(ctx, sel, &out)
+		err := e.scanOneFast(ctx, db.Select().From(e.table).Where(pred), &out)
 		return out, err
 	}
 	// Get addresses a row by primary key and has no vocabulary for
@@ -666,12 +656,6 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	// Query(db) is the strict-checked path — see strict.go.
 	fb := db.Find(e.table).Where(pred)
 	fb.strict = false
-	if tenantPred != nil {
-		fb.Where(tenantPred)
-	}
-	if guardPred != nil {
-		fb.Where(guardPred)
-	}
 	err = fb.One(ctx, &out)
 	return out, err
 }
@@ -849,12 +833,6 @@ func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 	// Reaching straight for the SelectBuilder used to skip both, which
 	// made a batch job or an export the one way to read every tenant's
 	// rows at once without asking.
-	if err := q.applyTenantOnFB(ctx); err != nil {
-		return err
-	}
-	if err := q.applyGuardOnFB(ctx); err != nil {
-		return err
-	}
 	sel := q.fb.Select()
 	if q.e.HasFastScan() {
 		// Stream reads through the fast scanner, so it owes the
@@ -1031,6 +1009,16 @@ func (e *Entity[T]) createWith(db *DB, ctx context.Context, r *T, bindings []Col
 // out of scope for now; callers needing finer control use db.Update
 // directly.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
+	// Before the validators and before anything is bound. This writes
+	// every mapped column of the row, the tenant axis among them, and
+	// what the struct carries there came from wherever the caller got
+	// it — a form, a JSON body, another request. Stamping makes the
+	// assignment a restatement of the ctx tenant, which is what
+	// checkAxisAssignment then lets through, and refuses a row that
+	// already carries somebody else's.
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	if err := e.runValidators(r); err != nil {
 		return err
 	}
@@ -1039,14 +1027,6 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 		return ErrPKNotSet
 	}
 	pred, err := e.pkPredicate(e.pkValuesOf(r))
-	if err != nil {
-		return err
-	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	guardPred, err := e.guardPredicate(ctx)
 	if err != nil {
 		return err
 	}
@@ -1084,12 +1064,6 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 			return errors.New("drops/pg: Update has no fields to set")
 		}
 		upd.Where(pred)
-		if tenantPred != nil {
-			upd.Where(tenantPred)
-		}
-		if guardPred != nil {
-			upd.Where(guardPred)
-		}
 		if e.versionCol != nil {
 			curVer := v.FieldByIndex(e.versionField).Interface()
 			upd.Where(Eq(e.versionCol, curVer))
@@ -1141,23 +1115,9 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
-	tenantPred, err := e.tenantPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
-	guardPred, err := e.guardPredicate(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var res drops.Result
 	doDelete := func(tx *DB) error {
 		del := tx.Delete(e.table).Where(pred)
-		if tenantPred != nil {
-			del.Where(tenantPred)
-		}
-		if guardPred != nil {
-			del.Where(guardPred)
-		}
 		r, derr := del.Exec(ctx)
 		if derr != nil {
 			return derr
@@ -1251,38 +1211,6 @@ func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 	return &EntityQuery[T]{e: e, fb: db.Find(e.table)}
 }
 
-// applyTenantOnFB injects the tenant predicate on q.fb when the
-// entity is scoped. Helper used by All / One / Stream / Page.
-func (q *EntityQuery[T]) applyTenantOnFB(ctx context.Context) error {
-	// A query that named FilterTenant asked for the cross-tenant read
-	// explicitly, ctx tenant or not — so this must come before
-	// tenantPredicate, which errors when the ctx carries none.
-	if q.fb.ignoresFilter(FilterTenant) {
-		return nil
-	}
-	tenantPred, err := q.e.tenantPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	if tenantPred != nil {
-		q.fb.Where(tenantPred)
-	}
-	return nil
-}
-
-// applyGuardOnFB injects the authorisation predicate on q.fb
-// when the entity is guarded.
-func (q *EntityQuery[T]) applyGuardOnFB(ctx context.Context) error {
-	guardPred, err := q.e.guardPredicate(ctx)
-	if err != nil {
-		return err
-	}
-	if guardPred != nil {
-		q.fb.Where(guardPred)
-	}
-	return nil
-}
-
 // Where appends predicates joined by AND.
 func (q *EntityQuery[T]) Where(preds ...drops.Expression) *EntityQuery[T] {
 	q.fb.Where(preds...)
@@ -1371,7 +1299,7 @@ func (q *EntityQuery[T]) LoadRel(rel *Relation, fn func(*RelConfig)) *EntityQuer
 // accident this API exists to prevent. Drop it by naming it —
 // IgnoreFilters(pg.FilterTenant).
 func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] {
-	q.fb.Unscoped()
+	q.fb.UnscopedDefaults()
 	return q
 }
 
@@ -1402,12 +1330,6 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	}
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
-	if err := q.applyTenantOnFB(ctx); err != nil {
-		return nil, err
-	}
-	if err := q.applyGuardOnFB(ctx); err != nil {
-		return nil, err
-	}
 	if q.e.budget.MaxRows > 0 {
 		// Apply the row-cap LIMIT before rendering. Honour the
 		// user's tighter Limit by leaving it alone.
@@ -1441,12 +1363,6 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 	}
 	ctx, cancel := q.e.budgetCtx(ctx)
 	defer cancel()
-	if err := q.applyTenantOnFB(ctx); err != nil {
-		return *new(T), err
-	}
-	if err := q.applyGuardOnFB(ctx); err != nil {
-		return *new(T), err
-	}
 	if q.cacheable() {
 		return q.oneCached(ctx)
 	}

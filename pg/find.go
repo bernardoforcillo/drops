@@ -232,6 +232,12 @@ func (f *FindBuilder) Offset(n int64) *FindBuilder { f.sel.Offset(n); return f }
 // independently.
 func (f *FindBuilder) Unscoped() *FindBuilder { f.sel.Unscoped(); return f }
 
+// UnscopedDefaults drops the table's declaration-time filters and
+// leaves its request-time ones — the tenant axis, an authorisation
+// guard — standing. It is what [EntityQuery.Unscoped] means by
+// unscoped; see filterScope.keepCtx.
+func (f *FindBuilder) UnscopedDefaults() *FindBuilder { f.sel.UnscopedDefaults(); return f }
+
 // IgnoreFilters bypasses the named global filters on the root table
 // and leaves every other one standing — see
 // [SelectBuilder.IgnoreFilters]. Eager-loaded relations keep their own

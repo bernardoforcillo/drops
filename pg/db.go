@@ -255,6 +255,12 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 // hints on ctx (see [WithPlanHints]) are prepended for the same
 // reason and at the same point.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	// Before the span opens and before anything reaches the driver: a
+	// statement that cannot be sent should be reported by the call
+	// that built it, not by the protocol. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = hintStatement(ctx, drops.TagStatement(ctx, sql))
 	spanCtx, span := db.startSpan(ctx, "drops.exec")
 	span.SetAttribute(AttrSystem, AttrSystemPG)
@@ -288,6 +294,12 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 // trailing comment and plan hints prepended as a leading one, as in
 // [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	// Before the span opens and before anything reaches the driver: a
+	// statement that cannot be sent should be reported by the call
+	// that built it, not by the protocol. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = hintStatement(ctx, drops.TagStatement(ctx, sql))
 	spanCtx, span := db.startSpan(ctx, "drops.query")
 	span.SetAttribute(AttrSystem, AttrSystemPG)

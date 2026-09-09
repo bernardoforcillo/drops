@@ -22,6 +22,7 @@ ClickHouse and Qdrant.
 | [Vector search](vector-search.md) | One query vocabulary over pgvector, ClickHouse and Qdrant. |
 | [OLTP → OLAP → vector](mirror.md) | Keeping one table mirrored across all three, without three schema declarations. |
 | [Change data capture](cdc.md) | Reading the write-ahead log instead of asking every writer to write twice — and the slot that fills your disk if you look away. |
+| [Tenancy](tenancy.md) | The predicate that cannot be forgotten: where it is declared, which clause it lands in, and the four things the test suite enforces about it. |
 | [Caching](caching.md) | Why a query cache needs more than a TTL, and the one rule that makes topic invalidation safe. |
 | [Query plans](plans.md) | Measuring how selective a predicate is, hinting the planner, and holding the plan to a test. |
 | [Running it](operations.md) | The SQLSTATEs that mean "do something else", draining a node for failover, durable jobs, and results that will not fit in memory. |

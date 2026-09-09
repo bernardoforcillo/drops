@@ -160,6 +160,12 @@ func (db *DB) Delete(t *Table) *DeleteBuilder { return &DeleteBuilder{db: db, ta
 // a trailing comment before anything else looks at it, so the hook and
 // the server both report the same statement text.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	// Before anything reaches the driver: a statement that cannot be
+	// sent should be reported by the call that built it, not by the
+	// server. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = drops.TagStatement(ctx, sql)
 	start := time.Now()
 	res, err := db.drv.Exec(ctx, sql, args...)
@@ -173,6 +179,12 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 // Query runs a statement that returns rows. Query tags on ctx are
 // appended as a trailing comment, as in [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	// Before anything reaches the driver: a statement that cannot be
+	// sent should be reported by the call that built it, not by the
+	// server. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = drops.TagStatement(ctx, sql)
 	start := time.Now()
 	rows, err := db.drv.Query(ctx, sql, args...)

@@ -47,6 +47,13 @@ helpers, money and PII types.
 
 Use it unless you have a reason not to.
 
+Four of those — bulk `CopyFrom`, `Subscribe` and the LISTEN/NOTIFY
+change feed, pool metrics, and connection acquisition — are optional
+driver interfaces rather than SQL, and `database/sql` cannot express
+any of them. Connect through `drops/pgxdriver` instead of
+`drops/stdlib` and they answer; see [Which driver you connect
+with](operations.md#which-driver-you-connect-with).
+
 ## SQLite
 
 Close behind, and the right choice for tests, embedded use and small

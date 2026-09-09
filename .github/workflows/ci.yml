@@ -29,6 +29,8 @@ jobs:
         working-directory: cmd/drops
       - run: go mod tidy
         working-directory: integration
+      - run: go mod tidy
+        working-directory: pgxdriver
       # Whole-tree diff: the root module has no external deps, so its
       # go.sum does not exist — naming it explicitly errored with "no
       # such path". A bare diff still catches any go.mod (or go.sum)
@@ -174,6 +176,39 @@ jobs:
         # servers are already paid for by then.
         run: go test ./... -race -count=1 -v
 
+  # ── the pgx driver module ────────────────────────────────────────────
+  # pgxdriver is a module of its own so pgx does not reach the build of
+  # a user on MySQL, SQLite or ClickHouse. It is not in the root ./... ,
+  # so without this job it would compile for the first time in the
+  # integration job — after the servers have been paid for and started.
+  #
+  # Its own tests need no server: what they assert is that drops/pg
+  # FINDS the four optional interfaces, which is a property of the type.
+  # The ones that need a server are in the integration module, where the
+  # servers are.
+  pgxdriver:
+    name: pgx driver module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+          cache: true
+      - name: vet
+        run: go vet ./...
+        working-directory: pgxdriver
+      - name: build
+        run: go build ./...
+        working-directory: pgxdriver
+      - name: test
+        run: go test ./... -count=1
+        working-directory: pgxdriver
+      - name: race
+        run: go test ./... -race -count=1
+        working-directory: pgxdriver
+
   # ── fuzzing ──────────────────────────────────────────────────────────
   # Every `go test` runs a fuzz target's SEED corpus, which is how the
   # nasty-name fixtures are checked. It does not run the fuzzer, so the
@@ -243,6 +278,8 @@ jobs:
         working-directory: cmd/drops
       - run: staticcheck ./...
         working-directory: integration
+      - run: staticcheck ./...
+        working-directory: pgxdriver
 
   golangci-lint:
     name: golangci-lint
@@ -274,6 +311,13 @@ jobs:
         with:
           version: latest
           working-directory: integration
+      # The fourth module, named for the same reason the third was: a
+      # linter's coverage should not depend on which directories
+      # somebody remembered.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: pgxdriver
 
   # ── security ─────────────────────────────────────────────────────────
   govulncheck:
@@ -300,3 +344,7 @@ jobs:
         working-directory: cmd/drops
       - run: govulncheck ./...
         working-directory: integration
+      # And the driver, which is the module a user's own build links
+      # pgx through — so an advisory against pgx lands here first.
+      - run: govulncheck ./...
+        working-directory: pgxdriver

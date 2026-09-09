@@ -146,6 +146,20 @@ To use the bundled `database/sql` adapter (`drops/stdlib`) you also need
 a driver — for PostgreSQL, `github.com/jackc/pgx/v5/stdlib`; for
 ClickHouse, `github.com/ClickHouse/clickhouse-go/v2`.
 
+On PostgreSQL there is a second adapter, `drops/pgxdriver`, which wraps
+a `*pgxpool.Pool` directly. It is a module of its own, so it costs a
+separate `go get` and adds nothing to a build that does not import it:
+
+```sh
+go get github.com/bernardoforcillo/drops/pgxdriver
+```
+
+It is what makes `pg.CopyFrom`, `pg.Subscribe` / the LISTEN-NOTIFY
+change feed, `pg.StartPoolMetrics` and `pg.ConnAcquirer` answer —
+optional interfaces `database/sql` structurally cannot satisfy. See
+[which driver you connect
+with](docs/operations.md#which-driver-you-connect-with).
+
 ## Documentation
 
 The [docs](docs/) directory has the explanations: a
@@ -527,8 +541,14 @@ type Driver interface {
 ```
 
 `drops` itself imports no concrete driver. The `stdlib` subpackage
-adapts `*sql.DB`; you can write your own adapter for `pgx.Pool` or
-anything else in a few dozen lines.
+adapts `*sql.DB` and the `pgxdriver` module adapts `*pgxpool.Pool`;
+you can write your own adapter for anything else in a few dozen lines.
+
+A driver may also satisfy optional interfaces — `pg.Copier`,
+`pg.Listener`, `pg.PoolStatsProvider`, `pg.ConnAcquirer`,
+`pg.LogicalStreamer` — which `pg` duck-types for at the call site
+rather than requiring up front. `pgxdriver` implements the first four;
+a `database/sql` driver cannot.
 
 ### Building queries
 
@@ -1607,6 +1627,7 @@ drops/cache/memcached/       Memcached cache backend (own ASCII client)
 drops/cache/tiered/          two-level L1+L2 read-through cache
 drops/otel/                  OpenTelemetry spans + metrics from Hook
 drops/stdlib/                database/sql adapter
+drops/pgxdriver/             pgx adapter (own module): COPY, LISTEN, pool stats, conn acquire
 drops/cmd/drops/             the CLI: generate, migrate, push, drift, pull, baseline, status (own module — links pgx)
 drops/examples/cli/          a schema package shaped the way the CLI expects
 drops/examples/sqlgen/       no-deps SQL-generation demo (pg)

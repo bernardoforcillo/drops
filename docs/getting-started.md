@@ -44,6 +44,40 @@ directly.
 Connection pooling, timeouts and TLS stay where they already are, in
 the driver. drops does not wrap them.
 
+On PostgreSQL there is a second adapter, and which one you pick decides
+whether four features work at all:
+
+```go
+import (
+    "github.com/jackc/pgx/v5/pgxpool"
+
+    "github.com/bernardoforcillo/drops/pg"
+    "github.com/bernardoforcillo/drops/pgxdriver"
+)
+
+pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+if err != nil {
+    return err
+}
+defer pool.Close()
+
+db := pg.New(pgxdriver.New(pool))
+```
+
+`pgxdriver` additionally satisfies `pg.Copier`, `pg.Listener`,
+`pg.PoolStatsProvider` and `pg.ConnAcquirer` — the optional interfaces
+`pg` probes for, and the ones `database/sql` has no way to express. Bulk
+`pg.CopyFrom`, `pg.Subscribe` and the LISTEN/NOTIFY change feed, and
+`pg.StartPoolMetrics` need them; everything else is identical through
+either adapter. It is a separate module, so `drops` itself still pulls
+in nothing:
+
+```sh
+go get github.com/bernardoforcillo/drops/pgxdriver
+```
+
+See [Which driver you connect with](operations.md#which-driver-you-connect-with).
+
 ## Declare a schema
 
 A table is a variable, and so is every column:

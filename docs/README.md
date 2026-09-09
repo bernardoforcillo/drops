@@ -25,7 +25,7 @@ ClickHouse and Qdrant.
 | [Tenancy](tenancy.md) | The predicate that cannot be forgotten: where it is declared, which clause it lands in, and the four things the test suite enforces about it. |
 | [Caching](caching.md) | Why a query cache needs more than a TTL, and the one rule that makes topic invalidation safe. |
 | [Query plans](plans.md) | Measuring how selective a predicate is, hinting the planner, and holding the plan to a test. |
-| [Running it](operations.md) | The SQLSTATEs that mean "do something else", draining a node for failover, durable jobs, and results that will not fit in memory. |
+| [Running it](operations.md) | The SQLSTATEs that mean "do something else", draining a node for failover, durable jobs, results that will not fit in memory, and which driver you have to connect through for COPY and LISTEN to answer. |
 | [Testing](testing.md) | The two suites, why the second exists, and which of your tests belongs in which. |
 | [`drops lint`](lint.md) | Three query mistakes caught at build time, and the false-positive story for each. |
 

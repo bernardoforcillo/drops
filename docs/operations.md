@@ -317,6 +317,68 @@ temporary file at commit time, before the first row is read. Worth it
 for a slow consumer writing each batch to a remote API; not worth it
 for a fast local one.
 
+## Which driver you connect with
+
+Four of the things on this page are optional interfaces `pg` probes the
+driver for, not methods on `drops.Driver`. Whether they answer depends
+entirely on what you passed to `pg.New`:
+
+| | `drops/stdlib` over `*sql.DB` | `drops/pgxdriver` over `*pgxpool.Pool` |
+|---|---|---|
+| Queries, entities, transactions | ✅ | ✅ |
+| `pg.CopyFrom` (bulk load) | `ErrCopyNotSupported` | ✅ |
+| `pg.Subscribe`, LISTEN/NOTIFY change feed | `ErrListenNotSupported` | ✅ |
+| `pg.StartPoolMetrics` | `database/sql`'s own `DBStats` | pgx's, for the pool the statements go through |
+| `pg.ConnAcquirer` (queue-time, pinned work) | — | ✅ |
+| SQLSTATE, constraint name, retry classes | ✅ | ✅ |
+| Dependency | whatever driver you already registered | pgx v5 |
+
+Nothing in that list is a translation layer: it is what `database/sql`
+structurally cannot express. `COPY FROM STDIN` is not a statement it can
+send. `LISTEN` needs one connection held open and read from, which is
+the one thing a pool of interchangeable connections will not promise.
+So the second column is not a faster first column — it is the reason
+four shipped features have anything to run on.
+
+```go
+import (
+    "github.com/jackc/pgx/v5/pgxpool"
+
+    "github.com/bernardoforcillo/drops/pg"
+    "github.com/bernardoforcillo/drops/pgxdriver"
+)
+
+pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+if err != nil {
+    return err
+}
+defer pool.Close()
+
+db := pg.New(pgxdriver.New(pool))
+```
+
+`pgxdriver` is its own module, so importing `drops` does not pull pgx
+into a build that does not want it:
+
+```sh
+go get github.com/bernardoforcillo/drops/pgxdriver
+```
+
+The pool stays yours. `pgxdriver.New` does not close it, does not
+configure it, and does not touch its timeouts — pooling, TLS and
+connection limits stay where you set them, in `pgxpool.Config`.
+
+Errors are unchanged either way. `pg` reads a SQLSTATE from anything
+exposing `SQLState()` and a constraint name from `*pgconn.PgError`,
+which pgx returns natively, so `pg.IsUniqueViolation`, the retry
+classes above and the constraint-name errors behave identically
+through both drivers.
+
+**A nested `Begin` is a savepoint.** pgx has real nested transactions,
+so `db.InTx` inside `db.InTx` gives you `SAVEPOINT` / `ROLLBACK TO`
+rather than a second top-level transaction. That is what you want, and
+it is worth knowing when reading a query log.
+
 ## A note on composing the wrappers
 
 Three of these are `drops.Driver` wrappers and the order matters:

@@ -13,8 +13,17 @@ import (
 // COPY is typically 10–50× faster than INSERT.
 //
 // drops imports no concrete driver, so the COPY path is opt-in via
-// duck typing on drops.Driver. The pgx stdlib bridge exposes
-// CopyFrom on its Conn; adapt it in ~10 lines:
+// duck typing on drops.Driver. database/sql cannot express COPY at
+// all, so a *sql.DB behind drops/stdlib will never satisfy Copier.
+// The drops/pgxdriver module does — it is the shipped answer:
+//
+//	pool, _ := pgxpool.New(ctx, dsn)
+//	db := pg.New(pgxdriver.New(pool))
+//
+//	n, err := pg.CopyFrom(db, ctx, UserEntity, rows)
+//
+// Another pool can satisfy it in about ten lines, since pgx does the
+// work:
 //
 //	type pgxCopier struct { conn *pgx.Conn }
 //	func (c pgxCopier) Copy(ctx context.Context, table string,
@@ -23,14 +32,10 @@ import (
 //	        pgx.CopyFromRows(rows))
 //	}
 //
-// Compose pgxCopier with the regular drops.Driver implementation
-// (embedding works) and drops' CopyFrom helper picks it up
-// automatically:
-//
-//	n, err := pg.CopyFrom(db, ctx, UserEntity, rows)
-//
-// For drivers that don't expose CopyFrom, drops returns
-// ErrCopyNotSupported and the caller falls back to CreateMany.
+// Compose it with the regular drops.Driver implementation (embedding
+// works) and CopyFrom picks it up automatically. For drivers that
+// don't expose COPY, drops returns ErrCopyNotSupported and the caller
+// falls back to CreateMany.
 
 // Copier is the contract drops uses to dispatch a bulk COPY. Any
 // driver that satisfies it (typically by adding a Copy method to
@@ -44,7 +49,9 @@ type Copier interface {
 }
 
 // ErrCopyNotSupported is returned by CopyFrom when the underlying
-// driver does not satisfy Copier. Callers should fall back to
+// driver does not satisfy Copier — which every database/sql driver
+// answers with, COPY not being something database/sql can send.
+// Connect through drops/pgxdriver, or fall back to
 // Entity.CreateMany / UpsertMany.
 var ErrCopyNotSupported = errors.New("drops/pg: driver does not implement Copier — fall back to CreateMany")
 

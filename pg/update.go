@@ -15,6 +15,14 @@ type UpdateBuilder struct {
 	wheres    []drops.Expression
 	returning []drops.Expression
 	scope     filterScope
+
+	// defaults are the default filters of the tables this statement
+	// names, resolved for one execution — see SelectBuilder.defaults.
+	defaults resolvedDefaults
+
+	// resolved marks a builder resolveCtx has already produced, so a
+	// statement is not scoped twice. See SelectBuilder.resolved.
+	resolved bool
 }
 
 // Set adds one or more assignments. Use (*Col[T]).Val(v) to bind a typed
@@ -73,7 +81,7 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 	if u.table.hasUpdateHooks() {
 		sets = u.applyUpdateHooks()
 	}
-	wheres := u.scope.apply(u.table, u.wheres)
+	wheres := u.scope.apply(u.table, u.wheres, u.defaults)
 	b.WriteString("UPDATE ")
 	u.table.writeFrom(b)
 	b.WriteString(" SET ")
@@ -104,14 +112,120 @@ func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
 	}
 }
 
+// ToSQLCtx renders the statement ctx would send: the context filters of
+// the target table and of every FROM table, resolved and AND-ed in, and
+// every statement written inside the SET list, the WHERE clause or the
+// RETURNING projection resolved with them.
+//
+// An UPDATE is the statement where losing the axis is worst. A SELECT
+// that loses it reads rows it should not have; an UPDATE that loses it
+// REWRITES them, and there is nothing to walk back. So a filter that
+// refuses returns the refusal and no statement at all.
+func (u *UpdateBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := u.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution — the
+// receiver when there was nothing to resolve. See
+// [SelectBuilder.resolveCtx] for why the identity matters.
+//
+// The context predicates are appended to the WHERE list of the copy
+// rather than kept in a field of their own: they are already resolved
+// when they arrive, and resolved marks the builder so the walk does not
+// come back to them.
+func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) {
+	if u.resolved {
+		return u, nil
+	}
+	cp := *u
+	changed := false
+
+	// The assigned value is an operand position like any other, and the
+	// one that decides what gets written rather than which rows do.
+	if r, err := resolveSets(ctx, u.sets); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.sets, changed = r, true
+	}
+	wheres := u.wheres
+	if r, err := resolveExprs(ctx, u.wheres); err != nil {
+		return nil, err
+	} else if r != nil {
+		wheres, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, u.returning); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.returning, changed = r, true
+	}
+
+	if !u.scope.unscoped {
+		tables := make([]*Table, 0, len(u.from)+1)
+		if u.table != nil {
+			tables = append(tables, u.table)
+		}
+		tables = append(tables, u.from...)
+		var preds []drops.Expression
+		for _, t := range tables {
+			// A FROM table is joined into the statement and its rows
+			// choose which target rows the UPDATE rewrites, so its
+			// filters are as load-bearing as the target's.
+			p, err := t.resolveContextFilters(ctx)
+			if err != nil {
+				return nil, err
+			}
+			preds = append(preds, p...)
+		}
+		if len(preds) > 0 {
+			all := make([]drops.Expression, 0, len(wheres)+len(preds))
+			all = append(all, wheres...)
+			wheres, changed = append(all, preds...), true
+		}
+		defaults, err := resolveTableDefaults(ctx, tables...)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
+	}
+
+	if !changed {
+		return u, nil
+	}
+	cp.wheres = wheres
+	cp.resolved = true
+	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable], so an UPDATE written as
+// a CTE body carries the same predicates a bare one would — the shape
+// that made WITH moved AS (UPDATE scoped RETURNING ...) a cross-tenant
+// write.
+func (u *UpdateBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := u.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != u, nil
+}
+
 // applyUpdateHooks runs every UpdateHook registered on the table and
 // returns the (possibly extended) SET list.
 func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
-	ctx := &UpdateHookCtx{bound: make(map[*Column]bool, len(u.sets))}
+	ctx := &UpdateHookCtx{bound: make(map[string]bool, len(u.sets))}
 	for _, s := range u.sets {
-		ctx.bound[s.column().key()] = true
+		// Keyed by the name the statement writes, not by the handle
+		// that wrote it: the two handles a hook and a caller hold for
+		// one column need not be the same pointer. See boundKey.
+		ctx.bound[boundKey(s.column())] = true
 	}
-	for _, h := range u.table.updateHooks {
+	for _, h := range u.table.updateHookList() {
 		h.BeforeUpdate(ctx)
 	}
 	if len(ctx.add) == 0 {

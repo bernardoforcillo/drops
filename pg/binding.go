@@ -44,6 +44,19 @@ func (e *exprBinding) withBoundExpr(x drops.Expression) ColumnValue {
 	return &cp
 }
 
+// insertBinding binds value to col as a parameter — the shape a
+// binding takes when drops supplies the value rather than the caller,
+// which today is the ctx tenant an INSERT stamps onto its axis.
+//
+// It is a valueBinding rather than an exprBinding so that
+// classifyBinding reads it back as a literal: the tenant stamp is
+// compared with the ctx tenant on every later pass over the row, and a
+// binding that renders as an opaque expression is one the comparison
+// has to refuse.
+func insertBinding(col *Column, value any) ColumnValue {
+	return &valueBinding[any]{col: col, val: value}
+}
+
 // sqlDefault renders the literal token DEFAULT — used for omitted
 // columns in INSERT batches and via (*Col[T]).SetDefault.
 type sqlDefault struct{}

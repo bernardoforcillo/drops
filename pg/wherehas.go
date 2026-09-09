@@ -516,9 +516,9 @@ func hasPredicates(n *hasNode, lead drops.Expression) []drops.Expression {
 		preds = append(preds, Eq(rel.MorphTypeCol, rel.MorphType))
 	}
 	if rel.Kind == ManyToManyKind {
-		preds = append(preds, n.scope.apply(rel.Through, nil)...)
+		preds = append(preds, n.scope.apply(rel.Through, nil, nil)...)
 	}
-	preds = append(preds, n.scope.apply(rel.To, nil)...)
+	preds = append(preds, n.scope.apply(rel.To, nil, nil)...)
 	preds = append(preds, n.wheres...)
 	for _, child := range n.children {
 		preds = append(preds, hasExpr(child))

@@ -27,6 +27,30 @@ type SelectBuilder struct {
 	setOps       []setOp // UNION / INTERSECT / EXCEPT continuations
 	scope        filterScope
 	err          error // deferred error (e.g. cursor decode failure) surfaced at Rows()
+
+	// ctxFrom and ctxJoins are the context filters of the FROM table
+	// and of each joined table, built for one execution by resolveCtx
+	// and AND-ed in by writeCore. They are the resolver's own output —
+	// resolveContextFilters walks the predicates before handing them
+	// back — so resolveCtx does not read them again; see
+	// resolverOwnedFields, and resolved for why walking them twice
+	// would bind the tenant twice.
+	ctxFrom  []drops.Expression
+	ctxJoins []drops.Expression
+
+	// defaults are the default filters of the tables this statement
+	// names, resolved for one execution. Nil on the ToSQL path and
+	// whenever no default filter held a statement, and then the
+	// render-time list is used unchanged.
+	defaults resolvedDefaults
+
+	// resolved marks a builder resolveCtx has already produced. It is
+	// what keeps resolution from happening twice on one statement:
+	// resolving is not idempotent — a second pass asks every context
+	// filter for a fresh predicate and AND-s it in beside the first,
+	// so the tenant is bound twice and a filter that refuses would
+	// refuse a statement that had already been answered.
+	resolved bool
 }
 
 type setOp struct {
@@ -214,6 +238,194 @@ func (s *SelectBuilder) WriteSQL(b *drops.Builder) {
 	}
 }
 
+// ToSQLCtx renders the statement ctx would send.
+//
+// A SELECT rendered through [SelectBuilder.ToSQL] carries the table's
+// DefaultFilters and none of its ContextFilters, because a render has
+// no ctx to build one from — so on a tenant-scoped table it is not the
+// statement that would be sent. This is: the context filters of the
+// FROM table and of every joined table are built, walked and AND-ed in,
+// and every statement written inside the query — a subquery operand, a
+// CTE body, a set-operation branch — is resolved on the same terms.
+//
+// A filter that cannot decide what the request may see refuses, and the
+// refusal is returned instead of a statement: no SQL at all is safer
+// than SQL missing the predicate that makes it safe.
+func (s *SelectBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := s.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution: the
+// receiver when there was nothing to resolve, and a shallow copy
+// carrying the resolved lists when there was.
+//
+// Handing back the receiver is not a micro-optimisation.
+// resolveStatement reports "this differs from the original" by
+// comparing pointers, and resolveExprs copies the whole list it is
+// walking the moment any element reports a change — so a builder that
+// always answered with a copy would tell every statement it is nested
+// in that it had changed, on every execution.
+//
+// The deferred error is checked here rather than at the executors,
+// because both paths into rendering go through this one: a cursor that
+// failed to decode must not reach the server as the false predicate
+// AfterCursor fails closed with, which matches nothing and reports
+// nothing.
+func (s *SelectBuilder) resolveCtx(ctx context.Context) (*SelectBuilder, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.resolved {
+		return s, nil
+	}
+	cp := *s
+	changed := false
+
+	// Every list the renderer reads is walked, because a statement can
+	// be written in any of them — the DISTINCT ON list is the one that
+	// went out unscoped when this was a list of the obvious ones.
+	if r, err := resolveExprs(ctx, s.columns); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.columns, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, s.distinctOn); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.distinctOn, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, s.fromExprs); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.fromExprs, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, s.wheres); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.wheres, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, s.groupBys); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.groupBys, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, s.havings); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.havings, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, s.orderBys); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.orderBys, changed = r, true
+	}
+	if r, err := resolveCTEs(ctx, s.ctes); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.ctes, changed = r, true
+	}
+
+	// A join's ON is a predicate like any other, and a statement in it
+	// decides which rows the join admits.
+	joins := s.joins
+	for i, j := range s.joins {
+		on, ch, err := resolveExpr(ctx, j.on)
+		if err != nil {
+			return nil, err
+		}
+		if !ch {
+			continue
+		}
+		if &joins[0] == &s.joins[0] {
+			joins = append([]joinClause(nil), s.joins...)
+		}
+		joins[i].on, changed = on, true
+	}
+	if changed {
+		cp.joins = joins
+	}
+
+	// A set operation's right-hand side is a statement in its own
+	// right: UNION with an unscoped branch reads every tenant's rows
+	// into a result the left-hand side scoped.
+	setOps := s.setOps
+	for i, op := range s.setOps {
+		r, err := op.right.resolveCtx(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if r == op.right {
+			continue
+		}
+		if &setOps[0] == &s.setOps[0] {
+			setOps = append([]setOp(nil), s.setOps...)
+		}
+		setOps[i].right, changed = r, true
+	}
+	if changed {
+		cp.setOps = setOps
+	}
+
+	// Unscoped is the statement saying it wants none of the table's
+	// automatic predicates, and it means the request-time ones too —
+	// see [SelectBuilder.Unscoped], which is the blunt instrument.
+	if !s.scope.unscoped {
+		tables := make([]*Table, 0, len(s.joins)+1)
+		if s.from != nil {
+			tables = append(tables, s.from)
+		}
+		ctxFrom, err := s.from.resolveContextFilters(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(ctxFrom) > 0 {
+			cp.ctxFrom, changed = ctxFrom, true
+		}
+		var ctxJoins []drops.Expression
+		for _, j := range s.joins {
+			tables = append(tables, j.table)
+			preds, err := j.table.resolveContextFilters(ctx)
+			if err != nil {
+				return nil, err
+			}
+			ctxJoins = append(ctxJoins, preds...)
+		}
+		if len(ctxJoins) > 0 {
+			cp.ctxJoins, changed = ctxJoins, true
+		}
+		defaults, err := resolveTableDefaults(ctx, tables...)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
+	}
+
+	if !changed {
+		return s, nil
+	}
+	cp.resolved = true
+	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable]: it is resolveCtx behind
+// the interface resolveExpr dispatches on, so a SELECT written as a CTE
+// body or a subquery operand carries the same predicates a bare one
+// would.
+func (s *SelectBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := s.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != s, nil
+}
+
 // writeCore renders the SELECT body without any WITH prefix or set-op
 // continuation. Set operations call this on each operand.
 func (s *SelectBuilder) writeCore(b *drops.Builder) {
@@ -256,7 +468,17 @@ func (s *SelectBuilder) writeCore(b *drops.Builder) {
 		// produced SQL no server would parse.
 		b.Append(orTrue(j.on))
 	}
-	wheres := s.scope.apply(s.from, s.wheres)
+	wheres := s.scope.apply(s.from, s.wheres, s.defaults)
+	if len(s.ctxFrom) > 0 || len(s.ctxJoins) > 0 {
+		// Copied rather than appended to: wheres may be the builder's
+		// own slice, and an append into its spare capacity would leave
+		// this execution's tenant predicate in a statement the caller
+		// holds and runs again.
+		all := make([]drops.Expression, 0, len(wheres)+len(s.ctxFrom)+len(s.ctxJoins))
+		all = append(all, wheres...)
+		all = append(all, s.ctxFrom...)
+		wheres = append(all, s.ctxJoins...)
+	}
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)

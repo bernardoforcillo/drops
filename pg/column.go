@@ -35,6 +35,9 @@ type Column struct {
 	version    bool // marked via (*Col[T]).OptimisticLock()
 	pii        bool // marked via (*Col[T]).AsPII()
 	managed    bool // drops writes this column, not the application
+	// alwaysInsert makes Create bind the column even when the Go
+	// field is at its zero value — see (*Col[T]).AlwaysInsert.
+	alwaysInsert bool
 
 	// goType is the Go value type the typed handle carries — the T of
 	// the *Col[T] this Column was created for. It is the one thing a
@@ -287,6 +290,30 @@ func (c *Col[T]) Managed() *Col[T] {
 	c.Column.managed = true
 	return c
 }
+
+// AlwaysInsert makes Create bind this column even when the struct
+// field is at its zero value, instead of omitting it and letting the
+// column's DEFAULT decide.
+//
+// Omitting a zero value is the right default and the wrong answer for
+// one shape: a bool with DEFAULT true. Every row written with the field
+// left false takes the default and comes back true, and nothing in the
+// statement says so — the row the application built is not the row the
+// database holds. The same goes for a numeric column defaulting to
+// anything but zero, and a text column defaulting to anything but "".
+//
+// It is declared per column rather than inferred from the default,
+// because "false is a value here" is a fact about the application's
+// domain and not about the DDL. The `alwaysInsert` struct tag is the
+// same declaration for a table derived from tags.
+func (c *Col[T]) AlwaysInsert() *Col[T] {
+	c.Column.alwaysInsert = true
+	return c
+}
+
+// IsAlwaysInsert reports whether the column is bound on Create even at
+// its zero value.
+func (c *Column) IsAlwaysInsert() bool { return c.alwaysInsert }
 
 // RenamedFrom states that this column is the column that used to be
 // called previous — the same column, the same data, a different name.

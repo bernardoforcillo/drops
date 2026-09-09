@@ -94,12 +94,22 @@ func (s filterScope) ignores(name string) bool {
 // apply prepends t's surviving filters to wheres. Filters lead so the
 // rendered WHERE reads scope-first, which is also where they have
 // always been.
-func (s filterScope) apply(t *Table, wheres []drops.Expression) []drops.Expression {
-	if t == nil || s.unscoped || len(t.filters) == 0 {
+//
+// defaults is what this execution resolved for t, and is nil on the
+// ToSQL path and whenever no default filter had a statement inside it
+// — in which case the render-time list is used, unchanged and byte for
+// byte. See resolvedDefaults.
+func (s filterScope) apply(t *Table, wheres []drops.Expression, defaults resolvedDefaults) []drops.Expression {
+	if t == nil || s.unscoped || !t.hasDefaultFilters() {
 		return wheres
 	}
-	kept := make([]drops.Expression, 0, len(t.filters)+len(wheres))
-	for _, f := range t.filters {
+	// Through the table's scope rather than off the table, so an alias
+	// applies the guards its table carries now, and restated so that
+	// the handles they were declared with resolve to this alias — see
+	// tableScope and resolveFilterExprs.
+	filters := defaults.of(t)
+	kept := make([]drops.Expression, 0, len(filters)+len(wheres))
+	for _, f := range filters {
 		if s.ignores(f.name) {
 			continue
 		}
@@ -109,4 +119,23 @@ func (s filterScope) apply(t *Table, wheres []drops.Expression) []drops.Expressi
 		return wheres
 	}
 	return append(kept, wheres...)
+}
+
+// applyAll is apply over every table the statement names, in the order
+// it names them.
+//
+// A DELETE ... USING and an UPDATE ... FROM join a second table in, and
+// its rows choose which of the target's rows the statement touches — so
+// a soft-delete guard on the joined table decides what gets deleted as
+// surely as one on the target does. Applying only the target's was how
+// a DELETE joined against a table full of soft-deleted rows removed the
+// rows those referred to.
+func (s filterScope) applyAll(tables []*Table, wheres []drops.Expression, defaults resolvedDefaults) []drops.Expression {
+	for i := len(tables) - 1; i >= 0; i-- {
+		// Backwards, because each apply PREPENDS: walking the list in
+		// reverse leaves the filters in the order the statement names
+		// the tables.
+		wheres = s.apply(tables[i], wheres, defaults)
+	}
+	return wheres
 }

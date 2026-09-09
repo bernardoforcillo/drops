@@ -81,6 +81,16 @@ type Entity[T any] struct {
 	// skip the reflection path entirely.
 	fastScan func(Scanner, *T) error
 
+	// fastCols are the columns fastScan was generated for, in the
+	// order it reads them. A generated scanner calls Scan with one
+	// destination per mapped field and in its own order, and a
+	// SELECT * hands it the TABLE's columns instead: an unmapped
+	// column, or one added to the middle of the table, shifts every
+	// value one field along and the mismatch is silent whenever the
+	// neighbouring types agree. So the statement projects this list —
+	// see projectFast.
+	fastCols []string
+
 	// cache, when set via WithCache, makes Get / Query.All /
 	// Query.One read-through and Update / Save / Delete
 	// write-invalidate. Provides single-flight protection for the
@@ -120,6 +130,14 @@ type Entity[T any] struct {
 	// Delete. The subject lives on ctx (WithSubject); missing
 	// subject errors out.
 	guard Guard
+
+	// rowType is T with its pointers stripped — the type NewEntity
+	// mapped the columns against. It is held rather than recomputed
+	// because it is the key an entity's row-scope filters are
+	// registered under: see rowScopeFilterKey, which needs the type's
+	// import path and name to keep two entities over one table from
+	// replacing each other's guard.
+	rowType reflect.Type
 }
 
 // Scanner mirrors the subset of drops.Rows the fast scan helpers
@@ -229,7 +247,42 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 		colFields:    colFields,
 		versionCol:   versionCol,
 		versionField: versionField,
+		rowType:      rt,
 	}
+}
+
+// fieldFor returns the field-index path bound to c, and whether T has
+// one at all.
+//
+// The match is by [Column.key], so a handle taken off an alias of the
+// table finds the field its declared column is bound to. A column the
+// table declares and the struct does not map is not an error — see
+// [Entity.tenantWriteAxis], where it is the difference between
+// stamping the row and stamping the binding.
+func (e *Entity[T]) fieldFor(c *Column) ([]int, bool) {
+	if c == nil {
+		return nil, false
+	}
+	for _, cf := range e.colFields {
+		if cf.col.key() == c.key() {
+			return cf.field, true
+		}
+	}
+	return nil, false
+}
+
+// hasRowScope reports whether which rows this entity can see depends on
+// the request: a tenant axis, an authorisation guard, or a context
+// filter registered on its table by anything at all.
+//
+// It is the question the cache asks before writing a row into the PK
+// namespace, which has no room for the scope in its key — see
+// refreshPK. Asking the table as well as the entity is the half that is
+// easy to leave out: a table scoped with Table.ContextFilter alone has
+// no entity-level axis to find, and the rows it answers with are as
+// per-request as any.
+func (e *Entity[T]) hasRowScope() bool {
+	return e.tenantCol != nil || e.guard != nil || e.table.hasContextFilters()
 }
 
 // EntityOption configures [NewEntity].
@@ -391,9 +444,50 @@ func (e *Entity[T]) Validate(v Validator[T]) *Entity[T] {
 // scanner. Eager-loaded relations still fall back to the reflection
 // path because they rely on field-map introspection of the loaded
 // slice.
-func (e *Entity[T]) SetFastScan(scan func(Scanner, *T) error) *Entity[T] {
+// cols are the columns scan reads, in the order it reads them; the
+// generated Register<T> passes the list it emitted the scanner from.
+// Every executor that takes the fast path projects exactly those
+// columns rather than SELECT *, which is what keeps the values and the
+// destinations aligned — see Entity.fastCols. Passing none leaves the
+// projection alone, which is the older behaviour and safe only while
+// the struct maps every column of the table in declaration order.
+func (e *Entity[T]) SetFastScan(cols []string, scan func(Scanner, *T) error) *Entity[T] {
+	if len(cols) == 0 {
+		panic(fmt.Sprintf("drops/pg: SetFastScan on %q needs the column list the scanner was generated for: without it the statement projects SELECT * and the scanner reads the table's columns instead of its own",
+			e.table.Name()))
+	}
+	for _, name := range cols {
+		if e.table.Col(name) == nil {
+			panic(fmt.Sprintf("drops/pg: SetFastScan on %q: table has no column %q — the generated scanner and this schema have diverged, and the alternative to failing here is scanning rows into the wrong fields for the life of the process",
+				e.table.Name(), name))
+		}
+	}
 	e.fastScan = scan
+	e.fastCols = cols
 	return e
+}
+
+// projectFast narrows sel to the columns the fast scanner was
+// generated for.
+//
+// It leaves a statement that projects something of its own alone: a
+// caller who named columns has said what they want, and the fast
+// scanner is not what will read them.
+//
+// Every name in the list is a column of the table: SetFastScan refuses
+// a list that names anything else, so the divergence is a panic at
+// declaration time rather than a row scanned into the wrong fields at
+// request time.
+func (e *Entity[T]) projectFast(sel *SelectBuilder) *SelectBuilder {
+	if len(e.fastCols) == 0 || sel == nil || len(sel.columns) > 0 {
+		return sel
+	}
+	cols := make([]drops.Expression, 0, len(e.fastCols))
+	for _, name := range e.fastCols {
+		cols = append(cols, e.table.Col(name))
+	}
+	sel.columns = cols
+	return sel
 }
 
 // HasFastScan reports whether a zero-reflection scanner is wired up.
@@ -622,7 +716,7 @@ func (e *Entity[T]) getCached(db *DB, ctx context.Context, pkValues []any, pred 
 // scanOneFast runs sel and decodes the first row via fastScan.
 // Returns ErrNoRows when sel produces no rows.
 func (e *Entity[T]) scanOneFast(ctx context.Context, sel *SelectBuilder, dest *T) error {
-	rows, err := sel.Rows(ctx)
+	rows, err := e.projectFast(sel).Rows(ctx)
 	if err != nil {
 		return err
 	}
@@ -641,7 +735,7 @@ func (e *Entity[T]) scanOneFast(ctx context.Context, sel *SelectBuilder, dest *T
 
 // scanAllFast runs sel and appends every row to dest via fastScan.
 func (e *Entity[T]) scanAllFast(db *DB, ctx context.Context, sel *SelectBuilder, dest *[]T) error {
-	rows, err := sel.Rows(ctx)
+	rows, err := e.projectFast(sel).Rows(ctx)
 	if err != nil {
 		return err
 	}
@@ -761,7 +855,15 @@ func (q *EntityQuery[T]) Stream(ctx context.Context, fn func(*T) error) error {
 	if err := q.applyGuardOnFB(ctx); err != nil {
 		return err
 	}
-	rows, err := q.fb.Select().Rows(ctx)
+	sel := q.fb.Select()
+	if q.e.HasFastScan() {
+		// Stream reads through the fast scanner, so it owes the
+		// projection that scanner was generated for — see
+		// Entity.projectFast. Rendering SELECT * here handed it the
+		// table's columns and shifted every value one field along.
+		sel = q.e.projectFast(sel)
+	}
+	rows, err := sel.Rows(ctx)
 	if err != nil {
 		return err
 	}
@@ -811,6 +913,82 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	if len(bindings) == 0 {
 		return errors.New("drops/pg: Create has nothing to insert")
 	}
+	return e.createWith(db, ctx, r, bindings)
+}
+
+// CreateCols INSERTs r binding exactly the named columns, whatever
+// they hold, and nothing else at all.
+//
+// It is the per-call form of what [Col.AlwaysInsert] declares once. The
+// skip rule Create applies — a zero value on a column with a DEFAULT is
+// left to the server — is right for the row a form filled in and wrong
+// for the row a caller assembled deliberately: "set tier back to the
+// empty string" and "say nothing about tier" are the same struct, and
+// only the call site knows which one it meant.
+//
+// Every named column has to be one this entity can bind, and the whole
+// call is refused before any statement is issued when one is not: a
+// column of another table, a column with no struct field behind it, or
+// a handle from a second table object naming the same relation, which
+// renders identically and is bound to nothing here. Writing the columns
+// that were understood and dropping the rest would store a row nobody
+// asked for.
+//
+// A tenant-scoped entity refuses a list that leaves its axis out, for
+// the same reason: the row would be written outside every tenant, and
+// so be visible to none of them.
+func (e *Entity[T]) CreateCols(db *DB, ctx context.Context, r *T, cols ...ColRef) error {
+	if len(cols) == 0 {
+		return fmt.Errorf("drops/pg: CreateCols on %q requires at least one column", e.table.Name())
+	}
+	named := make([]*Column, 0, len(cols))
+	for _, ref := range cols {
+		if ref == nil {
+			return fmt.Errorf("drops/pg: CreateCols on %q was given a nil column", e.table.Name())
+		}
+		c := ref.col()
+		if c.table != nil && c.table.Name() != e.table.Name() {
+			return fmt.Errorf("drops/pg: CreateCols on %q: column %q belongs to table %q",
+				e.table.Name(), c.Name(), c.table.Name())
+		}
+		if _, ok := e.fieldFor(c); !ok {
+			return fmt.Errorf("drops/pg: CreateCols on %q: no struct field bound to column %q",
+				e.table.Name(), c.Name())
+		}
+		named = append(named, c)
+	}
+	if axis, ok := e.tenantAxisColumn(); ok {
+		found := false
+		for _, c := range named {
+			if c.key() == axis.key() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("drops/pg: CreateCols on %q: tenant column %q is missing from the column list; a row written without it belongs to no tenant and is visible to none",
+				e.table.Name(), axis.Name())
+		}
+	}
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
+	if err := e.runValidators(r); err != nil {
+		return err
+	}
+	v := reflect.ValueOf(r).Elem()
+	bindings := make([]ColumnValue, 0, len(named))
+	for _, c := range named {
+		idx, _ := e.fieldFor(c)
+		bindings = append(bindings, &exprBinding{col: c, expr: e.bindValue(c, v.FieldByIndex(idx))})
+	}
+	return e.createWith(db, ctx, r, bindings)
+}
+
+// createWith runs the INSERT both create paths share: RETURNING every
+// column, the audit record in the same transaction, and the cache and
+// topic bookkeeping a new row allows.
+func (e *Entity[T]) createWith(db *DB, ctx context.Context, r *T, bindings []ColumnValue) error {
 	doCreate := func(tx *DB) error {
 		ins := tx.Insert(e.table).Row(bindings...)
 		for _, c := range e.table.Columns() {
@@ -835,11 +1013,12 @@ func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
 	// invalidates precisely; see invalidateTopicsConservatively for
 	// why the others cannot.
 	e.invalidateTopics(ctx, nil, e.topicRow(r))
-	if e.cache != nil {
-		// Populate the PK cache with the freshly-inserted row so the
-		// next Get hits immediately.
-		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
-	}
+	// Through refreshPK rather than straight into the cache: the PK
+	// namespace is keyed by id alone and has no room for the scope, so
+	// a row this request may see is not a row the next request may. An
+	// unscoped entity stores it and the next Get hits; a scoped one
+	// deletes whatever is under the key. See refreshPK.
+	e.refreshPK(ctx, e.pkValuesOf(r), *r)
 	return nil
 }
 
@@ -935,8 +1114,8 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if err == nil {
 		e.invalidateTopicsConservatively(ctx)
 	}
-	if err == nil && e.cache != nil {
-		_ = e.cache.writeKey(ctx, e.pkKey(e.pkValuesOf(r)), *r)
+	if err == nil {
+		e.refreshPK(ctx, e.pkValuesOf(r), *r)
 	}
 	return e.FieldError(err)
 }
@@ -1012,6 +1191,17 @@ func auditKey(values []any) any {
 	return strings.Join(parts, "|")
 }
 
+// bindValue wraps a field's value as the expression that binds it,
+// redacting a PII column so a hook or a tracer formatting the argument
+// sees "<redacted>" rather than the value.
+func (e *Entity[T]) bindValue(c *Column, fv reflect.Value) drops.Expression {
+	val := fv.Interface()
+	if c.IsPII() {
+		return PIIParam{Value: val}
+	}
+	return drops.Param{Value: val}
+}
+
 // collectInsertBindings extracts column values from r. Columns whose
 // Go field is the zero value are omitted when they have a DEFAULT or
 // are the primary key — letting the DB fill them in. PII-flagged
@@ -1021,17 +1211,15 @@ func (e *Entity[T]) collectInsertBindings(v reflect.Value) []ColumnValue {
 	out := make([]ColumnValue, 0, len(e.colFields))
 	for _, cf := range e.colFields {
 		fv := v.FieldByIndex(cf.field)
-		if fv.IsZero() && (cf.col.HasDefault() || e.isKeyColumn(cf.col) || isImplicitDefault(cf.col)) {
+		if fv.IsZero() && !cf.col.alwaysInsert &&
+			(cf.col.HasDefault() || e.isKeyColumn(cf.col) || isImplicitDefault(cf.col)) {
+			// AlwaysInsert is the column saying its zero value is a
+			// value: a bool with DEFAULT true takes the default from
+			// every row that left the field false, and comes back
+			// true. See (*Col[T]).AlwaysInsert.
 			continue
 		}
-		val := fv.Interface()
-		var expr drops.Expression
-		if cf.col.IsPII() {
-			expr = PIIParam{Value: val}
-		} else {
-			expr = drops.Param{Value: val}
-		}
-		out = append(out, &exprBinding{col: cf.col, expr: expr})
+		out = append(out, &exprBinding{col: cf.col, expr: e.bindValue(cf.col, fv)})
 	}
 	return out
 }

@@ -34,6 +34,14 @@ type PushOptions struct {
 	// default; see Push's doc comment for why.
 	DropUnmanagedIndexes bool
 
+	// DropUnmanagedTables lets Push drop a table that exists in the
+	// database and is declared by no table in the Go schema. It is off
+	// by default, and of the three this is the one that would hurt
+	// most: a database drops shares with a legacy application, an
+	// extension or another team's schema is full of tables that are
+	// nobody's to drop, and DROP TABLE takes the rows with it.
+	DropUnmanagedTables bool
+
 	// DropUnmanagedObjects lets Push drop an enum, sequence, view or
 	// policy that exists in the database and appears nowhere in the Go
 	// schema, and lets it switch off a row-level security the schema
@@ -298,6 +306,22 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	notices = append(notices, unrepresentableIndexNotices(desired)...)
 	notices = append(notices, enumOrderNotices(current, desired)...)
 
+	// The live side is narrowed to what the schema declares BEFORE the
+	// diff, so a table, enum, sequence or view that is nobody's to drop
+	// never becomes a statement to withhold — see ownedBy. What each
+	// option asks for is the kind it names put back.
+	live := current
+	current, held := ownedBy(current, desired)
+	if opt.DropUnmanagedTables {
+		held.tables = restoreObjects(current.Tables, live.Tables, held.tables)
+	}
+	if opt.DropUnmanagedObjects {
+		held.enums = restoreObjects(current.Enums, live.Enums, held.enums)
+		held.sequences = restoreObjects(current.Sequences, live.Sequences, held.sequences)
+		held.views = restoreObjects(current.Views, live.Views, held.views)
+	}
+	notices = append(notices, unmanagedNotices(live, held, opt.Safe)...)
+
 	stmts := Diff(current, desired, DiffOptions{Safe: opt.Safe, Renames: renames})
 	if !opt.DropUnmanagedIndexes {
 		var withheld []SchemaNotice
@@ -311,7 +335,7 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 		// Before anything runs, and on a DryRun too: a view Push may
 		// not drop, standing on one it is about to rebuild, is a plan
 		// the server will refuse halfway through.
-		if err := checkUndeclaredViewDependents(current, desired); err != nil {
+		if err := checkUndeclaredViewDependents(live, desired); err != nil {
 			return nil, err
 		}
 	}
@@ -762,6 +786,149 @@ func qualifiedTableSQL(t *TableSnapshot) string {
 // ----------------------------------------------------------------------
 // Notices
 // ----------------------------------------------------------------------
+
+// ownedBy narrows the live snapshot to the objects the Go schema
+// declares, and hands back the ones it held.
+//
+// It is the answer to a question the notice machinery below asks too
+// late. Withholding a statement Diff has already produced works for the
+// drops that name one object — an index, a policy — and cannot work for
+// a table: DROP TABLE is emitted for every live table the schema does
+// not declare, and a database drops shares with anything else (a legacy
+// application, an extension, another team's schema) is full of them. So
+// the live side is narrowed BEFORE the diff, and Diff never sees the
+// objects that are not drops's to touch.
+//
+// The four kinds are narrowed together because the reason is one:
+// PostGIS installs geometry_columns and geography_columns as views, an
+// audit trail arrives as a table, a legacy enum and a hand-made
+// sequence are the same story. Sub-objects of a table drops DOES manage
+// stay with the older mechanism — see unmanagedIndexDrops — because
+// there the drop is only sometimes wrong, and the statement text is
+// what tells the two apart.
+func ownedBy(live, declared *Snapshot) (*Snapshot, heldObjects) {
+	owned := EmptySnapshot()
+	owned.ID, owned.PrevID = live.ID, live.PrevID
+	owned.Version, owned.Dialect = live.Version, live.Dialect
+	owned.Schemas, owned.Roles, owned.Policies = live.Schemas, live.Roles, live.Policies
+	owned.Meta = live.Meta
+
+	var held heldObjects
+	for _, key := range sortedKeys(live.Tables) {
+		if _, ok := declared.Tables[key]; ok {
+			owned.Tables[key] = live.Tables[key]
+			continue
+		}
+		held.tables = append(held.tables, key)
+	}
+	for _, key := range sortedKeys(live.Enums) {
+		if _, ok := declared.Enums[key]; ok {
+			owned.Enums[key] = live.Enums[key]
+			continue
+		}
+		held.enums = append(held.enums, key)
+	}
+	for _, key := range sortedKeys(live.Sequences) {
+		if _, ok := declared.Sequences[key]; ok {
+			owned.Sequences[key] = live.Sequences[key]
+			continue
+		}
+		held.sequences = append(held.sequences, key)
+	}
+	for _, key := range sortedKeys(live.Views) {
+		if _, ok := declared.Views[key]; ok {
+			owned.Views[key] = live.Views[key]
+			continue
+		}
+		held.views = append(held.views, key)
+	}
+	return owned, held
+}
+
+// restoreObjects puts the held objects of one kind back into the
+// snapshot the diff reads, and reports that nothing of that kind is
+// held any more. It is what a DropUnmanaged* option asks for: the
+// narrowing is the default, and the option is the way back out of it.
+func restoreObjects[V any](dst, src map[string]V, keys []string) []string {
+	for _, key := range keys {
+		dst[key] = src[key]
+	}
+	return nil
+}
+
+// heldObjects names what ownedBy kept out of the diff, by kind, in the
+// live snapshot's keys.
+//
+// Keys rather than snapshots, so the notices are rendered from the live
+// snapshot the caller already holds: one description of each object,
+// read from the one place it was introspected into.
+type heldObjects struct {
+	tables    []string
+	enums     []string
+	sequences []string
+	views     []string
+}
+
+// any reports whether anything was held back at all.
+func (h heldObjects) any() bool {
+	return len(h.tables)+len(h.enums)+len(h.sequences)+len(h.views) > 0
+}
+
+// unmanagedNotices reports one notice per object ownedBy held back, so
+// a push that quietly did nothing to somebody else's table says which
+// table and what it did not run.
+//
+// The statement in each notice is the one that WOULD have been emitted.
+// That is the whole value of the notice: an operator who decides the
+// object really is drops's to manage can declare it and push again, and
+// one who decides it is not has the sentence to put in the review.
+func unmanagedNotices(live *Snapshot, held heldObjects, safe bool) []SchemaNotice {
+	if !held.any() {
+		return nil
+	}
+	out := make([]SchemaNotice, 0, len(held.tables)+len(held.enums)+len(held.sequences)+len(held.views))
+	for _, key := range held.tables {
+		t := live.Tables[key]
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-table",
+			Table:  t.Name,
+			Object: t.Name,
+			Message: fmt.Sprintf(
+				"table %q exists in the database and is declared by no table in the Go schema; Push left it alone", t.Name),
+			SQL: dropTableSQL(t, safe),
+		})
+	}
+	for _, key := range held.enums {
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-enum",
+			Object: key,
+			Message: fmt.Sprintf(
+				"enum type %q exists in the database and is declared by no Schema.AddEnum; Push left it alone", key),
+			SQL: dropEnumSQL(key, safe),
+		})
+	}
+	for _, key := range held.sequences {
+		seq := live.Sequences[key]
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-sequence",
+			Object: seq.Name,
+			Message: fmt.Sprintf(
+				"sequence %q exists in the database and is declared by no Schema.AddSequence; Push left it alone", seq.Name),
+			SQL: dropSequenceSQL(seq.Name, safe),
+		})
+	}
+	for _, key := range held.views {
+		v := live.Views[key]
+		out = append(out, SchemaNotice{
+			Rule:   "unmanaged-view",
+			Object: v.Name,
+			Message: fmt.Sprintf(
+				"view %q exists in the database and is declared by no Schema.AddView; Push left it alone", v.Name),
+			SQL: dropViewSQL(v, safe),
+		})
+	}
+	return out
+}
 
 // unmanagedIndexDrops returns, keyed by the exact statement Diff would
 // emit, a notice for every DROP INDEX that targets an index the

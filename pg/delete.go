@@ -14,6 +14,14 @@ type DeleteBuilder struct {
 	wheres    []drops.Expression
 	returning []drops.Expression
 	scope     filterScope
+
+	// defaults are the default filters of the tables this statement
+	// names, resolved for one execution — see SelectBuilder.defaults.
+	defaults resolvedDefaults
+
+	// resolved marks a builder resolveCtx has already produced, so a
+	// statement is not scoped twice. See SelectBuilder.resolved.
+	resolved bool
 }
 
 // Table returns the target table.
@@ -82,19 +90,118 @@ func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
 	return d
 }
 
+// namedTables is the target and every USING table, in the order the
+// statement names them — the tables whose automatic predicates this
+// DELETE carries.
+func (d *DeleteBuilder) namedTables() []*Table {
+	tables := make([]*Table, 0, len(d.using)+1)
+	if d.table != nil {
+		tables = append(tables, d.table)
+	}
+	return append(tables, d.using...)
+}
+
+// ToSQLCtx renders the statement ctx would send: the context filters of
+// the target table and of every USING table, resolved and AND-ed in,
+// and every statement written inside the WHERE clause or the RETURNING
+// projection resolved with them.
+//
+// A DELETE that loses its axis removes another tenant's rows and
+// reports success, and nothing walks that back — so a filter that
+// refuses returns the refusal and no statement at all.
+func (d *DeleteBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution — the
+// receiver when there was nothing to resolve. See
+// [SelectBuilder.resolveCtx] for why the identity matters, and
+// [UpdateBuilder.resolveCtx] for why the predicates land in the WHERE
+// list rather than in a field of their own.
+func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) {
+	if d.resolved {
+		return d, nil
+	}
+	cp := *d
+	changed := false
+
+	wheres := d.wheres
+	if r, err := resolveExprs(ctx, d.wheres); err != nil {
+		return nil, err
+	} else if r != nil {
+		wheres, changed = r, true
+	}
+	if r, err := resolveExprs(ctx, d.returning); err != nil {
+		return nil, err
+	} else if r != nil {
+		cp.returning, changed = r, true
+	}
+
+	if !d.scope.unscoped {
+		tables := d.namedTables()
+		var preds []drops.Expression
+		for _, t := range tables {
+			// A USING table's rows choose which target rows go, so an
+			// unfiltered one lets another tenant's rows decide what
+			// this DELETE removes.
+			p, err := t.resolveContextFilters(ctx)
+			if err != nil {
+				return nil, err
+			}
+			preds = append(preds, p...)
+		}
+		if len(preds) > 0 {
+			all := make([]drops.Expression, 0, len(wheres)+len(preds))
+			all = append(all, wheres...)
+			wheres, changed = append(all, preds...), true
+		}
+		defaults, err := resolveTableDefaults(ctx, tables...)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
+	}
+
+	if !changed {
+		return d, nil
+	}
+	cp.wheres = wheres
+	cp.resolved = true
+	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable], so a DELETE written as a
+// CTE body is scoped like a bare one — WITH moved AS (DELETE FROM
+// scoped RETURNING ...) is the shape that made an unscoped one
+// reachable through the exported API.
+func (d *DeleteBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != d, nil
+}
+
 // WriteSQL renders the DELETE. If the table has DeleteHooks and the
 // caller has not opted out via Unscoped, hooks may replace the
 // statement entirely — used by SoftDelete to flip DELETE into UPDATE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 	if !d.scope.unscoped {
-		for _, h := range d.table.deleteHooks {
+		for _, h := range d.table.deleteHookList() {
 			if rep := h.BeforeDelete(d); rep != nil {
 				rep.WriteSQL(b)
 				return
 			}
 		}
 	}
-	wheres := d.scope.apply(d.table, d.wheres)
+	wheres := d.scope.applyAll(d.namedTables(), d.wheres, d.defaults)
 	b.WriteString("DELETE FROM ")
 	d.table.writeFrom(b)
 	if len(d.using) > 0 {

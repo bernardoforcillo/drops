@@ -8,17 +8,6 @@ import (
 	"github.com/bernardoforcillo/drops"
 )
 
-// writeOperand writes v as either an existing Expression or a bound
-// parameter. It is the bridge that lets every operator accept raw Go
-// values alongside columns and other expressions.
-func writeOperand(b *drops.Builder, v any) {
-	if e, ok := v.(drops.Expression); ok {
-		e.WriteSQL(b)
-		return
-	}
-	b.AddArg(v)
-}
-
 // expandSlice unwraps a single slice argument into its elements so that
 // In(col, []int{1,2,3}) works without manual spreading.
 func expandSlice(values []any) []any {
@@ -40,16 +29,20 @@ func expandSlice(values []any) []any {
 }
 
 // binOp builds a parenthesised binary infix expression "(left OP right)".
+//
+// Both operands are held rather than closed over, so either may be a
+// statement and is scoped as one: Eq(col, Subquery(sel)) is the
+// ordinary spelling of a scalar-subquery comparison, and every
+// automatic predicate this package builds — a tenant axis, an
+// authorisation guard — is an Eq or an In over whatever the caller
+// declared. A closure here was the hole the census names: a guard
+// answering with ExprFunc is a guard resolveExpr cannot enter, so a
+// statement inside it rendered with none of its own scoping.
 func binOp(left any, op string, right any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, left)
-		b.WriteByte(' ')
-		b.WriteString(op)
-		b.WriteByte(' ')
-		writeOperand(b, right)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts:    []string{"(", " " + op + " ", ")"},
+		operands: []drops.Expression{operandExpr(left), operandExpr(right)},
+	}
 }
 
 // Comparison operators ---------------------------------------------------
@@ -119,24 +112,17 @@ func orTrue(p drops.Expression) drops.Expression {
 
 func joinPreds(sep, empty string, preds []drops.Expression) drops.Expression {
 	preds = dropNilPreds(preds)
-	return drops.ExprFunc(func(b *drops.Builder) {
-		if len(preds) == 0 {
-			b.WriteString(empty)
-			return
-		}
-		if len(preds) == 1 {
-			preds[0].WriteSQL(b)
-			return
-		}
-		b.WriteByte('(')
-		for i, p := range preds {
-			if i > 0 {
-				b.WriteString(sep)
-			}
-			p.WriteSQL(b)
-		}
-		b.WriteByte(')')
-	})
+	if len(preds) == 0 {
+		return drops.Raw(empty)
+	}
+	if len(preds) == 1 {
+		// One predicate is itself, not a conjunction of one: And over
+		// a single term has always rendered the term, and a caller who
+		// passes a statement gets it back with its own resolution
+		// intact.
+		return preds[0]
+	}
+	return listOp("(", sep, ")", preds)
 }
 
 // Not negates a predicate. A nil predicate is the empty conjunction,
@@ -145,11 +131,7 @@ func Not(p drops.Expression) drops.Expression {
 	if p == nil {
 		p = And()
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteString("(NOT ")
-		p.WriteSQL(b)
-		b.WriteByte(')')
-	})
+	return &opExpr{parts: []string{"(NOT ", ")"}, operands: []drops.Expression{p}}
 }
 
 // Set membership -------------------------------------------------------
@@ -177,51 +159,38 @@ func inExpr(left any, op string, values []any) drops.Expression {
 		}
 		return drops.Raw("(true)")
 	}
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, left)
-		b.WriteByte(' ')
-		b.WriteString(op)
-		b.WriteString(" (")
-		for i, v := range values {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			writeOperand(b, v)
+	var o opBuilder
+	o.text("(")
+	o.value(left)
+	o.text(" " + op + " (")
+	for i, v := range values {
+		if i > 0 {
+			o.text(", ")
 		}
-		b.WriteString("))")
-	})
+		o.value(v)
+	}
+	o.text("))")
+	return o.done()
 }
 
 // Null tests -----------------------------------------------------------
 
 func IsNull(e any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, e)
-		b.WriteString(" IS NULL)")
-	})
+	return &opExpr{parts: []string{"(", " IS NULL)"}, operands: []drops.Expression{operandExpr(e)}}
 }
 
 func IsNotNull(e any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, e)
-		b.WriteString(" IS NOT NULL)")
-	})
+	return &opExpr{parts: []string{"(", " IS NOT NULL)"}, operands: []drops.Expression{operandExpr(e)}}
 }
 
 // Between renders "left BETWEEN low AND high".
 func Between(left, low, high any) drops.Expression {
-	return drops.ExprFunc(func(b *drops.Builder) {
-		b.WriteByte('(')
-		writeOperand(b, left)
-		b.WriteString(" BETWEEN ")
-		writeOperand(b, low)
-		b.WriteString(" AND ")
-		writeOperand(b, high)
-		b.WriteByte(')')
-	})
+	return &opExpr{
+		parts: []string{"(", " BETWEEN ", " AND ", ")"},
+		operands: []drops.Expression{
+			operandExpr(left), operandExpr(low), operandExpr(high),
+		},
+	}
 }
 
 // --- Nodes -------------------------------------------------------------

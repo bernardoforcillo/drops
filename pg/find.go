@@ -831,9 +831,32 @@ func (f *FindBuilder) loadManyToMany(
 				}
 			}
 		}
+		// The per-parent cap. The direct edges take it in SQL, through
+		// the ROW_NUMBER window buildPerParentLimitedSQL writes; a
+		// many-to-many edge cannot, because the rows are matched to
+		// parents through the junction after the target query has run.
+		// So it is applied here, to each parent's own slice, which is
+		// the same window over the same order.
+		if node.limit > 0 {
+			result = capPerParent(result, node.offset, node.limit)
+		}
 		target.Set(result)
 	}
 	return collectChildPtrs(parentSlice, parentIsPtr, relField, childStructType, needChildren), childStructType, nil
+}
+
+// capPerParent returns the window [offset, offset+limit) of s, or an
+// empty slice when the offset is past the end. It is the Go half of
+// what the ROW_NUMBER rewrite does in SQL.
+func capPerParent(s reflect.Value, offset, limit int) reflect.Value {
+	if offset >= s.Len() {
+		return reflect.MakeSlice(s.Type(), 0, 0)
+	}
+	end := offset + limit
+	if end > s.Len() {
+		end = s.Len()
+	}
+	return s.Slice(offset, end)
 }
 
 func parentValue(v reflect.Value, isPtr bool) reflect.Value {

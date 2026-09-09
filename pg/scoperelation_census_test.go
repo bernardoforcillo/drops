@@ -284,6 +284,9 @@ func relationEntryPoints() []relationCase {
 		{name: "Table.As", build: func(f *relFixture) ctxSQLable {
 			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table { return t.As("u") }))
 		}},
+		{name: "Table.RenamedFrom", build: func(f *relFixture) ctxSQLable {
+			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table { return t.RenamedFrom("ex_rows_old") }))
+		}},
 		{name: "Table.AddCheck", build: func(f *relFixture) ctxSQLable {
 			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table { return t.AddCheck("ck", "id > 0") }))
 		}},
@@ -301,6 +304,9 @@ func relationEntryPoints() []relationCase {
 		{name: "Table.EnableRLS", build: func(f *relFixture) ctxSQLable {
 			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table { return t.EnableRLS() }))
 		}},
+		{name: "Table.ForceRLS", build: func(f *relFixture) ctxSQLable {
+			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table { return t.ForceRLS() }))
+		}},
 		{name: "Table.PrimaryKey", build: func(f *relFixture) ctxSQLable {
 			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table { return t.PrimaryKey(t.Col("id")) }))
 		}},
@@ -316,6 +322,11 @@ func relationEntryPoints() []relationCase {
 		}},
 		{name: "Table.DefaultFilter", build: func(f *relFixture) ctxSQLable {
 			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table { return t.DefaultFilter(pg.IsNotNull(t.Col("id"))) }))
+		}},
+		{name: "Table.AddFilter", build: func(f *relFixture) ctxSQLable {
+			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table {
+				return t.AddFilter("nonNullId", pg.IsNotNull(t.Col("id")))
+			}))
 		}},
 		{name: "Table.ContextFilter", build: func(f *relFixture) ctxSQLable {
 			return f.db.Delete(f.late(func(t *pg.Table) *pg.Table {

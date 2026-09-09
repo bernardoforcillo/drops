@@ -132,7 +132,7 @@ func (db *DB) Begin(ctx context.Context) (*DB, drops.Tx, error) {
 // of DB has a disposition here, and each disposition is what bind
 // does.
 func (db *DB) bind(tx drops.Tx) *DB {
-	return &DB{drv: tx, hook: db.hook, tracer: db.tracer}
+	return &DB{drv: tx, hook: db.hook, tracer: db.tracer, strictLoading: db.strictLoading}
 }
 
 // InTx runs fn inside a transaction. The transaction is committed if fn

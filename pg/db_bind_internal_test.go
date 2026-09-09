@@ -31,10 +31,11 @@ import (
 // would be wrong, on the same terms as the exemption maps in the
 // scoping censuses.
 var bindDisposition = map[string]string{
-	"drv":    "replaced — putting the transaction handle where the pool was is the whole of what bind is for",
-	"hook":   "carried — a hook that stopped seeing statements at the BEGIN would lose exactly the statements a transaction exists to group, and the audit trail with them",
-	"tracer": "carried — the field this test was written for: a trace that stopped at the BEGIN went dark across the boundary a latency investigation follows it over, and lost the two statements InTxAs sends to establish the identity the work ran under",
-	"retry":  "dropped — a RetryPolicy re-runs a whole transaction and this DB is inside one already, so a nested InTx that retried would re-run its body against a transaction the failed attempt had aborted, which PostgreSQL answers with 25P02 until the outer transaction ends. Retrying belongs to the outermost InTx, which still has the policy",
+	"drv":           "replaced — putting the transaction handle where the pool was is the whole of what bind is for",
+	"hook":          "carried — a hook that stopped seeing statements at the BEGIN would lose exactly the statements a transaction exists to group, and the audit trail with them",
+	"tracer":        "carried — the field this test was written for: a trace that stopped at the BEGIN went dark across the boundary a latency investigation follows it over, and lost the two statements InTxAs sends to establish the identity the work ran under",
+	"strictLoading": "carried — it is a refusal, and a refusal that stopped at the BEGIN would let exactly the code inside a transaction read an unloaded relation silently: the same shape as the tracer defect below, on the safety setting rather than on the observability one",
+	"retry":         "dropped — a RetryPolicy re-runs a whole transaction and this DB is inside one already, so a nested InTx that retried would re-run its body against a transaction the failed attempt had aborted, which PostgreSQL answers with 25P02 until the outer transaction ends. Retrying belongs to the outermost InTx, which still has the policy",
 }
 
 // TestEveryDBFieldHasABindDisposition is the census. It fails when DB

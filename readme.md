@@ -100,6 +100,38 @@ Pre-1.0, and the API can still move. Five dialects ship today:
   the analytics-aggregate library (`uniq`, `uniqExact`, `quantile`,
   `argMax`, `groupArray`, `quantileTiming`, …).
 
+Beyond the dialects, `drops/pg` carries the production concerns a
+service ends up writing by hand — each with a page in
+[docs](docs/) explaining the trade it makes:
+
+- **[Change data capture from the WAL](docs/cdc.md)** — logical replication slots
+  with the operational half nobody ships (lag, orphan-slot detection,
+  the snapshot handoff that makes an initial copy and the stream that
+  follows it join without a gap), plus `mirror.LogicalSource`, which
+  feeds a mirror from the log instead of asking every writer to write
+  to an outbox too.
+- **[Precise query-cache invalidation](docs/caching.md)** — a query declares the topics
+  it read, a write announces the topics it touched, and an overlap
+  evicts. The alternative, and what the query cache had before, is a
+  TTL.
+- **[Plan hints and plan assertions](docs/plans.md)** — `pg_hint_plan` directives
+  rendered as a leading comment, and expectations (`UsesIndex`,
+  `NoSeqScanOn`, `NoNestedLoopOver`) that a test can hold the plan to.
+  A hint that stops applying is silent without them.
+- **[An in-flight statement registry](docs/operations.md#draining-a-node)** — `Quiesce` to drain, `Cancel`
+  to stop, for a failover or a graceful shutdown. A `Hook` fires after
+  the fact and cannot do either.
+- **[A durable job queue](docs/operations.md#long-jobs)** — long jobs as rows, claimed with
+  `SKIP LOCKED`, one live job per key enforced by a partial unique
+  index, with heartbeats, progress and cancellation.
+- **[The operator's SQLSTATEs](docs/operations.md#errors-that-change-what-you-do-next)** — the codes that change what the caller
+  does next (`25006` route elsewhere, `40003` the write may have
+  landed, `53300` stop retrying), and `RetryCachedPlans` for the
+  `0A000` every migration causes and nobody predicts.
+- **[Selectivity estimates](docs/plans.md#is-this-predicate-worth-an-index) and [bounded-memory scans](docs/operations.md#result-sets-that-will-not-fit)** — a Count-Min
+  sketch per column for "is this predicate worth an index", and a
+  server-side cursor for the result set that will not fit.
+
 Every dialect shares the root `drops` package (driver interface,
 `Expression`, `Builder`, `Hook`, transactions, and the generic
 `All[T]` / `One[T]` result scanners).
@@ -121,8 +153,12 @@ The [docs](docs/) directory has the explanations: a
 [declare a schema](docs/schema.md) without it drifting from your
 structs, [entities and relations](docs/entities.md),
 [which dialect gives you what](docs/dialects.md),
-[portable vector search](docs/vector-search.md), and
-[mirroring one table across all three engines](docs/mirror.md), and
+[portable vector search](docs/vector-search.md),
+[mirroring one table across all three engines](docs/mirror.md),
+[change data capture from the write-ahead log](docs/cdc.md),
+[cache invalidation that is not a TTL](docs/caching.md),
+[making the planner do what you meant](docs/plans.md),
+[running it in production](docs/operations.md), and
 [how the two test suites divide the work](docs/testing.md).
 
 Package reference is on

@@ -13,6 +13,7 @@ drops migrate
 drops push --schema ./db/schema --dry-run
 drops drift --schema ./db/schema
 drops lint ./...
+drops mcp --dsn "$DATABASE_URL"
 ```
 
 Every command takes `-h`. Connection strings come from `--dsn`, else
@@ -411,3 +412,38 @@ either learning about the other.
 
 The rollback direction is drops's addition. drizzle-kit has no
 concept of one.
+
+
+## `drops mcp`
+
+The rest of the binary is for a person at a terminal. `drops mcp`
+speaks the Model Context Protocol over stdin and stdout instead, so an
+assistant working in the repository can ask the database directly
+rather than being told about it second hand.
+
+```json
+{ "mcpServers": { "drops": {
+    "command": "drops",
+    "args": ["mcp", "--dsn", "postgres://..."]
+} } }
+```
+
+Four tools:
+
+| tool | answers |
+|---|---|
+| `schema` | the live tables, columns, indexes and constraints, as JSON |
+| `explain` | the plan for a statement, its fingerprint, and the indexes it uses |
+| `selectivity` | what fraction of a table's rows carry a value, to decide whether a predicate is worth an index |
+| `replication` | the logical replication slots, their lag, and whether anything is consuming them |
+
+**Every tool is read-only, and that is a design decision.** Nothing
+here migrates, pushes, writes or drops. An assistant holding a
+production DSN should be able to answer questions about the database
+and should not be able to change it — and "should not" has to mean
+"cannot", because a tool description is not an access control. The
+commands that change things stay where a person runs them, with the
+confirmation prompts and the exit codes they already have.
+
+`explain` runs without `ANALYZE`, so the statement is planned and
+never executed. Asking for the plan of a `DELETE` deletes nothing.

@@ -78,6 +78,8 @@ func run() error {
 		return runDiagram(args)
 	case "lint":
 		return runLint(ctx, args)
+	case "mcp":
+		return runMCP(ctx, args)
 	case "version", "--version", "-v":
 		fmt.Println("drops", version)
 	case "help", "-h", "--help":
@@ -107,6 +109,10 @@ Database commands (need --dsn, or DROPS_PG_DSN / DATABASE_URL):
   status     Show what is applied, what is pending and what is unaccounted for
   baseline   Adopt an existing database: snapshot it, mark the history applied
   pull       Introspect a live database into a Go schema file
+
+Assistants:
+  mcp        Serve the schema, query plans and replication state over the
+             Model Context Protocol, read-only, on stdin/stdout
 
 Offline:
   lint       Report query mistakes the type checker can see: "drops lint ./..."

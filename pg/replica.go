@@ -60,6 +60,11 @@ type Replicated struct {
 	// WithWriteDelay). Zero leaves routing entirely to the window and
 	// the LSN.
 	writeDelay time.Duration
+
+	// readOnlyRedirects counts reads a replica refused with SQLSTATE
+	// 25006 and that were re-issued on the primary. See
+	// ReadOnlyRedirects.
+	readOnlyRedirects atomic.Uint64
 }
 
 // NewReplicated returns a Replicated driver. Pass zero replicas for
@@ -157,8 +162,41 @@ func (r *Replicated) Query(ctx context.Context, sql string, args ...any) (drops.
 		}
 		return rows, err
 	}
-	return r.routeRead(ctx).Query(ctx, sql, args...)
+	target := r.routeRead(ctx)
+	rows, err := target.Query(ctx, sql, args...)
+	if err != nil && target != r.primary && IsReadOnly(err) {
+		// SQLSTATE 25006 from a replica is the server correcting the
+		// routing decision: whatever isWriteStatement concluded, this
+		// statement writes, and a standby will refuse it forever. The
+		// keyword scan is documented as fallible in exactly this
+		// direction (a write it cannot see is a write on the wrong
+		// node), and this is the only signal that says so — so the
+		// statement is re-issued on the primary rather than returned
+		// as a failure the caller cannot act on.
+		//
+		// It is safe to re-issue precisely because nothing ran: the
+		// standby rejected the statement before executing it, which
+		// is what 25006 means.
+		r.readOnlyRedirects.Add(1)
+		rows, err = r.primary.Query(ctx, sql, args...)
+		if s, ok := readYourWrites(ctx); ok {
+			s.mark()
+			if err == nil {
+				r.captureWriteLSN(ctx, s)
+			}
+		}
+	}
+	return rows, err
 }
+
+// ReadOnlyRedirects reports how many times a read routed to a replica
+// came back with SQLSTATE 25006 and was re-issued on the primary.
+//
+// A non-zero and growing count is worth an alert. It means one of two
+// things, and both want fixing: [isWriteStatement] is misreading a
+// statement your application issues often, or a node configured as a
+// replica is being handed traffic that belongs on the primary.
+func (r *Replicated) ReadOnlyRedirects() uint64 { return r.readOnlyRedirects.Load() }
 
 // isWriteStatement reports whether a statement issued through Query
 // modifies data. It reads the leading keyword rather than parsing SQL:

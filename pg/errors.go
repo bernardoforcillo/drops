@@ -146,24 +146,12 @@ func classifyError(err error) error {
 		return err
 	}
 	pe := &PgError{Code: code, Constraint: constraintName(err), Column: columnName(err), Err: err}
-	switch code {
-	case "23505":
-		pe.Sentinel = ErrUniqueViolation
-	case "23503":
-		pe.Sentinel = ErrForeignKeyViolation
-	case "23514":
-		pe.Sentinel = ErrCheckViolation
-	case "23502":
-		pe.Sentinel = ErrNotNullViolation
-	case "42P01":
-		pe.Sentinel = ErrUndefinedTable
-	case "42703":
-		pe.Sentinel = ErrUndefinedColumn
-	case "40001":
-		pe.Sentinel = ErrSerializationFailure
-	case "40P01":
-		pe.Sentinel = ErrDeadlock
-	}
+	// The mapping lives in one table (pg/sqlstate.go) rather than a
+	// switch here, so the constraint codes an application branches on
+	// and the operational codes a deployment branches on cannot drift
+	// apart. A code the table does not know leaves Sentinel nil and
+	// the *PgError still carries Code, Class and Condition.
+	pe.Sentinel = sentinelFor(code)
 	return pe
 }
 

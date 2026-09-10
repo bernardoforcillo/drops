@@ -220,6 +220,17 @@ filters), not the full package PostgreSQL has.
 
 Four differences shape the API rather than the SQL:
 
+- **No transactional DDL, so migrations are recorded in two phases.**
+  MySQL commits the open transaction when it meets DDL, so the
+  transaction PostgreSQL and SQLite wrap a migration in does not exist
+  here. `Migrator` writes the history row *before* the migration and
+  marks it applied *after*, so one that fails leaves a row with a null
+  `appliedAt`. The next `Up` refuses with `ErrMigrationInterrupted`
+  rather than retrying (which would fail on a column that already
+  exists) or skipping (which would call a half-applied migration done).
+  A hook still gets a transaction of its own, which is why a data
+  change belongs in one and not in the migration body.
+
 - **No `RETURNING`.** `Entity.Create` issues the INSERT and reads the
   generated key back through the driver's `LastInsertId`. `CreateMany`
   deliberately does not backfill keys, because `LastInsertId` reports

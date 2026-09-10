@@ -26,11 +26,22 @@ would mean has no `ALTER` behind it and comes back as a refusal. Column
 TTLs are the one declared thing `system.columns` cannot report, so they
 are left out of the comparison and reported as a notice.
 
-¹ PostgreSQL introspection does not yet read back enums, sequences,
-views, RLS or policies, though the diff generator can write all of
-them. A schema declaring one enum therefore makes `Push` re-emit its
-`CREATE TYPE` on every run and `DetectDrift` permanently noisy. See
-`pg/introspect.go`.
+¹ PostgreSQL introspection reads back the schema-level objects as well
+as the tables: enum types with their labels in catalogue order,
+standalone sequences, views and materialised views, and per table
+whether row-level security is enabled and forced together with its
+policies. A schema declaring any of them reaches a steady state —
+`TestPGPushIsIdempotentWithSchemaObjects` is what holds that.
+
+What `Push` still cannot see is narrower and mostly about indexes: an
+index's operator class, `WITH` storage parameters, column ordering or
+`NULLS NOT DISTINCT`; an index with an expression element such as
+`lower(name)`, which is reported as an `unrepresentable-index` notice
+rather than compared; a multi-column foreign key; where a live sequence
+has got to; which columns a view reads; and an enum label that was
+removed or reordered, which PostgreSQL itself cannot do in place. The
+authoritative list is "What Push cannot see" in `pg.Push`'s doc
+comment, which is kept beside the behaviour rather than here.
 
 Where a cell is empty the feature is not there yet, not disabled. The
 package doc for each dialect says what it covers, and `## What's not

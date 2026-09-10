@@ -287,6 +287,18 @@ There is no `UPDATE`/`DELETE` in the usual sense — mutations rewrite
 whole parts asynchronously — so the shape of a ClickHouse workload is
 append, and collapse on merge. [mirror.md](mirror.md) is built on that.
 
+**What runs out here is bytes, not parameters.** The other three
+dialects refuse a statement carrying more bound parameters than the
+backend accepts. ClickHouse has no such number: clickhouse-go binds `?`
+by substitution, rendering each argument into the SQL text, so nothing
+travels as a parameter. The ceiling is `max_query_size` — 262144 bytes
+by default — on the text after substitution, and a batch of eight short
+columns crosses it at about a thousand rows. Over it, the server answers
+with a *syntax error* at a position where nothing is wrong. drops
+estimates the substituted size from below and refuses first; the
+estimate can only undershoot, so it never refuses a statement the server
+would have taken.
+
 `Introspect` reads a table back out of `system.tables` and
 `system.columns`, `BuildSnapshot` derives the same shape from the Go
 declaration, `Diff` puts them side by side and `Push` applies the

@@ -242,6 +242,17 @@ func render(e drops.Expression) (string, []any) {
 	return b.SQL()
 }
 
+// ToSQL renders e with the MySQL dialect. Exposed for tests and
+// logging, mirroring sqlite.ToSQL and clickhouse.ToSQL.
+//
+// It renders e as written, with no ctx: a builder whose table carries
+// context filters renders here WITHOUT them, because there is no ctx to
+// resolve them against. Use (*SelectBuilder).ToSQLCtx when what you
+// want is the statement the server would see.
+func ToSQL(e drops.Expression) (sql string, args []any) {
+	return drops.StringWithDialect(Dialect, e)
+}
+
 func (db *DB) emit(ctx context.Context, e drops.QueryEvent) {
 	drops.CallHook(db.hook, ctx, e)
 }

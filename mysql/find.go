@@ -136,7 +136,14 @@ func (f *FindBuilder) All(ctx context.Context, dest any) error {
 }
 
 // One runs the find and populates dest, a pointer to a struct. Returns
-// ErrNoRows when no row matches.
+// [drops.ErrNoRows] when no row matches, which is what Entity.Get
+// returns for the same outcome.
+//
+// NOT this package's ErrNoRows, which despite the name means something
+// else entirely: "an INSERT was executed with no rows" (see insert.go).
+// The port of this file from drops/sqlite returned that one, where the
+// same identifier does mean "no rows in the result set" — so a Find
+// that matched nothing reported a failure about an INSERT nobody ran.
 func (f *FindBuilder) One(ctx context.Context, dest any) error {
 	rv := reflect.ValueOf(dest)
 	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Struct {
@@ -149,7 +156,7 @@ func (f *FindBuilder) One(ctx context.Context, dest any) error {
 		return err
 	}
 	if slice.Len() == 0 {
-		return ErrNoRows
+		return drops.ErrNoRows
 	}
 	rv.Elem().Set(slice.Index(0))
 	return nil

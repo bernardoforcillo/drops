@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/cache"
 	"github.com/bernardoforcillo/drops/cache/memory"
 	"github.com/bernardoforcillo/drops/dropstest"
@@ -155,11 +156,44 @@ func TestPKCacheHoldsNoScopedRow(t *testing.T) {
 
 // TestScopedGetNeverReadsPKCache is the read half, and it is written
 // around the guard rather than the tenant on purpose.
-// drops/sqlite has a third test here, for a guard that resolves to no
-// predicate re-opening the cached path. It is not ported because this
-// package has no authorisation guard to open it with. When authz
-// arrives, that test comes with it — and so does the e.guard term in
-// hasRowScope, which is what it checks.
+// The gate is "is this entity guarded", not "did the guard resolve to a
+// predicate on THIS ctx". A guard that returns no predicate for the
+// current subject — the ordinary spelling of "this subject is
+// unrestricted" — would otherwise put the entity back on the cached
+// path, and the next request from a subject the guard DOES restrict
+// would be served whatever the primary-key namespace happened to hold.
+//
+// This test was left out when the cache was ported here, because there
+// was no guard to write it with. It arrives with authz, which is the
+// point: hasRowScope grew a term and this is what holds that term in
+// place.
+func TestGuardedGetNeverReadsPKCache(t *testing.T) {
+	tbl, _ := scopedProjectsTable()
+	cc := newCountingCache(t)
+	drv := scopedProjectsDriver()
+	db := mysql.New(drv)
+	ctx := context.Background()
+
+	sibling := mysql.NewEntity[scopedProject](tbl).WithCache(cc, time.Minute)
+	if _, err := sibling.Get(db, ctx, int64(7)); err != nil {
+		t.Fatalf("sibling Get: %v", err)
+	}
+	if got, want := len(drv.Statements()), 1; got != want {
+		t.Fatalf("statements after the sibling's Get: got = %v, want %v", got, want)
+	}
+
+	guarded := mysql.NewEntity[scopedProject](tbl).
+		AuthorizeWith(mysql.CustomGuard(func(context.Context) (drops.Expression, error) {
+			return nil, nil
+		})).
+		WithCache(cc, time.Minute)
+	if _, err := guarded.Get(db, ctx, int64(7)); err != nil {
+		t.Fatalf("guarded Get: %v", err)
+	}
+	if got, want := len(drv.Statements()), 2; got != want {
+		t.Fatalf("statements after the guarded Get: got = %v, want %v (it was served the sibling's cached row)", got, want)
+	}
+}
 
 // TestScopedGetWithoutTenantFailsClosed pins the failure the PK cache
 // can silently take away. A tenant-scoped Get with no tenant on ctx

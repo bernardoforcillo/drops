@@ -40,6 +40,7 @@ type Entity[T any] struct {
 
 	// Optional cross-cutting wiring; nil unless opted into.
 	audit *auditWiring // WithAudit (audit.go)
+	guard Guard        // AuthorizeWith (authz.go)
 	cache *EntityCache // WithCache (cache.go)
 
 	// rowType is T with its pointers stripped — the type NewEntity
@@ -233,15 +234,18 @@ func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg
 }
 
 // hasRowScope reports whether reading through this entity is narrowed
-// by anything a cache key would have to account for: a tenant axis or a
-// context filter registered on the table.
+// by anything a cache key would have to account for: a tenant axis, an
+// authorisation guard, or a context filter registered on the table.
 //
-// drops/pg and drops/sqlite also ask about an authorisation guard here.
-// This package has none, so there is nothing to ask — and when authz
-// arrives, this is the line that has to grow with it, or a guarded read
-// starts being served from a cache entry written for somebody else.
+// The guard term is the one worth spelling out. The question is about
+// the entity's CONFIGURATION, not about what the guard resolves to on
+// the current ctx: a guard that returns no predicate for this subject —
+// the ordinary spelling of "this subject is unrestricted" — would
+// otherwise put the entity back on the cached path, and the next
+// request from a subject the guard does restrict would be served
+// whatever the primary-key namespace happened to hold.
 func (e *Entity[T]) hasRowScope() bool {
-	return e.tenantCol != nil || e.table.hasContextFilters()
+	return e.tenantCol != nil || e.guard != nil || e.table.hasContextFilters()
 }
 
 // auditKey renders a key for the audit trail's single rowID column,

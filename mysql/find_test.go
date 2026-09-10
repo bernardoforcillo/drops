@@ -2,6 +2,7 @@ package mysql_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -260,8 +261,12 @@ func TestFindOneReturnsErrNoRows(t *testing.T) {
 
 	var user frUser
 	err := db.Find(usersT).One(context.Background(), &user)
-	if err != mysql.ErrNoRows {
-		t.Errorf("expected ErrNoRows, got %v", err)
+	// drops.ErrNoRows, not this package's ErrNoRows — see
+	// TestFindOneReportsNoRowsAndNotTheInsertSentinel below. The
+	// assertion this test was ported with named the identifier that
+	// means "INSERT has no rows" here.
+	if !errors.Is(err, drops.ErrNoRows) {
+		t.Errorf("expected drops.ErrNoRows, got %v", err)
 	}
 }
 
@@ -420,5 +425,32 @@ func TestFindManyToManyEagerLoadsThroughTheJunction(t *testing.T) {
 	// one per parent.
 	if len(fd.queries) != 3 {
 		t.Errorf("ran %d queries, want 3: %v", len(fd.queries), fd.queries)
+	}
+}
+
+// Find().One() reports "no rows in the result set", not "INSERT has no
+// rows".
+//
+// This package has an exported ErrNoRows whose message is "drops/mysql:
+// INSERT has no rows" — a different fact that happens to share the name
+// drops/pg and drops/sqlite give to the query-result sentinel. The port
+// of find.go returned that one, so a Find that matched nothing failed
+// with a complaint about an INSERT nobody ran.
+func TestFindOneReportsNoRowsAndNotTheInsertSentinel(t *testing.T) {
+	users := mysql.NewTable("users")
+	mysql.Add(users, mysql.BigInt("id").PrimaryKey())
+	mysql.Add(users, mysql.Text("name").NotNull())
+
+	fd := &frDriver{handler: func(string, []any) (drops.Rows, error) {
+		return &frRows{cols: []string{"id", "name"}}, nil
+	}}
+
+	var got frUser
+	err := mysql.New(fd).Find(users).One(context.Background(), &got)
+	if !errors.Is(err, drops.ErrNoRows) {
+		t.Fatalf("Find.One with no matching row: %v, want drops.ErrNoRows", err)
+	}
+	if errors.Is(err, mysql.ErrNoRows) {
+		t.Errorf("Find.One reported the INSERT sentinel: %v", err)
 	}
 }

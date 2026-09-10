@@ -16,7 +16,7 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Introspection reads back | most¹ | ✅ | ✅ | most² | — |
 | Outbox, saga, event store | ✅ | ✅ | ✅ | event store | — |
 | Typed driver errors, retry | ✅ | sentinels only | ✅ | — | — |
-| Audit, tenancy, authz, cache | ✅ | ✅ | audit, tenancy, cache | — | — |
+| Audit, tenancy, authz, cache | ✅ | ✅ | ✅ | — | — |
 | Vector search | ✅ pgvector | — | — | ✅ built-in | ✅ native |
 
 ² ClickHouse has `Introspect`, `BuildSnapshot`, `Diff` and `Push` but
@@ -215,12 +215,12 @@ transactional outbox and event store, keyset pagination, typed driver
 errors and the expression library. Relations are declared with
 `NewRelations` and eager-loaded with `Find().With(...)`, one batched
 query per edge — single-level, as in SQLite. The audit trail, the saga
-coordinator and the entity cache are here too. What is not is the
-authorisation guard: `AuthorizeWith` and `Guard` are PostgreSQL and
-SQLite only, and that absence is load-bearing — `hasRowScope`, which
-decides whether an entity may use the primary-key cache, asks about the
-tenant axis and the table's context filters because there is no guard
-to ask about.
+coordinator, the entity cache, the authorisation guard, soft delete and
+`DetectDrift` are all here.
+
+What is still PostgreSQL-and-SQLite only: the N+1 detector, `Explain`,
+the hook logger and tracing helpers, the test factories and seeding,
+and the `Money` / PII / JSON-path types.
 
 Four differences shape the API rather than the SQL:
 

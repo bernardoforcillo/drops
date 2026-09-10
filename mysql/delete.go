@@ -56,6 +56,25 @@ func (d *DeleteBuilder) Limit(n int64) *DeleteBuilder { d.limit = &n; return d }
 // instrument; see [SelectBuilder.Unscoped].
 func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.scope.unscoped = true; return d }
 
+// Table returns the target table.
+func (d *DeleteBuilder) Table() *Table { return d.table }
+
+// DB returns the executing DB — used by DeleteHooks that build a
+// replacement statement (an UPDATE for soft-delete).
+func (d *DeleteBuilder) DB() *DB { return d.db }
+
+// Wheres returns a copy of the predicate slice, so a DeleteHook can
+// read the original WHERE clauses when synthesising replacement SQL.
+func (d *DeleteBuilder) Wheres() []drops.Expression {
+	return append([]drops.Expression(nil), d.wheres...)
+}
+
+// IsUnscoped reports whether the caller opted out of every default
+// scope via Unscoped. A DeleteHook reads it to tell a hard DELETE from
+// the soft one it would otherwise rewrite; IgnoreFilters does not set
+// it, because naming a filter drops a predicate and not the rewrite.
+func (d *DeleteBuilder) IsUnscoped() bool { return d.scope.unscoped }
+
 // IgnoreFilters bypasses the named global filters on the table and
 // leaves every other one standing — see [SelectBuilder.IgnoreFilters].
 func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
@@ -65,6 +84,27 @@ func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
 
 // WriteSQL renders the DELETE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
+	// A DeleteHook may replace the statement entirely — SoftDelete
+	// flips the DELETE into an UPDATE — unless the caller opted out.
+	if !d.scope.unscoped {
+		for _, h := range d.table.deleteHookList() {
+			if rep := h.BeforeDelete(d); rep != nil {
+				// The rewrite inherits this execution's resolution.
+				// The hook builds its UPDATE out of d.Wheres(), which
+				// already carries the resolved predicates — but the
+				// table's DEFAULT filters are not in that list, and a
+				// freshly built UpdateBuilder would re-derive them
+				// from the table, unwalked. A statement written inside
+				// one would then read every tenant's rows to decide
+				// which of this tenant's rows to mutate.
+				if upd, ok := rep.(*UpdateBuilder); ok && upd.defaults == nil {
+					upd.defaults = d.defaults
+				}
+				rep.WriteSQL(b)
+				return
+			}
+		}
+	}
 	if d.table.alias != "" {
 		// An aliased DELETE has to name the alias twice: once as the
 		// target and once in the FROM. MariaDB rejects the shorter

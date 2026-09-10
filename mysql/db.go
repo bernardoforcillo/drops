@@ -27,6 +27,10 @@ type DB struct {
 	// that would leave a declared relation field unloaded. See
 	// strict.go.
 	strictLoading bool
+
+	// tracer, set by WithTracer, receives a span per statement. See
+	// tracing.go.
+	tracer Tracer
 }
 
 // New wraps a drops.Driver as a MySQL DB.
@@ -172,11 +176,24 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 		return nil, err
 	}
 	sql = drops.TagStatement(ctx, sql)
+	ctx, span := db.startSpan(ctx, "mysql.exec")
+	defer span.End()
+	db.annotateSpan(span, "exec", sql, args)
 	start := time.Now()
-	res, err := db.drv.Exec(ctx, sql, args...)
+	// The driver gets the real values; the hook below gets the wrapped
+	// ones, so a logger formatting QueryEvent.Args sees "<redacted>"
+	// for a PII column and the server still receives the password.
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	res, err := db.drv.Exec(ctx, sql, drvArgs...)
 	// Classify before the hook sees it, so a log line and a caller's
 	// errors.Is agree about what happened — see [ServerError].
 	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
 	db.emit(ctx, drops.QueryEvent{Kind: "exec", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return res, err
 }
@@ -191,9 +208,19 @@ func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, e
 		return nil, err
 	}
 	sql = drops.TagStatement(ctx, sql)
+	ctx, span := db.startSpan(ctx, "mysql.query")
+	defer span.End()
+	db.annotateSpan(span, "query", sql, args)
 	start := time.Now()
-	rows, err := db.drv.Query(ctx, sql, args...)
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	rows, err := db.drv.Query(ctx, sql, drvArgs...)
 	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
 	db.emit(ctx, drops.QueryEvent{Kind: "query", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return rows, err
 }

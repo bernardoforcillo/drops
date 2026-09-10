@@ -218,9 +218,18 @@ query per edge — single-level, as in SQLite. The audit trail, the saga
 coordinator, the entity cache, the authorisation guard, soft delete and
 `DetectDrift` are all here.
 
-What is still PostgreSQL-and-SQLite only: the N+1 detector, `Explain`,
-the hook logger and tracing helpers, the test factories and seeding,
-and the `Money` / PII / JSON-path types.
+Statement hooks (`OnInsert` / `OnUpdate` / `OnDelete`), mixins and
+templates, the N+1 detector, `Explain`, tracing, test factories and
+seeding, backfill, `Money` and PII redaction are all here too — MySQL
+has everything SQLite has except the pieces it does not need. `Cast`,
+`Enum` and `JSONPath` exist under those names already, written for
+MySQL's own syntax; SQLite's `tenantguard` is a trigger workaround for
+having no users or grants, and MySQL's answer to the same question is
+`tenantview.go`, which covers writes as well.
+
+What remains PostgreSQL-only is PostgreSQL-shaped: RLS, `LISTEN`,
+`COPY`, logical replication, pgvector, PostGIS, materialised views,
+sharding, plan hints.
 
 Four differences shape the API rather than the SQL:
 

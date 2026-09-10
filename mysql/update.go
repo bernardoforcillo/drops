@@ -26,6 +26,11 @@ type UpdateBuilder struct {
 	// render-time filters, and nil when none of them held a statement.
 	defaults resolvedDefaults
 
+	// hooked says the SET list already carries what the UPDATE hooks
+	// add, so a builder resolveCtx produced does not run them again at
+	// render.
+	hooked bool
+
 	// resolved marks the copy resolveCtx produced, so a statement
 	// nested in another is not resolved twice.
 	resolved bool
@@ -91,10 +96,14 @@ var ErrNoAssignments = errors.New("drops/mysql: UPDATE has no assignments")
 
 // WriteSQL renders the UPDATE.
 func (u *UpdateBuilder) WriteSQL(b *drops.Builder) {
+	sets := u.sets
+	if !u.hooked && u.table.hasUpdateHooks() {
+		sets = u.applyUpdateHooks()
+	}
 	b.WriteString("UPDATE ")
 	u.table.writeFrom(b)
 	b.WriteString(" SET ")
-	for i, s := range u.sets {
+	for i, s := range sets {
 		if i > 0 {
 			b.WriteString(", ")
 		}
@@ -151,6 +160,29 @@ func (u *UpdateBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, e
 // receiver when there was nothing to resolve, and a shallow copy
 // carrying the resolved lists when there was. See
 // [SelectBuilder.resolveCtx] for why the identity matters.
+// applyUpdateHooks runs every UpdateHook on the table and returns the
+// (possibly extended) SET list.
+//
+// A hook that assigns a column the caller already assigned is ignored:
+// the caller's value wins, because a hook is a default. That is what
+// UpdateHookCtx.Has answers, and it is keyed by the name the statement
+// writes rather than by the handle that wrote it — the two handles a
+// hook and a caller hold for one column need not be the same pointer.
+func (u *UpdateBuilder) applyUpdateHooks() []ColumnValue {
+	hctx := &UpdateHookCtx{bound: make(map[string]bool, len(u.sets))}
+	for _, s := range u.sets {
+		hctx.bound[boundKey(s.column())] = true
+	}
+	for _, h := range u.table.updateHookList() {
+		h.BeforeUpdate(hctx)
+	}
+	if len(hctx.add) == 0 {
+		return u.sets
+	}
+	out := append([]ColumnValue(nil), u.sets...)
+	return append(out, hctx.add...)
+}
+
 func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) {
 	if u.resolved {
 		return u, nil
@@ -160,19 +192,32 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 	cp := *u
 	changed := false
 
+	// The hooks run before everything below, for two reasons. A hook
+	// binds an arbitrary expression, so running it after the resolve
+	// walk would leave a hook's subquery to render through WriteSQL,
+	// which has no ctx. And a hook can assign the tenant column, so its
+	// assignment has to reach the axis check like any other — a hook
+	// that quietly reassigned the axis would be the one write nobody
+	// checked.
+	sets := u.sets
+	if u.table.hasUpdateHooks() {
+		sets = u.applyUpdateHooks()
+		cp.sets, cp.hooked, changed = sets, true, true
+	}
+
 	// The SET list is the half of an UPDATE a tenant predicate does not
 	// reach: the WHERE clause says which rows may be touched, and the
 	// assignment says what they become — including, if nobody checks,
 	// somebody else's tenant.
 	if !u.scope.dropsContextFilters() {
-		if err := checkAxisAssignment(ctx, u.table, u.sets); err != nil {
+		if err := checkAxisAssignment(ctx, u.table, sets); err != nil {
 			return nil, err
 		}
 	}
 
 	// The assigned value is an operand position like any other, and the
 	// one that decides what gets written rather than which rows do.
-	if r, err := resolveSets(ctx, u.sets); err != nil {
+	if r, err := resolveSets(ctx, sets); err != nil {
 		return nil, err
 	} else if r != nil {
 		cp.sets, changed = r, true

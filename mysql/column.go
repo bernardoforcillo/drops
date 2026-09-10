@@ -47,6 +47,12 @@ type Column struct {
 	// comparison of two schemas can recover — see rename.go — and the
 	// schema is where Push can find it.
 	renamedFrom string
+
+	// pii marks the column as carrying sensitive data, so a value
+	// bound to it travels as a redaction marker and a logger formatting
+	// the args sees "<redacted>". See pii.go; DB.Exec and DB.Query
+	// unwrap it before the driver call.
+	pii bool
 }
 
 // FK describes a single-column foreign-key reference.
@@ -419,8 +425,23 @@ type columnValue struct {
 	val any
 }
 
-func (v columnValue) column() *Column              { return v.col }
-func (v columnValue) valueExpr() drops.Expression  { return drops.Param{Value: v.val} }
+func (v columnValue) column() *Column { return v.col }
+
+// valueExpr binds the assigned value.
+//
+// A PII column binds a redaction marker instead of the bare value, so
+// a logger or a hook formatting the args sees "<redacted>"; DB.Exec and
+// DB.Query unwrap it before the driver call, so the server still gets
+// the real thing. It is done here rather than in writeValue because
+// writeValue renders through this method — putting it in one place is
+// what keeps what the resolver walks and what the statement binds from
+// drifting apart.
+func (v columnValue) valueExpr() drops.Expression {
+	if v.col != nil && v.col.pii {
+		return drops.Param{Value: piiArg{Value: v.val}}
+	}
+	return drops.Param{Value: v.val}
+}
 func (v columnValue) writeValue(b *drops.Builder)  { b.Append(v.valueExpr()) }
 func (v columnValue) rebind(c *Column) ColumnValue { v.col = c; return v }
 

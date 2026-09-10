@@ -73,6 +73,14 @@ type tableScope struct {
 	// Table.ContextFilter.
 	ctxFilters []ctxFilter
 
+	// insertHooks / updateHooks / deleteHooks are the optional
+	// statement hooks the table carries. They live on the scope rather
+	// than on the Table so an alias runs the hooks its table has NOW,
+	// for the same reason the filters do.
+	insertHooks []InsertHook
+	updateHooks []UpdateHook
+	deleteHooks []DeleteHook
+
 	// tenantCol is the column an INSERT into this table stamps from the
 	// ctx tenant — the write-side half of the tenant axis, declared by
 	// Entity.ScopeByTenant or by Table.ScopeWritesByTenant.
@@ -724,4 +732,63 @@ func resolveTableDefaults(ctx context.Context, tables ...*Table) (resolvedDefaul
 		out[t] = resolved
 	}
 	return out, nil
+}
+
+// insertHookList / updateHookList / deleteHookList return the table's
+// hooks through the shared scope, so an alias runs the hooks its table
+// carries now rather than the ones it carried when As was called.
+func (t *Table) insertHookList() []InsertHook {
+	if t == nil || t.scope == nil {
+		return nil
+	}
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.insertHooks
+}
+
+func (t *Table) updateHookList() []UpdateHook {
+	if t == nil || t.scope == nil {
+		return nil
+	}
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.updateHooks
+}
+
+func (t *Table) deleteHookList() []DeleteHook {
+	if t == nil || t.scope == nil {
+		return nil
+	}
+	t.scope.mu.RLock()
+	defer t.scope.mu.RUnlock()
+	return t.scope.deleteHooks
+}
+
+func (t *Table) hasInsertHooks() bool { return len(t.insertHookList()) > 0 }
+func (t *Table) hasUpdateHooks() bool { return len(t.updateHookList()) > 0 }
+func (t *Table) hasDeleteHooks() bool { return len(t.deleteHookList()) > 0 }
+
+// OnInsert registers an INSERT hook, run before every INSERT renders.
+func (t *Table) OnInsert(h InsertHook) *Table {
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.insertHooks = appendShared(t.scope.insertHooks, h)
+	return t
+}
+
+// OnUpdate registers an UPDATE hook, run before every UPDATE renders.
+func (t *Table) OnUpdate(h UpdateHook) *Table {
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.updateHooks = appendShared(t.scope.updateHooks, h)
+	return t
+}
+
+// OnDelete registers a DELETE hook, run before every DELETE renders. A
+// hook may replace the DELETE with another statement (soft delete).
+func (t *Table) OnDelete(h DeleteHook) *Table {
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.deleteHooks = appendShared(t.scope.deleteHooks, h)
+	return t
 }

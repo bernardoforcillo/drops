@@ -263,6 +263,18 @@ func (t *Table) FilterNames() []string {
 	return out
 }
 
+// add registers a column built without the generic Add helper — the
+// path autotable.go takes, which derives columns from a struct and has
+// no type parameter to hand.
+func (t *Table) add(c *Column) {
+	if _, dup := t.byName[c.name]; dup {
+		panic("drops/mysql: duplicate column " + c.name + " on table " + t.name)
+	}
+	c.table = t
+	t.columns = append(t.columns, c)
+	t.byName[c.name] = c
+}
+
 // Col looks a column up by name, returning nil when absent.
 func (t *Table) Col(name string) *Column { return t.byName[name] }
 

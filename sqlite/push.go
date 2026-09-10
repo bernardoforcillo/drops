@@ -33,6 +33,30 @@ type PushOptions struct {
 	// one answer must not stand in for the other.
 	AllowDestructive bool
 
+	// Allow authorises destruction one named change at a time, and is
+	// the answer to prefer over AllowDestructive.
+	//
+	// An entry matches a finding on Rule, Table and Object — the three
+	// that say WHICH change — and on nothing else: a consent does not
+	// carry a row count, so it does not expire on the next INSERT. Hand
+	// back the values Push reported, or write them out:
+	//
+	//	sqlite.PushOptions{Allow: []sqlite.DestructiveChange{
+	//	    {Rule: "drop-column", Table: "users", Object: "email"},
+	//	}}
+	//
+	// The difference from AllowDestructive is what happens to the
+	// change nobody considered. A blanket permission is set once, by
+	// somebody reasoning about the change in front of them that day,
+	// and then stands over every change the schema makes afterwards;
+	// the flag that authorised dropping a column nobody wanted
+	// authorises dropping the column somebody did. A named consent
+	// authorises that column and refuses the next one.
+	//
+	// An entry that authorises nothing this push found is reported in
+	// PushResult.Notices rather than ignored — see "stale-consent".
+	Allow []DestructiveChange
+
 	// Renames answers the rename questions this push raises, for one
 	// run. They are merged over what the schema itself declares — see
 	// DeclaredRenames — with these winning.
@@ -58,10 +82,24 @@ type PushResult struct {
 	Applied bool
 
 	// Destructive is what this push destroys — read out of the diff,
-	// because none of it can be read out of Statements. Non-empty only
-	// on a DryRun or under AllowDestructive: otherwise Push refuses
-	// and these come back inside a *DestructiveChangeError instead.
+	// because none of it can be read out of Statements, with the rows
+	// each change costs counted against the live database.
+	//
+	// Non-empty only on a DryRun, or on a run where every finding was
+	// authorised: otherwise Push refuses and the unauthorised ones come
+	// back inside a *DestructiveChangeError instead. A DryRun reports
+	// the whole list whether or not it is authorised, because a preview
+	// that will not show you the plan you would have to permit is no
+	// preview at all.
+	//
+	// Changes against empty tables are not in it. They destroy nothing,
+	// so there is nothing to authorise and nothing to report.
 	Destructive []DestructiveChange
+
+	// Notices are the differences Push saw and did not act on. Today
+	// that is stale-consent: an Allow entry that authorised nothing
+	// this push found.
+	Notices []SchemaNotice
 }
 
 // ErrSchemaRequired is returned by Push when schema is nil.
@@ -85,15 +123,27 @@ func (e *DestructiveChangeError) Error() string {
 	fmt.Fprintf(&b, "drops/sqlite: refusing a push that destroys %d thing(s), and applying nothing:", len(e.Changes))
 	for _, c := range e.Changes {
 		b.WriteString("\n  [" + c.Rule + "] " + c.Message)
+		// The count is what decides. "drop-column on users.email" is a
+		// line an operator waves through; the same line carrying
+		// "2400000 rows" is one they read twice, and that difference is
+		// the whole reason the gate counts rather than warning.
+		if countedRules[c.Rule] {
+			b.WriteString("\n      " + rowsPhrase(c.Rows) + " at stake.")
+		}
 		if c.Suggestion != "" {
 			b.WriteString("\n      " + c.Suggestion)
 		}
+		b.WriteString("\n      Authorise this one with: " + consentSuggestion(c))
 	}
 	b.WriteString("\nNone of this is visible in the statements the push would run: on SQLite a schema change is a\n" +
 		"table rebuild, and a rebuild that loses a column is spelled exactly like one that does not.\n" +
-		"Set PushOptions.AllowDestructive once you have read the list.")
+		"Authorise the ones you meant with PushOptions.Allow, naming each by Rule, Table and Object.")
 	return b.String()
 }
+
+// Unwrap reports ErrDestructivePush, so a caller can branch on the
+// refusal with errors.Is without type-asserting for the findings.
+func (e *DestructiveChangeError) Unwrap() error { return ErrDestructivePush }
 
 // Push introspects the live database, diffs it against the supplied Go
 // schema, and applies the changes — the drops equivalent of drizzle-kit
@@ -223,11 +273,19 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	if err != nil {
 		return nil, err
 	}
+	destructive = withRowCounts(ctx, db, destructive, renames)
+	refused, consented, stale := splitByConsent(destructive, opt.Allow, opt.AllowDestructive)
+	notices := staleConsentNotices(stale)
 	if opt.DryRun {
-		return &PushResult{Statements: stmts, Applied: false, Destructive: destructive}, nil
+		// A dry run does not refuse, and it reports the whole list
+		// rather than only the part nobody authorised: the caller is
+		// asking what this push would do, and "what it would destroy"
+		// does not become a different answer because they have already
+		// said yes to some of it.
+		return &PushResult{Statements: stmts, Applied: false, Destructive: destructive, Notices: notices}, nil
 	}
-	if len(destructive) > 0 && !opt.AllowDestructive {
-		return nil, &DestructiveChangeError{Changes: destructive}
+	if len(refused) > 0 {
+		return nil, &DestructiveChangeError{Changes: refused}
 	}
 
 	if err := db.InTx(ctx, func(tx *DB) error {
@@ -240,7 +298,7 @@ func Push(ctx context.Context, db *DB, schema *Schema, opts ...PushOptions) (*Pu
 	}); err != nil {
 		return nil, err
 	}
-	return &PushResult{Statements: stmts, Applied: true, Destructive: destructive}, nil
+	return &PushResult{Statements: stmts, Applied: true, Destructive: consented, Notices: notices}, nil
 }
 
 // confirmAgainstTheRows puts the three findings that are not settled by

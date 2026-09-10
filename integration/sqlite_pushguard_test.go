@@ -964,3 +964,187 @@ func TestSQLitePushKeepsACheckItCannotPutToTheRows(t *testing.T) {
 		t.Error("SQLite accepted a CHECK calling a function it does not have")
 	}
 }
+
+// ── the rows decide ──────────────────────────────────────────────────
+
+// sqliteUsersEmpty is sqliteUsersWithEmail's table with no row in it.
+//
+// The two fixtures differ by one INSERT and that is the whole point of
+// the pair: the same schema change is refused against one and applied
+// against the other, because what the gate is protecting is data and
+// there is none here to protect.
+func sqliteUsersEmpty(t *testing.T, db *sqlite.DB) {
+	t.Helper()
+	before := sqlite.NewTable("users")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("email").NotNull())
+	if _, err := db.ExecExpr(context.Background(), sqlite.CreateTable(before)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+}
+
+// A dropped column on an empty table is not a loss, and stopping for it
+// is how the override stops meaning anything.
+//
+// This is the development loop, not an exotic case: add a column,
+// change your mind, push again. A gate that demands a permission for it
+// teaches the reflex of setting the permission, and after that the gate
+// is no longer protecting the case it exists for. So the answer is not
+// a nicer message — it is not refusing.
+func TestSQLitePushLetsADropThroughWhenTheTableIsEmpty(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+	sqliteUsersEmpty(t, db)
+
+	after := sqlite.NewTable("users")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+
+	res, err := sqlite.Push(ctx, db, sqlite.NewSchema(after))
+	if err != nil {
+		t.Fatalf("push refused a drop that destroys nothing: %v", err)
+	}
+	if !res.Applied {
+		t.Error("the push reported nothing applied")
+	}
+	if len(res.Destructive) != 0 {
+		t.Errorf("a change against an empty table was reported as destroying something: %v", res.Destructive)
+	}
+	if _, ok := sqliteColumn(t, db, "users", "email"); ok {
+		t.Error("the column is still there, so the push did not actually apply")
+	}
+}
+
+// The same change against the same schema, one row later, is refused —
+// and the refusal carries the count.
+//
+// The count is the difference between a line an operator waves through
+// and one they read twice, which is the whole reason the gate counts
+// rather than warning.
+func TestSQLitePushCountsTheRowsAtStake(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+	sqliteUsersWithEmail(t, db)
+	if _, err := db.Exec(ctx, `INSERT INTO "users" (id, email) VALUES (2, ?)`, "grace@example.com"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("users")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+
+	refusal := mustRefuse(t, mustErr(sqlite.Push(ctx, db, sqlite.NewSchema(after))))
+	var found bool
+	for _, c := range refusal.Changes {
+		if c.Rule != "drop-column" || c.Object != "email" {
+			continue
+		}
+		found = true
+		if c.Rows != 2 {
+			t.Errorf("Rows = %d, want 2 — the count is read off the live table", c.Rows)
+		}
+	}
+	if !found {
+		t.Fatalf("the refusal did not name the dropped column: %v", refusal.Changes)
+	}
+	if !strings.Contains(refusal.Error(), "2 rows") {
+		t.Errorf("the refusal does not say what is at stake:\n%s", refusal.Error())
+	}
+}
+
+// ── consent, one named change at a time ──────────────────────────────
+
+// Allow authorises the change it names and nothing else.
+//
+// This is the property AllowDestructive cannot have. A push that drops
+// two columns and a permission for one of them applies neither: the
+// consent is not a mood the push is in, it is an answer about a column.
+func TestSQLitePushTakesConsentOneChangeAtATime(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+	before := sqlite.NewTable("users")
+	sqlite.Add(before, sqlite.BigInt("id").PrimaryKey())
+	sqlite.Add(before, sqlite.Text("email").NotNull())
+	sqlite.Add(before, sqlite.Text("nickname").NotNull())
+	if _, err := db.ExecExpr(ctx, sqlite.CreateTable(before)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO "users" (id, email, nickname) VALUES (1, ?, ?)`,
+		"ada@example.com", "ada"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	after := sqlite.NewTable("users")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+
+	// One of the two named. The other one refuses, and because a
+	// refused push applies nothing, the authorised column is still
+	// there too.
+	onlyEmail := sqlite.PushOptions{Allow: []sqlite.DestructiveChange{
+		{Rule: "drop-column", Table: "users", Object: "email"},
+	}}
+	refusal := mustRefuse(t, mustErr(sqlite.Push(ctx, db, sqlite.NewSchema(after), onlyEmail)))
+	if hasRule(refusal, "drop-column", "email") {
+		t.Error("the consent did not authorise the change it named")
+	}
+	if !hasRule(refusal, "drop-column", "nickname") {
+		t.Errorf("the consent authorised a change it did not name: %v", refusal.Changes)
+	}
+	if _, ok := sqliteColumn(t, db, "users", "email"); !ok {
+		t.Error("the refused push applied part of itself")
+	}
+
+	// Both named, and the push goes through.
+	both := sqlite.PushOptions{Allow: []sqlite.DestructiveChange{
+		{Rule: "drop-column", Table: "users", Object: "email"},
+		{Rule: "drop-column", Table: "users", Object: "nickname"},
+	}}
+	res, err := sqlite.Push(ctx, db, sqlite.NewSchema(after), both)
+	if err != nil {
+		t.Fatalf("push with both changes authorised: %v", err)
+	}
+	if len(res.Destructive) != 2 {
+		t.Errorf("the result reported %d authorised losses, want 2", len(res.Destructive))
+	}
+	for _, col := range []string{"email", "nickname"} {
+		if _, ok := sqliteColumn(t, db, "users", col); ok {
+			t.Errorf("column %q survived a push that was permitted to drop it", col)
+		}
+	}
+}
+
+// A consent that matches nothing is reported, not ignored.
+//
+// It reads at the call site exactly like one that still authorises
+// something, so the day the change it names comes back — a column
+// re-added and re-dropped — it would authorise a drop nobody
+// reconsidered.
+func TestSQLitePushReportsAConsentThatMatchedNothing(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t)
+	sqliteUsersWithEmail(t, db)
+
+	after := sqlite.NewTable("users")
+	sqlite.Add(after, sqlite.BigInt("id").PrimaryKey())
+
+	res, err := sqlite.Push(ctx, db, sqlite.NewSchema(after), sqlite.PushOptions{
+		Allow: []sqlite.DestructiveChange{
+			{Rule: "drop-column", Table: "users", Object: "email"},
+			{Rule: "drop-column", Table: "users", Object: "nickname"}, // never existed
+		},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	var stale []string
+	for _, n := range res.Notices {
+		if n.Rule == "stale-consent" {
+			stale = append(stale, n.Object)
+		}
+	}
+	if len(stale) != 1 || stale[0] != "nickname" {
+		t.Errorf("stale consents = %v, want [nickname] — the live one must not be reported", stale)
+	}
+}
+
+// mustErr returns the error of a (result, error) pair, failing when
+// there is none. It exists so a refusal assertion reads as one line.
+func mustErr[T any](_ T, err error) error { return err }

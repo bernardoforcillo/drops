@@ -558,6 +558,22 @@ type DestructiveChange struct {
 
 	// Suggestion is how to keep it, or how to say the loss is intended.
 	Suggestion string
+
+	// Rows is how many rows the table holds, counted exactly, and -1
+	// for a table the count would not run against. It is a count of
+	// the table's rows rather than of the values the change destroys,
+	// which for a dropped column is the same number.
+	//
+	// It is filled in by Push, which has a database to ask; it is zero
+	// on a DestructiveChanges result, which is a comparison of two
+	// snapshots and has none. Zero never reaches a reader from Push:
+	// a change against an empty table destroys nothing and is dropped
+	// rather than reported.
+	//
+	// It is not part of what a consent matches on. Requiring a caller
+	// to reproduce the count would make their consent expire on the
+	// next INSERT.
+	Rows int64
 }
 
 // String renders the change as "rule: message".

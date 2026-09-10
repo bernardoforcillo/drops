@@ -10,7 +10,7 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Entity CRUD | ✅ | ✅ | ✅ | ✅ | n/a |
 | Drift check | ✅ | ✅ | ✅ | ✅ | n/a |
 | Composite keys | ✅ | ✅ | ✅ | n/a | n/a |
-| Relations, eager loading | ✅ | partial | declaration only | — | — |
+| Relations, eager loading | ✅ | partial | partial | — | — |
 | Keyset pagination | ✅ | ✅ | ✅ | ✅ (via mirror) | ✅ (via vector) |
 | Migrations, diff, snapshot | ✅ | ✅ | ✅ | diff + push² | — |
 | Introspection reads back | most¹ | ✅ | ✅ | most² | — |
@@ -212,8 +212,11 @@ dependent object, rebuild, and re-create it.
 The schema and query surface, entity CRUD with the drift check and
 composite keys, migrations against `information_schema`, a
 transactional outbox and event store, keyset pagination, typed driver
-errors and the expression library. Not audit, tenancy, authz or cache,
-and relations are declaration-only — there is no eager loader.
+errors and the expression library. Relations are declared with
+`NewRelations` and eager-loaded with `Find().With(...)`, one batched
+query per edge — single-level, as in SQLite. Not audit, authz or cache;
+tenancy is the scope layer (`ScopeWritesByTenant` and the context
+filters), not the full package PostgreSQL has.
 
 Four differences shape the API rather than the SQL:
 

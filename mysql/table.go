@@ -17,6 +17,7 @@ type Table struct {
 	comment   string
 	columns   []*Column
 	byName    map[string]*Column
+	relations map[string]*Relation
 
 	// scope is the automatic-predicate state: the two filter lists and
 	// the write-side tenant column. It is a POINTER so that a table
@@ -143,6 +144,29 @@ func (t *Table) As(alias string) *Table {
 			cp.checks[name] = expr
 		}
 	}
+	// Every map on the copy has to be its own, or a relation declared
+	// against the alias writes through into the table it was aliased
+	// from.
+	if t.relations != nil {
+		rebind := func(c *Column) *Column {
+			if c != nil && c.table == t {
+				if aliased := cp.byName[c.name]; aliased != nil {
+					return aliased
+				}
+			}
+			return c
+		}
+		cp.relations = make(map[string]*Relation, len(t.relations))
+		for name, rel := range t.relations {
+			r := *rel
+			// Only the near side — the end of the edge that belongs to
+			// this table — moves to the alias. On a self-referential
+			// relation both ends name this table and rebinding both
+			// would erase the distinction the alias exists to draw.
+			r.Local = rebind(r.Local)
+			cp.relations[name] = &r
+		}
+	}
 	// The remaining slices are shared by value but not by array: a
 	// copy taken at full capacity would let an append through the
 	// alias land in the base table's spare capacity, and the next
@@ -245,12 +269,16 @@ func (t *Table) Col(name string) *Column { return t.byName[name] }
 // Columns returns the columns in declaration order.
 func (t *Table) Columns() []*Column { return t.columns }
 
-// This package declares no relations. A Table.Relation / Table.Rel pair
-// and a relations map lived here, against a *Relation type no file in
-// the package ever defined — so it had never compiled, nothing could
-// populate the map, and there is no loader here for an edge to feed.
-// See drops/pg's relations.go and find.go for the shape a dialect needs
-// before either is worth having.
+// Relation returns the relation declared under name, or nil.
+func (t *Table) Relation(name string) *Relation { return t.relations[name] }
+
+// setRelation registers r under name (used by NewRelations).
+func (t *Table) setRelation(name string, r *Relation) {
+	if t.relations == nil {
+		t.relations = map[string]*Relation{}
+	}
+	t.relations[name] = r
+}
 
 // Add registers a column with the table and returns it, so a
 // declaration reads as one expression:

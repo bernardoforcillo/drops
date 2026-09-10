@@ -42,8 +42,9 @@ documents are the explanation.
 
 drops is pre-1.0 and the surface is not evenly deep. PostgreSQL has the
 most (migrations, outbox, saga, event store, audit, tenancy, geo,
-money); SQLite has most of it; MySQL has the schema and query surface
-but none of the cross-cutting packages yet; ClickHouse is analytical
+money); SQLite has most of it; MySQL has the schema and query surface,
+relations and the tenancy scope layer, but not audit, authz or cache;
+ClickHouse is analytical
 rather than transactional; Qdrant is a focused HTTP client, not SQL at
 all. [dialects.md](dialects.md) has the table. Where a page describes
 something one dialect cannot do, it says so rather than leaving you to

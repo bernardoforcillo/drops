@@ -22,6 +22,11 @@ type DB struct {
 	drv   drops.Driver
 	hook  drops.Hook
 	retry *RetryPolicy
+
+	// strictLoading, set by StrictLoading, makes Find refuse a query
+	// that would leave a declared relation field unloaded. See
+	// strict.go.
+	strictLoading bool
 }
 
 // New wraps a drops.Driver as a MySQL DB.

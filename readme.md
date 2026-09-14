@@ -153,6 +153,7 @@ The [docs](docs/) directory has the explanations: a
 [declare a schema](docs/schema.md) without it drifting from your
 structs, [entities and relations](docs/entities.md),
 [which dialect gives you what](docs/dialects.md),
+[running it on Cloudflare](docs/cloudflare.md),
 [portable vector search](docs/vector-search.md),
 [mirroring one table across all three engines](docs/mirror.md),
 [change data capture from the write-ahead log](docs/cdc.md),
@@ -1585,6 +1586,110 @@ reach for a full-featured client like `github.com/redis/go-redis/v9` —
 this package's scope is the `cache.Cache` contract plus a few utility
 commands.
 
+## Cloudflare
+
+Four products, four different relationships to drops — and only one of
+them is a database drops speaks to.
+
+| | package | what it is to drops |
+|---|---|---|
+| D1 | `cloudflare/d1` | a `drops.Driver`; the SQLite dialect runs on it unchanged |
+| Vectorize | `cloudflare/vectorize` | a `vector.Store`, like `qdrant` |
+| Workers KV | `cache/cloudflarekv` | a `cache.Cache`, like `cache/redis` |
+| Hyperdrive | `cloudflare/hyperdrive` | not a backend — a pooler in front of *your* Postgres, and a list of what stops working behind it |
+
+All four share one API client, which holds the token, the account, the
+envelope decoding and the retry policy. Zero dependencies, like the
+rest of the library.
+
+```go
+cf, _ := cloudflare.New(accountID, cloudflare.WithAPIToken(token))
+db := sqlite.New(d1.New(cf, databaseID))
+```
+
+### D1, and the two transports
+
+`d1.New` goes to Cloudflare's public REST API — the transport for a
+migration runner, a CI job, a laptop. `d1.NewBridge("http://d1.internal")`
+goes to a Worker of yours holding the binding, which is faster,
+cheaper and needs no API token.
+
+The Worker half ships here too: `cloudflare/d1/worker/handler.js` is a
+dependency-free ES module you **mount** inside your own Worker, so your
+auth, routing and logging stay yours and only the wire format comes
+from drops. That split is deliberate — a protocol owned by neither
+side drifts, and the drift here is data-shaped (column order, BLOB
+encoding, int64 precision), so it returns wrong rows rather than
+failing to build. `worker/fixtures.json` is the conformance suite both
+halves run, so a change to one that the other has not made fails in
+CI.
+
+### What D1 takes away
+
+**Transactions.** D1's HTTP API has no interactive transactions —
+there is no `BEGIN` to send. What it has is the batch, and
+`Driver.Begin` is built on it: `Exec` buffers, `Commit` ships the
+buffer as one request, `Rollback` discards it. A `Query` inside a
+transaction returns `ErrTxQuery` rather than running outside the
+buffer, because running it outside would silently break
+read-your-writes. So `InTx` works for write-only units of work and
+refuses read-modify-write ones instead of getting them subtly wrong —
+put the guard in the statement (`UPDATE … WHERE version = ?`, then
+read the row count) and it needs no session to hold it.
+
+**A hundred bound parameters.** `WHERE id IN (?, ?, …)` over a slice
+meets the ceiling at a hundred ids. The driver refuses locally,
+without a round trip, and the error names the way through: one JSON
+parameter and `IN (SELECT value FROM json_each(?))`.
+
+**Streaming.** A result set arrives whole inside an HTTP response,
+capped at 1 MB. Page with `LIMIT` or a keyset cursor.
+
+Rows come back as JSON, which loses SQLite's type information; the
+driver puts it back. Integers past 2^53 keep their low bits, a
+`BOOLEAN` column's 1 and 0 scan into a `*bool`, four date/time
+spellings scan into a `time.Time`, and a violated index still answers
+`errors.Is(err, sqlite.ErrUniqueViolation)`.
+
+### Vectorize, and what a filter cannot say
+
+Vectorize's metadata filter is conjunctive: `$eq`, `$ne`, `$in`,
+`$nin` and the four ranges, ANDed. No `$or`, no `$not`. drops refuses
+those rather than approximating them — emulating an `Or` with two
+queries changes what `topK` means and what the scores rank against.
+A negated leaf with a direct opposite *is* rewritten, because that is
+a rewrite rather than an approximation.
+
+Two more worth knowing before the first write: a filter only narrows
+on a property that has a metadata index, and an unindexed one matches
+nothing rather than erroring; and there is no delete-by-filter, so
+`DeleteWhere` composes one out of a query and a delete-by-ID and
+refuses when the set may exceed what a query can see. Derive
+deterministic IDs instead — that is the shape that scales.
+
+### Workers KV, and what "eventually consistent" costs
+
+A KV write takes up to sixty seconds to be visible everywhere, and a
+TTL cannot be shorter than sixty seconds. So it suits an embedding or
+a rendered page — expensive to compute, safe to serve slightly stale —
+and not a query cache a write has to invalidate. A TTL below the floor
+is an error rather than a rounding, because an entry given sixty
+seconds when it asked for five is served stale for fifty-five and that
+bug surfaces far from the `Set` that caused it.
+
+### Hyperdrive, and the features that fail quietly
+
+Hyperdrive is a pooler, so the dialect stays `drops/pg`. What changes
+is everything that lives in a session: `LISTEN`/`NOTIFY`, logical
+replication, session advisory locks, the statement registry, `SET`,
+temp tables, `COPY`. Most of them do not error behind a pooler — they
+do the wrong thing. `hyperdrive.Check` is the startup assertion that
+turns that into a boot failure instead of a mystery, and
+`hyperdrive.Works()` says what is unaffected, which is most of drops
+including the outbox and the job queue.
+
+[docs/cloudflare.md](docs/cloudflare.md) is the long version.
+
 ## Layout
 
 ```
@@ -1598,12 +1703,18 @@ drops/clickhouse/            ClickHouse schema, engines, query builder,
 drops/mysql/                 MySQL / MariaDB schema, query builders, entities
 drops/qdrant/                Qdrant vector-database HTTP client
 drops/vector/                portable vector search shared by pg/CH/Qdrant
+drops/cloudflare/            shared Cloudflare API client: token, envelope, retries
+drops/cloudflare/d1/         D1 as a drops.Driver (REST or your own Worker)
+drops/cloudflare/d1/worker/  the Worker half: wire protocol handler + conformance fixtures
+drops/cloudflare/vectorize/  Vectorize as a vector.Store
+drops/cloudflare/hyperdrive/ what stops working behind Cloudflare's pooler
 drops/mirror/                keeps a pg table mirrored into ClickHouse + Qdrant
 integration/                 separate module: the suite that runs against real servers
 drops/cache/                 Cache interface + sentinels
 drops/cache/memory/          in-process cache backend
 drops/cache/redis/           Redis cache backend (own RESP2 client)
 drops/cache/memcached/       Memcached cache backend (own ASCII client)
+drops/cache/cloudflarekv/    Cloudflare Workers KV cache backend
 drops/cache/tiered/          two-level L1+L2 read-through cache
 drops/otel/                  OpenTelemetry spans + metrics from Hook
 drops/stdlib/                database/sql adapter

@@ -67,6 +67,32 @@
 //     Stdlib-only HTTP client: collection management, upsert/delete/retrieve,
 //     search / recommend / scroll, and a Must/Should/MustNot filter DSL.
 //
+// # Cloudflare
+//
+// Four products, four different relationships to this library. Only
+// one of them is a database drops speaks to; the shared API client is
+// [github.com/bernardoforcillo/drops/cloudflare].
+//
+//   - [github.com/bernardoforcillo/drops/cloudflare/d1] — Cloudflare
+//     D1 as a [Driver], so the SQLite dialect runs on it unchanged.
+//     Two transports: the public REST API, and a Worker of yours
+//     holding the binding, for which the package ships the wire
+//     protocol, a reference handler and a conformance suite. D1 has
+//     no interactive transactions, so [InTx] there buffers writes
+//     and ships them as one batch — read the package comment before
+//     relying on it.
+//
+//   - [github.com/bernardoforcillo/drops/cloudflare/vectorize] —
+//     Vectorize as a
+//     [github.com/bernardoforcillo/drops/vector.Store]. Its filter
+//     language is conjunctive, so the operators it lacks are refused
+//     rather than approximated.
+//
+//   - [github.com/bernardoforcillo/drops/cloudflare/hyperdrive] — not
+//     a backend but a pooler in front of your own PostgreSQL, and the
+//     list of drops features that stop working behind one. Several
+//     fail silently, which is what the list is for.
+//
 // # Cache packages
 //
 //   - [github.com/bernardoforcillo/drops/cache] — driver-agnostic cache
@@ -79,6 +105,11 @@
 //
 //   - [github.com/bernardoforcillo/drops/cache/redis] — Redis backend with
 //     a minimal RESP2 client and a bounded connection pool. Zero deps.
+//
+//   - [github.com/bernardoforcillo/drops/cache/cloudflarekv] — Cloudflare
+//     Workers KV. Eventually consistent, with a sixty-second floor on
+//     a TTL, so it suits something expensive to compute and safe to
+//     serve stale rather than a cache a write must invalidate.
 //
 // # Adapter
 //

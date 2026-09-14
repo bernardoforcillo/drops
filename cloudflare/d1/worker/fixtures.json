@@ -1,0 +1,159 @@
+{
+  "protocol": 1,
+  "about": [
+    "Conformance fixtures for the drops D1 wire protocol.",
+    "",
+    "Both halves run these. The Go side runs them in",
+    "cloudflare/d1/conformance_test.go; the Worker side runs them in",
+    "whatever test runner your Worker already has. A change to one",
+    "half that the other has not made fails here rather than in",
+    "production, which is the whole reason the fixtures are data in a",
+    "file instead of assertions in two languages.",
+    "",
+    "encode: a Go value, the parameter it must become on the wire.",
+    "decode: a wire value and a column type, the Go value it must scan to.",
+    "requests: a driver call, the exact request body it must produce.",
+    "responses: a handler reply, what the driver must make of it."
+  ],
+
+  "encode": [
+    { "name": "null", "go": null, "wire": null },
+    { "name": "true is 1, because SQLite has no boolean", "go": true, "wire": 1 },
+    { "name": "false is 0", "go": false, "wire": 0 },
+    { "name": "string", "go": "hello", "wire": "hello" },
+    { "name": "integer", "go": 42, "wire": 42 },
+    { "name": "large integer keeps every bit", "go": 9007199254740993, "wire": 9007199254740993 },
+    { "name": "float", "go": 1.5, "wire": 1.5 },
+    { "name": "blob is an array of byte values", "go": "hi", "goKind": "bytes", "wire": [104, 105] },
+    { "name": "empty blob is not null", "go": "", "goKind": "bytes", "wire": [] },
+    { "name": "nil blob is null", "go": null, "goKind": "bytes", "wire": null },
+    { "name": "time is RFC 3339 in UTC", "go": "2024-03-01T10:20:30Z", "goKind": "time", "wire": "2024-03-01T10:20:30Z" }
+  ],
+
+  "decode": [
+    { "name": "integer to int64", "wire": 7, "as": "int64", "want": 7 },
+    { "name": "integer past 2^53 to int64", "wire": 9007199254740993, "as": "int64", "want": 9007199254740993 },
+    { "name": "1 to bool", "wire": 1, "as": "bool", "want": true },
+    { "name": "0 to bool", "wire": 0, "as": "bool", "want": false },
+    { "name": "real to float64", "wire": 2.25, "as": "float64", "want": 2.25 },
+    { "name": "text to string", "wire": "x", "as": "string", "want": "x" },
+    { "name": "null to string is empty", "wire": null, "as": "string", "want": "" },
+    { "name": "blob array to bytes", "wire": [104, 105], "as": "bytes", "want": "hi" },
+    { "name": "text to bytes", "wire": "hi", "as": "bytes", "want": "hi" },
+    { "name": "RFC 3339 text to time", "wire": "2024-03-01T10:20:30Z", "as": "time", "want": "2024-03-01T10:20:30Z" },
+    { "name": "SQLite datetime() text to time", "wire": "2024-03-01 10:20:30", "as": "time", "want": "2024-03-01T10:20:30Z" },
+    { "name": "date text to time", "wire": "2024-03-01", "as": "time", "want": "2024-03-01T00:00:00Z" },
+    { "name": "unix seconds to time", "wire": 1709288430, "as": "time", "want": "2024-03-01T10:20:30Z" },
+    { "name": "JSON column arrives as text", "wire": "{\"a\":1}", "as": "string", "want": "{\"a\":1}" }
+  ],
+
+  "requests": [
+    {
+      "name": "one statement, no parameters",
+      "call": { "op": "query", "sql": "SELECT 1" },
+      "body": { "protocol": 1, "statements": [{ "sql": "SELECT 1" }] }
+    },
+    {
+      "name": "one statement with parameters",
+      "call": { "op": "exec", "sql": "INSERT INTO t (a, b) VALUES (?, ?)", "args": ["x", 1] },
+      "body": {
+        "protocol": 1,
+        "statements": [{ "sql": "INSERT INTO t (a, b) VALUES (?, ?)", "params": ["x", 1] }]
+      }
+    },
+    {
+      "name": "a batch keeps its statements separate, unlike the REST transport",
+      "call": {
+        "op": "batch",
+        "statements": [
+          { "sql": "INSERT INTO a VALUES (?)", "args": [1] },
+          { "sql": "INSERT INTO b VALUES (?)", "args": [2] }
+        ]
+      },
+      "body": {
+        "protocol": 1,
+        "statements": [
+          { "sql": "INSERT INTO a VALUES (?)", "params": [1] },
+          { "sql": "INSERT INTO b VALUES (?)", "params": [2] }
+        ]
+      }
+    }
+  ],
+
+  "responses": [
+    {
+      "name": "rows in column order",
+      "body": {
+        "protocol": 1,
+        "results": [
+          {
+            "columns": ["id", "name"],
+            "rows": [[1, "ada"], [2, "grace"]],
+            "meta": { "changes": 0, "last_row_id": 0, "rows_read": 2, "rows_written": 0 }
+          }
+        ]
+      },
+      "expect": { "kind": "rows", "columns": ["id", "name"], "rowCount": 2 }
+    },
+    {
+      "name": "write result carries changes and last_row_id",
+      "body": {
+        "protocol": 1,
+        "results": [
+          {
+            "columns": [],
+            "rows": [],
+            "meta": { "changes": 3, "last_row_id": 17, "rows_read": 900, "rows_written": 3 }
+          }
+        ]
+      },
+      "expect": { "kind": "result", "rowsAffected": 3, "lastInsertID": 17, "rowsRead": 900 }
+    },
+    {
+      "name": "a unique violation is classified from SQLite's own words",
+      "body": {
+        "protocol": 1,
+        "error": {
+          "message": "UNIQUE constraint failed: users.email",
+          "code": "SQLITE_CONSTRAINT_UNIQUE",
+          "index": 0
+        }
+      },
+      "expect": { "kind": "error", "sentinel": "unique", "table": "users", "columns": ["email"] }
+    },
+    {
+      "name": "a foreign-key violation names no columns, and must not invent any",
+      "body": {
+        "protocol": 1,
+        "error": { "message": "FOREIGN KEY constraint failed", "code": "SQLITE_CONSTRAINT_FOREIGNKEY", "index": 0 }
+      },
+      "expect": { "kind": "error", "sentinel": "foreign_key", "table": "", "columns": [] }
+    },
+    {
+      "name": "not null violation",
+      "body": {
+        "protocol": 1,
+        "error": { "message": "NOT NULL constraint failed: users.name", "index": 0 }
+      },
+      "expect": { "kind": "error", "sentinel": "not_null", "table": "users", "columns": ["name"] }
+    },
+    {
+      "name": "check violation names the constraint, not a column",
+      "body": {
+        "protocol": 1,
+        "error": { "message": "CHECK constraint failed: positive_total", "index": 0 }
+      },
+      "expect": { "kind": "error", "sentinel": "check", "table": "", "columns": [] }
+    },
+    {
+      "name": "missing table",
+      "body": { "protocol": 1, "error": { "message": "no such table: ghosts", "index": 0 } },
+      "expect": { "kind": "error", "sentinel": "undefined_table" }
+    },
+    {
+      "name": "a handler speaking another protocol version is refused",
+      "body": { "protocol": 99, "results": [] },
+      "expect": { "kind": "error", "sentinel": "protocol" }
+    }
+  ]
+}

@@ -791,7 +791,7 @@ func TestEntityQueryUnscopedKeepsTheTenantAndDropsTheDefaultFilter(t *testing.T)
 	mysql.Add(tbl, mysql.Text("title"))
 	deleted := mysql.Add(tbl, mysql.Timestamp("deletedAt", false))
 	tbl.DefaultFilter(deleted.IsNull())
-	ent := mysql.NewEntity[equPost](tbl, mysql.AllowUnmappedColumns("deletedAt")).
+	ent := mysql.NewEntity[equPost](tbl, mysql.AllowUnmappedColumns("deletedAt"), mysql.AllowNullableColumns("title")).
 		ScopeByTenant(tenant)
 
 	drv := dropstest.New().AlwaysRows([]string{"id", "tenantId", "title"})

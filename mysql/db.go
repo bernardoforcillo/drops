@@ -22,6 +22,15 @@ type DB struct {
 	drv   drops.Driver
 	hook  drops.Hook
 	retry *RetryPolicy
+
+	// strictLoading, set by StrictLoading, makes Find refuse a query
+	// that would leave a declared relation field unloaded. See
+	// strict.go.
+	strictLoading bool
+
+	// tracer, set by WithTracer, receives a span per statement. See
+	// tracing.go.
+	tracer Tracer
 }
 
 // New wraps a drops.Driver as a MySQL DB.
@@ -160,12 +169,31 @@ func (db *DB) Delete(t *Table) *DeleteBuilder { return &DeleteBuilder{db: db, ta
 // a trailing comment before anything else looks at it, so the hook and
 // the server both report the same statement text.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	// Before anything reaches the driver: a statement that cannot be
+	// sent should be reported by the call that built it, not by the
+	// server. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = drops.TagStatement(ctx, sql)
+	ctx, span := db.startSpan(ctx, "mysql.exec")
+	defer span.End()
+	db.annotateSpan(span, "exec", sql, args)
 	start := time.Now()
-	res, err := db.drv.Exec(ctx, sql, args...)
+	// The driver gets the real values; the hook below gets the wrapped
+	// ones, so a logger formatting QueryEvent.Args sees "<redacted>"
+	// for a PII column and the server still receives the password.
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	res, err := db.drv.Exec(ctx, sql, drvArgs...)
 	// Classify before the hook sees it, so a log line and a caller's
 	// errors.Is agree about what happened — see [ServerError].
 	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
 	db.emit(ctx, drops.QueryEvent{Kind: "exec", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return res, err
 }
@@ -173,10 +201,26 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 // Query runs a statement that returns rows. Query tags on ctx are
 // appended as a trailing comment, as in [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	// Before anything reaches the driver: a statement that cannot be
+	// sent should be reported by the call that built it, not by the
+	// server. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = drops.TagStatement(ctx, sql)
+	ctx, span := db.startSpan(ctx, "mysql.query")
+	defer span.End()
+	db.annotateSpan(span, "query", sql, args)
 	start := time.Now()
-	rows, err := db.drv.Query(ctx, sql, args...)
+	drvArgs := args
+	if containsPII(args) {
+		drvArgs = unwrapPII(args)
+	}
+	rows, err := db.drv.Query(ctx, sql, drvArgs...)
 	err = classifyError(err)
+	if err != nil {
+		span.RecordError(err)
+	}
 	db.emit(ctx, drops.QueryEvent{Kind: "query", SQL: sql, Args: args, Duration: time.Since(start), Err: err})
 	return rows, err
 }
@@ -223,6 +267,17 @@ func render(e drops.Expression) (string, []any) {
 	b := drops.NewBuilder(drops.WithDialect(Dialect))
 	b.Append(e)
 	return b.SQL()
+}
+
+// ToSQL renders e with the MySQL dialect. Exposed for tests and
+// logging, mirroring sqlite.ToSQL and clickhouse.ToSQL.
+//
+// It renders e as written, with no ctx: a builder whose table carries
+// context filters renders here WITHOUT them, because there is no ctx to
+// resolve them against. Use (*SelectBuilder).ToSQLCtx when what you
+// want is the statement the server would see.
+func ToSQL(e drops.Expression) (sql string, args []any) {
+	return drops.StringWithDialect(Dialect, e)
 }
 
 func (db *DB) emit(ctx context.Context, e drops.QueryEvent) {

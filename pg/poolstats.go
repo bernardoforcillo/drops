@@ -15,6 +15,9 @@ import (
 // pgx report the same numbers under their own return types
 // (sql.DBStats, pgxpool.Stat), so each needs a one-method
 // adapter to satisfy PoolStatsProvider — see the note there.
+// Both adapters ship: drops/stdlib translates sql.DBStats, and
+// drops/pgxdriver reports pgxpool.Stat, which describes the pool
+// the statements actually go through.
 //
 //	stop := db.StartPoolMetrics(ctx, 5*time.Second,
 //	    func(s pg.PoolStats) {
@@ -177,7 +180,7 @@ func SupportsPoolStats(db *DB) bool {
 // half of [drops.QueryEvent] measurable for that pool.
 //
 // A *sql.DB satisfies it in a handful of lines via sql.DB.Conn; a pgx
-// pool via Pool.Acquire.
+// pool via Pool.Acquire, which is what drops/pgxdriver does.
 type ConnAcquirer interface {
 	// AcquireConn takes one connection out of the pool and returns a
 	// Driver bound to it, together with a release function the caller

@@ -10,13 +10,13 @@ honest summary is that PostgreSQL is where the library is deepest.
 | Entity CRUD | ✅ | ✅ | ✅ | ✅ | n/a |
 | Drift check | ✅ | ✅ | ✅ | ✅ | n/a |
 | Composite keys | ✅ | ✅ | ✅ | n/a | n/a |
-| Relations, eager loading | ✅ | partial | declaration only | — | — |
+| Relations, eager loading | ✅ | partial | partial | — | — |
 | Keyset pagination | ✅ | ✅ | ✅ | ✅ (via mirror) | ✅ (via vector) |
 | Migrations, diff, snapshot | ✅ | ✅ | ✅ | diff + push² | — |
 | Introspection reads back | most¹ | ✅ | ✅ | most² | — |
-| Outbox, saga, event store | ✅ | ✅ | outbox, event store | event store | — |
+| Outbox, saga, event store | ✅ | ✅ | ✅ | event store | — |
 | Typed driver errors, retry | ✅ | sentinels only | ✅ | — | — |
-| Audit, tenancy, authz, cache | ✅ | ✅ | — | — | — |
+| Audit, tenancy, authz, cache | ✅ | ✅ | ✅ | — | — |
 | Vector search | ✅ pgvector | — | — | ✅ built-in | ✅ native |
 
 ² ClickHouse has `Introspect`, `BuildSnapshot`, `Diff` and `Push` but
@@ -26,11 +26,22 @@ would mean has no `ALTER` behind it and comes back as a refusal. Column
 TTLs are the one declared thing `system.columns` cannot report, so they
 are left out of the comparison and reported as a notice.
 
-¹ PostgreSQL introspection does not yet read back enums, sequences,
-views, RLS or policies, though the diff generator can write all of
-them. A schema declaring one enum therefore makes `Push` re-emit its
-`CREATE TYPE` on every run and `DetectDrift` permanently noisy. See
-`pg/introspect.go`.
+¹ PostgreSQL introspection reads back the schema-level objects as well
+as the tables: enum types with their labels in catalogue order,
+standalone sequences, views and materialised views, and per table
+whether row-level security is enabled and forced together with its
+policies. A schema declaring any of them reaches a steady state —
+`TestPGPushIsIdempotentWithSchemaObjects` is what holds that.
+
+What `Push` still cannot see is narrower and mostly about indexes: an
+index's operator class, `WITH` storage parameters, column ordering or
+`NULLS NOT DISTINCT`; an index with an expression element such as
+`lower(name)`, which is reported as an `unrepresentable-index` notice
+rather than compared; a multi-column foreign key; where a live sequence
+has got to; which columns a view reads; and an enum label that was
+removed or reordered, which PostgreSQL itself cannot do in place. The
+authoritative list is "What Push cannot see" in `pg.Push`'s doc
+comment, which is kept beside the behaviour rather than here.
 
 Where a cell is empty the feature is not there yet, not disabled. The
 package doc for each dialect says what it covers, and `## What's not
@@ -46,6 +57,13 @@ sharding, materialised views, online DDL, query-plan capture, PostGIS
 helpers, money and PII types.
 
 Use it unless you have a reason not to.
+
+Four of those — bulk `CopyFrom`, `Subscribe` and the LISTEN/NOTIFY
+change feed, pool metrics, and connection acquisition — are optional
+driver interfaces rather than SQL, and `database/sql` cannot express
+any of them. Connect through `drops/pgxdriver` instead of
+`drops/stdlib` and they answer; see [Which driver you connect
+with](operations.md#which-driver-you-connect-with).
 
 ## SQLite
 
@@ -194,10 +212,37 @@ dependent object, rebuild, and re-create it.
 The schema and query surface, entity CRUD with the drift check and
 composite keys, migrations against `information_schema`, a
 transactional outbox and event store, keyset pagination, typed driver
-errors and the expression library. Not audit, tenancy, authz or cache,
-and relations are declaration-only — there is no eager loader.
+errors and the expression library. Relations are declared with
+`NewRelations` and eager-loaded with `Find().With(...)`, one batched
+query per edge — single-level, as in SQLite. The audit trail, the saga
+coordinator, the entity cache, the authorisation guard, soft delete and
+`DetectDrift` are all here.
+
+Statement hooks (`OnInsert` / `OnUpdate` / `OnDelete`), mixins and
+templates, the N+1 detector, `Explain`, tracing, test factories and
+seeding, backfill, `Money` and PII redaction are all here too — MySQL
+has everything SQLite has except the pieces it does not need. `Cast`,
+`Enum` and `JSONPath` exist under those names already, written for
+MySQL's own syntax; SQLite's `tenantguard` is a trigger workaround for
+having no users or grants, and MySQL's answer to the same question is
+`tenantview.go`, which covers writes as well.
+
+What remains PostgreSQL-only is PostgreSQL-shaped: RLS, `LISTEN`,
+`COPY`, logical replication, pgvector, PostGIS, materialised views,
+sharding, plan hints.
 
 Four differences shape the API rather than the SQL:
+
+- **No transactional DDL, so migrations are recorded in two phases.**
+  MySQL commits the open transaction when it meets DDL, so the
+  transaction PostgreSQL and SQLite wrap a migration in does not exist
+  here. `Migrator` writes the history row *before* the migration and
+  marks it applied *after*, so one that fails leaves a row with a null
+  `appliedAt`. The next `Up` refuses with `ErrMigrationInterrupted`
+  rather than retrying (which would fail on a column that already
+  exists) or skipping (which would call a half-applied migration done).
+  A hook still gets a transaction of its own, which is why a data
+  change belongs in one and not in the migration body.
 
 - **No `RETURNING`.** `Entity.Create` issues the INSERT and reads the
   generated key back through the driver's `LastInsertId`. `CreateMany`
@@ -279,6 +324,18 @@ INSERT, materialised views, and the analytics aggregates.
 There is no `UPDATE`/`DELETE` in the usual sense — mutations rewrite
 whole parts asynchronously — so the shape of a ClickHouse workload is
 append, and collapse on merge. [mirror.md](mirror.md) is built on that.
+
+**What runs out here is bytes, not parameters.** The other three
+dialects refuse a statement carrying more bound parameters than the
+backend accepts. ClickHouse has no such number: clickhouse-go binds `?`
+by substitution, rendering each argument into the SQL text, so nothing
+travels as a parameter. The ceiling is `max_query_size` — 262144 bytes
+by default — on the text after substitution, and a batch of eight short
+columns crosses it at about a thousand rows. Over it, the server answers
+with a *syntax error* at a position where nothing is wrong. drops
+estimates the substituted size from below and refuses first; the
+estimate can only undershoot, so it never refuses a statement the server
+would have taken.
 
 `Introspect` reads a table back out of `system.tables` and
 `system.columns`, `BuildSnapshot` derives the same shape from the Go

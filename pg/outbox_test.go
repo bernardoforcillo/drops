@@ -25,6 +25,13 @@ type outboxDriver struct {
 	drainRows [][]any // each call to Query pops the next batch
 	tryLock   bool    // pg_try_advisory_xact_lock response
 	pending   [][]any // PendingAggregates responses
+
+	// queries and args record what Query was asked, for the tests
+	// that assert on the SHAPE of the drain rather than on its rows —
+	// the claim is a property of the statement, and a fake that
+	// answers rows cannot show whether it took them.
+	queries []string
+	args    [][]any
 }
 
 type outboxInsert struct {
@@ -86,9 +93,11 @@ func (d *outboxDriver) Exec(_ context.Context, sql string, args ...any) (drops.R
 	return outboxResult{}, nil
 }
 
-func (d *outboxDriver) Query(_ context.Context, sql string, _ ...any) (drops.Rows, error) {
+func (d *outboxDriver) Query(_ context.Context, sql string, args ...any) (drops.Rows, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.queries = append(d.queries, sql)
+	d.args = append(d.args, args)
 	if strings.Contains(sql, "pg_try_advisory_xact_lock") {
 		return &fakeRows{cols: []string{"ok"}, data: [][]any{{d.tryLock}}}, nil
 	}
@@ -578,3 +587,99 @@ func (d *failingDriver) Query(context.Context, string, ...any) (drops.Rows, erro
 	return nil, d.err
 }
 func (d *failingDriver) Begin(context.Context) (drops.Tx, error) { return nil, d.err }
+
+// ----------------------------------------------------------------------
+// Draining is a claim, not a read
+// ----------------------------------------------------------------------
+
+// A row lock lives as long as the transaction that took it, and a
+// statement sent outside one runs in an implicit transaction that
+// commits the moment the statement finishes. So SELECT ... FOR UPDATE
+// SKIP LOCKED, sent bare, released its locks before Drain returned:
+// SKIP LOCKED had nothing left to skip, and the second worker to poll
+// read the same rows and published them again.
+//
+// Nothing about that reports itself — no error, no contention, no
+// crash. It shows up downstream, as duplicates in the topic, on exactly
+// the multi-worker deployment the pattern recommends. These pin the
+// claim that replaced it.
+
+func TestDrainClaimsTheRowsItReturns(t *testing.T) {
+	drv := &outboxDriver{}
+	ob := pg.NewOutbox(pg.New(drv), "outbox")
+
+	if _, err := ob.Drain(context.Background(), 10); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(drv.queries) != 1 {
+		t.Fatalf("statements = %v, want one", drv.queries)
+	}
+	got := drv.queries[0]
+
+	// It writes. A drain that only reads cannot exclude a second
+	// worker, whatever it locks.
+	if !strings.Contains(got, "UPDATE") || !strings.Contains(got, `"availableAt" = now() +`) {
+		t.Errorf("Drain does not claim the rows it returns:\n%s", got)
+	}
+	// One statement, so it needs no transaction to hold anything.
+	// Counted on the UPDATE that names the table, since FOR UPDATE
+	// carries the word too.
+	if n := strings.Count(got, `UPDATE "outbox"`); n != 1 {
+		t.Errorf("the claim is %d statements, want one:\n%s", n, got)
+	}
+	// SKIP LOCKED stays, and now it is doing the job it is for:
+	// two concurrent claims are two UPDATEs, and the second would
+	// otherwise block on the first's rows.
+	if !strings.Contains(got, "FOR UPDATE SKIP LOCKED") {
+		t.Errorf("the claim no longer skips locked rows, so a second worker waits:\n%s", got)
+	}
+	// The visibility timeout is bound, not interpolated.
+	if len(drv.args) == 0 || len(drv.args[0]) != 2 {
+		t.Fatalf("args = %v, want the limit and the interval", drv.args)
+	}
+	if got := drv.args[0][1]; got != "30000 milliseconds" {
+		t.Errorf("interval = %v, want the default visibility timeout", got)
+	}
+}
+
+// The claimed rows come back in id order. UPDATE ... RETURNING promises
+// none, so the claim reads its own result through a CTE.
+func TestDrainReturnsTheClaimedRowsInOrder(t *testing.T) {
+	drv := &outboxDriver{}
+	ob := pg.NewOutbox(pg.New(drv), "outbox")
+	if _, err := ob.Drain(context.Background(), 10); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	got := drv.queries[0]
+	if !strings.Contains(got, "WITH claimed AS") || !strings.Contains(got, `FROM claimed ORDER BY "id"`) {
+		t.Errorf("the claim does not order what it returns:\n%s", got)
+	}
+}
+
+func TestTheVisibilityTimeoutIsTheCallers(t *testing.T) {
+	drv := &outboxDriver{}
+	ob := pg.NewOutbox(pg.New(drv), "outbox").WithVisibilityTimeout(2 * time.Minute)
+	if _, err := ob.Drain(context.Background(), 10); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if got := drv.args[0][1]; got != "120000 milliseconds" {
+		t.Errorf("interval = %v, want the timeout the caller set", got)
+	}
+}
+
+// DrainUnaggregated adds one clause to the same claim, rather than
+// being the old read with a filter on it.
+func TestDrainUnaggregatedClaimsToo(t *testing.T) {
+	drv := &outboxDriver{}
+	ob := pg.NewOutbox(pg.New(drv), "outbox")
+	if _, err := ob.DrainUnaggregated(context.Background(), 10); err != nil {
+		t.Fatalf("DrainUnaggregated: %v", err)
+	}
+	got := drv.queries[0]
+	if !strings.Contains(got, `"availableAt" = now() +`) {
+		t.Errorf("DrainUnaggregated does not claim:\n%s", got)
+	}
+	if !strings.Contains(got, `"aggregateID" IS NULL`) {
+		t.Errorf("DrainUnaggregated lost its restriction:\n%s", got)
+	}
+}

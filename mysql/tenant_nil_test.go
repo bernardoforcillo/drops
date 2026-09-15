@@ -39,7 +39,7 @@ func nilAxisEntity(name string) *mysql.Entity[nilAxisRow] {
 	mysql.Add(tbl, mysql.BigInt("id").PrimaryKey())
 	tenant := mysql.Add(tbl, mysql.Text("tenantId"))
 	mysql.Add(tbl, mysql.Text("title"))
-	return mysql.NewEntity[nilAxisRow](tbl).ScopeByTenant(tenant)
+	return mysql.NewEntity[nilAxisRow](tbl, mysql.AllowNullableColumns("title")).ScopeByTenant(tenant)
 }
 
 // nilTenants are the shapes a nil arrives in. Each is a non-nil

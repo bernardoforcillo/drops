@@ -45,7 +45,7 @@ func ccTable(name string) (*sqlite.Table, *sqlite.Entity[ccRow]) {
 	tenant := sqlite.Add(t, sqlite.BigInt("tenantId").NotNull())
 	sqlite.Add(t, sqlite.Text("name"))
 	t.ContextFilter(sqlite.TenantFilter(tenant))
-	return t, sqlite.NewEntity[ccRow](t)
+	return t, sqlite.NewEntity[ccRow](t, sqlite.AllowNullableColumns("name"))
 }
 
 func ccCache(t *testing.T) *memory.Cache {

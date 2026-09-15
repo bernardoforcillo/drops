@@ -634,7 +634,13 @@ const (
 // checking. What the statement will bind is what gets compared, because
 // it is produced the same way the statement produces it.
 func classifyBinding(v ColumnValue) (any, int) {
-	b := drops.NewBuilder(Placeholder)
+	// The whole Dialect, not just Placeholder: the placeholder style
+	// is the same either way, but identifier quoting is not. A Builder
+	// with no Dialect falls back to drops.StdQuoteIdent, which doubles
+	// the quote and leaves backslashes alone — see quoteIdent for the
+	// name that then arrives at the server, and ToSQL for the same
+	// note.
+	b := drops.NewBuilder(drops.WithDialect(Dialect))
 	v.writeValue(b)
 	sql, args := b.SQL()
 	if len(args) == 1 && sql == "?" {

@@ -682,6 +682,105 @@ func columnPath(c *Column) string {
 // "The same name" is [identKey]'s question rather than a byte
 // comparison, because which spellings the server resolves to one
 // column is a property of the dialect and not of Go.
+// checkAxisAssignment refuses an UPDATE that assigns the table's tenant
+// axis to anything but the tenant the ctx already names.
+//
+// It is the write-side half of what the context filter does for reads,
+// and the asymmetry it closes is stark: the WHERE clause decides which
+// rows a statement may touch, and the SET list decides what they
+// become. A statement scoped correctly in the half a reviewer checks
+// could hand the row to another tenant in the half they do not —
+// UPDATE `gadgets` SET `tenantId` = 999 WHERE id = 7 AND `tenantId` = 3
+// finds exactly one row, the caller's own, and gives it away. It
+// succeeds, it reports one row affected, and nothing walks it back.
+//
+// The rules are [stampTenantColumn]'s, because the two are the same
+// question asked of an INSERT and of an UPDATE:
+//
+//   - the column is matched by the name it RENDERS, so a handle from
+//     another table object for a column of the same name is caught;
+//   - a bound value equal to the ctx tenant is a restatement and
+//     renders — the shape [Entity.Update] composes, having stamped the
+//     field from ctx one call earlier;
+//   - a bound value naming another tenant is refused;
+//   - an expression is refused rather than trusted: what it evaluates
+//     to is the server's answer, and a transfer written as arithmetic
+//     is still a transfer.
+//
+// A ctx with no tenant refuses any assignment to the axis at all. A
+// table that names its write axis and scopes its reads some other way
+// has no context filter to fail closed for it, so the SET list is where
+// that statement has to be stopped.
+//
+// [UpdateBuilder.Unscoped] is the opt-out, and it is the whole
+// statement's authority that changes: the WHERE clause loses the tenant
+// predicate in the same breath, so a statement that moves a row between
+// tenants — a migration, a merge of two accounts, an admin tool — is
+// writable here and says so where a reviewer reads it.
+func checkAxisAssignment(ctx context.Context, t *Table, sets []ColumnValue) error {
+	axis := t.tenantAxis()
+	if axis == nil {
+		return nil
+	}
+	for _, s := range sets {
+		if !namesAxis(s.column(), axis) {
+			continue
+		}
+		tenant, ok := TenantFrom(ctx)
+		if !ok {
+			return fmt.Errorf("%w: %s is assigned by this UPDATE", ErrTenantMissing, columnPath(axis))
+		}
+		bound, kind := classifyBinding(bindingExpr(s))
+		if kind == bindingLiteral && sameTenant(bound, tenant) {
+			continue
+		}
+		if kind == bindingLiteral {
+			return fmt.Errorf("%w: %s is assigned another tenant's value; say Unscoped if the statement is meant to move the row",
+				ErrTenantMismatch, columnPath(axis))
+		}
+		return fmt.Errorf("%w: %s is assigned an expression drops cannot compare with the ctx tenant; assign a value, leave the column out, or say Unscoped",
+			ErrTenantMismatch, columnPath(axis))
+	}
+	return nil
+}
+
+// bindingExpr renders a SET assignment's VALUE alone, so
+// classifyBinding — which reads the rendered SQL and args — can be
+// asked the same question of an UPDATE's SET list that it is asked of
+// an INSERT's row.
+//
+// A closure is sound here and nowhere else in this file: nothing
+// resolves what it returns, the render is thrown away, and only the
+// shape is read.
+func bindingExpr(v ColumnValue) drops.Expression {
+	return drops.ExprFunc(func(b *drops.Builder) { v.writeValue(b) })
+}
+
+// namesAxis reports whether a bound column handle will RENDER as the
+// tenant axis in the statement being built.
+//
+// The comparison is on the rendered column name rather than on
+// [Column.key], because those two questions have different answers for
+// a handle obtained from a different table object — and the renderer
+// asks the first one. An INSERT column list, an UPDATE SET target and
+// an upsert assignment all write the bare name, so a foreign
+// OtherTable.TenantID and this table's tenant column are one column as
+// far as the server is concerned while key calls them strangers. A
+// check that compares by key therefore reads such a handle as "not the
+// axis" and lets the statement bind it anyway: on an INSERT the ctx
+// stamp was then APPENDED ALONGSIDE it, and a server that accepts a
+// duplicate column and keeps the first — SQLite does — wrote the row
+// under a tenant the ctx never named.
+//
+// Name equality is the weaker of the two tests and that is the point:
+// key equality implies it, since an alias copy keeps the declared
+// name, so nothing that matched before stops matching. Within one
+// table names are unique, so a column of the entity's own table that
+// is not the axis cannot collide with it here.
+//
+// "The same name" is [identKey]'s question rather than a byte
+// comparison, because which spellings the server resolves to one
+// column is a property of the dialect and not of Go.
 func namesAxis(c, axis *Column) bool {
 	if c == nil || axis == nil {
 		return false

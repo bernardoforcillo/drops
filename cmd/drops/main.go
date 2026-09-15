@@ -76,6 +76,8 @@ func run() error {
 		return runStatus(ctx, args)
 	case "diagram":
 		return runDiagram(args)
+	case "check":
+		return runCheck(ctx, args)
 	case "lint":
 		return runLint(ctx, args)
 	case "mcp":
@@ -103,6 +105,7 @@ Schema commands (need --schema, a Go package that exports
   generate   Diff the Go schema against the last snapshot and write a migration
   push       Diff the Go schema against the live database and apply it directly
   drift      Report where the live database and the Go schema disagree
+  check      Read the schema against itself; see Offline below
 
 Database commands (need --dsn, or DROPS_PG_DSN / DATABASE_URL):
   migrate    Apply pending migrations; "drops migrate down" rolls the last one back
@@ -111,10 +114,12 @@ Database commands (need --dsn, or DROPS_PG_DSN / DATABASE_URL):
   pull       Introspect a live database into a Go schema file
 
 Assistants:
-  mcp        Serve the schema, query plans and replication state over the
-             Model Context Protocol, read-only, on stdin/stdout
+  mcp        Serve the schema, query plans, drift, migration state and the
+             safety verdict on a set of statements over the Model Context
+             Protocol, read-only, on stdin/stdout
 
 Offline:
+  check      Report schema declarations that cost at scale — no database opened
   lint       Report query mistakes the type checker can see: "drops lint ./..."
   diagram    Emit a Mermaid ER diagram from a snapshot JSON
   version    Print the toolkit version

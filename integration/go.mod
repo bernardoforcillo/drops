@@ -11,9 +11,12 @@ go 1.25.0
 
 replace github.com/bernardoforcillo/drops => ../
 
+replace github.com/bernardoforcillo/drops/pgxdriver => ../pgxdriver
+
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
-	github.com/bernardoforcillo/drops v0.0.0-00010101000000-000000000000
+	github.com/bernardoforcillo/drops v0.0.0
+	github.com/bernardoforcillo/drops/pgxdriver v0.0.0-00010101000000-000000000000
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/jackc/pgx/v5 v5.10.0
 	modernc.org/sqlite v1.57.0

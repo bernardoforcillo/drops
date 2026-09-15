@@ -113,6 +113,14 @@ func (db *DB) Insert(t *Table) *InsertBuilder {
 // system.query_log both report the same statement text.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
 	sql = drops.TagStatement(ctx, sql)
+	// After the tag and before anything reaches the driver. After,
+	// because the tag is a comment the server reads and therefore
+	// counts; before, because a statement that cannot be read should be
+	// reported by the call that built it and not as a syntax error from
+	// the server. See ErrQueryTooLarge.
+	if err := checkQuerySize(sql, args); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	res, err := db.drv.Exec(ctx, sql, args...)
 	db.emit(ctx, drops.QueryEvent{
@@ -126,6 +134,10 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 // trailing comment, as in [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
 	sql = drops.TagStatement(ctx, sql)
+	// See DB.Exec: after the tag, before the driver.
+	if err := checkQuerySize(sql, args); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	rows, err := db.drv.Query(ctx, sql, args...)
 	db.emit(ctx, drops.QueryEvent{

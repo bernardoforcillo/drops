@@ -38,7 +38,7 @@ func flagSchema(t *testing.T) (*pg.Entity[flagRow], flagCols) {
 	pg.Add(tbl, pg.Boolean("admin").NotNull().Default("true"))
 	pg.Add(tbl, pg.Boolean("notify").Default("true"))
 	tier := pg.Add(tbl, pg.Text("tier").Default("'free'"))
-	return pg.NewEntity[flagRow](tbl), flagCols{name: name, tier: tier}
+	return pg.NewEntity[flagRow](tbl, pg.AllowNullableColumns("tier")), flagCols{name: name, tier: tier}
 }
 
 // flagDriver answers the INSERT's RETURNING with a full row. notify
@@ -178,7 +178,8 @@ func TestCreateColsRejectsColumnsItCannotBind(t *testing.T) {
 	pg.Add(unmappedTbl, pg.Boolean("notify"))
 	pg.Add(unmappedTbl, pg.Text("tier"))
 	tsv := pg.Add(unmappedTbl, pg.Text("search"))
-	unmapped := pg.NewEntity[flagRow](unmappedTbl, pg.AllowUnmappedColumns("search"))
+	unmapped := pg.NewEntity[flagRow](unmappedTbl,
+		pg.AllowUnmappedColumns("search"), pg.AllowNullableColumns("tier"))
 
 	// A second table object for the SAME relation, which is the
 	// stranger the tenant-scoping phase is about: its handles render

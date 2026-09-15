@@ -194,11 +194,15 @@
 // assignments so a collision with another tenant's row rewrites
 // nothing: see [InsertBuilder.ToSQLCtx].
 //
-// There are no relations here. The declaration API existed and nothing
-// consumed it: mysql has no eager loader, so a HasMany compiled, ran,
-// and did nothing at all — which is worse than its absence, because a
-// caller who declares one has no way to find out. Join the tables
-// explicitly until there is a loader to declare them for.
+// Relations are declared with [NewRelations] and loaded with [DB.Find],
+// one batched query per requested edge, so eager loading never degrades
+// into N+1. There was a period when the declaration API existed and
+// nothing consumed it — a HasMany compiled, ran, and did nothing at
+// all, which is worse than its absence because a caller who declares
+// one has no way to find out — and the API was withdrawn rather than
+// left lying. It is back because the loader is: see find.go, and
+// strict.go for the option that refuses a query which would leave a
+// declared relation looking empty.
 package mysql
 
 import "github.com/bernardoforcillo/drops"

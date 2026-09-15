@@ -1,0 +1,136 @@
+package mysql
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+// AuditLog records who-changed-what-when for every Create / Update /
+// Delete on the entities attached to it. The audit row is written in the
+// SAME transaction as the business mutation, so a rollback rolls back
+// both.
+//
+//	audit := mysql.NewAuditLog(db, "audit_events")
+//	mysql.WithAudit(UserEntity, audit)
+//	ctx = mysql.WithActor(ctx, currentUserID)
+//	UserEntity.Update(db, ctx, &u) // also writes an audit row
+type AuditLog struct {
+	db    *DB
+	table string
+}
+
+// AuditEvent is the row written per mutation.
+type AuditEvent struct {
+	Entity  string
+	Op      string
+	PK      json.RawMessage
+	Payload json.RawMessage
+	Actor   string
+}
+
+// NewAuditLog binds the log to db and a destination table.
+func NewAuditLog(db *DB, table string) *AuditLog {
+	if table == "" {
+		table = "audit_events"
+	}
+	return &AuditLog{db: db, table: table}
+}
+
+// NewAuditTable declares the canonical audit table.
+func NewAuditTable(name string) *Table {
+	t := NewTable(name)
+	Add(t, BigSerial("id").PrimaryKey())
+	Add(t, Text("entity").NotNull())
+	Add(t, Text("op").NotNull())
+	Add(t, JSON("pk"))
+	Add(t, JSON("payload"))
+	Add(t, Text("actor"))
+	Add(t, Timestamp("createdAt", false).NotNull().Default("CURRENT_TIMESTAMP"))
+	return t
+}
+
+// Record inserts ev using tx so the audit row lives or dies with the
+// surrounding transaction.
+func (a *AuditLog) Record(tx *DB, ctx context.Context, ev AuditEvent) error {
+	// Backticks, not double quotes. MySQL reads a double-quoted string
+	// as a LITERAL unless ANSI_QUOTES is set, so the column list this
+	// was ported with is a syntax error on a default server — and one
+	// that only ever fires on an audited write, which is the write you
+	// least want to discover it on.
+	sql := fmt.Sprintf(
+		"INSERT INTO %s (%s, %s, %s, %s, %s) VALUES (?, ?, ?, ?, ?)",
+		quoteIdent(a.table), quoteIdent("entity"), quoteIdent("op"),
+		quoteIdent("pk"), quoteIdent("payload"), quoteIdent("actor"))
+	_, err := tx.Exec(ctx, sql, ev.Entity, ev.Op, ev.PK, ev.Payload, ev.Actor)
+	return err
+}
+
+type actorCtxKey int
+
+const actorKey actorCtxKey = 1
+
+// WithActor annotates ctx with an actor identifier.
+func WithActor(ctx context.Context, actor any) context.Context {
+	return context.WithValue(ctx, actorKey, actor)
+}
+
+// ActorFrom returns the actor stored on ctx, or "" when absent.
+func ActorFrom(ctx context.Context) string {
+	v := ctx.Value(actorKey)
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// WithAudit attaches log to the entity so subsequent Create / Update /
+// Delete record audit events in the same transaction.
+func WithAudit[T any](e *Entity[T], log *AuditLog) *Entity[T] {
+	e.audit = &auditWiring{log: log}
+	return e
+}
+
+// auditWiring is the type-erased handle stored on Entity[T].
+type auditWiring struct {
+	log *AuditLog
+}
+
+// recordAudit writes an audit event for op when auditing is enabled.
+func (e *Entity[T]) recordAudit(tx *DB, ctx context.Context, op string, row *T, pkv any) error {
+	if e.audit == nil {
+		return nil
+	}
+	pkJSON, err := json.Marshal(pkv)
+	if err != nil {
+		return err
+	}
+	var payload json.RawMessage
+	if row != nil {
+		raw, err := json.Marshal(row)
+		if err != nil {
+			return err
+		}
+		payload = raw
+	}
+	return e.audit.log.Record(tx, ctx, AuditEvent{
+		Entity:  e.table.Name(),
+		Op:      op,
+		PK:      pkJSON,
+		Payload: payload,
+		Actor:   ActorFrom(ctx),
+	})
+}
+
+// pkValue returns r's primary-key field via reflection.
+func (e *Entity[T]) pkValue(r *T) any {
+	if len(e.pkFields) == 0 {
+		return nil
+	}
+	return auditKey(e.pkValuesOf(r))
+}
+
+// ErrAuditTableMissing is returned when an audit operation fails because
+// the configured table does not exist.
+var ErrAuditTableMissing = errors.New("drops/mysql: audit table not present; create it via NewAuditTable + migration")

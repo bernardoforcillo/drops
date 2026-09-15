@@ -157,6 +157,14 @@ func CompareGuard[T any](
 	// than a raw SELECT, so both runs go through the same scanning,
 	// tenanting and default-filter machinery. Only the one thing
 	// under test differs.
+	//
+	// Clearing the field is half of it: the guard reaches a statement
+	// as a context filter registered on the TABLE, and the closure
+	// there is bound to the entity that registered it, so a copy with
+	// a nil guard still renders the original's. The read below names
+	// that filter and steps around it — the tenant axis, the soft
+	// delete guard and every other predicate stay exactly where they
+	// were, which is what makes the two runs comparable.
 	unguarded := *e
 	unguarded.guard = nil
 	// The cache would serve one run the other's rows: the cache key
@@ -166,7 +174,7 @@ func CompareGuard[T any](
 	unguarded.cache = nil
 
 	start = time.Now()
-	all, err := build(unguarded.Query(db)).All(ctx)
+	all, err := build(unguarded.Query(db)).IgnoreFilters(guardFilterName(e.rowType)).All(ctx)
 	if err != nil {
 		return diff, fmt.Errorf("drops/pg: CompareGuard: unguarded read: %w", err)
 	}

@@ -60,8 +60,16 @@ func runDrift(ctx context.Context, args []string) error {
 			fmt.Println("  " + oneLine(s))
 		}
 	}
-	fmt.Println(`
-Every difference shows up in both lists — once as the change and once
+	fmt.Println("\n" + driftCaveats)
+	return findingError{fmt.Errorf("the database and the Go schema disagree")}
+}
+
+// driftCaveats says what a difference in the report does and does not
+// mean. Both the command and the drift tool `drops mcp` serves print
+// it: a reader who does not know that expressions are compared as text
+// will chase a difference that is not one, and an assistant will chase
+// it faster and further.
+const driftCaveats = `Every difference shows up in both lists — once as the change and once
 as its inverse — so the pair says which side to correct, not that there
 are two problems.
 
@@ -75,6 +83,4 @@ PostgreSQL's own spelling of them, not yours: a CHECK body, a partial
 index's predicate, a policy's USING clause or a view's definition will
 be listed on every run even when the database matches. Drift has no
 server to ask. "drops push --dry-run" does, and respells the declared
-side before comparing.`)
-	return findingError{fmt.Errorf("the database and the Go schema disagree")}
-}
+side before comparing.`

@@ -350,7 +350,16 @@ func TestPushSeesTheDestructiveActionInsideABatchedAlter(t *testing.T) {
 	mysql.Add(users, mysql.Varchar("nickname", 40).NotNull())
 
 	drv := pushDriver(live, map[string]int64{"users": 12}, nil)
-	res, err := mysql.Push(context.Background(), mysql.New(drv), mysql.NewSchema(users))
+	// The rename question is answered "no" up front: a column going
+	// and another arriving in the same push is a rename candidate, and
+	// Push refuses that BEFORE it looks at data loss. Declining it is
+	// what leaves this test asking the question it is about — whether
+	// the gate sees the DROP COLUMN inside a batched ALTER — instead of
+	// the one it is not.
+	res, err := mysql.Push(context.Background(), mysql.New(drv), mysql.NewSchema(users),
+		mysql.PushOptions{Renames: []mysql.RenameDecision{{
+			Rename: mysql.Rename{Kind: mysql.RenameColumn, Table: "users", From: "email"},
+		}}})
 	if !errors.Is(err, mysql.ErrDestructivePush) {
 		t.Fatalf("err = %v, want ErrDestructivePush", err)
 	}

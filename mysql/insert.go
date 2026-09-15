@@ -28,6 +28,11 @@ type InsertBuilder struct {
 	// [InsertBuilder.Unscoped].
 	unscoped bool
 
+	// hooked records that the table's InsertHooks have already been
+	// applied to cols/rows, so a builder that ToSQLCtx resolved does
+	// not run them a second time at render.
+	hooked bool
+
 	// resolved marks a builder resolveCtx has already produced.
 	// Resolution is not idempotent: the table still carries its tenant
 	// axis afterwards, and a second pass would stamp a column the first
@@ -222,6 +227,49 @@ func alignRow(cols []*Column, values []ColumnValue) []drops.Expression {
 	return out
 }
 
+// applyInsertHooks runs every InsertHook on the table and returns the
+// column list and rows with the hook's bindings appended.
+//
+// drops/sqlite's twin appends a ColumnValue to each row and lets the
+// column list fall out of row zero. This package keeps the columns
+// separately and flattens each row to expressions when it is bound, so
+// a hook-supplied column has to be appended in BOTH places and to every
+// row — uniformly, or the column list and the value tuples stop lining
+// up and MySQL rejects the statement.
+//
+// A hook that binds a column the caller already bound is ignored, which
+// is what InsertHookCtx.Has is for: the caller's value wins, because a
+// hook is a default and not an override.
+func (i *InsertBuilder) applyInsertHooks() ([]*Column, [][]drops.Expression) {
+	hctx := &InsertHookCtx{bound: make(map[string]bool, len(i.cols))}
+	for _, c := range i.cols {
+		hctx.bound[boundKey(c)] = true
+	}
+	for _, h := range i.table.insertHookList() {
+		h.BeforeInsert(hctx)
+	}
+	if len(hctx.adds) == 0 {
+		return i.cols, i.rows
+	}
+	cols := make([]*Column, 0, len(i.cols)+len(hctx.adds))
+	cols = append(cols, i.cols...)
+	for _, cv := range hctx.adds {
+		cols = append(cols, cv.column())
+	}
+	rows := make([][]drops.Expression, len(i.rows))
+	for n, row := range i.rows {
+		nr := make([]drops.Expression, 0, len(row)+len(hctx.adds))
+		nr = append(nr, row...)
+		for _, cv := range hctx.adds {
+			// valueExpr, not a closure over writeValue: the resolver
+			// walks these, and a hook may bind a subquery.
+			nr = append(nr, cv.valueExpr())
+		}
+		rows[n] = nr
+	}
+	return cols, rows
+}
+
 // sqlDefault renders the DEFAULT keyword, for a column a row did not
 // bind. It is a named type rather than a drops.Raw so that the tenant
 // stamping can recognise the gap it fills — see stampTenantColumn.
@@ -238,15 +286,19 @@ func (i *InsertBuilder) WriteSQL(b *drops.Builder) {
 	}
 	b.WriteString("INTO ")
 	i.table.writeName(b)
+	cols, rows := i.cols, i.rows
+	if !i.hooked && i.table.hasInsertHooks() {
+		cols, rows = i.applyInsertHooks()
+	}
 	b.WriteString(" (")
-	for n, c := range i.cols {
+	for n, c := range cols {
 		if n > 0 {
 			b.WriteString(", ")
 		}
 		b.WriteIdent(c.name)
 	}
 	b.WriteString(") VALUES ")
-	for n, row := range i.rows {
+	for n, row := range rows {
 		if n > 0 {
 			b.WriteString(", ")
 		}
@@ -424,6 +476,16 @@ func (i *InsertBuilder) resolveCtx(ctx context.Context) (*InsertBuilder, error) 
 	changed := false
 
 	cols, rows := i.cols, i.rows
+	// The hooks run FIRST, not at render time. A hook binds an
+	// arbitrary expression, so it is an operand position a
+	// *SelectBuilder can be handed to — and one no call site shows. Run
+	// after the walk below and its subquery would render through
+	// WriteSQL, which has no ctx, so a hook's SELECT would read every
+	// tenant's rows. cp.hooked stops the renderer applying them again.
+	if i.table.hasInsertHooks() {
+		cols, rows = i.applyInsertHooks()
+		cp.hooked, changed = true, true
+	}
 	rowsCopied := false
 	for r, row := range rows {
 		resolved, err := resolveExprs(ctx, row)

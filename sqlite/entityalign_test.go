@@ -91,7 +91,7 @@ func TestEntityBatchWidensRatherThanDiscards(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tbl := eaTable([]string{"ea1", "ea2", "ea3"}[i])
-			ent := sqlite.NewEntity[eaPost](tbl)
+			ent := sqlite.NewEntity[eaPost](tbl, sqlite.AllowNullableColumns("title", "kind"))
 			drv := dropstest.New()
 			db := sqlite.New(drv)
 

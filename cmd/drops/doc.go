@@ -10,6 +10,8 @@
 //	drops baseline   Adopt an existing database: snapshot it, mark the history applied
 //	drops status     Show what is applied, what is pending and what is unaccounted for
 //	drops lint       Report query mistakes the type checker can see
+//	drops mcp        Serve the schema, plans, drift and migration state to an
+//	                 assistant over the Model Context Protocol, read-only
 //	drops diagram    Emit a Mermaid ER diagram from a snapshot JSON
 //	drops version    Print the toolkit version
 //
@@ -28,10 +30,10 @@
 //
 // and a package without one is reported as such, with the function to
 // add. Those three commands therefore need a Go toolchain and have to
-// be run from inside the module, as does status when it is given
-// --schema. The rest — migrate, baseline, pull, diagram, and status
-// without --schema — read the database and the migration directory
-// only, and run anywhere.
+// be run from inside the module, as do status and mcp when either is
+// given --schema. The rest — migrate, baseline, pull, diagram, status
+// without --schema, and the rest of what mcp serves — read the
+// database and the migration directory only, and run anywhere.
 //
 // # Connecting
 //

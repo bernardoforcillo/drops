@@ -168,6 +168,12 @@ func (db *DB) Delete(t *Table) *DeleteBuilder {
 // a trailing comment before anything else looks at it, so the span,
 // the hook and the server all report the same statement text.
 func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	// Before anything reaches the driver: a statement that cannot be
+	// sent should be reported by the call that built it, not by the
+	// server. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = drops.TagStatement(ctx, sql)
 	ctx, span := db.startSpan(ctx, "sqlite.exec")
 	defer span.End()
@@ -189,6 +195,12 @@ func (db *DB) Exec(ctx context.Context, sql string, args ...any) (drops.Result, 
 // Query runs a raw SQL query. Query tags on ctx are appended as a
 // trailing comment, as in [DB.Exec].
 func (db *DB) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	// Before anything reaches the driver: a statement that cannot be
+	// sent should be reported by the call that built it, not by the
+	// server. See ErrTooManyParameters.
+	if err := checkParamCount(sql, args); err != nil {
+		return nil, err
+	}
 	sql = drops.TagStatement(ctx, sql)
 	ctx, span := db.startSpan(ctx, "sqlite.query")
 	defer span.End()

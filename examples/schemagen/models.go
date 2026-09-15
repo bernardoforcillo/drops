@@ -84,13 +84,19 @@ type Tag struct {
 	Label string `drop:"label,notNull"`
 }
 
-// PostTag has no key of its own, which is what a junction usually
-// looks like: the pair is the identity.
+// PostTag is a junction, and the pair IS the identity — so the pair is
+// declared as the key rather than only described as one. Two
+// primaryKey tags render one composite PRIMARY KEY.
+//
+// Without it the junction admits the same tag on the same post twice,
+// and logical replication cannot represent an UPDATE or a DELETE of
+// the row at all. `drops check` reports a table in that state, and
+// reported this one.
 //
 //drops:schema table=PostTags name=post_tags
 type PostTag struct {
-	PostID int64 `drop:"post_id,notNull"`
-	TagID  int64 `drop:"tag_id,notNull"`
+	PostID int64 `drop:"post_id,notNull,primaryKey"`
+	TagID  int64 `drop:"tag_id,notNull,primaryKey"`
 }
 
 // Note is the polymorphic pair, both halves of it. owner_type names

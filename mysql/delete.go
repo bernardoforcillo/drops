@@ -15,6 +15,14 @@ type DeleteBuilder struct {
 	orderBys []drops.Expression
 	limit    *int64
 	scope    filterScope
+
+	// defaults is what this execution resolved for the table's
+	// render-time filters, and nil when none of them held a statement.
+	defaults resolvedDefaults
+
+	// resolved marks the copy resolveCtx produced, so a statement
+	// nested in another is not resolved twice.
+	resolved bool
 }
 
 // Where appends predicates joined by AND. Nil predicates are ignored,
@@ -48,6 +56,25 @@ func (d *DeleteBuilder) Limit(n int64) *DeleteBuilder { d.limit = &n; return d }
 // instrument; see [SelectBuilder.Unscoped].
 func (d *DeleteBuilder) Unscoped() *DeleteBuilder { d.scope.unscoped = true; return d }
 
+// Table returns the target table.
+func (d *DeleteBuilder) Table() *Table { return d.table }
+
+// DB returns the executing DB — used by DeleteHooks that build a
+// replacement statement (an UPDATE for soft-delete).
+func (d *DeleteBuilder) DB() *DB { return d.db }
+
+// Wheres returns a copy of the predicate slice, so a DeleteHook can
+// read the original WHERE clauses when synthesising replacement SQL.
+func (d *DeleteBuilder) Wheres() []drops.Expression {
+	return append([]drops.Expression(nil), d.wheres...)
+}
+
+// IsUnscoped reports whether the caller opted out of every default
+// scope via Unscoped. A DeleteHook reads it to tell a hard DELETE from
+// the soft one it would otherwise rewrite; IgnoreFilters does not set
+// it, because naming a filter drops a predicate and not the rewrite.
+func (d *DeleteBuilder) IsUnscoped() bool { return d.scope.unscoped }
+
 // IgnoreFilters bypasses the named global filters on the table and
 // leaves every other one standing — see [SelectBuilder.IgnoreFilters].
 func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
@@ -57,6 +84,27 @@ func (d *DeleteBuilder) IgnoreFilters(names ...string) *DeleteBuilder {
 
 // WriteSQL renders the DELETE.
 func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
+	// A DeleteHook may replace the statement entirely — SoftDelete
+	// flips the DELETE into an UPDATE — unless the caller opted out.
+	if !d.scope.unscoped {
+		for _, h := range d.table.deleteHookList() {
+			if rep := h.BeforeDelete(d); rep != nil {
+				// The rewrite inherits this execution's resolution.
+				// The hook builds its UPDATE out of d.Wheres(), which
+				// already carries the resolved predicates — but the
+				// table's DEFAULT filters are not in that list, and a
+				// freshly built UpdateBuilder would re-derive them
+				// from the table, unwalked. A statement written inside
+				// one would then read every tenant's rows to decide
+				// which of this tenant's rows to mutate.
+				if upd, ok := rep.(*UpdateBuilder); ok && upd.defaults == nil {
+					upd.defaults = d.defaults
+				}
+				rep.WriteSQL(b)
+				return
+			}
+		}
+	}
 	if d.table.alias != "" {
 		// An aliased DELETE has to name the alias twice: once as the
 		// target and once in the FROM. MariaDB rejects the shorter
@@ -71,7 +119,7 @@ func (d *DeleteBuilder) WriteSQL(b *drops.Builder) {
 		b.WriteString("DELETE FROM ")
 		d.table.writeName(b)
 	}
-	wheres := d.scope.apply(d.table, d.wheres)
+	wheres := d.scope.apply(d.table, d.wheres, d.defaults)
 	if len(wheres) > 0 {
 		b.WriteString(" WHERE ")
 		writeAnd(b, wheres)
@@ -98,11 +146,88 @@ var ErrAliasedDeleteBounded = errors.New(
 // thousand rows into the whole table.
 func (d *DeleteBuilder) ToSQL() (string, []any) { return render(d) }
 
-// Exec runs the DELETE.
+// ToSQLCtx renders the statement ctx would send: the table's context
+// filters built and AND-ed into the WHERE clause, and every statement
+// written inside the predicates resolved on the same terms.
+//
+// A filter that cannot decide what the request may see refuses, and
+// the refusal is returned instead of a statement. Nothing walks a
+// DELETE back.
+func (d *DeleteBuilder) ToSQLCtx(ctx context.Context) (sql string, args []any, err error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	sql, args = r.ToSQL()
+	return sql, args, nil
+}
+
+// resolveCtx returns the builder to render for one execution: the
+// receiver when there was nothing to resolve, and a shallow copy
+// carrying the resolved lists when there was.
+func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) {
+	if d.resolved {
+		return d, nil
+	}
+	ctx = withIgnoredFilters(ctx, d.scope)
+
+	cp := *d
+	changed := false
+
+	wheres := d.wheres
+	if r, err := resolveExprs(ctx, d.wheres); err != nil {
+		return nil, err
+	} else if r != nil {
+		wheres, changed = r, true
+	}
+
+	if !d.scope.dropsContextFilters() {
+		preds, err := d.table.resolveContextFilters(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(preds) > 0 {
+			all := make([]drops.Expression, 0, len(wheres)+len(preds))
+			all = append(all, wheres...)
+			wheres, changed = append(all, preds...), true
+		}
+		defaults, err := resolveTableDefaults(ctx, d.table)
+		if err != nil {
+			return nil, err
+		}
+		if defaults != nil {
+			cp.defaults, changed = defaults, true
+		}
+	}
+
+	if !changed {
+		return d, nil
+	}
+	cp.wheres = wheres
+	cp.resolved = true
+	return &cp, nil
+}
+
+// resolveStatement implements [ctxResolvable], so a DELETE written as a
+// CTE body is scoped like a bare one.
+func (d *DeleteBuilder) resolveStatement(ctx context.Context) (drops.Expression, bool, error) {
+	r, err := d.resolveCtx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return r, r != d, nil
+}
+
+// Exec runs the DELETE, with the table's context filters resolved
+// against ctx first: a DELETE that loses them removes another tenant's
+// rows and reports success.
 func (d *DeleteBuilder) Exec(ctx context.Context) (drops.Result, error) {
 	if d.table.alias != "" && (len(d.orderBys) > 0 || d.limit != nil) {
 		return nil, ErrAliasedDeleteBounded
 	}
-	sql, args := d.ToSQL()
+	sql, args, err := d.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return d.db.Exec(ctx, sql, args...)
 }

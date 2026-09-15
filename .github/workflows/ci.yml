@@ -29,6 +29,8 @@ jobs:
         working-directory: cmd/drops
       - run: go mod tidy
         working-directory: integration
+      - run: go mod tidy
+        working-directory: pgxdriver
       # Whole-tree diff: the root module has no external deps, so its
       # go.sum does not exist — naming it explicitly errored with "no
       # such path". A bare diff still catches any go.mod (or go.sum)
@@ -89,6 +91,13 @@ jobs:
         working-directory: cmd/drops
       - name: test
         run: go test ./... -count=1
+        working-directory: cmd/drops
+      # The root module runs its tests under -race in every matrix leg
+      # and this module ran them under none. It is not single-threaded:
+      # the MCP server answers concurrent requests over stdio, and the
+      # linter walks packages in parallel.
+      - name: race
+        run: go test ./... -race -count=1
         working-directory: cmd/drops
 
       # The linter's own corpus proves it reports what it should. This
@@ -158,7 +167,99 @@ jobs:
           # skip: a silently skipped integration job is worse than none,
           # because it reports green.
           DROPS_REQUIRE_ALL: '1'
-        run: go test ./... -count=1 -v
+        # Under -race, and this is the job that most needs it. Every
+        # other job races against fakes; here the pool hands out real
+        # connections, the outbox worker drains on a timer and the
+        # change feed reads from a replication slot — three places
+        # whose concurrency has no meaning without a server on the
+        # other end. It roughly doubles the job's runtime and the
+        # servers are already paid for by then.
+        run: go test ./... -race -count=1 -v
+
+  # ── the pgx driver module ────────────────────────────────────────────
+  # pgxdriver is a module of its own so pgx does not reach the build of
+  # a user on MySQL, SQLite or ClickHouse. It is not in the root ./... ,
+  # so without this job it would compile for the first time in the
+  # integration job — after the servers have been paid for and started.
+  #
+  # Its own tests need no server: what they assert is that drops/pg
+  # FINDS the four optional interfaces, which is a property of the type.
+  # The ones that need a server are in the integration module, where the
+  # servers are.
+  pgxdriver:
+    name: pgx driver module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+          cache: true
+      - name: vet
+        run: go vet ./...
+        working-directory: pgxdriver
+      - name: build
+        run: go build ./...
+        working-directory: pgxdriver
+      - name: test
+        run: go test ./... -count=1
+        working-directory: pgxdriver
+      - name: race
+        run: go test ./... -race -count=1
+        working-directory: pgxdriver
+
+  # ── fuzzing ──────────────────────────────────────────────────────────
+  # Every `go test` runs a fuzz target's SEED corpus, which is how the
+  # nasty-name fixtures are checked. It does not run the fuzzer, so the
+  # inputs nobody thought of are never tried — and what these targets
+  # cover is identifier and literal quoting, which is the boundary
+  # between a name and the statement around it.
+  #
+  # It is not in the pull-request path: a bounded budget over
+  # twenty-five targets is minutes, and a fuzzer that finds something
+  # on the twelfth run of the same code should not block the pull
+  # request that did not change it. On main and nightly, where a
+  # finding is acted on rather than waited for.
+  fuzz:
+    name: fuzz (quoting and binding)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: ['.', './pg', './mysql', './sqlite', './clickhouse']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+          cache: true
+      - name: fuzz each target in the package
+        run: |
+          set -euo pipefail
+          # -fuzz takes one target at a time, so they are enumerated
+          # and run in turn rather than named in a list that goes stale
+          # the day somebody adds the twenty-sixth.
+          targets=$(go test ${{ matrix.pkg }} -list 'Fuzz.*' | grep '^Fuzz' || true)
+          if [ -z "$targets" ]; then
+            echo "no fuzz targets in ${{ matrix.pkg }}"; exit 0
+          fi
+          for t in $targets; do
+            echo "── $t"
+            go test ${{ matrix.pkg }} -run "^$t$" -fuzz "^$t$" -fuzztime=30s
+          done
+      # A crasher is written to testdata/fuzz/<target>/ and is the only
+      # reproducer there is. Without this the job is red and the input
+      # that made it red is gone with the runner.
+      - name: keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers-${{ strategy.job-index }}
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
 
   # ── linters ───────────────────────────────────────────────────────────
   staticcheck:
@@ -177,6 +278,8 @@ jobs:
         working-directory: cmd/drops
       - run: staticcheck ./...
         working-directory: integration
+      - run: staticcheck ./...
+        working-directory: pgxdriver
 
   golangci-lint:
     name: golangci-lint
@@ -208,6 +311,13 @@ jobs:
         with:
           version: latest
           working-directory: integration
+      # The fourth module, named for the same reason the third was: a
+      # linter's coverage should not depend on which directories
+      # somebody remembered.
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: pgxdriver
 
   # ── security ─────────────────────────────────────────────────────────
   govulncheck:
@@ -234,3 +344,7 @@ jobs:
         working-directory: cmd/drops
       - run: govulncheck ./...
         working-directory: integration
+      # And the driver, which is the module a user's own build links
+      # pgx through — so an advisory against pgx lands here first.
+      - run: govulncheck ./...
+        working-directory: pgxdriver

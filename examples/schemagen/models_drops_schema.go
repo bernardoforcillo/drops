@@ -29,8 +29,8 @@ var (
 // PostTags is the "post_tags" table, derived from PostTag.
 var (
 	PostTags      = pg.NewTable("post_tags")
-	PostTagPostID = pg.Add(PostTags, pg.BigInt("post_id").NotNull())
-	PostTagTagID  = pg.Add(PostTags, pg.BigInt("tag_id").NotNull())
+	PostTagPostID = pg.Add(PostTags, pg.BigInt("post_id").PrimaryKey())
+	PostTagTagID  = pg.Add(PostTags, pg.BigInt("tag_id").PrimaryKey())
 )
 
 // Profiles is the "profiles" table, derived from Profile.

@@ -41,7 +41,7 @@ func aliasTenantedEntity(t *testing.T, name string) *pg.Entity[aliasTenantedRow]
 	pg.Add(tbl, pg.BigInt("id").PrimaryKey())
 	pg.Add(tbl, pg.BigInt("tenantId").NotNull())
 	pg.Add(tbl, pg.Text("title"))
-	return pg.NewEntity[aliasTenantedRow](tbl).ScopeByTenant(tbl.As("u").Col("tenantId"))
+	return pg.NewEntity[aliasTenantedRow](tbl, pg.AllowNullableColumns("title")).ScopeByTenant(tbl.As("u").Col("tenantId"))
 }
 
 func aliasTenantCtx() context.Context {

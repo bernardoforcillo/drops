@@ -62,6 +62,7 @@ type DrizzleMigrator struct {
 	after       []DrizzleHook
 	lockTimeout time.Duration
 	noLock      bool
+	gate        safetyGate
 }
 
 // NewDrizzleMigrator wraps db with a migrator that reads from dir within
@@ -81,6 +82,22 @@ func NewDrizzleMigrator(db *DB, fsys fs.FS, dir string) *DrizzleMigrator {
 
 // WithSchema overrides the migration history schema. Match
 // drizzle.config.ts's `migrationsSchema` to stay interoperable.
+// WithSafetyGate refuses to apply a file whose SQL the analyser grades
+// at min or worse, returning an [UnsafeMigrationError] naming the tag
+// and listing what it found. It wraps [ErrUnsafeMigration].
+//
+// The whole pending run is graded before any of it is applied, as on
+// [Migrator]: a drizzle directory is a sequence somebody generated, and
+// stopping halfway through leaves the database between two snapshots
+// that the next `drops generate` then has to diff against.
+//
+// Every migration here is text by definition — there is no
+// programmatic entry — so every pending file is graded.
+func (d *DrizzleMigrator) WithSafetyGate(min SafetySeverity) *DrizzleMigrator {
+	d.gate = safetyGate{min: min, on: true}
+	return d
+}
+
 func (d *DrizzleMigrator) WithSchema(schema string) *DrizzleMigrator {
 	d.schema = schema
 	return d
@@ -292,6 +309,16 @@ func (d *DrizzleMigrator) up(ctx context.Context) error {
 	applied, err := d.appliedHashes(ctx)
 	if err != nil {
 		return err
+	}
+	if d.gate.on {
+		for _, e := range entries {
+			if applied[e.Hash] {
+				continue
+			}
+			if err := d.gate.check(e.Tag, e.SQL); err != nil {
+				return err
+			}
+		}
 	}
 	for _, e := range entries {
 		if applied[e.Hash] {

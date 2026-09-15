@@ -980,7 +980,8 @@ func TestAliasCarriesScopingDeclaredAfterAs(t *testing.T) {
 		{
 			name: "Entity.ScopeByTenant",
 			decl: func(base *pg.Table) {
-				pg.NewEntity[aliasLate](base).ScopeByTenant(base.Col("orgId"))
+				pg.NewEntity[aliasLate](base, pg.AllowNullableColumns("name")).
+					ScopeByTenant(base.Col("orgId"))
 			},
 			ctx:     pg.WithTenant(context.Background(), tenant),
 			want:    `("u"."orgId" = $?)`,
@@ -990,7 +991,7 @@ func TestAliasCarriesScopingDeclaredAfterAs(t *testing.T) {
 		{
 			name: "Entity.AuthorizeWith",
 			decl: func(base *pg.Table) {
-				pg.NewEntity[aliasLate](base).
+				pg.NewEntity[aliasLate](base, pg.AllowNullableColumns("name")).
 					AuthorizeWith(pg.OwnerGuard{Owner: base.Col("orgId")})
 			},
 			ctx:     pg.WithSubject(context.Background(), subject),

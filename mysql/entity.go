@@ -31,6 +31,25 @@ type Entity[T any] struct {
 	// MapConstraint; the names drops and MySQL generate are derived
 	// rather than stored — see (*Entity[T]).FieldError.
 	constraintFields map[string]string
+
+	// Tenant scoping (see tenant.go). tenantCol is nil unless
+	// ScopeByTenant was called; tenantField is the struct field it
+	// binds, so a write can stamp the ctx tenant onto the row.
+	tenantCol   *Column
+	tenantField []int
+
+	// Optional cross-cutting wiring; nil unless opted into.
+	audit *auditWiring // WithAudit (audit.go)
+	guard Guard        // AuthorizeWith (authz.go)
+	cache *EntityCache // WithCache (cache.go)
+
+	// rowType is T with its pointers stripped — the type NewEntity
+	// mapped the columns against. It is held rather than recomputed
+	// because it is the key an entity's row-scope filters are
+	// registered under: see rowScopeFilterKey, which needs the type's
+	// import path and name to keep two entities over one table from
+	// replacing each other's.
+	rowType reflect.Type
 }
 
 type entityColField struct {
@@ -147,7 +166,11 @@ func NewEntity[T any](t *Table, opts ...EntityOption) *Entity[T] {
 	if err := checkDrift(rt, t, colFields, cfg); err != nil {
 		panic(err.Error())
 	}
-	return &Entity[T]{table: t, pk: pk, pkField: pkField, pks: pks, pkFields: pkFields, colFields: colFields}
+	return &Entity[T]{
+		table: t, pk: pk, pkField: pkField,
+		pks: pks, pkFields: pkFields, colFields: colFields,
+		rowType: rt,
+	}
 }
 
 // checkDrift reports columns bound to no struct field — see
@@ -208,6 +231,34 @@ func checkNullability(rt reflect.Type, t *Table, colFields []entityColField, cfg
 		})
 	}
 	return drift.ReportNullable("drops/mysql", rt.Name(), t.name, bad, "mysql.AllowNullableColumns")
+}
+
+// hasRowScope reports whether reading through this entity is narrowed
+// by anything a cache key would have to account for: a tenant axis, an
+// authorisation guard, or a context filter registered on the table.
+//
+// The guard term is the one worth spelling out. The question is about
+// the entity's CONFIGURATION, not about what the guard resolves to on
+// the current ctx: a guard that returns no predicate for this subject —
+// the ordinary spelling of "this subject is unrestricted" — would
+// otherwise put the entity back on the cached path, and the next
+// request from a subject the guard does restrict would be served
+// whatever the primary-key namespace happened to hold.
+func (e *Entity[T]) hasRowScope() bool {
+	return e.tenantCol != nil || e.guard != nil || e.table.hasContextFilters()
+}
+
+// auditKey renders a key for the audit trail's single rowID column,
+// joining a composite key rather than losing all but its first column.
+func auditKey(values []any) any {
+	if len(values) == 1 {
+		return values[0]
+	}
+	parts := make([]string, len(values))
+	for i, v := range values {
+		parts[i] = fmt.Sprintf("%v", v)
+	}
+	return strings.Join(parts, "|")
 }
 
 // Table returns the entity's table.
@@ -301,8 +352,43 @@ func (e *Entity[T]) Get(db *DB, ctx context.Context, key ...any) (T, error) {
 	if err != nil {
 		return out, err
 	}
+	// The tenant axis reaches the statement as a context filter on the
+	// table and the executors resolve it — nothing injects it here. It
+	// is also why a scoped entity does not read through the cache: the
+	// PK namespace has no room for the scope, so an entry written for
+	// one tenant would answer another's Get.
+	if e.cache != nil && !e.hasRowScope() {
+		return e.getCached(db, ctx, key, pred)
+	}
 	err = db.Select(e.selectCols()...).From(e.table).Where(pred).One(ctx, &out)
 	return out, err
+}
+
+// getCached is the cache-aware implementation of Get. Concurrent misses
+// for the same key collapse to one database read via the single-flight
+// group.
+func (e *Entity[T]) getCached(db *DB, ctx context.Context, pkValues []any, pred drops.Expression) (T, error) {
+	var out T
+	key := e.pkKey(pkValues)
+	if hit, err := e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := e.cache.sf.do(key, func() (any, error) {
+		var t T
+		if hit, err := e.cache.readPK(ctx, key, &t); err == nil && hit {
+			return t, nil
+		}
+		sel := db.Select(e.selectCols()...).From(e.table).Where(pred)
+		if serr := sel.One(ctx, &t); serr != nil {
+			return nil, serr
+		}
+		_ = e.cache.writeKey(ctx, key, t)
+		return t, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.(T), nil
 }
 
 // Query begins a typed SELECT over the entity's table.
@@ -331,7 +417,7 @@ func (q *EntityQuery[T]) Offset(n int64) *EntityQuery[T] { q.sb.Offset(n); retur
 
 // Unscoped opts out of every global filter on the table — named and
 // anonymous alike; the blunt instrument. See [SelectBuilder.Unscoped].
-func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.Unscoped(); return q }
+func (q *EntityQuery[T]) Unscoped() *EntityQuery[T] { q.sb.UnscopedDefaults(); return q }
 
 // IgnoreFilters bypasses the named global filters and leaves every
 // other one standing — see [SelectBuilder.IgnoreFilters]. It is the
@@ -350,6 +436,9 @@ func (q *EntityQuery[T]) ToSQL() (string, []any) { return q.sb.ToSQL() }
 
 // All returns every matching row.
 func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
+	if q.e.cache != nil {
+		return q.allCached(ctx)
+	}
 	var out []T
 	if err := q.sb.All(ctx, &out); err != nil {
 		return nil, err
@@ -357,11 +446,82 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	return out, nil
 }
 
-// One returns the first matching row.
+// One returns the first matching row. Cached the same way as All when
+// the entity has a cache attached.
 func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
+	q.sb.Limit(1)
+	if q.e.cache != nil {
+		return q.oneCached(ctx)
+	}
 	var out T
-	err := q.sb.Limit(1).One(ctx, &out)
+	err := q.sb.One(ctx, &out)
 	return out, err
+}
+
+// allCached and oneCached read the rendered query through the entity
+// cache. Both go through the single-flight group so a cold key under
+// concurrent load issues one query rather than one per caller — the
+// stampede protection the PK path already had.
+//
+// Unlike the PK path, these do NOT skip a scoped entity, and the reason
+// is the key: it is taken from the RESOLVED statement, so the tenant
+// that arrived as a context filter is already in it. Two tenants
+// running the same query get two keys. The PK namespace has no such
+// room, which is why hasRowScope keeps a scoped entity out of it.
+func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
+	sql, args, err := q.sb.ToSQLCtx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	key := queryKey(q.e.table.Name(), sql, args)
+	var out []T
+	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := q.e.cache.sf.do(key, func() (any, error) {
+		var hits []T
+		if hit, rErr := q.e.cache.readPK(ctx, key, &hits); rErr == nil && hit {
+			return hits, nil
+		}
+		var rs []T
+		if qErr := q.sb.All(ctx, &rs); qErr != nil {
+			return rs, qErr
+		}
+		_ = q.e.cache.writeKey(ctx, key, rs)
+		return rs, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.([]T), nil
+}
+
+func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
+	sql, args, err := q.sb.ToSQLCtx(ctx)
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	key := queryKey(q.e.table.Name(), sql, args) + ":one"
+	var out T
+	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
+		return out, nil
+	}
+	v, err := q.e.cache.sf.do(key, func() (any, error) {
+		var t T
+		if hit, rErr := q.e.cache.readPK(ctx, key, &t); rErr == nil && hit {
+			return t, nil
+		}
+		if qErr := q.sb.One(ctx, &t); qErr != nil {
+			return t, qErr
+		}
+		_ = q.e.cache.writeKey(ctx, key, t)
+		return t, nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return v.(T), nil
 }
 
 // Create inserts r.
@@ -373,15 +533,44 @@ func (q *EntityQuery[T]) One(ctx context.Context) (T, error) {
 // leaves the field alone rather than failing: the row is inserted
 // either way, and silently reporting an id of 0 would be worse.
 func (e *Entity[T]) Create(db *DB, ctx context.Context, r *T) error {
-	v := reflect.ValueOf(r).Elem()
-	ins := db.Insert(e.table)
-	ins.Row(e.bindings(v, false)...)
-	res, err := ins.Exec(ctx)
-	if err != nil {
-		return e.FieldError(err)
+	// Stamped before the row is read into bindings, so the INSERT
+	// carries the ctx tenant rather than whatever the caller left in
+	// the struct — and refuses outright when the struct already
+	// carries somebody else's. Without it the zero the caller never
+	// set reaches the axis check as another tenant's value.
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
 	}
-	e.applyGeneratedKey(v, res)
-	return nil
+	v := reflect.ValueOf(r).Elem()
+	do := func(tx *DB) error {
+		ins := tx.Insert(e.table)
+		ins.Row(e.bindings(v, false)...)
+		res, err := ins.Exec(ctx)
+		if err != nil {
+			return e.FieldError(err)
+		}
+		// Before the audit row, because the audit names the key and on
+		// MySQL the key is whatever the server just assigned. Reading
+		// it from the same transaction is also why LastInsertId is
+		// trustworthy here: it answers per connection, and the
+		// transaction pins one.
+		e.applyGeneratedKey(v, res)
+		return e.recordAudit(tx, ctx, "create", r, auditKey(e.pkValuesOf(r)))
+	}
+	var err error
+	if e.audit != nil {
+		err = db.InTx(ctx, do)
+	} else {
+		err = do(db)
+	}
+	if err == nil {
+		// Through refreshPK rather than straight into the cache: the
+		// PK namespace has no room for the scope, so a scoped entity
+		// must not put a row there — and deletes whatever is under the
+		// key instead. See refreshPK.
+		e.refreshPK(ctx, e.pkValuesOf(r), *r)
+	}
+	return err
 }
 
 // CreateMany inserts every row in one multi-row INSERT. Generated keys
@@ -394,6 +583,13 @@ func (e *Entity[T]) CreateMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
+		// Per row, because the stamp fills a field of each: a batch
+		// stamped only on the first would bind values under the wrong
+		// names for the rest — the INSERT column list is derived from
+		// row zero.
+		if err := e.stampTenant(ctx, &rows[i]); err != nil {
+			return nil, err
+		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
 	res, err := ins.Exec(ctx)
@@ -414,6 +610,13 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 	}
 	ins := db.Insert(e.table)
 	for i := range rows {
+		// Per row, because the stamp fills a field of each: a batch
+		// stamped only on the first would bind values under the wrong
+		// names for the rest — the INSERT column list is derived from
+		// row zero.
+		if err := e.stampTenant(ctx, &rows[i]); err != nil {
+			return nil, err
+		}
 		ins.Row(e.bindings(reflect.ValueOf(&rows[i]).Elem(), false)...)
 	}
 	res, err := ins.OnDuplicateKeyUpdateAll().Exec(ctx)
@@ -423,6 +626,13 @@ func (e *Entity[T]) UpsertMany(db *DB, ctx context.Context, rows []T) (drops.Res
 // Update writes every non-key column of r to the row its key
 // addresses.
 func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
+	// Stamped first, for the reason Create is: an UPDATE writes every
+	// non-key column, and on a scoped entity the tenant column is one
+	// of them — an unstamped struct would write its zero over a row it
+	// is otherwise allowed to touch and hand it to no tenant at all.
+	if err := e.stampTenant(ctx, r); err != nil {
+		return err
+	}
 	if e.pkIsZero(r) {
 		return ErrPKNotSet
 	}
@@ -435,8 +645,22 @@ func (e *Entity[T]) Update(db *DB, ctx context.Context, r *T) error {
 	if len(sets) == 0 {
 		return ErrNoAssignments
 	}
-	_, err = db.Update(e.table).Set(sets...).Where(pred).Exec(ctx)
-	return e.FieldError(err)
+	pkVals := e.pkValuesOf(r)
+	do := func(tx *DB) error {
+		if _, uerr := tx.Update(e.table).Set(sets...).Where(pred).Exec(ctx); uerr != nil {
+			return e.FieldError(uerr)
+		}
+		return e.recordAudit(tx, ctx, "update", r, auditKey(pkVals))
+	}
+	if e.audit != nil {
+		err = db.InTx(ctx, do)
+	} else {
+		err = do(db)
+	}
+	if err == nil {
+		e.refreshPK(ctx, pkVals, *r)
+	}
+	return err
 }
 
 // Save inserts r when every key field is zero, and updates it
@@ -454,8 +678,24 @@ func (e *Entity[T]) Delete(db *DB, ctx context.Context, key ...any) (drops.Resul
 	if err != nil {
 		return nil, err
 	}
-	res, err := db.Delete(e.table).Where(pred).Exec(ctx)
-	return res, e.FieldError(err)
+	var res drops.Result
+	do := func(tx *DB) error {
+		r, derr := tx.Delete(e.table).Where(pred).Exec(ctx)
+		if derr != nil {
+			return e.FieldError(derr)
+		}
+		res = r
+		return e.recordAudit(tx, ctx, "delete", nil, auditKey(key))
+	}
+	if e.audit != nil {
+		err = db.InTx(ctx, do)
+	} else {
+		err = do(db)
+	}
+	if err == nil {
+		e.invalidatePK(ctx, key)
+	}
+	return res, err
 }
 
 // bindings extracts column values from a row. skipKey omits the

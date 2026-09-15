@@ -27,9 +27,13 @@ import (
 //
 // LISTEN requires a sticky connection to the server, so drops
 // dispatches via the Listener interface — same duck-typing
-// pattern as the Copier path. Drivers that don't expose listen
-// (lib/pq does, pgx does via PgConn.WaitForNotification, others
-// don't) return ErrListenNotSupported.
+// pattern as the Copier path. A pool of interchangeable
+// connections cannot promise stickiness, which is why
+// database/sql cannot express this either; the drops/pgxdriver
+// module holds a connection out of the pool and pumps
+// PgConn.WaitForNotification, so connecting through it is what
+// makes Listen and the change feed work. Drivers that don't
+// expose listen return ErrListenNotSupported.
 
 // Listener is the driver contract drops uses to subscribe to a
 // channel. Implementations should keep their own goroutine
@@ -47,8 +51,9 @@ type Notification struct {
 }
 
 // ErrListenNotSupported is returned by Listen when the driver
-// does not satisfy Listener — fall back to polling or wire pgx /
-// lib/pq's listener APIs into an adapter.
+// does not satisfy Listener — connect through drops/pgxdriver,
+// fall back to polling, or wire lib/pq's listener API into an
+// adapter of your own.
 var ErrListenNotSupported = errors.New("drops/pg: driver does not implement Listener")
 
 // Listen subscribes to channel and returns a typed channel that

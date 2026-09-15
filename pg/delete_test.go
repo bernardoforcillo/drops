@@ -371,6 +371,35 @@ func TestDeleteSoftDeleteRewriteCarriesSubqueryScope(t *testing.T) {
 	)
 }
 
+// The rewrite carries the resolved DEFAULT filters too, not only the
+// predicates it copies out of the DELETE.
+//
+// A default filter is declaration-time, so it is not in d.Wheres() and
+// the hook cannot copy it: the UpdateBuilder it builds derives the list
+// from the table itself, which is the unwalked one. A statement written
+// inside such a filter then chose which rows to mutate by reading every
+// tenant's, in the one statement in this file that writes.
+func TestDeleteSoftDeleteRewriteCarriesResolvedDefaults(t *testing.T) {
+	db := pg.New(nil)
+	blocked := wscoped("blocked", nil)
+	notes := pg.NewTable("notes")
+	noteID := pg.Add(notes, pg.BigInt("id").PrimaryKey())
+	tenant := pg.Add(notes, pg.BigInt("tenantId").NotNull())
+	notes.ContextFilter(pg.TenantFilter(tenant))
+	notes.DefaultFilter(pg.NotIn(noteID, db.Select(blocked.Col("id")).From(blocked)))
+	pg.ApplyMixins(notes, &pg.SoftDeleteMixin{})
+
+	checkCtx(t, wctx(),
+		db.Delete(notes).Where(pg.Eq(noteID, int64(2))),
+		`UPDATE "notes" SET "deletedAt" = now() WHERE `+
+			`("notes"."id" NOT IN (SELECT "blocked"."id" FROM "blocked" `+
+			`WHERE ("blocked"."deletedAt" IS NULL) AND ("blocked"."tenantId" = $1))) AND `+
+			`("notes"."deletedAt" IS NULL) AND `+
+			`("notes"."id" = $2) AND ("notes"."tenantId" = $3)`,
+		wtenant, int64(2), wtenant,
+	)
+}
+
 // A subquery that cannot be resolved aborts the whole DELETE — both
 // renderings of it. Refusing is the only safe answer: the alternative
 // is a delete whose row set was chosen by a read that saw every tenant.

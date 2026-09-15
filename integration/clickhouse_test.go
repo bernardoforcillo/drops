@@ -1064,3 +1064,74 @@ func TestCHPushLeavesAViewAlone(t *testing.T) {
 		t.Errorf("the view is gone")
 	}
 }
+
+// ── the statement-size ceiling ───────────────────────────────────────
+
+// The refusal drops makes is only worth having if the ceiling behind it
+// is real. This sends the server a statement drops would have refused
+// and reads back what it says — which is the whole reason the guard
+// exists, because what it says is a SYNTAX ERROR.
+//
+// Nothing here is a unit test in a suit: the numbers in querysize.go
+// (262144, and the claim that a substituted argument counts toward it)
+// are claims about a server, and this is the only place they can be
+// checked against one.
+func TestCHRejectsAStatementOverTheQuerySize(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+
+	// Comfortably over max_query_size, sent as ONE literal so the
+	// failure is the size of the statement and nothing else.
+	huge := "SELECT length('" + strings.Repeat("x", 300*1024) + "')"
+	_, err := db.Exec(ctx, huge)
+	if err == nil {
+		t.Fatal("ClickHouse accepted a 300 KiB statement: max_query_size is not what drops assumes it is")
+	}
+	// The message is the point. If this ever stops saying it, the doc
+	// comment in querysize.go is describing a failure that no longer
+	// happens.
+	if !strings.Contains(err.Error(), "Max query size exceeded") {
+		t.Errorf("the server refused it with something else, so the guard's premise has changed:\n%v", err)
+	}
+
+	// And just under, the same statement shape is fine — so the
+	// refusal is about the size rather than about the shape.
+	ok := "SELECT length('" + strings.Repeat("x", 200*1024) + "')"
+	if _, err := db.Exec(ctx, ok); err != nil {
+		t.Errorf("a 200 KiB statement was refused, so the ceiling is lower than drops assumes: %v", err)
+	}
+}
+
+// The same ceiling, reached the way a caller actually reaches it: a
+// bulk insert whose batch grew. drops refuses before sending, and the
+// test proves the refusal was not merely cautious by showing the server
+// rejects the same batch when it is allowed through the door.
+func TestCHRefusesABulkInsertBeforeTheServerHasTo(t *testing.T) {
+	db := openCH(t)
+	ctx := context.Background()
+
+	tbl := clickhouse.NewTable(integration.UniqueName(t, "qs_rows"))
+	id := clickhouse.Add(tbl, clickhouse.Int64("id"))
+	body := clickhouse.Add(tbl, clickhouse.String("body"))
+	tbl.Engine(clickhouse.MergeTree()).OrderBy(id)
+	dropCH(t, db, tbl)
+	execCH(t, db, clickhouse.CreateTable(tbl))
+
+	ins := db.Insert(tbl)
+	for i := 0; i < 512; i++ {
+		ins = ins.Row(id.Val(int64(i)), body.Val(strings.Repeat("x", 1024)))
+	}
+	_, err := ins.Exec(ctx)
+	if !errors.Is(err, clickhouse.ErrQueryTooLarge) {
+		t.Fatalf("Insert: %v, want ErrQueryTooLarge", err)
+	}
+
+	// Half the batch fits, and goes.
+	half := db.Insert(tbl)
+	for i := 0; i < 100; i++ {
+		half = half.Row(id.Val(int64(i)), body.Val(strings.Repeat("x", 1024)))
+	}
+	if _, err := half.Exec(ctx); err != nil {
+		t.Fatalf("a batch under the ceiling was refused: %v", err)
+	}
+}

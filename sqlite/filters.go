@@ -38,7 +38,18 @@ type tableFilter struct {
 // opts out of nothing.
 type filterScope struct {
 	unscoped bool
-	ignored  map[string]struct{}
+	// keepCtx says that unscoped means the table's DECLARATION-time
+	// filters only, and that the request-time ones still apply.
+	//
+	// It is what separates [EntityQuery.Unscoped] from
+	// [SelectBuilder.Unscoped]. "Include the soft-deleted rows" is the
+	// thing callers reach for, and on the entity path it must not also
+	// mean "and every other tenant's": an entity is the typed, scoped
+	// surface, so the axis survives an opt-out aimed at the guards. The
+	// raw builder's Unscoped stays the blunt instrument it documents
+	// itself as.
+	keepCtx bool
+	ignored map[string]struct{}
 }
 
 // ignore records names this statement bypasses. An unknown name is
@@ -65,20 +76,61 @@ func (s filterScope) ignores(name string) bool {
 	return ok
 }
 
-// apply prepends t's surviving filters to wheres.
-func (s filterScope) apply(t *Table, wheres []drops.Expression) []drops.Expression {
-	if t == nil || s.unscoped || len(t.filters) == 0 {
-		return wheres
-	}
-	kept := make([]drops.Expression, 0, len(t.filters)+len(wheres))
-	for _, f := range t.filters {
-		if s.ignores(f.name) {
-			continue
-		}
-		kept = append(kept, f.pred)
-	}
+// apply prepends t's surviving filters to wheres. Filters lead so the
+// rendered WHERE reads scope-first, which is also where they have
+// always been.
+//
+// defaults is what this execution resolved for t, and is nil on the
+// ToSQL path and whenever no default filter had a statement inside it
+// — in which case the render-time list is used, unchanged and byte for
+// byte. See resolvedDefaults.
+func (s filterScope) apply(t *Table, wheres []drops.Expression, defaults resolvedDefaults) []drops.Expression {
+	kept := s.filtersOf(t, defaults)
 	if len(kept) == 0 {
 		return wheres
 	}
 	return append(kept, wheres...)
 }
+
+// filtersOf returns the default filters of t that survive this
+// statement's opt-outs, restated for the instance of the table the
+// statement names.
+//
+// It is the one place that answers "which of this table's render-time
+// predicates apply here", so the renderers that place them differently
+// — a joined table's go in its ON clause, the FROM table's in the
+// WHERE — ask the same question and get the same answer.
+func (s filterScope) filtersOf(t *Table, defaults resolvedDefaults) []drops.Expression {
+	if t == nil || s.unscoped || !t.hasDefaultFilters() {
+		return nil
+	}
+	// Through the table's scope rather than off the table, so an alias
+	// applies the guards its table carries now, and restated so that
+	// the handles they were declared with resolve to this alias — see
+	// tableScope and resolveFilterExprs.
+	filters := defaults.of(t)
+	kept := make([]drops.Expression, 0, len(filters))
+	for _, f := range filters {
+		if s.ignores(f.name) {
+			continue
+		}
+		kept = append(kept, f.pred)
+	}
+	return kept
+}
+
+// applyAll is apply over every table the statement names, in the order
+// it names them.
+func (s filterScope) applyAll(tables []*Table, wheres []drops.Expression, defaults resolvedDefaults) []drops.Expression {
+	for i := len(tables) - 1; i >= 0; i-- {
+		// Backwards, because each apply PREPENDS: walking the list in
+		// reverse leaves the filters in the order the statement names
+		// the tables.
+		wheres = s.apply(tables[i], wheres, defaults)
+	}
+	return wheres
+}
+
+// dropsContextFilters reports whether this statement's opt-out reaches
+// the request-time filters as well as the render-time ones.
+func (s filterScope) dropsContextFilters() bool { return s.unscoped && !s.keepCtx }

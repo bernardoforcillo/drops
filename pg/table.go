@@ -54,22 +54,14 @@ type Table struct {
 	// SECURITY: policies apply to the table's owner too.
 	rlsForced bool
 
-	// insertHooks / updateHooks / deleteHooks are the optional
-	// lifecycle hooks registered on this table. They are invoked by
-	// the corresponding builders during WriteSQL. Empty by default —
-	// a table with no hooks behaves exactly as it did before this
-	// feature shipped.
-	insertHooks []InsertHook
-	updateHooks []UpdateHook
-	deleteHooks []DeleteHook
-
-	// filters are the predicates applied automatically by
-	// SelectBuilder / UpdateBuilder / DeleteBuilder. A named filter
-	// (AddFilter) can be bypassed one at a time with IgnoreFilters;
-	// an anonymous one (DefaultFilter) only by Unscoped. Used to
-	// implement default scopes — SoftDelete's "deletedAt IS NULL"
-	// guard, a tenancy axis. See filters.go.
-	filters []tableFilter
+	// scope is the automatic-predicate state: the two filter lists,
+	// the write-side tenant column and the lifecycle hooks. It is a
+	// pointer because a table and every alias taken off it share ONE
+	// of them — an alias that snapshotted the lists was an alias
+	// scoped as the table stood when As was called, which is how a
+	// package-level alias of a table scoped in init went unscoped for
+	// ever. See tablescope.go.
+	scope *tableScope
 
 	// renamedFrom is the name this table used to have, set by
 	// RenamedFrom. See (*Col[T]).RenamedFrom for what it is for.
@@ -99,14 +91,14 @@ func (t *Table) PreviousName() string { return t.renamedFrom }
 // startup rather than at the first query.
 func NewTable(name string) *Table {
 	mustIdent("table", name)
-	return &Table{name: name, byName: map[string]*Column{}, relations: map[string]*Relation{}}
+	return &Table{name: name, byName: map[string]*Column{}, relations: map[string]*Relation{}, scope: &tableScope{}}
 }
 
 // NewSchemaTable creates a table in an explicit schema.
 func NewSchemaTable(schema, name string) *Table {
 	mustIdent("schema", schema)
 	mustIdent("table", name)
-	return &Table{schema: schema, name: name, byName: map[string]*Column{}, relations: map[string]*Relation{}}
+	return &Table{schema: schema, name: name, byName: map[string]*Column{}, relations: map[string]*Relation{}, scope: &tableScope{}}
 }
 
 // Relation looks up a registered relation by name. Returns nil if no
@@ -190,17 +182,18 @@ func (t *Table) Alias() string { return t.alias }
 // relation the statement names. Aliasing changes how a reference
 // renders and nothing else.
 //
-// What is not rewritten is anything the caller built and drops only
-// re-emits: a predicate, and a Patch operation. Both are closed over
-// the handles they were given. A global filter registered by
-// SoftDeleteMixin, or an authz guard built from the package-level
-// columns, still qualifies with the table name — so against a query
-// whose only FROM entry is the alias PostgreSQL raises 42P01, and in a
-// self-join the guard binds to whichever side is un-aliased rather
-// than to the one you meant. Scope an aliased query with Unscoped (or
-// IgnoreFilters, when only one filter is in the way) plus an explicit
-// predicate built from the alias's own handles, and build a Patch for
-// an aliased entity from the alias's handles too.
+// The automatic predicates are shared rather than copied: the alias
+// carries the filters, the tenant axis and the hooks the table has when
+// the statement runs, not the ones it had when As was called — see
+// tableScope for the cross-tenant DELETE the snapshot made reachable.
+// They are closed over the handles they were declared with, so they are
+// rendered under a relation rename that resolves those references to
+// this alias; resolveFilterExprs says what that does and does not
+// reach.
+//
+// What is still not rewritten is a Patch operation, which is closed
+// over the handles it was given: build one for an aliased entity from
+// the alias's own handles.
 //
 // Indexes are shared with the base table for the same reason — an
 // index's column list may hold arbitrary expressions — so Index.Table
@@ -304,10 +297,10 @@ func (t *Table) As(alias string) *Table {
 	// alias land in the base table's spare capacity, and the next
 	// append through the base overwrite it.
 	cp.indexes = append([]*Index(nil), t.indexes...)
-	cp.insertHooks = append([]InsertHook(nil), t.insertHooks...)
-	cp.updateHooks = append([]UpdateHook(nil), t.updateHooks...)
-	cp.deleteHooks = append([]DeleteHook(nil), t.deleteHooks...)
-	cp.filters = append([]tableFilter(nil), t.filters...)
+	// The scope is the exception, and deliberately: cp.scope is the
+	// same pointer, so the alias carries the filters and hooks the
+	// table has NOW rather than the ones it had when As was called.
+	// See tableScope.
 	return &cp
 }
 
@@ -442,13 +435,17 @@ func Add[T any](t *Table, c *Col[T]) *Col[T] {
 // hook can fill column values the caller didn't explicitly bind; user
 // values always win.
 func (t *Table) OnInsert(h InsertHook) *Table {
-	t.insertHooks = append(t.insertHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.insertHooks = appendShared(t.scope.insertHooks, h)
 	return t
 }
 
 // OnUpdate registers a hook invoked by UpdateBuilder.WriteSQL.
 func (t *Table) OnUpdate(h UpdateHook) *Table {
-	t.updateHooks = append(t.updateHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.updateHooks = appendShared(t.scope.updateHooks, h)
 	return t
 }
 
@@ -456,7 +453,9 @@ func (t *Table) OnUpdate(h UpdateHook) *Table {
 // may return a non-nil expression to replace the rendered DELETE
 // entirely — used by SoftDelete to flip DELETE into UPDATE.
 func (t *Table) OnDelete(h DeleteHook) *Table {
-	t.deleteHooks = append(t.deleteHooks, h)
+	t.scope.mu.Lock()
+	defer t.scope.mu.Unlock()
+	t.scope.deleteHooks = appendShared(t.scope.deleteHooks, h)
 	return t
 }
 
@@ -468,7 +467,7 @@ func (t *Table) OnDelete(h DeleteHook) *Table {
 // which gives the predicate a name a single query can step around
 // without giving up the rest of the table's scoping.
 func (t *Table) DefaultFilter(e drops.Expression) *Table {
-	t.filters = append(t.filters, tableFilter{pred: e})
+	t.addDefaultFilter(tableFilter{pred: e})
 	return t
 }
 
@@ -488,30 +487,81 @@ func (t *Table) AddFilter(name string, e drops.Expression) *Table {
 	if name == "" {
 		panic("drops/pg: AddFilter needs a non-empty name — use DefaultFilter for an anonymous filter")
 	}
-	t.filters = append(t.filters, tableFilter{name: name, pred: e})
+	t.addDefaultFilter(tableFilter{name: name, pred: e})
 	return t
 }
 
 // Filters returns the table's global-filter predicates in registration
 // order, named and anonymous alike.
 func (t *Table) Filters() []drops.Expression {
-	out := make([]drops.Expression, len(t.filters))
-	for i, f := range t.filters {
-		out[i] = f.pred
-	}
-	return out
+	return filterPreds(t.defaultFilterList())
 }
 
 // FilterNames returns the names of the table's named filters in
 // registration order. Anonymous filters contribute nothing.
 func (t *Table) FilterNames() []string {
 	var out []string
-	for _, f := range t.filters {
+	for _, f := range t.defaultFilterList() {
 		if f.name != "" {
 			out = append(out, f.name)
 		}
 	}
 	return out
+}
+
+// ScopeWritesByTenant declares col as the column every INSERT into this
+// table stamps from the ctx tenant, refusing when the ctx carries none.
+//
+// It is the write-side half of what [Table.ContextFilter] does for
+// reads, and it is declared separately because it cannot be derived
+// from the filter. A [ContextFilterFunc] is a closure that answers with
+// a predicate; nothing can ask it which column it names, and guessing
+// one from the predicate it rendered would be drops deciding which
+// column owns a row — so a table scoped with
+// ContextFilter(TenantFilter(col)) and nothing else keeps its guarantee
+// on every read, every UPDATE and every DELETE while its INSERTs stay
+// the caller's to bind. Naming the column here hands them to drops:
+//
+//	Posts.ContextFilter(pg.TenantFilter(PostTenantID)).
+//	    ScopeWritesByTenant(PostTenantID)
+//
+// [Entity.ScopeByTenant] calls this for you, so an entity-declared axis
+// covers both halves at once. Declaring it twice with the same column
+// is idempotent.
+//
+// The consequence worth stating plainly: from here on every INSERT into
+// this table needs a tenant on its ctx, including one built straight
+// from db.Insert(), and an ON CONFLICT DO UPDATE against it is gated so
+// that a collision with another tenant's row rewrites nothing — see
+// [InsertBuilder.ToSQLCtx]. A statement that legitimately writes outside
+// the ctx tenant says so with [InsertBuilder.Unscoped].
+//
+// The handle has to be one of this table's own columns, and a handle
+// this table does not own is a panic at declaration time rather than a
+// statement at request time: what it is given ends up in the INSERT
+// column list and in every axis check the package makes, so a codegen'd
+// OtherTable.TenantID passed here named a column the table does not
+// have, and the server's refusal reached the caller as a query error
+// about a name they never typed.
+//
+// Ownership is asked by [Column.key], so a handle taken off a table
+// alias names the same axis as the declared one; what is STORED is this
+// table's own handle rather than the one passed in, for the reason
+// [Entity.ScopeByTenant] stores its own: an alias handle qualifies with
+// an alias an INSERT into this table has no name for.
+func (t *Table) ScopeWritesByTenant(col ColRef) *Table {
+	if col == nil {
+		return t
+	}
+	c := col.col()
+	for _, own := range t.columns {
+		if own.key() == c.key() {
+			t.setTenantAxis(own)
+			return t
+		}
+	}
+	panic("drops/pg: ScopeWritesByTenant column " + columnPath(c) +
+		" is not a column of " + t.Name())
 }
 
 // AddIndex registers an index to be created alongside the table. The
@@ -636,8 +686,8 @@ func (t *Table) Policies() map[string]*Policy { return t.policies }
 // hasHooks reports whether the table has any lifecycle hooks
 // registered — used by builders to skip the hook pipeline when
 // nothing is wired up.
-func (t *Table) hasInsertHooks() bool { return len(t.insertHooks) > 0 }
-func (t *Table) hasUpdateHooks() bool { return len(t.updateHooks) > 0 }
+func (t *Table) hasInsertHooks() bool { return len(t.insertHookList()) > 0 }
+func (t *Table) hasUpdateHooks() bool { return len(t.updateHookList()) > 0 }
 
 // writeName writes only the (schema-qualified) table name, with no alias.
 // Used by DDL where AS clauses are not permitted.
@@ -660,6 +710,15 @@ func (t *Table) writeFrom(b *drops.Builder) {
 func (t *Table) writeRef(b *drops.Builder) {
 	if t.alias != "" {
 		b.WriteIdent(t.alias)
+		return
+	}
+	// A table's automatic predicates are built from the declared
+	// column handles and may be rendering inside a statement whose
+	// FROM entry is an alias of this table. resolveFilterExprs
+	// installs the rename for the length of each such predicate; here
+	// is where it lands.
+	if renamed := b.RelationAlias(t.relRef()); renamed != "" {
+		b.WriteIdent(renamed)
 		return
 	}
 	b.WriteQualified(t.schema, t.name)

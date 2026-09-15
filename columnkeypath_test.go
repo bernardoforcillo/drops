@@ -96,9 +96,7 @@ var keyPathExemptions = map[string]string{
 	// --- mysql ---
 	"mysql/table.go:As":                       "declaration time, the same wiring as pg's",
 	"mysql/tablescope.go:ScopeWritesByTenant": "a handle this table does not own panics at declaration time",
-	"mysql/tablescope.go:setTenantAxis": "normalises an alias copy onto the declared column before storing " +
-		"it, so the axis is the declared handle whichever spelling declared it",
-	"mysql/tenant.go:ScopeByTenant": "a handle with no matching struct field panics at declaration time",
+	"mysql/tenant.go:ScopeByTenant":           "a handle with no matching struct field panics at declaration time",
 	"mysql/page.go:rebindSpec": "moves a cursor key onto the entity's own handle; a stranger is left as it " +
 		"came and renders qualified, which is different SQL the server can see",
 	"mysql/tenantview.go:Axis": "normalises an alias copy onto its origin at declaration time; the view's " +
@@ -116,12 +114,14 @@ var keyPathExemptions = map[string]string{
 	// --- sqlite ---
 	"sqlite/table.go:As":                  "declaration time, the same wiring as pg's",
 	"sqlite/table.go:ScopeWritesByTenant": "a handle this table does not own panics at declaration time",
-	"sqlite/table.go:setTenantAxis":       "normalises an alias copy onto the declared column before storing it",
 	"sqlite/tenant.go:ScopeByTenant":      "a handle with no matching struct field panics at declaration time",
 	"sqlite/entity.go:alignBindings": "the one alignment sqlite has, and every binding it indexes was built " +
 		"by this package from the entity's own colFields — CreateMany takes rows of T, not handles, and " +
 		"sqlite has no CreateCols for a caller to name a column through. It widens rather than selects, " +
 		"so no binding is dropped either",
+	"sqlite/entity.go:rowsMatchColumns": "alignBindings's shortcut, asked of the column list alignBindings " +
+		"has just built from those same colFields: the two sides are the same handles, and a mismatch only " +
+		"sends the batch down the widening path that is exempt above",
 	"sqlite/tenantguard.go:Axis": "normalises an alias copy onto its origin at declaration time; the " +
 		"trigger's WHEN does render a bare NEW.<col>, but a handle the guarded table does not own is " +
 		"refused by validate as ErrTenantGuardAxisNotInTable and no DDL renders until it passes",

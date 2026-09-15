@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -26,6 +27,8 @@ func runPush(ctx context.Context, args []string) error {
 	dryRun := fs.Bool("dry-run", false, "print the statements and apply nothing")
 	allow := fs.Bool("allow-destructive", false, "apply statements that destroy data or objects; it does not answer a rename question")
 	dropIdx := fs.Bool("drop-unmanaged-indexes", false, "drop indexes the database has and the Go schema does not declare")
+	dropTbl := fs.Bool("drop-unmanaged-tables", false,
+		"drop tables the database has and the Go schema does not declare; of the two this is the one that takes rows with it")
 	interactive := fs.Bool("interactive", false,
 		"ask on stdin about each change that could be a rename, instead of refusing")
 	answers := &renameAnswers{}
@@ -55,6 +58,7 @@ func runPush(ctx context.Context, args []string) error {
 		Safe:                 *safe,
 		DryRun:               true,
 		DropUnmanagedIndexes: *dropIdx,
+		DropUnmanagedTables:  *dropTbl,
 		Renames:              decisions,
 	}
 	plan, err := planPush(ctx, pkg, req)
@@ -95,8 +99,48 @@ func runPush(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	// The library's own data-loss gate, which is a different question
+	// from the CLI's text guard below and asked with more to go on:
+	// it has counted the ROWS each change would destroy, so a drop
+	// from an empty table is not on this list at all.
+	//
+	// --allow-destructive answers it, and answering it means consenting
+	// to the changes THIS PLAN found — which have just been printed,
+	// with what each costs. That is a different thing from a standing
+	// permission in a config file, which is what pg.PushOptions.Allow's
+	// doc argues against: this one is a flag on one invocation, against
+	// one printed plan, and it expires with the command.
+	if len(plan.DataLoss) > 0 {
+		printDataLoss(os.Stdout, plan.DataLoss, *allow)
+		if !*allow {
+			return findingError{errors.New(plan.DataLossMessage +
+				"\n\nre-run with --allow-destructive if that is what you meant")}
+		}
+		req.Allow = plan.DataLoss
+		if plan, err = planPush(ctx, pkg, req); err != nil {
+			return err
+		}
+		if len(plan.DataLoss) > 0 && plan.DataLossMessage != "" {
+			// The consent authorised nothing the second plan found,
+			// which means the two plans disagree — the database moved
+			// under us between them. Refusing is the only safe answer:
+			// applying would be applying a plan nobody was shown.
+			return findingError{errors.New(plan.DataLossMessage +
+				"\n\nthe plan changed between the two runs; re-read it and try again")}
+		}
+	}
+
 	printNotices(plan.Notices)
 	if len(plan.Statements) == 0 {
+		// "already matches" is a claim, and with a notice just printed
+		// above it is a false one: the database has something the
+		// schema does not declare, push knows it, and said so one line
+		// earlier. Saying both is how an operator learns to skip the
+		// notices.
+		if len(plan.Notices) > 0 {
+			fmt.Println("no statements to apply; the differences above were left alone")
+			return nil
+		}
 		fmt.Println("no changes: the database already matches the Go schema")
 		return nil
 	}
@@ -144,6 +188,44 @@ func planPush(ctx context.Context, pkg *schemaPackage, req bridgeRequest) (*brid
 func mustDSN(flagValue string) string {
 	dsn, _ := resolveDSN(flagValue)
 	return dsn
+}
+
+// printDataLoss reports what the push would destroy, with the rows
+// each change costs.
+//
+// The row count is the number that decides. "drop-column on
+// users.email" is a line an operator waves through; "drop-column on
+// users.email (~2,400,000 rows)" is one they read twice, and that
+// difference is the whole reason drops counts rather than warning.
+//
+// "never analysed, and not empty" is the third answer and it is not a
+// hedge: PostgreSQL had no estimate for the table, drops probed it, and
+// the probe found rows. What is unknown is how many.
+func printDataLoss(w io.Writer, loss []bridgeDestructive, allowed bool) {
+	verb := "refusing"
+	if allowed {
+		verb = "running"
+	}
+	fmt.Fprintf(w, "\n%s %d change(s) that destroy data:\n", verb, len(loss))
+	for _, d := range loss {
+		where := d.Table
+		if d.Object != "" {
+			where += "." + d.Object
+		}
+		fmt.Fprintf(w, "  %-16s %s (%s)\n", d.Op, where, rowsPhrase(d.Rows))
+		if d.SQL != "" {
+			fmt.Fprintf(w, "  %-16s %s\n", "", oneLine(d.SQL))
+		}
+	}
+}
+
+// rowsPhrase says what the count means, since -1 is not a count. It
+// matches drops/pg's own wording, because the operator reads both.
+func rowsPhrase(rows int64) string {
+	if rows < 0 {
+		return "never analysed, and not empty"
+	}
+	return fmt.Sprintf("~%d rows", rows)
 }
 
 // printNotices reports the differences Push saw and declined to act

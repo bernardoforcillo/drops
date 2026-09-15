@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -39,15 +40,33 @@ func pushDeps(t *testing.T, db *pg.DB, desired *pg.Schema, opts ...pg.PushOption
 	t.Helper()
 	ctx := context.Background()
 	dry := pg.PushOptions{DryRun: true}
+	var real pg.PushOptions
 	if len(opts) > 0 {
-		dry = opts[0]
+		real = opts[0]
+		dry = real
 		dry.DryRun = true
 	}
 	plan, err := pg.Push(ctx, db, desired, dry)
+	// Every test using this helper drops something from a table it has
+	// just seeded a row into — that IS the subject: what goes with the
+	// column when the column goes. So the data-loss gate fires on every
+	// one of them, and consenting is the fixture rather than the thing
+	// under test.
+	//
+	// The consent is what the plan found, not a blanket "yes": the dry
+	// run reports each change it would refuse, and those exact changes
+	// are handed back. A drop the plan did not find is not authorised
+	// by this, which is the difference between a fixture and a flag
+	// that turns the gate off.
+	if errors.Is(err, pg.ErrDestructivePush) && plan != nil {
+		dry.Allow = plan.DataLoss
+		real.Allow = plan.DataLoss
+		plan, err = pg.Push(ctx, db, desired, dry)
+	}
 	if err != nil {
 		t.Fatalf("planning the push: %v", err)
 	}
-	if _, err := pg.Push(ctx, db, desired, opts...); err != nil {
+	if _, err := pg.Push(ctx, db, desired, real); err != nil {
 		t.Fatalf("push: %v\nthe plan was:\n  %s", err, strings.Join(plan.Statements, "\n  "))
 	}
 }
@@ -287,7 +306,10 @@ func TestPGPushDropsATableAForeignKeyPointsAt(t *testing.T) {
 	notesAfter := pg.NewTable("notes")
 	pg.Add(notesAfter, pg.BigSerial("id").PrimaryKey())
 	pg.Add(notesAfter, pg.BigInt("legacyId"))
-	pushDeps(t, db, pg.NewSchema(notesAfter))
+	// A table the schema stops naming is nobody's to drop until it is
+	// said — see pg.PushOptions.DropUnmanagedTables. That gate is not
+	// what this test is about; the DROP CASCADE that follows it is.
+	pushDeps(t, db, pg.NewSchema(notesAfter), pg.PushOptions{DropUnmanagedTables: true})
 
 	if tableExists(t, db, "legacy") {
 		t.Fatal("the table the schema stopped naming is still there")

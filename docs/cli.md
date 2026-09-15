@@ -13,7 +13,7 @@ drops migrate
 drops push --schema ./db/schema --dry-run
 drops drift --schema ./db/schema
 drops lint ./...
-drops mcp --dsn "$DATABASE_URL"
+drops mcp --dsn "$DATABASE_URL" --schema ./db/schema
 ```
 
 Every command takes `-h`. Connection strings come from `--dsn`, else
@@ -63,10 +63,10 @@ to add.
 Two consequences worth knowing before you script this:
 
 - `generate`, `push` and `drift` need a Go toolchain and have to run
-  from inside your module, as does `status --schema`. On a deploy host
-  with only the binary, `migrate`, `status` without `--schema`,
-  `baseline` and `pull` still work — they read the database and the
-  migration directory, not your source.
+  from inside your module, as do `status --schema` and `mcp --schema`.
+  On a deploy host with only the binary, `migrate`, `status` without
+  `--schema`, `baseline` and `pull` still work — they read the database
+  and the migration directory, not your source.
 - The program is written into a temporary directory inside your module
   and removed afterwards.
 - `push` is the one mode where that program opens a database
@@ -253,6 +253,48 @@ directory accounts for, which means a file was edited after it was
 applied or came from another branch. Pass `--schema` and it reports
 drift as well.
 
+### `drops check`
+
+Reads the schema against itself. No database is opened and no query
+source is parsed — it is about the declaration, and about the
+declarations that are legal SQL, that `push` will apply without a word,
+and that a production workload then pays for.
+
+```
+drops check --schema ./schema
+```
+
+The three offline-ish commands divide cleanly:
+
+| | reads | reports |
+|---|---|---|
+| `check` | the Go schema | declarations that cost at scale |
+| `lint` | the Go source | query mistakes the type checker can see |
+| `drift` | a live database | where it and the schema disagree |
+
+Seven rules, each of which says what it costs and what to change:
+
+| rule | what it finds |
+|---|---|
+| `unindexed-foreign-key` | a key whose own columns no index leads with. PostgreSQL indexes the *referenced* side for you and never this one — the side every delete of a parent row consults. |
+| `no-primary-key` | a table no entity can address, and whose UPDATE and DELETE logical replication cannot represent. |
+| `rls-without-policy` | row-level security on with nothing granted: the table returns no rows, as an empty result rather than a denial. |
+| `policy-without-rls` | the mirror image, and worse — the schema reads as protection and every row is visible. |
+| `nullable-unique` | a unique constraint over a nullable column. Two NULLs are distinct in PostgreSQL, so any number of rows may repeat the rest of the key. |
+| `redundant-index` | an index that is a leading prefix of another: maintained on every write, read by nothing. |
+| `foreign-key-type-mismatch` | a key compared through a cast, which stops the index on the referenced side being used. |
+
+Every rule is about a cost, never about taste — a schema check that
+reports preferences gets turned off wholesale within a week and takes
+the rules that mattered with it. `--off` skips rules by name (an
+unknown name is an error, not a silent no-op), and `--json` emits the
+findings as an array for CI. Exits 3 on a finding, as `drift` does.
+
+It found one on this repository's own example the first time it ran: a
+junction table whose comment said "the pair is the identity" and whose
+schema did not declare it, so the same tag could be attached to a post
+twice.
+
 ### `drops lint`
 
 Reads the source rather than the database: a DELETE or UPDATE executed
@@ -424,11 +466,11 @@ rather than being told about it second hand.
 ```json
 { "mcpServers": { "drops": {
     "command": "drops",
-    "args": ["mcp", "--dsn", "postgres://..."]
+    "args": ["mcp", "--dsn", "postgres://...", "--schema", "./db/schema"]
 } } }
 ```
 
-Four tools:
+Seven tools:
 
 | tool | answers |
 |---|---|
@@ -436,6 +478,9 @@ Four tools:
 | `explain` | the plan for a statement, its fingerprint, and the indexes it uses |
 | `selectivity` | what fraction of a table's rows carry a value, to decide whether a predicate is worth an index |
 | `replication` | the logical replication slots, their lag, and whether anything is consuming them |
+| `drift` | where the live database and the Go schema disagree, in both directions, with the statements that would destroy data named |
+| `safety` | what applying a set of statements would cost — what is destroyed, what is locked, what is rewritten — without running any of it |
+| `migrations` | what is applied, what is pending, and what the database records that the migration directory cannot account for |
 
 **Every tool is read-only, and that is a design decision.** Nothing
 here migrates, pushes, writes or drops. An assistant holding a
@@ -447,3 +492,38 @@ confirmation prompts and the exit codes they already have.
 
 `explain` runs without `ANALYZE`, so the statement is planned and
 never executed. Asking for the plan of a `DELETE` deletes nothing.
+`safety` does not reach the server at all: it reads the statements as
+text, which is also why SQL that is not a file yet can be checked
+before anybody writes one.
+
+`migrations` reads the journal off disk and selects the applied
+hashes. `drops status` answers the same question through
+`pg.DrizzleMigrator.Status`, which creates the history table when it
+is missing — the right thing for a command that is about to apply
+migrations, and a write. Here a database with no history table is
+reported as what it is: nothing has been applied there yet.
+
+### What the operator decides, and what the assistant decides
+
+`--dsn` has always been a flag rather than a tool argument. `--schema`
+(the Go package that declares your tables) and `--dir` (the migration
+directory, default `drizzle`) are flags for the same reason, and it is
+a stronger one than tidiness: evaluating a Go schema means compiling
+and running it, so a tool argument naming the package to evaluate
+would let anything that can call a tool run code of its choosing out
+of your module. What the server may read is settled once, in the
+configuration you wrote.
+
+Read-only is a promise about the database. Evaluating your schema
+package writes a temporary directory inside your module and runs the
+program it holds — exactly what `drops drift` does, and for the same
+reason: a schema built out of `pg.NewTable` is a Go value, and the
+only thing that can evaluate one is Go.
+
+`drift` is the tool that needs `--schema`, and therefore the one that
+needs a Go toolchain and a server started inside your module — the
+same bill `drops drift` pays, for the same reason. Started without it
+the tool says so and names the flag, and every other tool goes on
+working. The package is re-evaluated on every call: a drift report is
+about the schema as it is now, and an assistant asking for one has
+usually just edited it.

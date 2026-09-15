@@ -328,8 +328,20 @@ func (e *Entity[T]) AuthorizeWith(g Guard) *Entity[T] {
 	// runs, so clearing a guard clears the predicate, and re-registering
 	// under the same key keeps an entity rebuilt per request from
 	// stacking one filter per construction.
-	e.table.setContextFilter(rowScopeFilterKey(e.rowType, "guard"), e.guardPredicate)
+	e.table.setNamedContextFilter(
+		rowScopeFilterKey(e.rowType, "guard"), guardFilterName(e.rowType), e.guardPredicate)
 	return e
+}
+
+// guardFilterName is the name the guard filter may be bypassed by.
+//
+// It is not exported and not documented as a filter a caller names,
+// because "show me the rows my guard hides" is not a query anybody
+// should write by hand — it is what [CompareGuard] does, in one place,
+// to compare the guard against a rule. Keying it by row type keeps two
+// entities over one table from bypassing each other's.
+func guardFilterName(rowType reflect.Type) string {
+	return "guard:" + rowScopeFilterKey(rowType, "")
 }
 
 // rowScopeFilterKey names the context filter an entity registers on its

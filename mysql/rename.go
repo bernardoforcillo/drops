@@ -63,9 +63,17 @@ func (r Rename) String() string {
 	return fmt.Sprintf("%s=%s", r.From, r.To)
 }
 
-// key identifies the question a Rename answers, so a recorded decision
-// can be looked up by the candidate that provoked it.
-func (r Rename) key() string {
+// renameKey identifies the question a Rename answers, so a recorded
+// decision can be looked up by the candidate that provoked it.
+//
+// It is not called key, and the name is load-bearing rather than
+// stylistic: a zero-argument method called key means [Column.key]
+// everywhere else in this package, and the census that reads the
+// package source for every comparison by column identity
+// (TestEveryColumnKeyComparisonIsAnsweredFor) matches on exactly that
+// spelling. A second, unrelated key() put eighteen false sites in
+// front of it, and a census nobody can read reports nothing.
+func (r Rename) renameKey() string {
 	return string(r.Kind) + "\x00" + r.Table + "\x00" + r.From + "\x00" + r.To
 }
 
@@ -170,7 +178,7 @@ func DetectRenames(prev, cur *Snapshot) []RenameCandidate {
 	}
 	out := detectTableRenames(prev, cur)
 	out = append(out, detectColumnRenames(prev, cur)...)
-	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	sort.Slice(out, func(i, j int) bool { return out[i].renameKey() < out[j].renameKey() })
 	return out
 }
 
@@ -201,7 +209,7 @@ func detectTableRenames(prev, cur *Snapshot) []RenameCandidate {
 			}})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	sort.Slice(out, func(i, j int) bool { return out[i].renameKey() < out[j].renameKey() })
 	return out
 }
 
@@ -235,7 +243,7 @@ func detectColumnRenames(prev, cur *Snapshot) []RenameCandidate {
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	sort.Slice(out, func(i, j int) bool { return out[i].renameKey() < out[j].renameKey() })
 	return out
 }
 
@@ -377,7 +385,7 @@ func DeclaredRenames(schema *Schema) []RenameDecision {
 			})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
+	sort.Slice(out, func(i, j int) bool { return out[i].renameKey() < out[j].renameKey() })
 	return out
 }
 
@@ -422,7 +430,7 @@ func ResolveRenames(prev, cur *Snapshot, decisions []RenameDecision) (applied []
 func resolveOneKind(prev, cur *Snapshot, decisions []RenameDecision, kind RenameKind, candidates []RenameCandidate) (applied []Rename, unresolved []RenameCandidate) {
 	offered := map[string]bool{}
 	for _, c := range candidates {
-		offered[c.key()] = true
+		offered[c.renameKey()] = true
 	}
 	// The refusals are read first, because a refusal outranks a rename
 	// naming the same object. The two answers are not the same shape: a
@@ -450,7 +458,7 @@ func resolveOneKind(prev, cur *Snapshot, decisions []RenameDecision, kind Rename
 		if declined[d.Kind.side(d.Table, d.From)] {
 			continue
 		}
-		answered[d.key()] = d.IsRename
+		answered[d.renameKey()] = d.IsRename
 		// A rename nobody was asked about is still a rename. The
 		// detector decides what to ask, not what is true, and somebody
 		// renaming a column and changing its type past what the type
@@ -459,7 +467,7 @@ func resolveOneKind(prev, cur *Snapshot, decisions []RenameDecision, kind Rename
 		// change is applied, which is what keeps a recorded answer from
 		// an earlier migration from being replayed against a schema
 		// that has already moved past it.
-		if d.IsRename && !offered[d.key()] && renameStillPending(prev, cur, d.Rename) {
+		if d.IsRename && !offered[d.renameKey()] && renameStillPending(prev, cur, d.Rename) {
 			applied = append(applied, d.Rename)
 		}
 	}
@@ -472,14 +480,14 @@ func resolveOneKind(prev, cur *Snapshot, decisions []RenameDecision, kind Rename
 		claimed[r.Kind.side(r.Table, r.To)] = true
 	}
 	for _, c := range candidates {
-		if answered[c.key()] {
+		if answered[c.renameKey()] {
 			applied = append(applied, c.Rename)
 			claimed[c.Kind.side(c.Table, c.From)] = true
 			claimed[c.Kind.side(c.Table, c.To)] = true
 		}
 	}
 	for _, c := range candidates {
-		if _, ok := answered[c.key()]; ok {
+		if _, ok := answered[c.renameKey()]; ok {
 			continue
 		}
 		if declined[c.Kind.side(c.Table, c.From)] {
@@ -864,10 +872,10 @@ func marshalRenameLog(decisions []RenameDecision) ([]byte, error) {
 func mergeDecisions(recorded, given []RenameDecision) []RenameDecision {
 	byKey := map[string]RenameDecision{}
 	for _, d := range recorded {
-		byKey[d.key()] = d
+		byKey[d.renameKey()] = d
 	}
 	for _, d := range given {
-		byKey[d.key()] = d
+		byKey[d.renameKey()] = d
 	}
 	out := make([]RenameDecision, 0, len(byKey))
 	for _, k := range sortedKeys(byKey) {

@@ -39,7 +39,7 @@ func nilAxisEntity(name string) *sqlite.Entity[nilAxisRow] {
 	sqlite.Add(tbl, sqlite.BigInt("id").PrimaryKey())
 	tenant := sqlite.Add(tbl, sqlite.Text("tenantId"))
 	sqlite.Add(tbl, sqlite.Text("title"))
-	return sqlite.NewEntity[nilAxisRow](tbl).ScopeByTenant(tenant)
+	return sqlite.NewEntity[nilAxisRow](tbl, sqlite.AllowNullableColumns("title")).ScopeByTenant(tenant)
 }
 
 // nilTenants are the shapes a nil arrives in. Each is a non-nil

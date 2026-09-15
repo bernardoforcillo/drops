@@ -235,6 +235,12 @@ func TestNoExpressionConstructorSwallowsItsOperands(t *testing.T) {
 		// why the condition cannot be an expression: it outlives the
 		// statement that installed it.
 		"rowpolicy.go": "access-control DDL holds a stored condition string, not an operand",
+		// The snapshot renders an [Engine] into the two strings a
+		// schema comparison holds — a name and its arguments. An
+		// Engine is not a drops.Expression and takes no caller
+		// operand: it writes a fixed engine spec, and the closure is
+		// the adapter that lets renderBare drive its WriteEngine.
+		"snapshot.go": "an engine spec is rendered to text, and holds no operand",
 	}
 
 	entries, err := os.ReadDir(".")

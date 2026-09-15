@@ -3,6 +3,11 @@
 drops targets five backends. They are not interchangeable, and the
 honest summary is that PostgreSQL is where the library is deepest.
 
+Cloudflare D1 is not a sixth: it is SQLite, reached over HTTP, so it
+runs the SQLite dialect and appears in the SQLite column of the table
+below. What it takes away is a service limit rather than a dialect
+difference, and [cloudflare.md](cloudflare.md) is the page for it.
+
 | | PostgreSQL | SQLite | MySQL | ClickHouse | Qdrant |
 |---|---|---|---|---|---|
 | Schema, DDL, indexes | ✅ | ✅ | ✅ | ✅ | n/a |
@@ -364,6 +369,40 @@ collections, points, search, recommend and scroll, plus a filter DSL.
 
 Through [`drops/vector`](vector-search.md) it also satisfies the same
 portable search interface as pgvector and ClickHouse.
+
+## Cloudflare D1
+
+SQLite with a service around it, so everything in the SQLite section
+holds and this is only about the service. Use `cloudflare/d1` as the
+`drops.Driver` under `sqlite.New`.
+
+Four differences decide whether a SQLite schema ports:
+
+- **No interactive transactions.** `Begin` buffers writes and ships
+  them as one batch at commit; a `Query` inside a transaction is
+  refused rather than run outside it. Read-modify-write inside a
+  transaction has to become a conditional statement.
+- **100 bound parameters per statement.** An `IN (?, ?, …)` over a
+  slice meets it at a hundred values. One JSON parameter and
+  `IN (SELECT value FROM json_each(?))` is the way through.
+- **1 MB per query response**, and no streaming — the result set
+  arrives whole inside an HTTP response. Page with `LIMIT` or a
+  keyset cursor.
+- **No `ATTACH`, no `PRAGMA`, no extensions, no user-defined
+  functions, and no schemas.** Foreign keys are always enforced, so
+  the local dialect's "did you forget `PRAGMA foreign_keys=ON`?"
+  failure cannot happen; FTS5 and a named schema do not port.
+
+Rows arrive as JSON, which loses SQLite's type information. The driver
+puts it back: integers past 2^53 keep their low bits, a `BOOLEAN`
+column's 1 and 0 scan into a `*bool`, and four date/time spellings
+scan into a `time.Time`. Constraint failures keep SQLite's own
+message, so `errors.Is(err, sqlite.ErrUniqueViolation)` answers here
+exactly as it does against a file.
+
+[cloudflare.md](cloudflare.md) has the rest, including the two
+transports — the public REST API, and a Worker of yours holding the
+binding.
 
 ## Porting between them
 

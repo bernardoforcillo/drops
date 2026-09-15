@@ -3,7 +3,7 @@
 drops is a SQL toolkit for Go with no dependencies. It gives you typed
 schema declarations, a query builder that checks your comparisons at
 compile time, and entity CRUD — across PostgreSQL, MySQL, SQLite,
-ClickHouse and Qdrant.
+ClickHouse and Qdrant, and on Cloudflare D1, Vectorize and Workers KV.
 
 ## Start here
 
@@ -19,6 +19,7 @@ ClickHouse and Qdrant.
 | | |
 |---|---|
 | [Choosing a dialect](dialects.md) | What each of the five backends gives you, and what it does not. Read this before porting a schema. |
+| [Running on Cloudflare](cloudflare.md) | D1, Vectorize, Workers KV and Hyperdrive — which of them is a database, and what each one takes away. |
 | [Vector search](vector-search.md) | One query vocabulary over pgvector, ClickHouse and Qdrant. |
 | [OLTP → OLAP → vector](mirror.md) | Keeping one table mirrored across all three, without three schema declarations. |
 | [Change data capture](cdc.md) | Reading the write-ahead log instead of asking every writer to write twice — and the slot that fills your disk if you look away. |
@@ -46,6 +47,9 @@ money); SQLite has most of it; MySQL has the schema and query surface,
 relations and the tenancy scope layer, but not audit, authz or cache;
 ClickHouse is analytical
 rather than transactional; Qdrant is a focused HTTP client, not SQL at
-all. [dialects.md](dialects.md) has the table. Where a page describes
+all. The Cloudflare backends are drivers and adapters rather than
+dialects of their own — D1 runs the SQLite dialect, and
+[cloudflare.md](cloudflare.md) is the page for what it cannot do.
+[dialects.md](dialects.md) has the table. Where a page describes
 something one dialect cannot do, it says so rather than leaving you to
 find out.

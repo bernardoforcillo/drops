@@ -9,6 +9,294 @@ once a 1.0 is cut.
 ## [Unreleased]
 
 ### Added
+- **Running drops on Cloudflare: seven products, seven different
+  relationships to this library.** Only one of them is a database
+  drops speaks to, and getting that straight is the first thing the
+  support has to do. D1 is a `drops.Driver`; Vectorize is a
+  `vector.Store`; Workers KV is a `cache.Cache`; Workers AI is where
+  the vectors come from; R2 is where the operations that produce a
+  file put it; Queues is the durable hop an outbox publishes to; and
+  Hyperdrive is not a backend at all but a pooler in front of your own
+  PostgreSQL.
+
+  All seven share `drops/cloudflare`, which holds the token, the
+  account, the envelope decoding and the retry policy. The envelope is
+  why that package exists rather than seven copies of `net/http`
+  boilerplate: Cloudflare answers `"success": false` with HTTP 200
+  often enough that a status-code check alone lets a failure through,
+  and the useful part of a failure is the numeric code inside
+  `errors[]` rather than the status. Retries jitter, because a Worker
+  that fans out and meets a rate limit retries from every colo at
+  once. Only the API token is supported — the legacy global API key
+  authenticates as the whole account with no way to narrow it, so a
+  leaked one is a leaked account.
+
+  `drops/cache/cloudflarekv` is the KV backend, and its two properties
+  decide what it is good for. A write takes up to sixty seconds to be
+  visible everywhere, and a TTL cannot be shorter than sixty seconds —
+  so a `Set` asking for five is `ErrTTLTooShort` rather than a silent
+  rounding, because an entry given sixty seconds when it asked for
+  five is served stale for fifty-five and that bug surfaces far from
+  the call that caused it. `GetMulti` uses KV's bulk read, which
+  answers in JSON and therefore loses the bytes of a value that is not
+  valid UTF-8; those keys are detected and re-read byte-exact through
+  the single-value endpoint, so the common case stays one round trip
+  and the binary case is correct rather than fast.
+
+  `drops/cloudflare/hyperdrive` is mostly not a client. A pooler does
+  not hold a session, and a great deal of PostgreSQL is session state:
+  `LISTEN`/`NOTIFY`, logical replication, session advisory locks, the
+  statement registry, `SET`, temp tables, `COPY`. Most of them do not
+  error behind Hyperdrive — they silently do the wrong thing — so
+  `Unsupported` is the list, `Check` is the startup assertion that
+  turns one into a boot failure, `Report` prints the table marking the
+  ones that fail quietly, and `Works` says what is unaffected, which
+  is most of drops including the outbox, the job queue and the saga
+  runner. `Config.DSN` percent-encodes the password, which matters
+  more than it sounds: a generated password containing a `/` or an `@`
+  produces a URL that parses as a different host, and the failure
+  names neither the password nor the escaping. `hyperdrive.Client` is
+  the part that does talk to Cloudflare, because the pooler has to
+  exist before a Worker can bind it; `Origin` carries no password,
+  since Cloudflare stores one and never returns it and a
+  round-tripping type would blank it, and `Configuration.DirectConfig`
+  builds the connection that goes past the pooler to the origin, which
+  is what logical replication needs.
+
+- **Cloudflare D1 as a `drops.Driver`, so `drops/sqlite` runs on it
+  unchanged.** Schema declarations, the query builders, entities,
+  relations, migrations and the tenant axis all apply; this supplies
+  the missing half.
+
+  Two transports, because there are two genuinely different places the
+  calling code runs. `d1.New` goes to the public REST API — the
+  transport for a migration runner, a CI job, a laptop.
+  `d1.NewBridge` goes to a Worker of yours holding the binding, which
+  is faster, cheaper and needs no API token. The Worker half ships
+  here: `worker/handler.js` is a dependency-free ES module you *mount*
+  inside your own Worker, so authentication, routing and logging stay
+  yours and only the wire format comes from drops. That split is the
+  point — a protocol owned by neither side drifts, and the drift here
+  is data-shaped (column order, BLOB encoding, int64 precision), so it
+  returns wrong rows rather than failing to build.
+  `worker/fixtures.json` is the conformance suite both halves run.
+
+  **Transactions are the thing to read before shipping it.** D1's HTTP
+  API has no interactive transactions: there is no `BEGIN` to send,
+  and consecutive requests are not guaranteed to reach the same
+  connection. What D1 offers instead is the batch, and `Driver.Begin`
+  is built on it. `Exec` buffers, `Commit` ships the buffer as one
+  request, `Rollback` discards it and costs nothing. A buffered
+  statement's row count is `ErrPending` until the commit fills it in.
+  `Query` inside a transaction is `ErrTxQuery` rather than a SELECT
+  run outside the buffer, because running it outside would silently
+  break read-your-writes for every caller that reads back what it just
+  wrote. So `InTx` works for write-only units of work and refuses the
+  read-modify-write ones instead of getting them subtly wrong — put
+  the guard in the statement, and a conditional `UPDATE … WHERE
+  version = ?` reporting zero rows affected is the same answer a
+  transaction would have given, with no session to hold it.
+
+  Three service limits are checked locally, without a round trip,
+  because D1's own answer says neither what the limit is nor what to
+  do instead: the hundred bound parameters an `IN` over a slice meets
+  by accident (the error names the `json_each` way through), the
+  per-statement size, and the batch size. `d1.Published` carries them
+  as values so a test can assert against a number rather than read one
+  in a comment.
+
+  Rows arrive as JSON, which is lossier than SQLite's own protocol.
+  The REST transport uses `/raw` rather than `/query` so column order
+  survives a positional `Scan`; everything decodes with `UseNumber` so
+  a rowid past 2^53 keeps its low bits; a `BOOLEAN` column's 1 and 0
+  scan into a `*bool`, and four date/time spellings scan into a
+  `time.Time`. SQLite's own constraint message survives intact, so
+  `errors.Is(err, sqlite.ErrUniqueViolation)` and `drops.AsFieldError`
+  both answer on the dialect path without this package importing a
+  dialect.
+
+  The bridge transport has one wrinkle the REST one does not, and it
+  is stated rather than left to be discovered. D1's Worker API exposes
+  the projected column names through `raw()` and the statement's
+  metadata through `all()`, and no call returns both. The handler
+  takes `all()`, because losing the metadata is the silent and severe
+  half: `changes()` is what `Result.RowsAffected` answers, so the
+  conditional `UPDATE` that stands in for the transaction D1 does not
+  have would report that it lost the race every single time. The cost
+  is that a projection with two columns of the same name loses the
+  second, which fails loudly — a positional `Scan` comes up a column
+  short — and is fixed by aliasing.
+
+- **D1 read replication, and the session that makes it safe to turn
+  on.** D1 can place read replicas around the world, and a replica is
+  allowed to be behind the primary. Without a session two consecutive
+  reads may be served by two instances and the second may see *less*
+  than the first; a read after a write may not see the write. Nothing
+  errors — the data is simply old, which is the failure mode that gets
+  deployed.
+
+  `d1.Session` is D1's answer and drops'. Every request in one returns
+  a bookmark, the next request carries it, and D1 refuses to serve
+  that request from an instance that has not caught up to it, so the
+  reads stay local and cheap and stop going backwards. A `Session` is
+  itself a `drops.Driver`, so `sqlite.New(sess)` runs the whole
+  dialect inside one; `FirstUnconstrained` and `FirstPrimary` decide
+  only where the *first* request may be served from.
+  `Session.Bookmark` and `Driver.Resume` carry the guarantee across
+  the end of a request — a cookie, a header, a queue message — and
+  `Resume("")` is an error rather than a quietly unconstrained
+  session.
+
+  Sessions are a Worker binding feature: Cloudflare does not offer
+  them over the REST API, so `d1.New` answers `ErrSessionsUnsupported`
+  from `Session` and `Resume` — at construction rather than at the
+  first query, so a deployment pointed at the wrong transport by a
+  changed environment variable fails at boot instead of serving a
+  stale read months later.
+
+  The wire protocol carries the session, and a request now declares
+  the *floor* it needs rather than the newest version this package
+  knows: a plain statement still asks for version 1 and is still
+  served by a deployed version 1 handler, and only a request carrying
+  a session asks for 2. Stamping every request with the newest version
+  would have broken every Worker that had not been redeployed,
+  including the ones using nothing new.
+
+- **D1 databases as a resource, not just as a thing to run statements
+  against.** `d1.Admin` creates, lists, finds by name and deletes
+  them, and sets read replication. It is a separate type needing a
+  `cloudflare.Client` because the two halves are separately authorised
+  and separately reachable: creating a database is an account-level
+  REST operation, while running a statement can go through a Worker
+  binding with no account credential at all — so a service that only
+  queries holds a `Driver` and no `Admin`. D1's 10 GB ceiling is what
+  makes database-per-tenant a real design rather than an eccentric
+  one, and names are unique within an account, so `FindByName` means
+  the UUID never has to be stored anywhere.
+
+  Time Travel is there too: `Bookmark` before a migration, `Restore`
+  after one goes wrong, and `Restored.PreviousBookmark` to undo the
+  restore, which is the only handle on the state the restore replaced.
+  `Restore` refuses a bookmark and a timestamp together rather than
+  picking one, because the half ignored decides which data survives.
+  Time Travel reaches back thirty days on a paid plan and dies with
+  the database, so it is not a backup — `ExportTo` and `ImportFile`
+  are. Both are jobs D1 polls and one call here: `ExportTo` writes the
+  dump to any `io.Writer`, since the signed URL D1 hands back is good
+  for about an hour and a two-step API invites it being stored
+  somewhere it will be stale; `Import` hides the three round trips D1
+  requires (hash, presigned upload, ingest) and `ImportFile` hashes by
+  streaming, so a dump larger than memory never enters it.
+
+- **Cloudflare R2, for the drops operations that produce a file rather
+  than a row** — a D1 export that has to outlive Time Travel's thirty
+  days, a schema dump kept beside a migration, a large document whose
+  row holds only the key to it.
+
+  It uses Cloudflare's own REST object API rather than the S3 one,
+  which is a deliberate trade with both halves worth stating. What it
+  buys is that R2 becomes one more thing the account's API token
+  reaches: no SigV4, no second credential to mint and rotate, no
+  second SDK, and the same retry policy and hook, so an R2 write
+  appears in a log next to the D1 statement that produced it. What it
+  costs is a 300 MB ceiling and no multipart upload, so
+  `ErrObjectTooLarge` is raised before a byte is sent and R2's
+  S3-compatible API is named as the way past it. A database dump
+  reaches 300 MB long before a 10 GB D1 database does.
+
+  An object key is a path: its slashes survive as separators, and the
+  two segments `url.PathEscape` leaves alone are percent-encoded. `.`
+  and `..` are legal path characters, so a key segment of `..` would
+  travel as a dot segment and anything between the process and R2 is
+  entitled by RFC 3986 to resolve it away — a key of `../../secrets`
+  would then address a different URL than the one it names.
+
+  `SetLifecycle` is the retention policy a bucket of dumps needs, with
+  `DeleteAfter` and `CoolAfter` as the two rules it usually is. It
+  replaces rather than appends, because R2 has no add-one-rule
+  endpoint, and a rule with no transition is refused: R2 accepts one,
+  it does nothing, and it looks exactly like a retention policy.
+  `TemporaryCredentials` mints a scoped, expiring S3 credential for
+  handing one prefix to a browser or a partner — for an S3 client,
+  not for this package, which says so.
+
+- **Cloudflare Queues, and `mirror.QueuesSink`.** drops already had an
+  outbox; what it needed on the other side was somewhere durable to
+  publish to.
+
+  A Queue is consumed either by a Worker or by an HTTP pull consumer,
+  and only the second is reachable from a Go process, so that is what
+  is implemented: leases rather than deletes, a batch that is marked
+  and then settled in one request rather than a hundred, and `Consume`
+  for the case where the handler's error is the only decision. A
+  pulled message stays invisible for the visibility timeout and comes
+  back if nobody acknowledged it, so a consumer that crashes mid-batch
+  loses nothing and one that succeeds must say so.
+
+  A queue with no pull consumer answers a pull *exactly* as an empty
+  queue does — no error, no warning — so `EnsurePullConsumer` is the
+  call that belongs at boot and `PullConsumer` is how that question
+  gets an answer. `UpdateSettings`, `Pause` and `Resume` run the
+  queue; pausing stops delivery without losing anything, which is the
+  lever to pull when a consumer is doing damage and the messages are
+  worth keeping. `Purge` is the opposite and takes
+  `DeleteMessagesPermanently` as an argument rather than being a
+  second method, so the sentence about deleting every message with no
+  undo and no dead-letter hop is at the call site.
+
+  `mirror.QueuesSink` puts the change stream on a Queue — the mirror
+  whose far end is not a store at all, but a Worker invalidating a
+  cache or a job re-indexing a document. It deliberately does **not**
+  claim to be a `VersionAwareSink`: version-awareness means a store
+  can be asked to ignore a write older than what it holds, and a queue
+  holds nothing to compare against. So a fill-mode reseed refuses it,
+  and `Change.Key` and `Change.Version` travel in every message so the
+  consumer can deduplicate against both the pump's retries and the
+  queue's own redeliveries.
+
+- **Cloudflare Vectorize as a `vector.Store`, and Workers AI as where
+  its vectors come from.** Vectorize is a smaller query language than
+  the other stores drops speaks to, and the gaps are not ones an
+  adapter can paper over, so each fails loudly rather than quietly
+  returning the wrong page. The metadata filter is conjunctive —
+  `$eq`, `$ne`, `$in`, `$nin` and the four ranges, ANDed — so `Or` and
+  most `Not` are `ErrUnsupportedOp`: emulating an `Or` with two
+  queries changes what `topK` means and what the scores rank against.
+  A negated leaf with a direct opposite *is* rewritten, because that
+  is a rewrite rather than an approximation. There is no pagination,
+  so the cursor is served by over-fetch-and-slice and says
+  `ErrPageBeyondTopK` where that stops rather than repeating a page;
+  and there is no delete-by-filter, so `DeleteWhere` composes one and
+  refuses when the matching set may exceed what a query can see.
+  Filtering on a property with no metadata index matches nothing
+  rather than erroring, which is the worst way for it to go wrong, so
+  the indexes are declared before the first write.
+
+  `vectorize.Admin` creates the indexes. Dimension and metric are
+  fixed at creation — an index is rebuilt, not resized — so that call
+  is where both are decided, and a `Preset` decides them from the name
+  of an embedding model. `Create` refuses a preset alongside an
+  explicit dimension rather than picking one, because the half that
+  lost would be discovered by a search that ranked wrongly rather than
+  by an error. `Index.ListVectors` walks the identifiers a page at a
+  time, which is the enumeration a delete-by-filter would need.
+
+  `drops/cloudflare/workersai` is the other half of that sentence. A
+  `mirror.Embedder` has always been a function the caller supplies,
+  because drops cannot guess how a row becomes a vector, and nothing
+  on the platform side produced one. Its `Model` constants are the
+  same strings `vectorize.Preset` uses, on purpose: the model and the
+  index are one decision, and the asymmetry is why it is worth making
+  once — a **dimension** mismatch is refused on every write,
+  immediately and loudly, while a **model** mismatch at the same
+  dimension is accepted and simply returns the wrong neighbours. It
+  chunks at the hundred-text ceiling and reports the request count,
+  which is what Workers AI bills on; refuses an empty string, because
+  the vector that comes back for one is real and becomes somebody's
+  nearest neighbour; and refuses a reply whose shape does not line up
+  with the request rather than guessing which vector belongs to which
+  text.
+
 - **`dropsgen -rels`: the struct an eager load fills, generated.**
   Rows mode emits what a `SELECT` of one table hands back. What was
   still hand-written was the other shape — a parent with its children
@@ -956,6 +1244,48 @@ once a 1.0 is cut.
   transaction carrying the bump is the one that commits.
 
 ### Fixed
+- **Two entity reads returned a value the compiler was free to have
+  copied before it was filled in.** `EntityQuery.allCached` and
+  `oneCached`, on the uncached path, were written `return rs, scan(&rs)`
+  — the scan writes through the pointer, and the value beside it is
+  what the caller receives. Go orders the *function calls* in a return
+  statement left to right but leaves a plain operand among them
+  unordered, so the slice header handed back is one the implementation
+  may read either before or after the scan has appended to it.
+
+  gc reads it afterwards, which is why nothing was ever wrong and why
+  no test could have caught it; nothing would have said so if that
+  changed, and the failure it would become is an entity query that
+  quietly returns no rows. Both are sequenced explicitly now — the
+  scan runs, then the value is returned — and the reason is written
+  down beside them so the shorter spelling does not come back.
+
+- **A test asserted against a SQL string by slicing at an index that
+  can be −1.** `clickhouse/scope_test.go` cut a rendered statement at
+  `strings.Index(sql, "WHERE")` to check that the tenant guard had not
+  reached `PREWHERE`. A statement with no `WHERE` at all — which is
+  exactly what a regression in the guard would produce — sliced at −1
+  and panicked, reporting a bug in the assertion instead of the one it
+  was looking for. It `Cut`s now, and says what it found when there is
+  no clause to check.
+
+- **A flaky mirror test, and the reason it was flaky.**
+  `TestLogicalSourceBatchesAndAcksTheLastCommit` pushed two
+  transactions and polled `Fetch` for a second waiting to see both in
+  one batch. But `Fetch` *drains* what it finds, so a poll that
+  arrived between the two took the first and the next poll found the
+  buffer it had just emptied; it failed about one run in six under
+  `-race`. The stream counts the reads the reassembler makes, so the
+  test waits for the read that can only happen once the second
+  transaction has been handed over, then fetches once. What it asserts
+  — that one ack covers a batch, because a stream position is
+  cumulative — is unchanged.
+
+- **The integration harness read an unparseable transaction id as
+  xid 0.** Its `test_decoding` parser discarded `fmt.Sscanf`'s error,
+  and zero is a real xid rather than a sentinel. It now says which id
+  at which LSN would not parse.
+
 - **Four PostgreSQL schema changes the diff could not see, and a view
   it could not order around.** Each of the first three was the same
   shape: the snapshot recorded a value, both producers filled it in,

@@ -1608,7 +1608,7 @@ commands.
 
 ## Cloudflare
 
-Four products, four different relationships to drops — and only one of
+Six products, six different relationships to drops — and only one of
 them is a database drops speaks to.
 
 | | package | what it is to drops |
@@ -1616,9 +1616,11 @@ them is a database drops speaks to.
 | D1 | `cloudflare/d1` | a `drops.Driver`; the SQLite dialect runs on it unchanged |
 | Vectorize | `cloudflare/vectorize` | a `vector.Store`, like `qdrant` |
 | Workers KV | `cache/cloudflarekv` | a `cache.Cache`, like `cache/redis` |
+| R2 | `cloudflare/r2` | not a database — where the operations that produce a file put it |
+| Queues | `cloudflare/queues` | not a database — the durable hop an outbox publishes to, and a `mirror.Sink` |
 | Hyperdrive | `cloudflare/hyperdrive` | not a backend — a pooler in front of *your* Postgres, and a list of what stops working behind it |
 
-All four share one API client, which holds the token, the account, the
+All six share one API client, which holds the token, the account, the
 envelope decoding and the retry policy. Zero dependencies, like the
 rest of the library.
 
@@ -1671,6 +1673,48 @@ driver puts it back. Integers past 2^53 keep their low bits, a
 spellings scan into a `time.Time`, and a violated index still answers
 `errors.Is(err, sqlite.ErrUniqueViolation)`.
 
+### Read replication, and the session that makes it safe
+
+D1 can place read replicas around the world, and a replica is allowed
+to be behind the primary — so two consecutive reads can be served by
+two instances and the second can see *less* than the first. Nothing
+errors; the data is just old.
+
+`d1.Session` is the answer. Every request in one returns a bookmark,
+the next carries it, and D1 refuses to serve that request from an
+instance that has not caught up:
+
+```go
+sess, _ := drv.Session(d1.FirstUnconstrained)
+db := sqlite.New(sess)                    // a Session is a drops.Driver
+bookmark := sess.Bookmark()               // hand it on; drv.Resume() picks it up
+```
+
+Sessions are a Worker binding feature, so they need `d1.NewBridge`.
+Over the REST API `Session` returns `ErrSessionsUnsupported` — at
+construction, not at the first query, so a deployment pointed at the
+wrong transport fails at boot instead of serving a stale read months
+later.
+
+### The databases themselves
+
+`d1.Admin` is D1 as a resource rather than as a thing to run
+statements against: create, list, find by name, delete, and set read
+replication. D1's 10 GB ceiling is what makes database-per-tenant a
+real design, and this is the half that was missing.
+
+It also carries Time Travel — `Bookmark` before a migration, `Restore`
+after one goes wrong, `PreviousBookmark` to undo the restore — and the
+export and import jobs, which are polled at D1 and one call here:
+
+```go
+exp, err := admin.ExportTo(ctx, databaseID, w, d1.ExportOptions{})
+res, err := admin.ImportFile(ctx, databaseID, "dump.sql")
+```
+
+`ImportFile` hashes by streaming, so a dump larger than memory never
+enters it.
+
 ### Vectorize, and what a filter cannot say
 
 Vectorize's metadata filter is conjunctive: `$eq`, `$ne`, `$in`,
@@ -1697,6 +1741,40 @@ is an error rather than a rounding, because an entry given sixty
 seconds when it asked for five is served stale for fifty-five and that
 bug surfaces far from the `Set` that caused it.
 
+### R2, and the backup D1 actually needs
+
+Time Travel reaches back thirty days and dies with the database.
+Anything that has to outlive either belongs in a dump somewhere else:
+
+```go
+backups := r2.New(cf).Bucket("backups")
+_, err := backups.PutFile(ctx, key, path, r2.PutOptions{StorageClass: r2.InfrequentAccess})
+```
+
+This uses Cloudflare's own REST object API rather than the S3 one, so
+R2 is one more thing the account token reaches — no SigV4, no second
+credential, the same retry policy and the same hook. The cost is
+stated rather than discovered: 300 MB per object and no multipart
+upload, with `ErrObjectTooLarge` raised before a byte is sent and R2's
+S3 API named as the way past it.
+
+### Queues, and the other end of the outbox
+
+`pg.Outbox` writes the change and the intent to publish it in one
+transaction. Queues is where the intent goes.
+
+```go
+q := queues.New(cf).Queue(queueID)
+err := q.Publish(ctx, queues.JSON(event))
+```
+
+Only the pull consumer is reachable from a Go process, so that is what
+is here: leases rather than deletes, a batch that is marked and then
+settled in one request, and `Consume` for the case where the handler's
+error is the only decision. `mirror.QueuesSink` puts the change stream
+on a Queue — and deliberately does not claim to be version-aware,
+because a queue stores nothing to compare a version against.
+
 ### Hyperdrive, and the features that fail quietly
 
 Hyperdrive is a pooler, so the dialect stays `drops/pg`. What changes
@@ -1707,6 +1785,11 @@ do the wrong thing. `hyperdrive.Check` is the startup assertion that
 turns that into a boot failure instead of a mystery, and
 `hyperdrive.Works()` says what is unaffected, which is most of drops
 including the outbox and the job queue.
+
+`hyperdrive.NewClient(cf)` creates and edits the configuration itself,
+because the pooler has to exist before a Worker can bind it, and
+`Configuration.DirectConfig` builds the connection that goes *past* it
+to the origin — which is what logical replication needs.
 
 [docs/cloudflare.md](docs/cloudflare.md) is the long version.
 
@@ -1727,7 +1810,9 @@ drops/cloudflare/            shared Cloudflare API client: token, envelope, retr
 drops/cloudflare/d1/         D1 as a drops.Driver (REST or your own Worker)
 drops/cloudflare/d1/worker/  the Worker half: wire protocol handler + conformance fixtures
 drops/cloudflare/vectorize/  Vectorize as a vector.Store
-drops/cloudflare/hyperdrive/ what stops working behind Cloudflare's pooler
+drops/cloudflare/r2/         R2 object storage: D1 dumps, schema archives
+drops/cloudflare/queues/     Cloudflare Queues: publish, and the HTTP pull consumer
+drops/cloudflare/hyperdrive/ the pooler's configuration, and what stops working behind it
 drops/mirror/                keeps a pg table mirrored into ClickHouse + Qdrant
 integration/                 separate module: the suite that runs against real servers
 drops/cache/                 Cache interface + sentinels

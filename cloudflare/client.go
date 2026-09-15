@@ -416,19 +416,27 @@ func (c *Client) DoRaw(ctx context.Context, req Request) (resp *Response, err er
 // closed here.
 func (c *Client) attempt(ctx context.Context, req Request, target string, src bodySource) (*Response, error) {
 	var reader io.Reader
+	var streamed io.Closer
 	switch {
 	case src.open != nil:
 		rc, err := src.open()
 		if err != nil {
 			return nil, fmt.Errorf("drops/cloudflare: open request body: %w", err)
 		}
-		defer rc.Close()
+		// http.Client closes the request body it is handed, so this
+		// closer is only for the path where the request is never
+		// built and the body would otherwise be leaked. Closing it
+		// unconditionally would close the file twice.
+		streamed = rc
 		reader = rc
 	case src.bytes != nil:
 		reader = bytes.NewReader(src.bytes)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, target, reader)
 	if err != nil {
+		if streamed != nil {
+			_ = streamed.Close()
+		}
 		return nil, fmt.Errorf("drops/cloudflare: build request: %w", err)
 	}
 	if reader != nil {
@@ -447,6 +455,15 @@ func (c *Client) attempt(ctx context.Context, req Request, target string, src bo
 		}
 	}
 	for k, vs := range req.Header {
+		// The four headers this client owns are set below from the
+		// Request's own fields. Letting them through here would not
+		// override them, it would add a second value — two
+		// Content-Type headers on one request — so they are skipped
+		// rather than trusted, which is what the field's doc
+		// promises.
+		if reservedHeader(k) {
+			continue
+		}
 		for _, v := range vs {
 			httpReq.Header.Add(k, v)
 		}
@@ -473,6 +490,17 @@ func (c *Client) attempt(ctx context.Context, req Request, target string, src bo
 			fmt.Errorf("drops/cloudflare: %s %s: read response: %w", req.Method, req.Path, err)
 	}
 	return &Response{Status: httpResp.StatusCode, Header: httpResp.Header, Body: raw}, nil
+}
+
+// reservedHeader reports whether a header is set by this client from
+// a [Request] field rather than from [Request.Header].
+func reservedHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Authorization", "Accept", "Content-Type", "User-Agent":
+		return true
+	default:
+		return false
+	}
 }
 
 // bodySource is a request body ready to be sent, once per attempt.

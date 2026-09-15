@@ -90,6 +90,20 @@
 // arrays rather than objects — so column order survives, and decodes
 // values with [encoding/json.Decoder.UseNumber] so an INTEGER
 // primary key past 2^53 is not rounded on the way through a float64.
+//
+// The bridge transport has one wrinkle the REST one does not. D1's
+// Worker API exposes the projected column names exactly through
+// raw(), and the statement's metadata — the row counts, the instance
+// that answered — through all(), and there is no call that returns
+// both. The handler takes all(), because losing the metadata is the
+// silent and severe half: changes() is what [Result.RowsAffected]
+// answers, so the conditional UPDATE that stands in for the
+// transaction D1 does not have would report that it lost the race
+// every single time. What that costs is a projection with two
+// columns of the same name, where the second is lost; the failure is
+// loud — a positional Scan comes up a column short — and the fix is
+// to alias one of them. The REST transport returns both and needs
+// neither the compromise nor the caveat.
 // [Rows.Scan] converts into the usual destinations, including
 // [database/sql.Scanner] and [time.Time]; scan.go says what converts
 // into what.

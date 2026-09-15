@@ -1608,19 +1608,20 @@ commands.
 
 ## Cloudflare
 
-Six products, six different relationships to drops — and only one of
-them is a database drops speaks to.
+Seven products, seven different relationships to drops — and only one
+of them is a database drops speaks to.
 
 | | package | what it is to drops |
 |---|---|---|
 | D1 | `cloudflare/d1` | a `drops.Driver`; the SQLite dialect runs on it unchanged |
 | Vectorize | `cloudflare/vectorize` | a `vector.Store`, like `qdrant` |
+| Workers AI | `cloudflare/workersai` | not a store — the embeddings that fill Vectorize |
 | Workers KV | `cache/cloudflarekv` | a `cache.Cache`, like `cache/redis` |
 | R2 | `cloudflare/r2` | not a database — where the operations that produce a file put it |
 | Queues | `cloudflare/queues` | not a database — the durable hop an outbox publishes to, and a `mirror.Sink` |
 | Hyperdrive | `cloudflare/hyperdrive` | not a backend — a pooler in front of *your* Postgres, and a list of what stops working behind it |
 
-All six share one API client, which holds the token, the account, the
+All seven share one API client, which holds the token, the account, the
 envelope decoding and the retry policy. Zero dependencies, like the
 rest of the library.
 
@@ -1731,6 +1732,27 @@ nothing rather than erroring; and there is no delete-by-filter, so
 refuses when the set may exceed what a query can see. Derive
 deterministic IDs instead — that is the shape that scales.
 
+`vectorize.Admin` creates the indexes. Dimension and metric are fixed
+at creation, so that call is where both are decided — and a preset
+decides them from the name of an embedding model, which is the pairing
+that matters.
+
+### Workers AI, and where the vectors come from
+
+`mirror.Embedder` has always been a function you supply, because drops
+cannot guess how a row becomes a vector. This is Cloudflare's answer,
+on the same token as the index:
+
+```go
+ai := workersai.New(cf, workersai.ModelBGEBaseEN)
+vec, err := ai.EmbedOne(ctx, "a tender for street lighting")
+```
+
+The model names are `vectorize.Preset` strings on purpose: the model
+and the index are one decision. A dimension mismatch is refused on
+every write; a *model* mismatch at the same dimension is not refused
+at all — it just returns the wrong neighbours.
+
 ### Workers KV, and what "eventually consistent" costs
 
 A KV write takes up to sixty seconds to be visible everywhere, and a
@@ -1758,6 +1780,11 @@ stated rather than discovered: 300 MB per object and no multipart
 upload, with `ErrObjectTooLarge` raised before a byte is sent and R2's
 S3 API named as the way past it.
 
+`SetLifecycle` is the retention policy that keeps the bucket from
+growing forever — `r2.DeleteAfter` and `r2.CoolAfter` are the two
+sentences it usually needs. `TemporaryCredentials` mints a scoped,
+expiring S3 credential for handing one prefix to somebody else.
+
 ### Queues, and the other end of the outbox
 
 `pg.Outbox` writes the change and the intent to publish it in one
@@ -1774,6 +1801,13 @@ settled in one request, and `Consume` for the case where the handler's
 error is the only decision. `mirror.QueuesSink` puts the change stream
 on a Queue — and deliberately does not claim to be version-aware,
 because a queue stores nothing to compare a version against.
+
+A queue with no pull consumer answers `Pull` exactly as an empty queue
+does, so `EnsurePullConsumer` belongs at boot: afterwards the queue is
+consumable, or the error says why. `Pause` and `Resume` stop delivery
+without losing anything; `Purge` takes
+`queues.DeleteMessagesPermanently` as an argument, because deleting
+every message with no undo should read like that at the call site.
 
 ### Hyperdrive, and the features that fail quietly
 
@@ -1809,7 +1843,8 @@ drops/vector/                portable vector search shared by pg/CH/Qdrant
 drops/cloudflare/            shared Cloudflare API client: token, envelope, retries
 drops/cloudflare/d1/         D1 as a drops.Driver (REST or your own Worker)
 drops/cloudflare/d1/worker/  the Worker half: wire protocol handler + conformance fixtures
-drops/cloudflare/vectorize/  Vectorize as a vector.Store
+drops/cloudflare/vectorize/  Vectorize as a vector.Store, and the index lifecycle
+drops/cloudflare/workersai/  Workers AI embeddings: the vectors Vectorize stores
 drops/cloudflare/r2/         R2 object storage: D1 dumps, schema archives
 drops/cloudflare/queues/     Cloudflare Queues: publish, and the HTTP pull consumer
 drops/cloudflare/hyperdrive/ the pooler's configuration, and what stops working behind it

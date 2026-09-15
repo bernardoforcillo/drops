@@ -61,4 +61,22 @@
 // and a query asking for a different one is
 // [vector.ErrUnsupportedMetric] rather than a ranking by the wrong
 // function.
+//
+// # Creating the index, and filling it
+//
+// [Admin] makes and removes the indexes themselves. An index fixes
+// its dimension and metric at creation and neither can be changed
+// afterwards, so [Admin.Create] is where both are decided — and
+// [Preset] is the way to decide them once, from the name of the model
+// that will produce the vectors:
+//
+//	admin := vectorize.NewAdmin(cf)
+//	info, _ := admin.Create(ctx, vectorize.CreateOptions{
+//	    Name:   "tenders",
+//	    Preset: vectorize.Preset(workersai.ModelBGEBaseEN),
+//	})
+//
+// [github.com/bernardoforcillo/drops/cloudflare/workersai] is the
+// other half of that sentence: it produces the vectors, and its model
+// names are these preset strings.
 package vectorize

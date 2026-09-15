@@ -116,6 +116,34 @@ cannot miss a match, which is the opposite trade — but it is linear, so
 a billion-row collection wants either a partition key that prunes most
 parts, or Qdrant.
 
+## Where the vectors come from
+
+`vector` searches embeddings; it does not make them. That is
+deliberate — the choice of model is the choice of what "similar"
+means, and it is not one a SQL toolkit should make for you. So
+`mirror.Embedder` is a function you supply.
+
+On Cloudflare there is an answer on the same account and the same API
+token as the index:
+
+```go
+ai := workersai.New(cf, workersai.ModelBGEBaseEN)
+vec, err := ai.EmbedOne(ctx, "a tender for street lighting")
+```
+
+The one thing worth getting right is that the model and the store have
+to agree. A Vectorize index fixes its dimension at creation, so
+`workersai.Model` values are the same strings `vectorize.Preset` uses
+and the pair can be named from one constant. The asymmetry is the
+reason to care: a **dimension** mismatch is refused on every write,
+immediately and loudly, while a **model** mismatch at the same
+dimension is accepted and simply returns the wrong neighbours. The
+same is true of pgvector and Qdrant, which will store whatever width
+they were declared with and compare it to anything else of that width.
+
+[cloudflare.md](cloudflare.md#workers-ai) has the rest, including the
+batch and token ceilings.
+
 ## Adding a backend
 
 Implement `vector.Store` — one method. Compile the filter by handing a

@@ -258,68 +258,6 @@ func (i *Index) Describe(ctx context.Context) (*Info, error) {
 	return &info, nil
 }
 
-// CreateIndexRequest describes an index to create.
-type CreateIndexRequest struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Config      struct {
-		Dimensions int    `json:"dimensions"`
-		Metric     Metric `json:"metric"`
-	} `json:"config"`
-}
-
-// CreateIndex creates an index on the account.
-//
-// Dimensions and metric are fixed for the life of the index: there is
-// no ALTER here, and changing either means creating a new index and
-// re-embedding into it.
-func CreateIndex(ctx context.Context, cf *cloudflare.Client, name string, dimensions int, metric Metric, description string) (*Info, error) {
-	if name == "" {
-		return nil, ErrNoIndexName
-	}
-	if dimensions <= 0 {
-		return nil, fmt.Errorf("drops/cloudflare/vectorize: dimensions must be positive, got %d", dimensions)
-	}
-	req := CreateIndexRequest{Name: name, Description: description}
-	req.Config.Dimensions = dimensions
-	req.Config.Metric = metric
-
-	var info Info
-	err := cf.Do(ctx, cloudflare.Request{
-		Method: http.MethodPost,
-		Path:   cf.AccountPath("/vectorize/v2/indexes"),
-		Body:   req,
-	}, &info)
-	if err != nil {
-		return nil, err
-	}
-	return &info, nil
-}
-
-// ListIndexes returns every Vectorize index on the account.
-func ListIndexes(ctx context.Context, cf *cloudflare.Client) ([]Info, error) {
-	var out []Info
-	err := cf.Do(ctx, cloudflare.Request{
-		Method: http.MethodGet,
-		Path:   cf.AccountPath("/vectorize/v2/indexes"),
-	}, &out)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// DeleteIndex removes an index and everything in it.
-func DeleteIndex(ctx context.Context, cf *cloudflare.Client, name string) error {
-	if name == "" {
-		return ErrNoIndexName
-	}
-	return cf.Do(ctx, cloudflare.Request{
-		Method: http.MethodDelete,
-		Path:   cf.AccountPath("/vectorize/v2/indexes", name),
-	}, nil)
-}
-
 // Upsert writes vectors, replacing any that already exist under the
 // same ID.
 //

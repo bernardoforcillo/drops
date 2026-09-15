@@ -17,10 +17,15 @@
 // A Queue is consumed either by a Worker — Cloudflare pushes batches
 // into it — or by a pull consumer, which asks over HTTP. Only the
 // second is reachable from a Go process outside Cloudflare, so it is
-// the one this package implements, and a queue has to be configured
-// for it before [Queue.Pull] returns anything: the pull consumer is a
-// property of the queue, set with wrangler or in the dashboard, not
-// something a client turns on per request.
+// the one this package implements.
+//
+// A queue has to have one before [Queue.Pull] returns anything, and
+// it is a property of the queue rather than of a request.
+// [Queue.EnsurePullConsumer] is the call that belongs at boot: the
+// queue is consumable afterwards, or the error says why. Without it
+// the failure is silent, because a queue with no pull consumer
+// answers a pull exactly as an empty queue does —
+// [Queue.PullConsumer] is how that question gets an answer.
 //
 // # Leases, not deletes
 //
@@ -42,6 +47,17 @@
 //
 // [Queue.Consume] is that loop written once, for the common case
 // where the handler's error is the only decision.
+//
+// # The rest of the queue
+//
+// [Client.Create] and [Client.Delete] make and remove queues;
+// [Client.UpdateSettings] changes the delivery delay and the
+// retention period; [Client.Pause] and [Client.Resume] stop and start
+// delivery without losing anything, which is the lever to pull when a
+// consumer is doing damage and the messages are worth keeping.
+// [Queue.Purge] is the opposite of that and says so: it takes
+// [DeleteMessagesPermanently] as an argument so the sentence is at
+// the call site.
 //
 // At-least-once is the guarantee, which means a handler will
 // eventually see the same message twice — a lease that expired while

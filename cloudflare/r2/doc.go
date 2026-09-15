@@ -46,6 +46,29 @@
 // arriving from a tenant name cannot climb out of the prefix it was
 // meant to be under.
 //
+// # Retention
+//
+// A bucket of database dumps needs a policy or it grows forever, and
+// R2 applies one for you: [Bucket.SetLifecycle] with
+// [DeleteAfter] is the retention period, and [CoolAfter] is the
+// cheaper storage class for something nobody expects to read.
+//
+//	backups.SetLifecycle(ctx, []r2.LifecycleRule{
+//	    r2.CoolAfter("cool", "d1/", 30*24*time.Hour),
+//	    r2.DeleteAfter("retain", "d1/", 365*24*time.Hour),
+//	})
+//
+// It replaces rather than appends — R2 has no add-one-rule endpoint —
+// which the method comment says more about.
+//
+// # Handing a bucket out
+//
+// [Client.TemporaryCredentials] mints a scoped, expiring S3
+// credential: one prefix, read-only, fifteen minutes. It is how a
+// browser uploads directly or a partner fetches one day's export
+// without being given something that outlives the task. The
+// credential is for an S3 client, not for this package.
+//
 // # Consistency
 //
 // R2 is strongly consistent for reads after a write of an object,

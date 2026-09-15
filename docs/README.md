@@ -3,8 +3,8 @@
 drops is a SQL toolkit for Go with no dependencies. It gives you typed
 schema declarations, a query builder that checks your comparisons at
 compile time, and entity CRUD — across PostgreSQL, MySQL, SQLite,
-ClickHouse and Qdrant, and on Cloudflare D1, Vectorize, Workers KV,
-R2 and Queues.
+ClickHouse and Qdrant, and on Cloudflare D1, Vectorize, Workers AI,
+Workers KV, R2 and Queues.
 
 ## Start here
 
@@ -20,7 +20,7 @@ R2 and Queues.
 | | |
 |---|---|
 | [Choosing a dialect](dialects.md) | What each of the five backends gives you, and what it does not. Read this before porting a schema. |
-| [Running on Cloudflare](cloudflare.md) | D1, Vectorize, Workers KV, R2, Queues and Hyperdrive — which of them is a database, what each one takes away, and the session that makes read replication safe. |
+| [Running on Cloudflare](cloudflare.md) | D1, Vectorize, Workers AI, Workers KV, R2, Queues and Hyperdrive — which of them is a database, what each one takes away, and the session that makes read replication safe. |
 | [Vector search](vector-search.md) | One query vocabulary over pgvector, ClickHouse and Qdrant. |
 | [OLTP → OLAP → vector](mirror.md) | Keeping one table mirrored across all three, without three schema declarations. |
 | [Change data capture](cdc.md) | Reading the write-ahead log instead of asking every writer to write twice — and the slot that fills your disk if you look away. |

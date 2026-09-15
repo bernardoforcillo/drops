@@ -69,8 +69,8 @@
 //
 // # Cloudflare
 //
-// Six products, six different relationships to this library. Only one
-// of them is a database drops speaks to; the shared API client is
+// Seven products, seven different relationships to this library. Only
+// one of them is a database drops speaks to; the shared API client is
 // [github.com/bernardoforcillo/drops/cloudflare].
 //
 //   - [github.com/bernardoforcillo/drops/cloudflare/d1] — Cloudflare
@@ -89,7 +89,15 @@
 //     Vectorize as a
 //     [github.com/bernardoforcillo/drops/vector.Store]. Its filter
 //     language is conjunctive, so the operators it lacks are refused
-//     rather than approximated.
+//     rather than approximated. Its Admin type creates the index,
+//     whose dimension and metric cannot be changed afterwards.
+//
+//   - [github.com/bernardoforcillo/drops/cloudflare/workersai] — the
+//     embeddings that fill it. An
+//     [github.com/bernardoforcillo/drops/mirror.Embedder] has always
+//     been a function the caller supplies, because drops cannot guess
+//     how a row becomes a vector; this is Cloudflare's answer, on the
+//     same token as the index.
 //
 //   - [github.com/bernardoforcillo/drops/cloudflare/r2] — R2 object
 //     storage, for the operations that produce a file rather than a

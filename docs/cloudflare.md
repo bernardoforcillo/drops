@@ -1,19 +1,20 @@
 # Running drops on Cloudflare
 
-Six Cloudflare products, six different relationships to drops. The
-first thing to get straight is which is which, because only one of
+Seven Cloudflare products, seven different relationships to drops.
+The first thing to get straight is which is which, because only one of
 them is a database drops speaks to.
 
 | | package | what it is to drops |
 |---|---|---|
 | D1 | `cloudflare/d1` | a `drops.Driver`. The SQLite dialect runs on it unchanged. |
 | Vectorize | `cloudflare/vectorize` | a `vector.Store`, like `qdrant`. |
+| Workers AI | `cloudflare/workersai` | not a store — the embeddings that fill Vectorize. |
 | Workers KV | `cache/cloudflarekv` | a `cache.Cache`, like `cache/redis`. |
 | R2 | `cloudflare/r2` | not a database — object storage, for the operations that produce a file: a D1 export, a schema dump. |
 | Queues | `cloudflare/queues` | not a database either — the durable hop an outbox publishes to, and a `mirror.Sink`. |
 | Hyperdrive | `cloudflare/hyperdrive` | not a backend at all — a pooler in front of *your* PostgreSQL, and a list of what stops working behind it. |
 
-All six share one API client, `cloudflare`, which holds the token,
+All seven share one API client, `cloudflare`, which holds the token,
 the account, the envelope decoding and the retry policy.
 
 ```go
@@ -22,7 +23,8 @@ cf, err := cloudflare.New(accountID, cloudflare.WithAPIToken(token))
 
 Scope the token to what the backend needs — D1:Edit, Vectorize:Edit,
 Workers KV Storage:Edit, Workers R2 Storage:Edit, Queues:Edit,
-Hyperdrive:Edit — rather than reusing one across all of them. The
+Hyperdrive:Edit, Workers AI:Read — rather than reusing one across all
+of them. The
 legacy global API key is deliberately not supported: it authenticates
 as the whole account with no way to narrow it, so a leaked one is a
 leaked account.
@@ -423,6 +425,90 @@ Adopt it before the collection grows past the ceiling, not after.
 **Writes are asynchronous.** An upsert returns a mutation id, and a
 query issued immediately afterwards may not see it.
 
+### Creating the index
+
+`vectorize.Admin` makes and removes the indexes themselves.
+
+```go
+admin := vectorize.NewAdmin(cf)
+info, err := admin.Create(ctx, vectorize.CreateOptions{
+    Name:   "tenders",
+    Preset: vectorize.Preset(workersai.ModelBGEBaseEN),
+})
+index := admin.Index(info.Name)
+```
+
+An index fixes its **dimension and metric at creation** and neither
+can be changed afterwards — an index is rebuilt, not resized — so this
+call is where both are decided. A preset decides them from the name of
+an embedding model, which is the pairing that matters: a dimension
+mismatch is refused on every write, loudly, but a *model* mismatch at
+the same dimension is accepted and simply returns the wrong
+neighbours.
+
+`Create` refuses a preset alongside an explicit dimension or metric
+rather than picking one, because the half that lost would be
+discovered by a search that ranked wrongly rather than by an error.
+
+`Index.ListVectors` walks the index's identifiers a page at a time.
+It is the enumeration a delete-by-filter would need and Vectorize does
+not have — identifiers only, with a cursor that expires, which is the
+honest cost of the operation.
+
+---
+
+## Workers AI
+
+Vectorize stores embeddings and `mirror` keeps them in step with a
+table. Neither produces one: `mirror.Embedder` has always been a
+function the caller supplies, because drops cannot guess how a row
+becomes a vector. This is Cloudflare's answer to that question, on the
+same account and the same token as the index it feeds.
+
+```go
+ai := workersai.New(cf, workersai.ModelBGEBaseEN)
+vec, err := ai.EmbedOne(ctx, "a tender for street lighting")
+```
+
+### It has to agree with the index
+
+`workersai.Model` values are the same strings `vectorize.Preset`
+uses, on purpose: the model and the index are one decision, and this
+is what lets it be made once, in code, rather than in two
+configuration files.
+
+```go
+admin.Create(ctx, vectorize.CreateOptions{Name: "tenders", Preset: vectorize.Preset(model)})
+```
+
+### Feeding a mirror
+
+```go
+embed := func(ctx context.Context, ch mirror.Change) ([]float32, error) {
+    body, _ := ch.Row["body"].(string)
+    if body == "" {
+        return nil, nil        // a nil vector skips the row
+    }
+    return ai.EmbedOne(ctx, body)
+}
+sink, err := mirror.NewQdrantSink(cli, "tenders", embed)
+```
+
+### Limits
+
+A hundred texts per request and about 512 tokens each, for the BGE
+models. `Embed` chunks a longer slice and reports how many requests it
+took in `Result.Requests` — which is what Workers AI bills on. The
+token ceiling it cannot help with: truncation happens at the model and
+is not reported, so a document longer than the window is embedded from
+its beginning and the tail simply does not influence the vector. Split
+long documents into passages, which is also what makes a search return
+the paragraph rather than the file.
+
+An empty string is refused rather than embedded. The vector that comes
+back for one is a real vector — the model's opinion of nothing — and
+it will be somebody's nearest neighbour.
+
 ---
 
 ## Workers KV
@@ -537,6 +623,56 @@ one it names. They are percent-encoded, which still names the same key
 because a percent-encoded dot is not a dot segment. A key built from a
 tenant's name cannot climb out of the prefix it was put under.
 
+### Retention
+
+A bucket of database dumps grows forever unless something removes
+them, and R2 will do it:
+
+```go
+backups.SetLifecycle(ctx, []r2.LifecycleRule{
+    r2.CoolAfter("cool",     "d1/", 30*24*time.Hour),
+    r2.DeleteAfter("retain", "d1/", 365*24*time.Hour),
+})
+```
+
+`SetLifecycle` **replaces** the policy. R2 has no add-one-rule
+endpoint, so whatever is not in the slice is gone — a caller adding a
+rule to a bucket somebody else also configures has to read the current
+set, append, and write it back, and has to accept that two of them
+doing it at once is last-write-wins, because there is no version to
+make the write conditional on. `ClearLifecycle` is the spelling for
+removing the policy on purpose.
+
+A rule with no transition is accepted by R2 and does nothing, which is
+the worst way for a retention policy to be wrong, so drops refuses it
+(`ErrEmptyRule`). So are two rules sharing an ID, since R2 addresses
+rules by it and only one of them would survive.
+
+`AbortIncompleteUploadsAfter` is worth setting on any bucket an S3
+client writes to: a multipart upload that was started and never
+finished is invisible to a listing and billed anyway.
+
+### Handing a bucket out
+
+`TemporaryCredentials` mints a scoped, expiring S3 credential — one
+prefix, read-only, fifteen minutes — for a browser uploading directly
+or a partner fetching one day's export:
+
+```go
+creds, err := r2.New(cf).TemporaryCredentials(ctx, r2.CredentialRequest{
+    Bucket:            "backups",
+    ParentAccessKeyID: parentKey,   // an R2 access key, not the API token
+    Permission:        r2.ObjectReadOnly,
+    TTL:               15 * time.Minute,
+    Prefixes:          []string{"d1/2026-09-15/"},
+})
+```
+
+The credential is for an **S3 client**, not for this package:
+everything here authenticates with the account's API token against
+Cloudflare's REST API. And it is derived from an R2 access key — the
+kind minted for the S3 API — which it cannot outlive.
+
 ### Consistency
 
 R2 is strongly consistent for reads after a write of an object, which
@@ -563,12 +699,55 @@ err := q.Publish(ctx, queues.JSON(event))
 A Queue is consumed either by a Worker — Cloudflare pushes batches
 into it — or by a pull consumer, which asks over HTTP. Only the second
 works from a Go process outside Cloudflare, so it is the one this
-package implements. The queue has to be configured for it first: a
-pull consumer is a property of the queue, set with wrangler or in the
-dashboard, not something a client turns on per request. A queue
-without one answers `Pull` with an empty batch, which is
-indistinguishable from an empty queue —
-`QueueInfo.ConsumersTotalCount` is where that shows.
+package implements.
+
+The queue has to have one before `Pull` returns anything, and it is a
+property of the queue rather than of a request. A queue without one
+answers `Pull` with an empty batch, which is **indistinguishable from
+an empty queue** — no error, no warning, just nothing to do.
+
+So the call that belongs at boot is:
+
+```go
+_, err := q.EnsurePullConsumer(ctx, queues.ConsumerOptions{
+    Settings: queues.ConsumerSettings{
+        BatchSize:         100,
+        VisibilityTimeout: 2 * time.Minute,
+        MaxRetries:        10,
+    },
+    DeadLetterQueue: "changes-dlq",
+})
+```
+
+Afterwards the queue is consumable or the error says why.
+`EnsurePullConsumer` does not change an existing consumer's settings —
+a restarting peer should not quietly rewrite a running consumer's
+visibility timeout — so `UpdateConsumer` is the deliberate spelling
+for that, and `PullConsumer` answers the question a bare empty batch
+cannot.
+
+Leaving `DeadLetterQueue` empty is a decision rather than a default: a
+message that exhausts its retries with no dead-letter queue is
+discarded, and nothing anywhere records that it was.
+
+### Running the queue
+
+`UpdateSettings` changes the delivery delay and the retention period.
+`Pause` and `Resume` stop and start delivery without losing anything —
+publishes still succeed and the backlog grows — which is the lever to
+pull when a consumer is doing damage and the messages are worth
+keeping.
+
+`Purge` is the opposite, and its signature says so:
+
+```go
+err := q.Purge(ctx, queues.DeleteMessagesPermanently)
+```
+
+The confirmation is a parameter rather than a second method because a
+purge deletes every message with no undo and no dead-letter hop,
+including the ones already leased to a consumer. Putting the sentence
+at the call site is where a reviewer reads it.
 
 ### Leases, not deletes
 

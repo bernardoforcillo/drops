@@ -22,7 +22,23 @@ import (
 // worker/handler.js is the reference implementation, and
 // worker/fixtures.json is the conformance suite both sides run
 // against.
-const ProtocolVersion = 1
+const ProtocolVersion = 2
+
+// MinProtocolVersion is the oldest version this package still speaks.
+//
+// A request carries the *floor* it needs rather than the newest
+// version this package knows: a plain statement is served correctly by
+// a version 1 handler and says so, and only a request that needs
+// something version 1 does not have — today, a session — asks for 2.
+// That is why the number in a request can go down as well as up.
+//
+// The alternative, stamping every request with the newest version,
+// would make a library upgrade break every deployed Worker that had
+// not been redeployed with it, including the ones using no new
+// feature at all. This way the break lands only where the feature
+// does, and it lands as [ErrProtocolMismatch] rather than as a
+// silently unsessioned query.
+const MinProtocolVersion = 1
 
 // ErrProtocolMismatch is returned when a handler answers with a
 // protocol version this client does not speak. It is never retried:
@@ -63,6 +79,19 @@ type StatementResult struct {
 type Request struct {
 	Protocol   int         `json:"protocol"`
 	Statements []Statement `json:"statements"`
+
+	// Session is what D1's withSession() takes: a constraint
+	// ("first-primary", "first-unconstrained") for a session's first
+	// request, or the bookmark an earlier request in the same
+	// session returned. Empty means no session, which is the
+	// unsessioned behaviour version 1 had.
+	//
+	// Setting it raises the request's protocol floor to 2, because a
+	// version 1 handler would ignore the field rather than refuse
+	// it — and an ignored session is a read served from a replica
+	// that the caller asked to be served from the primary, which is
+	// precisely the failure a wire version exists to prevent.
+	Session string `json:"session,omitempty"`
 }
 
 // Response is the body a handler returns.
@@ -78,6 +107,11 @@ type Response struct {
 	Protocol int               `json:"protocol"`
 	Results  []StatementResult `json:"results,omitempty"`
 	Error    *WireError        `json:"error,omitempty"`
+
+	// Bookmark is where the session stands after this request, as
+	// D1's session.getBookmark() reports it. Present only for a
+	// request that carried [Request.Session]; empty otherwise.
+	Bookmark string `json:"bookmark,omitempty"`
 }
 
 // WireError is a statement failure as the handler reports it.
@@ -108,9 +142,22 @@ func (e *WireError) Error() string {
 	return e.Code + ": " + e.Message
 }
 
-// NewRequest builds a protocol request for stmts.
+// NewRequest builds an unsessioned protocol request for stmts.
 func NewRequest(stmts []Statement) Request {
-	return Request{Protocol: ProtocolVersion, Statements: stmts}
+	return Request{Protocol: MinProtocolVersion, Statements: stmts}
+}
+
+// NewSessionRequest builds a request that runs inside a D1 session.
+//
+// token is a constraint for the session's first request and a
+// bookmark for every one after it — the same value D1's withSession()
+// takes. An empty token yields an unsessioned request, identical to
+// [NewRequest].
+func NewSessionRequest(stmts []Statement, token string) Request {
+	if token == "" {
+		return NewRequest(stmts)
+	}
+	return Request{Protocol: 2, Statements: stmts, Session: token}
 }
 
 // DecodeResponse parses a handler's reply.
@@ -126,9 +173,13 @@ func DecodeResponse(raw []byte) (*Response, error) {
 	if err := dec.Decode(&resp); err != nil {
 		return nil, fmt.Errorf("drops/cloudflare/d1: decode response: %w", err)
 	}
-	if resp.Protocol != 0 && resp.Protocol != ProtocolVersion {
-		return nil, fmt.Errorf("%w: handler speaks protocol %d, this client speaks %d",
-			ErrProtocolMismatch, resp.Protocol, ProtocolVersion)
+	// A handler answers with the version it served the request at,
+	// which is the version the request asked for. Zero is a handler
+	// that omitted the field; it is read as version 1, the only
+	// version that existed before the field was load-bearing.
+	if resp.Protocol != 0 && (resp.Protocol < MinProtocolVersion || resp.Protocol > ProtocolVersion) {
+		return nil, fmt.Errorf("%w: handler answered at protocol %d, this client speaks %d to %d",
+			ErrProtocolMismatch, resp.Protocol, MinProtocolVersion, ProtocolVersion)
 	}
 	return &resp, nil
 }

@@ -29,8 +29,11 @@
  * failure rather than as a production incident.
  */
 
-/** The protocol version this handler speaks. */
-export const PROTOCOL_VERSION = 1;
+/** The newest protocol version this handler speaks. */
+export const PROTOCOL_VERSION = 2;
+
+/** The oldest protocol version this handler still serves. */
+export const MIN_PROTOCOL_VERSION = 1;
 
 /**
  * Handles one protocol request against a D1 binding.
@@ -65,8 +68,21 @@ export async function handleD1Request(request, db) {
     return protocolError(problem, 400);
   }
 
+  // A request carries the protocol floor it needs, so the reply is
+  // stamped with the version it was actually served at rather than
+  // with this handler's newest. A version 1 client talking to this
+  // handler must not be told it is speaking version 2.
+  const version = body.protocol;
+
+  // With a session, every statement runs against the session object
+  // rather than the binding: that is what makes D1 route the request
+  // to an instance caught up to the session's bookmark. Without one,
+  // the binding is used directly and the reply carries no bookmark.
+  const session = body.session ? db.withSession(body.session) : null;
+  const target = session ?? db;
+
   const prepared = body.statements.map((s) => {
-    const stmt = db.prepare(s.sql);
+    const stmt = target.prepare(s.sql);
     const params = s.params ?? [];
     return params.length > 0 ? stmt.bind(...params.map(decodeParam)) : stmt;
   });
@@ -78,10 +94,20 @@ export async function handleD1Request(request, db) {
     // statements precisely so they arrive here as one list.
     const results =
       prepared.length === 1
-        ? [await runOne(prepared[0])]
-        : (await db.batch(prepared)).map(fromBatchResult);
+        ? [shape(await prepared[0].all())]
+        : (await target.batch(prepared)).map(shape);
 
-    return json({ protocol: PROTOCOL_VERSION, results }, 200);
+    const reply = { protocol: version, results };
+    if (session) {
+      // getBookmark() answers null until the session has run
+      // something, and the Go side reads an absent bookmark as
+      // "unchanged" rather than as "reset".
+      const bookmark = session.getBookmark();
+      if (bookmark) {
+        reply.bookmark = bookmark;
+      }
+    }
+    return json(reply, 200);
   } catch (e) {
     // D1 reports a SQLite failure by throwing. The message is
     // SQLite's own text, and passing it through unaltered is what
@@ -89,7 +115,7 @@ export async function handleD1Request(request, db) {
     // the wire.
     return json(
       {
-        protocol: PROTOCOL_VERSION,
+        protocol: version,
         error: {
           message: sqliteMessage(e),
           code: e?.cause?.code ?? e?.code ?? "",
@@ -102,33 +128,27 @@ export async function handleD1Request(request, db) {
 }
 
 /**
- * Runs a single prepared statement and shapes it as a protocol
- * result.
+ * Shapes one D1Result — from all() or from one element of batch() —
+ * as a protocol result.
  *
- * `raw({ columnNames: true })` is what gives an ordered column list
- * and positional rows. `all()` would return objects, and an object
- * has no order: a positional Scan on the Go side would have to guess
- * which key a destination meant, and a join projecting two columns of
- * the same name would lose one of them.
- */
-async function runOne(stmt) {
-  const out = await stmt.raw({ columnNames: true });
-  // With columnNames, the first element is the header row.
-  const columns = out.length > 0 ? out[0] : [];
-  const rows = out.length > 1 ? out.slice(1) : [];
-  return { columns, rows, meta: normalizeMeta(stmt.meta ?? {}) };
-}
-
-/**
- * Shapes one element of a db.batch() result.
+ * Columns come from the first row's key order, which is the order
+ * SQLite projected them in. The alternative, raw({ columnNames: true }),
+ * gives the projected names exactly, duplicates included — but D1
+ * returns NO meta from raw(), and the two cannot both be had without
+ * running the statement twice.
  *
- * batch() answers with `results` as objects rather than raw rows, so
- * the column order has to be recovered from the first row's key
- * order — which is the order SQLite projected them in. It is the one
- * place this protocol cannot get order from the engine directly, and
- * the reason a single statement takes the raw() path above instead.
+ * Meta wins that trade, because losing it is silent and severe:
+ * `changes` is what a Go caller's RowsAffected() answers, so the
+ * conditional `UPDATE … WHERE version = ?` that stands in for the
+ * transaction D1 does not have would report "lost the race" every
+ * single time. Losing a duplicate column name is narrower and
+ * louder — a positional Scan comes up a column short — and the caller
+ * fixes it by aliasing: `SELECT a.id AS a_id, b.id AS b_id`.
+ *
+ * The REST transport is not affected: Cloudflare's /raw endpoint
+ * returns the column list and the meta together.
  */
-function fromBatchResult(r) {
+function shape(r) {
   const rows = r?.results ?? [];
   if (rows.length === 0) {
     return { columns: [], rows: [], meta: normalizeMeta(r?.meta ?? {}) };
@@ -144,11 +164,16 @@ function fromBatchResult(r) {
 /**
  * Fills in the meta fields the Go side reads, so a runtime that omits
  * one does not decode as a missing key.
+ *
+ * served_by_region, served_by_colo and served_by_primary are optional
+ * in D1's own types and absent under `wrangler dev`, which is why
+ * they are defaulted here rather than trusted.
  */
 function normalizeMeta(m) {
   return {
     served_by: m.served_by ?? "",
     served_by_region: m.served_by_region ?? "",
+    served_by_colo: m.served_by_colo ?? "",
     served_by_primary: m.served_by_primary ?? false,
     duration: m.duration ?? 0,
     changes: m.changes ?? 0,
@@ -174,13 +199,20 @@ function decodeParam(p) {
   return p;
 }
 
+/** The session constraints D1 accepts for a session's first query. */
+const CONSTRAINTS = new Set(["first-primary", "first-unconstrained"]);
+
 /** Validates the request envelope, returning a problem or null. */
 function validate(body) {
   if (body === null || typeof body !== "object") {
     return "request body must be a JSON object";
   }
-  if (body.protocol !== PROTOCOL_VERSION) {
-    return `client speaks protocol ${body.protocol}, this handler speaks ${PROTOCOL_VERSION}`;
+  if (
+    typeof body.protocol !== "number" ||
+    body.protocol < MIN_PROTOCOL_VERSION ||
+    body.protocol > PROTOCOL_VERSION
+  ) {
+    return `client asks for protocol ${body.protocol}, this handler speaks ${MIN_PROTOCOL_VERSION} to ${PROTOCOL_VERSION}`;
   }
   if (!Array.isArray(body.statements) || body.statements.length === 0) {
     return "statements must be a non-empty array";
@@ -191,6 +223,19 @@ function validate(body) {
     }
     if (s.params !== undefined && !Array.isArray(s.params)) {
       return `statement ${i} has params that are not an array`;
+    }
+  }
+  if (body.session !== undefined) {
+    if (typeof body.session !== "string" || body.session === "") {
+      return "session must be a non-empty string";
+    }
+    // A session is the one field whose silent loss changes what the
+    // caller gets back rather than whether the call works, so a
+    // request carrying one must declare the version that understands
+    // it. Refusing here is what stops a version 1 client's
+    // hand-written body from being served unsessioned.
+    if (body.protocol < 2) {
+      return `a session needs protocol 2, but the request asks for ${body.protocol}`;
     }
   }
   return null;
@@ -218,7 +263,13 @@ function json(body, status) {
 
 function protocolError(message, status) {
   return json(
-    { protocol: PROTOCOL_VERSION, error: { message, code: "DROPS_PROTOCOL", index: -1 } },
+    {
+      protocol: PROTOCOL_VERSION,
+      error: { message, code: "DROPS_PROTOCOL", index: -1 },
+    },
     status,
   );
 }
+
+/** Exported for the conformance suite; not part of the wire format. */
+export const __test__ = { shape, normalizeMeta, decodeParam, validate, CONSTRAINTS };

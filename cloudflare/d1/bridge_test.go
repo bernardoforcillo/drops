@@ -48,8 +48,15 @@ func TestBridgeSendsTheProtocolEnvelope(t *testing.T) {
 	}
 	rows.Close()
 
-	if got.Protocol != d1.ProtocolVersion {
-		t.Errorf("protocol = %d, want %d", got.Protocol, d1.ProtocolVersion)
+	// A request declares the oldest version that can serve it
+	// correctly, not the newest this package knows: an unsessioned
+	// statement is served by a version 1 handler, so asking for more
+	// would break deployments that need nothing newer.
+	if got.Protocol != d1.MinProtocolVersion {
+		t.Errorf("protocol = %d, want %d", got.Protocol, d1.MinProtocolVersion)
+	}
+	if got.Session != "" {
+		t.Errorf("session = %q on an unsessioned request", got.Session)
 	}
 	if len(got.Statements) != 1 || got.Statements[0].SQL != "SELECT ?" {
 		t.Errorf("statements = %+v", got.Statements)

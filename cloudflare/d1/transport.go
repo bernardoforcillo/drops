@@ -259,8 +259,28 @@ func (t *BridgeTransport) Target() string { return "d1 bridge:" + t.base }
 // BaseURL returns the Worker the transport points at.
 func (t *BridgeTransport) BaseURL() string { return t.base }
 
+var _ SessionTransport = (*BridgeTransport)(nil)
+
 // Send implements [Transport].
-func (t *BridgeTransport) Send(ctx context.Context, stmts []Statement, readOnly bool) (out []StatementResult, err error) {
+func (t *BridgeTransport) Send(ctx context.Context, stmts []Statement, readOnly bool) ([]StatementResult, error) {
+	out, _, err := t.exchange(ctx, NewRequest(stmts), stmts, readOnly)
+	return out, err
+}
+
+// SendInSession implements [SessionTransport].
+//
+// The session travels in the request body rather than in a header
+// because the handler needs it before it prepares anything: it
+// decides which D1 object the statements run against
+// (db.withSession(token) rather than db), and that is a different
+// object, not a flag on the request.
+func (t *BridgeTransport) SendInSession(ctx context.Context, stmts []Statement, readOnly bool, token string) ([]StatementResult, string, error) {
+	return t.exchange(ctx, NewSessionRequest(stmts, token), stmts, readOnly)
+}
+
+// exchange sends one protocol request, with retries, and returns the
+// results and the bookmark the handler reported.
+func (t *BridgeTransport) exchange(ctx context.Context, req Request, stmts []Statement, readOnly bool) (out []StatementResult, bookmark string, err error) {
 	start := time.Now()
 	kind := "exec"
 	if readOnly {
@@ -275,9 +295,9 @@ func (t *BridgeTransport) Send(ctx context.Context, stmts []Statement, readOnly 
 		})
 	}()
 
-	body, err := json.Marshal(NewRequest(stmts))
+	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("drops/cloudflare/d1: encode request: %w", err)
+		return nil, "", fmt.Errorf("drops/cloudflare/d1: encode request: %w", err)
 	}
 
 	attempts := t.retry.MaxAttempts
@@ -285,10 +305,10 @@ func (t *BridgeTransport) Send(ctx context.Context, stmts []Statement, readOnly 
 		attempts = 1
 	}
 	for attempt := 1; ; attempt++ {
-		resp, status, attemptErr := t.roundTrip(ctx, body)
+		resp, mark, status, attemptErr := t.roundTrip(ctx, body)
 
 		if attemptErr != nil && (errors.Is(attemptErr, context.Canceled) || errors.Is(attemptErr, context.DeadlineExceeded)) {
-			return nil, attemptErr
+			return nil, "", attemptErr
 		}
 		// Two failures the bridge will reproduce exactly, so
 		// repeating them only wastes the caller's time: a statement
@@ -296,7 +316,7 @@ func (t *BridgeTransport) Send(ctx context.Context, stmts []Statement, readOnly 
 		// client does not. Both arrive as errors alongside a 200,
 		// which is why the status alone cannot decide this.
 		if attemptErr != nil && !transientFailure(attemptErr) {
-			return nil, attemptErr
+			return nil, "", attemptErr
 		}
 		// A statement that failed at SQLite will fail identically
 		// next time, and a request carrying a write must never be
@@ -305,16 +325,16 @@ func (t *BridgeTransport) Send(ctx context.Context, stmts []Statement, readOnly 
 		retryable := attemptErr != nil || t.retry.RetryOn == nil || t.retry.RetryOn(status, attemptErr)
 		if attempt >= attempts || !readOnly || !retryable {
 			if attemptErr != nil {
-				return nil, attemptErr
+				return nil, "", attemptErr
 			}
-			return resp, nil
+			return resp, mark, nil
 		}
 		if t.retry.Backoff != nil {
 			timer := time.NewTimer(t.retry.Backoff(attempt))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return nil, ctx.Err()
+				return nil, "", ctx.Err()
 			case <-timer.C:
 			}
 		}
@@ -333,10 +353,10 @@ func transientFailure(err error) bool {
 
 // roundTrip performs one request. status is 0 when the failure was at
 // the transport level.
-func (t *BridgeTransport) roundTrip(ctx context.Context, body []byte) ([]StatementResult, int, error) {
+func (t *BridgeTransport) roundTrip(ctx context.Context, body []byte) ([]StatementResult, string, int, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, t.base, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, fmt.Errorf("drops/cloudflare/d1: build request: %w", err)
+		return nil, "", 0, fmt.Errorf("drops/cloudflare/d1: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
@@ -346,13 +366,13 @@ func (t *BridgeTransport) roundTrip(ctx context.Context, body []byte) ([]Stateme
 
 	httpResp, err := t.http.Do(httpReq)
 	if err != nil {
-		return nil, 0, err
+		return nil, "", 0, err
 	}
 	defer httpResp.Body.Close()
 
 	raw, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return nil, httpResp.StatusCode, fmt.Errorf("drops/cloudflare/d1: read bridge response: %w", err)
+		return nil, "", httpResp.StatusCode, fmt.Errorf("drops/cloudflare/d1: read bridge response: %w", err)
 	}
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
@@ -361,28 +381,28 @@ func (t *BridgeTransport) roundTrip(ctx context.Context, body []byte) ([]Stateme
 		// It may carry a protocol error body, and says more when it
 		// does.
 		if resp, decodeErr := DecodeResponse(raw); decodeErr == nil && resp.Error != nil {
-			return nil, httpResp.StatusCode, fmt.Errorf("drops/cloudflare/d1: bridge returned %d: %w",
+			return nil, "", httpResp.StatusCode, fmt.Errorf("drops/cloudflare/d1: bridge returned %d: %w",
 				httpResp.StatusCode, resp.Error)
 		}
-		return nil, httpResp.StatusCode, fmt.Errorf("drops/cloudflare/d1: bridge returned %d: %s",
+		return nil, "", httpResp.StatusCode, fmt.Errorf("drops/cloudflare/d1: bridge returned %d: %s",
 			httpResp.StatusCode, truncate(string(raw), 200))
 	}
 
 	resp, err := DecodeResponse(raw)
 	if err != nil {
-		return nil, httpResp.StatusCode, err
+		return nil, "", httpResp.StatusCode, err
 	}
 	if resp.Error != nil {
-		return nil, httpResp.StatusCode, &Error{
+		return nil, "", httpResp.StatusCode, &Error{
 			Sentinel: sentinelFromMessage(resp.Error.Message),
 			Message:  resp.Error.Message,
 			Err:      resp.Error,
 		}
 	}
 	if len(resp.Results) == 0 {
-		return nil, httpResp.StatusCode, errors.New("drops/cloudflare/d1: bridge returned no result for the statement")
+		return nil, "", httpResp.StatusCode, errors.New("drops/cloudflare/d1: bridge returned no result for the statement")
 	}
-	return resp.Results, httpResp.StatusCode, nil
+	return resp.Results, resp.Bookmark, httpResp.StatusCode, nil
 }
 
 // statementText renders the statements for a hook event — the one

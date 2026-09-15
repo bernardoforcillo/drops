@@ -221,7 +221,7 @@ func (d *Driver) Begin(ctx context.Context) (drops.Tx, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	return &Tx{drv: d}, nil
+	return &Tx{on: d}, nil
 }
 
 // send issues one D1 request carrying stmts and returns one result

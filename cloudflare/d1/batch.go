@@ -29,13 +29,28 @@ import (
 // [Driver.Begin] is the same mechanism wearing a [drops.Tx], for the
 // code that is already written against one.
 type Batch struct {
-	drv   *Driver
+	on    sender
 	stmts []Statement
 	err   error
 }
 
+// sender is the statement path a batch or a transaction runs on: a
+// [Driver] sends unsessioned, a [Session] sends inside its session and
+// advances its bookmark. Both apply the same local limit checks
+// first.
+//
+// It is unexported because there is no third implementation to be
+// had — a caller wanting one writes a [Transport], which is the
+// extension point at the right level.
+type sender interface {
+	send(ctx context.Context, stmts []Statement) ([]StatementResult, error)
+}
+
 // NewBatch starts a batch against drv.
-func NewBatch(drv *Driver) *Batch { return &Batch{drv: drv} }
+//
+// [Session.Batch] is the same thing inside a session, for a batch
+// whose commit has to advance a session's bookmark.
+func NewBatch(drv *Driver) *Batch { return &Batch{on: drv} }
 
 // Add appends a statement. Binding errors are held until [Batch.Run]
 // so a batch can be built up without an error check per line.
@@ -81,7 +96,7 @@ func (b *Batch) Run(ctx context.Context) ([]*Result, error) {
 	if len(b.stmts) == 0 {
 		return nil, ErrNoStatements
 	}
-	out, err := b.drv.send(ctx, b.stmts)
+	out, err := b.on.send(ctx, b.stmts)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +123,7 @@ func (b *Batch) Run(ctx context.Context) ([]*Result, error) {
 // a transaction whose statements must run in a fixed order should be
 // built from one goroutine.
 type Tx struct {
-	drv *Driver
+	on sender
 
 	mu      sync.Mutex
 	stmts   []Statement
@@ -169,7 +184,7 @@ func (t *Tx) Commit(ctx context.Context) error {
 		t.settle(nil, nil)
 		return nil
 	}
-	out, err := t.drv.send(ctx, t.stmts)
+	out, err := t.on.send(ctx, t.stmts)
 	if err != nil {
 		t.settle(nil, err)
 		return err

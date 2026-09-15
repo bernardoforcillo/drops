@@ -21,6 +21,11 @@ type Meta struct {
 	// one.
 	ServedByRegion string `json:"served_by_region"`
 
+	// ServedByColo is the three-letter airport code of the colo that
+	// ran the statement. Empty where the runtime reports none —
+	// wrangler dev does not.
+	ServedByColo string `json:"served_by_colo"`
+
 	// ServedByPrimary reports whether the answer came from the
 	// primary rather than a read replica. False on a replica means
 	// the read may be behind the primary — which is the trade

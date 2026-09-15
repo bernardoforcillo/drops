@@ -4,10 +4,18 @@
 // cache in front of PostgreSQL or MySQL that you already run, so the
 // drops dialect stays [github.com/bernardoforcillo/drops/pg] or
 // [github.com/bernardoforcillo/drops/mysql] and the driver stays
-// whatever it was. Nothing in this package talks to Cloudflare.
+// whatever it was.
 //
-// What it does instead is the two things that go wrong when a schema
-// written for a direct connection is pointed at a pooler.
+// Most of this package therefore needs no network: it is about what
+// happens to a drops feature once a pooler is in the path. The
+// exception is [Client], which creates and edits Hyperdrive
+// configurations over Cloudflare's API — because the Hyperdrive in
+// front of a database has to exist before a Worker can bind it, and
+// provisioning it from the code that owns the database beats doing it
+// by hand and writing the ID down somewhere.
+//
+// The rest is the two things that go wrong when a schema written for
+// a direct connection is pointed at a pooler.
 //
 // The first is the connection string. [Config.DSN] builds one from a
 // binding's parts, and refuses the combinations Hyperdrive will not
@@ -25,6 +33,12 @@
 //	if err := hyperdrive.Check(hyperdrive.Everything()...); err != nil {
 //	    log.Fatal(err)
 //	}
+//
+// Creating a configuration with [Client.Create] does not make any of
+// those features work; [Check] is still the call that finds out at
+// boot rather than at the first NOTIFY nobody receives. When one of
+// them is needed, [Configuration.DirectConfig] builds the connection
+// that goes past Hyperdrive to the origin.
 package hyperdrive
 
 import (

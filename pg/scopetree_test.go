@@ -547,7 +547,7 @@ func TestDeepPredicateTreeIsAffordable(t *testing.T) {
 	users := reachTable("qd_users")
 	db := pg.New(nil)
 
-	pred := drops.Expression(pg.Eq(users.Col("id"), int64(0)))
+	pred := pg.Eq(users.Col("id"), int64(0))
 	for i := 0; i < 25; i++ {
 		pred = pg.And(pg.Not(pred), pg.Eq(users.Col("id"), int64(i)))
 	}

@@ -43,13 +43,13 @@ func TestWarmUpDoesNotLeakAConnectionDialledDuringClose(t *testing.T) {
 		Addr:         fr.addr(),
 		MaxConns:     2,
 		MinIdleConns: 1,
-		Dialer: func(_ context.Context, network, addr string) (net.Conn, error) {
+		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			select {
 			case entered <- struct{}{}:
 			default:
 			}
 			<-release
-			nc, err := net.Dial(network, addr)
+			nc, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}

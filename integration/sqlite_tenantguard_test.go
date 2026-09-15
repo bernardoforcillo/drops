@@ -7,10 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	_ "modernc.org/sqlite"
+
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/sqlite"
 	"github.com/bernardoforcillo/drops/stdlib"
-	_ "modernc.org/sqlite"
 )
 
 // Everything sqlite/tenantguard.go claims, asked of the engine.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,8 +34,6 @@ import (
 // between versions — fine for a test fixture, which is all this is.
 // A production consumer uses pgoutput through a driver that speaks the
 // replication protocol.
-
-var errStopTest = errors.New("integration: stop the stream")
 
 // errStreamDrained ends a read once the slot has stayed empty for
 // idleFor. A real stream blocks on its socket indefinitely, which is
@@ -214,7 +213,14 @@ func (s *sqlStream) fetch(ctx context.Context, limit int) ([]pg.Message, error) 
 // containing only such changes arrives empty rather than not at all.
 func (s *sqlStream) parse(lsn uint64, xidText, data string) (pg.Message, bool, error) {
 	var xid uint32
-	fmt.Sscanf(xidText, "%d", &xid)
+	if xidText != "" {
+		n, err := strconv.ParseUint(xidText, 10, 32)
+		if err != nil {
+			return pg.Message{}, false, fmt.Errorf("integration: transaction id %q at %s is not a number: %w",
+				xidText, pg.FormatLSN(lsn), err)
+		}
+		xid = uint32(n)
+	}
 
 	switch {
 	case strings.HasPrefix(data, "BEGIN"):

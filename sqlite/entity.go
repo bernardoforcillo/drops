@@ -683,9 +683,8 @@ func (e *Entity[T]) Query(db *DB) *EntityQuery[T] {
 
 // EntityQuery is a typed wrapper over SelectBuilder that returns []T / T.
 type EntityQuery[T any] struct {
-	e             *Entity[T]
-	sb            *SelectBuilder
-	scopesApplied bool
+	e  *Entity[T]
+	sb *SelectBuilder
 }
 
 // applyScopes used to AND the ctx tenant predicate and the

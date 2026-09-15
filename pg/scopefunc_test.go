@@ -97,7 +97,7 @@ func operandConstructors(col drops.Expression) []operandCase {
 		{"ILike", func(s drops.Expression) drops.Expression { return pg.ILike(col, s) }},
 		{"And", func(s drops.Expression) drops.Expression { return pg.And(s, drops.Raw(`TRUE`)) }},
 		{"Or", func(s drops.Expression) drops.Expression { return pg.Or(s, drops.Raw(`FALSE`)) }},
-		{"Not", func(s drops.Expression) drops.Expression { return pg.Not(s) }},
+		{"Not", pg.Not},
 		{"In", func(s drops.Expression) drops.Expression { return pg.In(col, s) }},
 		{"NotIn", func(s drops.Expression) drops.Expression { return pg.NotIn(col, s) }},
 		{"IsNull", func(s drops.Expression) drops.Expression { return pg.IsNull(s) }},
@@ -105,9 +105,9 @@ func operandConstructors(col drops.Expression) []operandCase {
 		{"Between", func(s drops.Expression) drops.Expression { return pg.Between(col, s, 9) }},
 
 		// subquery.go — the constructors that name a subquery.
-		{"Exists", func(s drops.Expression) drops.Expression { return pg.Exists(s) }},
-		{"NotExists", func(s drops.Expression) drops.Expression { return pg.NotExists(s) }},
-		{"Subquery", func(s drops.Expression) drops.Expression { return pg.Subquery(s) }},
+		{"Exists", pg.Exists},
+		{"NotExists", pg.NotExists},
+		{"Subquery", pg.Subquery},
 		{"AnySub", func(s drops.Expression) drops.Expression { return pg.AnySub(col, s) }},
 		{"AllSub", func(s drops.Expression) drops.Expression { return pg.AllSub(col, s) }},
 
@@ -143,22 +143,22 @@ func operandConstructors(col drops.Expression) []operandCase {
 		{"JaccardDistance", func(s drops.Expression) drops.Expression { return pg.JaccardDistance(col, s) }},
 
 		// funcs.go — aggregates and the generic call.
-		{"Count", func(s drops.Expression) drops.Expression { return pg.Count(s) }},
-		{"CountDistinct", func(s drops.Expression) drops.Expression { return pg.CountDistinct(s) }},
-		{"SumDistinct", func(s drops.Expression) drops.Expression { return pg.SumDistinct(s) }},
-		{"AvgDistinct", func(s drops.Expression) drops.Expression { return pg.AvgDistinct(s) }},
+		{"Count", pg.Count},
+		{"CountDistinct", pg.CountDistinct},
+		{"SumDistinct", pg.SumDistinct},
+		{"AvgDistinct", pg.AvgDistinct},
 		{"Filter aggregate", func(s drops.Expression) drops.Expression { return pg.Filter(s, drops.Raw(`TRUE`)) }},
 		{"Filter predicate", func(s drops.Expression) drops.Expression { return pg.Filter(pg.CountAll(), pg.Exists(s)) }},
 		{"StringAgg", func(s drops.Expression) drops.Expression { return pg.StringAgg(s, ",") }},
 		{"BoolAnd", func(s drops.Expression) drops.Expression { return pg.BoolAnd(s) }},
 		{"BoolOr", func(s drops.Expression) drops.Expression { return pg.BoolOr(s) }},
 		{"Every", func(s drops.Expression) drops.Expression { return pg.Every(s) }},
-		{"Sum", func(s drops.Expression) drops.Expression { return pg.Sum(s) }},
-		{"Avg", func(s drops.Expression) drops.Expression { return pg.Avg(s) }},
-		{"Min", func(s drops.Expression) drops.Expression { return pg.Min(s) }},
-		{"Max", func(s drops.Expression) drops.Expression { return pg.Max(s) }},
-		{"Lower", func(s drops.Expression) drops.Expression { return pg.Lower(s) }},
-		{"Upper", func(s drops.Expression) drops.Expression { return pg.Upper(s) }},
+		{"Sum", pg.Sum},
+		{"Avg", pg.Avg},
+		{"Min", pg.Min},
+		{"Max", pg.Max},
+		{"Lower", pg.Lower},
+		{"Upper", pg.Upper},
 		{"Coalesce", func(s drops.Expression) drops.Expression { return pg.Coalesce(s, 0) }},
 		{"Func", func(s drops.Expression) drops.Expression { return pg.Func("f", s) }},
 		{"As", func(s drops.Expression) drops.Expression { return pg.As(s, "x") }},
@@ -1759,9 +1759,7 @@ func (p *pgSyntax) fieldsReadAt(recv string, fields map[string]bool, sites []wal
 					queue = append(queue, walkSite{fn: m})
 				}
 			case *ast.CallExpr:
-				for _, site := range p.helperSites(v, self) {
-					queue = append(queue, site)
-				}
+				queue = append(queue, p.helperSites(v, self)...)
 			}
 			return true
 		})

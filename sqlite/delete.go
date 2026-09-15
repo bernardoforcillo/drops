@@ -159,7 +159,8 @@ func (d *DeleteBuilder) resolveCtx(ctx context.Context) (*DeleteBuilder, error) 
 		if len(preds) > 0 {
 			all := make([]drops.Expression, 0, len(wheres)+len(preds))
 			all = append(all, wheres...)
-			wheres, changed = append(all, preds...), true
+			all = append(all, preds...)
+			wheres, changed = all, true
 		}
 		defaults, err := resolveTableDefaults(ctx, d.table)
 		if err != nil {

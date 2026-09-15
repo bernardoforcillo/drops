@@ -39,8 +39,10 @@ import (
 //     ERROR 1064. Nothing here emits a REVOKE.
 
 var (
-	tvDocs   = mysql.NewDatabaseTable("shop", "docs")
-	tvID     = mysql.Add(tvDocs, mysql.BigSerial("id").PrimaryKey())
+	tvDocs = mysql.NewDatabaseTable("shop", "docs")
+	// The binding is unused, but Add registers the column on the
+	// table, so the call itself is what builds the schema.
+	_        = mysql.Add(tvDocs, mysql.BigSerial("id").PrimaryKey())
 	tvTenant = mysql.Add(tvDocs, mysql.Varchar("tenantId", 64))
 	tvBody   = mysql.Add(tvDocs, mysql.Text("body"))
 

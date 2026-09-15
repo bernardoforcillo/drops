@@ -119,6 +119,11 @@ func (e *Entity[T]) pkKey(values []any) string {
 // corrupt an entry — it answers one tenant's query with another
 // tenant's rows. Forty-eight more bytes per key is not a price worth
 // arguing about against that.
+// table varies: sqlite/entity.go passes q.e.table.Name() through a
+// generic, which unparam does not follow — it sees only the constant
+// the tests pass.
+//
+//nolint:unparam // see above
 func queryKey(table, sql string, args []any) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%d\x00%s", len(sql), sql)

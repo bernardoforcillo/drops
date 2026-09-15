@@ -142,7 +142,7 @@ func (p *PageBuilder[T]) All(ctx context.Context) (*Page[T], error) {
 
 	var rows []T
 	if p.e.fastScan != nil {
-		if err := p.e.scanAllFast(p.db, ctx, sel, &rows); err != nil {
+		if err := p.e.scanAllFast(ctx, sel, &rows); err != nil {
 			return nil, err
 		}
 	} else {

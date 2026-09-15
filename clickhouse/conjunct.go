@@ -50,29 +50,6 @@ func writeAnd(b *drops.Builder, preds []drops.Expression) {
 	writeConjuncts(b, preds, len(preds) > 1)
 }
 
-// writeLeadingAnd is writeAnd for a clause that stands IN FRONT of the
-// clause drops writes its own guards into: PREWHERE.
-//
-// ClickHouse is the only dialect here with two predicate clauses in
-// sequence, and the ordering is what makes the difference. In a WHERE
-// clause a lone conjunct is the whole clause, and the automatic
-// predicates — which are prepended, never appended — are already in
-// front of it, so nothing of drops' is left for it to swallow. A
-// PREWHERE conjunct is in front of the WHERE clause, so a lone one that
-// opens a comment takes the tenant guard, the GROUP BY and the rest of
-// the statement with it, and the query runs, returning every tenant's
-// rows through a statement whose text contains the guard.
-//
-// So a PREWHERE conjunct is bracketed on its own shape rather than on
-// how many of them there are. Bracketing does not repair a comment
-// opener and is not meant to: "(a = 1 --)" leaves the parenthesis
-// unclosed and the server refuses the statement, which is the
-// fail-closed answer. What it does is stop the swallow from being
-// silent.
-func writeLeadingAnd(b *drops.Builder, preds []drops.Expression) {
-	writeConjuncts(b, preds, true)
-}
-
 func writeConjuncts(b *drops.Builder, preds []drops.Expression, bracket bool) {
 	for i, p := range preds {
 		if i > 0 {
@@ -86,47 +63,6 @@ func writeConjuncts(b *drops.Builder, preds []drops.Expression, bracket bool) {
 		}
 		b.Append(p)
 	}
-}
-
-// bracketConjunct returns p parenthesised when leaving it bare in a
-// conjunction would let it reach past its own position, and p itself
-// otherwise. It is writeAnd's decision, taken once when the expression
-// is built rather than each time it is rendered.
-//
-// [And], [Or] and [Not] take it, because a connective is a clause in
-// miniature and used to join its operands with a bare separator:
-// And(drops.Raw("a OR b"), guard) reassociated to "a OR (b AND guard)"
-// precisely as the WHERE clause did, which left the tenant guard in the
-// statement binding nothing. Not was worse — NOT binds tighter than
-// every connective a caller can put inside it, so
-// Not(drops.Raw("a OR b")) rendered "(NOT a OR b)", which negates half
-// of what the caller wrote.
-//
-// Deciding at construction rather than at render is what keeps a
-// predicate tree affordable. The check reads the operand's rendered
-// text, so a nested tree checked at render time would render each
-// subtree once per level, per render, and a predicate built from user
-// input a dozen combinators deep would cost more to bracket than to
-// execute. The answer cannot change afterwards: it depends on the
-// operand's shape, and the only thing resolution substitutes is a
-// scoped copy of a statement — which adds bracketed conjuncts inside a
-// SELECT and so can neither introduce a top-level OR nor unbalance a
-// parenthesis.
-func bracketConjunct(p drops.Expression) drops.Expression {
-	if escapesConjunct(p) {
-		return parens(p)
-	}
-	return p
-}
-
-// bracketConjuncts applies bracketConjunct to a whole list, into a new
-// slice so the caller's variadic backing array is not written through.
-func bracketConjuncts(preds []drops.Expression) []drops.Expression {
-	out := make([]drops.Expression, len(preds))
-	for i, p := range preds {
-		out[i] = bracketConjunct(p)
-	}
-	return out
 }
 
 // escapesConjunct reports whether p, written bare between two " AND "s,
@@ -320,31 +256,4 @@ func identByte(sql string, i int) bool {
 	c := sql[i]
 	return c == '_' || c == '$' || (c >= '0' && c <= '9') ||
 		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
-}
-
-// andWith returns on AND every predicate in extra, for an ON clause
-// that has to carry a table's automatic filters. A nil on — a join
-// written with no condition at all — yields the filters alone rather
-// than a dangling AND.
-//
-// It renders the conjunction through writeAnd rather than through And
-// because an ON clause is a WHERE clause in a different place: a
-// caller-written join condition whose top level is an OR reassociates
-// the guards that follow it exactly as it would in a WHERE clause, and
-// And joins its operands with a bare " AND ". The bracketing is
-// otherwise identical to And's, so an ON clause that was correct before
-// renders unchanged.
-func andWith(on drops.Expression, extra []drops.Expression) drops.Expression {
-	if len(extra) == 0 {
-		return on
-	}
-	preds := make([]drops.Expression, 0, len(extra)+1)
-	if on != nil {
-		preds = append(preds, on)
-	}
-	preds = append(preds, extra...)
-	if len(preds) == 1 {
-		return preds[0]
-	}
-	return drops.ExprFunc(func(b *drops.Builder) { writeAnd(b, preds) })
 }

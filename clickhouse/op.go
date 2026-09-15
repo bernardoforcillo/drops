@@ -117,7 +117,7 @@ func joinPreds(sep, empty string, preds []drops.Expression) drops.Expression {
 	for i, p := range preds {
 		bracketed[i] = bracketOperand(p)
 	}
-	return listOp("(", sep, ")", bracketed)
+	return listOp("(", sep, bracketed)
 }
 
 // Not negates a predicate. A nil predicate is the empty conjunction,
@@ -150,7 +150,7 @@ func inExpr(left any, op string, values []any) drops.Expression {
 		parts: []string{"(", " " + op + " ", ")"},
 		operands: []drops.Expression{
 			operandExpr(left),
-			listOp("(", ", ", ")", operandExprs(values)),
+			listOp("(", ", ", operandExprs(values)),
 		},
 	}
 }
@@ -260,25 +260,20 @@ func operandExprs(values []any) []drops.Expression {
 	return out
 }
 
-// listOp renders items between open and closing, separated by sep:
-// listOp("(", ", ", ")", ...) is a tuple, and listOp("f(", ", ", ")",
+// listOp renders items between open and a closing bracket, separated
+// by sep: listOp("(", ", ", ...) is a tuple, and listOp("f(", ", ",
 // ...) is a call.
-func listOp(open, sep, closing string, items []drops.Expression) drops.Expression {
+//
+// The close bracket is not a parameter because every caller closes
+// with one — an opening that is "f(" still closes with ")".
+func listOp(open, sep string, items []drops.Expression) drops.Expression {
 	parts := make([]string, 0, len(items)+1)
 	parts = append(parts, open)
 	for i := 1; i < len(items); i++ {
 		parts = append(parts, sep)
 	}
-	parts = append(parts, closing)
+	parts = append(parts, ")")
 	return &opExpr{parts: parts, operands: items}
-}
-
-// funcExpr renders name(args...). Every "<name>(<args>)" helper in the
-// package is built from it, so an argument that is a statement —
-// coalesce((SELECT ...), 0) — is walked and scoped rather than rendered
-// blind.
-func funcExpr(name string, args []drops.Expression) drops.Expression {
-	return listOp(name+"(", ", ", ")", args)
 }
 
 // parens wraps e in parentheses, holding it.

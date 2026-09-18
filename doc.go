@@ -69,7 +69,7 @@
 //
 // # Cloudflare
 //
-// Four products, four different relationships to this library. Only
+// Seven products, seven different relationships to this library. Only
 // one of them is a database drops speaks to; the shared API client is
 // [github.com/bernardoforcillo/drops/cloudflare].
 //
@@ -80,18 +80,42 @@
 //     protocol, a reference handler and a conformance suite. D1 has
 //     no interactive transactions, so [InTx] there buffers writes
 //     and ships them as one batch — read the package comment before
-//     relying on it.
+//     relying on it. Its Session type carries D1's read-replication
+//     bookmark, which is what stops a replica's read from going
+//     backwards; its Admin type provisions databases, reads and
+//     restores Time Travel bookmarks, and moves SQL dumps in and out.
 //
 //   - [github.com/bernardoforcillo/drops/cloudflare/vectorize] —
 //     Vectorize as a
 //     [github.com/bernardoforcillo/drops/vector.Store]. Its filter
 //     language is conjunctive, so the operators it lacks are refused
-//     rather than approximated.
+//     rather than approximated. Its Admin type creates the index,
+//     whose dimension and metric cannot be changed afterwards.
+//
+//   - [github.com/bernardoforcillo/drops/cloudflare/workersai] — the
+//     embeddings that fill it. An
+//     [github.com/bernardoforcillo/drops/mirror.Embedder] has always
+//     been a function the caller supplies, because drops cannot guess
+//     how a row becomes a vector; this is Cloudflare's answer, on the
+//     same token as the index.
+//
+//   - [github.com/bernardoforcillo/drops/cloudflare/r2] — R2 object
+//     storage, for the operations that produce a file rather than a
+//     row: the D1 export that has to outlive Time Travel's thirty
+//     days, a schema dump kept beside a migration.
+//
+//   - [github.com/bernardoforcillo/drops/cloudflare/queues] —
+//     Cloudflare Queues, the durable hop an outbox publishes to, with
+//     the pull consumer that is the only kind reachable from Go.
+//     [github.com/bernardoforcillo/drops/mirror.QueuesSink] puts the
+//     change stream on one.
 //
 //   - [github.com/bernardoforcillo/drops/cloudflare/hyperdrive] — not
 //     a backend but a pooler in front of your own PostgreSQL, and the
 //     list of drops features that stop working behind one. Several
-//     fail silently, which is what the list is for.
+//     fail silently, which is what the list is for. It also creates
+//     the configuration a Worker binds, because the pooler has to
+//     exist before anything can point at it.
 //
 // # Cache packages
 //

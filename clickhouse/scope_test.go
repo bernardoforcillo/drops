@@ -377,7 +377,14 @@ func TestGuardsAreNeverWrittenIntoPrewhere(t *testing.T) {
 	checkSQL(t, sql, `SELECT "hits"."id" FROM "hits" FINAL`+
 		` PREWHERE ("hits"."ts" >= ?) WHERE ("hits"."tenantId" = ?)`)
 	checkArgs(t, args, "2020-01-01", "acme")
-	if strings.Contains(sql[:strings.Index(sql, "WHERE")], "tenantId") {
+	// Cut at WHERE rather than indexing past it: a SQL string without
+	// one would slice with -1 and panic, which reports a bug in this
+	// assertion instead of the one it is looking for.
+	before, _, found := strings.Cut(sql, "WHERE")
+	if !found {
+		t.Fatalf("no WHERE clause to check against: %s", sql)
+	}
+	if strings.Contains(before, "tenantId") {
 		t.Errorf("the guard reached PREWHERE: %s", sql)
 	}
 }

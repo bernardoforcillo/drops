@@ -199,6 +199,7 @@ func TestDeleteCarriesTheTableAxisAndRefusesWithoutOne(t *testing.T) {
 		`DELETE FROM "scd_posts" WHERE ("scd_posts"."id" = ?) AND ("scd_posts"."tenantId" = ?)`,
 		args, []any{int64(9), scopeTenant})
 
+	//drops:lint ignore unfilteredwrite — the unfiltered delete is what must be refused with ErrTenantMissing; it never reaches a database
 	if _, err := db.Delete(posts).Exec(context.Background()); !errors.Is(err, sqlite.ErrTenantMissing) {
 		t.Fatalf("err = %v, want %v", err, sqlite.ErrTenantMissing)
 	}

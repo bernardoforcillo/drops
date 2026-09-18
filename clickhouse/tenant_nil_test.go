@@ -92,6 +92,7 @@ func TestSelectRefusesANilCtxTenant(t *testing.T) {
 			db := clickhouse.New(drv)
 
 			var out []struct{}
+			//drops:lint ignore unboundedread — the unbounded select is the subject: it must be refused before it runs
 			err := db.Select().From(scHits).All(typeCtx(tt.tenant), &out)
 			if !errors.Is(err, clickhouse.ErrTenantMissing) {
 				t.Errorf("All = %v, want ErrTenantMissing", err)

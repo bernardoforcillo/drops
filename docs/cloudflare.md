@@ -1,17 +1,20 @@
 # Running drops on Cloudflare
 
-Four Cloudflare products, four different relationships to drops. The
-first thing to get straight is which is which, because only one of
+Seven Cloudflare products, seven different relationships to drops.
+The first thing to get straight is which is which, because only one of
 them is a database drops speaks to.
 
 | | package | what it is to drops |
 |---|---|---|
 | D1 | `cloudflare/d1` | a `drops.Driver`. The SQLite dialect runs on it unchanged. |
 | Vectorize | `cloudflare/vectorize` | a `vector.Store`, like `qdrant`. |
+| Workers AI | `cloudflare/workersai` | not a store — the embeddings that fill Vectorize. |
 | Workers KV | `cache/cloudflarekv` | a `cache.Cache`, like `cache/redis`. |
+| R2 | `cloudflare/r2` | not a database — object storage, for the operations that produce a file: a D1 export, a schema dump. |
+| Queues | `cloudflare/queues` | not a database either — the durable hop an outbox publishes to, and a `mirror.Sink`. |
 | Hyperdrive | `cloudflare/hyperdrive` | not a backend at all — a pooler in front of *your* PostgreSQL, and a list of what stops working behind it. |
 
-All four share one API client, `cloudflare`, which holds the token,
+All seven share one API client, `cloudflare`, which holds the token,
 the account, the envelope decoding and the retry policy.
 
 ```go
@@ -19,10 +22,12 @@ cf, err := cloudflare.New(accountID, cloudflare.WithAPIToken(token))
 ```
 
 Scope the token to what the backend needs — D1:Edit, Vectorize:Edit,
-Workers KV Storage:Edit — rather than reusing one across all of them.
-The legacy global API key is deliberately not supported: it
-authenticates as the whole account with no way to narrow it, so a
-leaked one is a leaked account.
+Workers KV Storage:Edit, Workers R2 Storage:Edit, Queues:Edit,
+Hyperdrive:Edit, Workers AI:Read — rather than reusing one across all
+of them. The
+legacy global API key is deliberately not supported: it authenticates
+as the whole account with no way to narrow it, so a leaked one is a
+leaked account.
 
 ---
 
@@ -127,6 +132,140 @@ statement — a CTE, or a subquery in the `WHERE`.
 the clearer spelling when the unit of work is already a list of
 statements.
 
+### Read replication, and the session that makes it safe
+
+D1 can place read replicas around the world. Turning that on is one
+call:
+
+```go
+admin := d1.NewAdmin(cf)
+_, err := admin.SetReadReplication(ctx, databaseID, d1.ReplicationAuto)
+```
+
+Turning it on without reading the rest of this section is how a
+read-your-writes bug gets deployed. A replica is allowed to be behind
+the primary. So two consecutive reads may be served by two instances
+and the second may see *less* than the first, and a read after a write
+may not see the write at all. Nothing errors; the data is just old.
+
+D1's answer is the bookmark, and drops' is `d1.Session`:
+
+```go
+sess, err := drv.Session(d1.FirstUnconstrained)
+db := sqlite.New(sess)          // a Session is a drops.Driver
+```
+
+Every request in a session returns a bookmark, the next request
+carries it, and D1 refuses to serve that request from an instance
+that has not caught up to it. The reads stay local and cheap, and
+they stop going backwards.
+
+Scope one to the unit the consistency is wanted over — an HTTP
+request, a job, a page render. They cost nothing: there is no
+connection and nothing to close, so one per request is the intended
+use rather than an extravagance.
+
+The constraint applies to the first request only:
+
+| | |
+|---|---|
+| `d1.FirstUnconstrained` | the first read may go anywhere. The fast default, and right for a session that only reads. |
+| `d1.FirstPrimary` | the first read goes to the primary, so it sees every write committed before it. For a session that starts by reading something it is about to decide on. |
+
+To carry the guarantee past the end of one session, hand the bookmark
+on — a cookie, a header, a queue message:
+
+```go
+bookmark := sess.Bookmark()             // at the end of the write request
+sess, err := drv.Resume(bookmark)       // at the start of the next one
+```
+
+`Resume("")` is an error rather than an unconstrained session: the
+caller asked for a guarantee, and one that quietly is not provided is
+worse than one that says so.
+
+Two things to know before designing around it.
+
+**Sessions need the bridge.** Cloudflare offers the Sessions API
+through the Worker binding only, not over the REST API. `d1.New`
+therefore answers `d1.ErrSessionsUnsupported` from `Session` and
+`Resume` — at construction, not at the first query, so a deployment
+pointed at the wrong transport by a changed environment variable fails
+at boot rather than serving a stale read months later. Use
+`d1.NewBridge`.
+
+**A session is not a transaction.** It gives sequential consistency,
+which is a different thing: everything above about `Driver.Begin`
+still applies inside one.
+
+`Meta.ServedByPrimary` on a result says which instance answered, which
+is the flag to check when a read-your-writes bug is suspected.
+
+### Managing the databases themselves
+
+`d1.Admin` is the other half of `drops/cloudflare/d1` — the database
+as a resource rather than as a thing to run statements against.
+
+```go
+admin := d1.NewAdmin(cf)
+db, err := admin.Create(ctx, d1.CreateOptions{
+    Name:            "tenant-42",
+    PrimaryLocation: d1.LocationWesternEurope,
+})
+drv := admin.Driver(db.UUID)
+```
+
+It is a separate type, needing a `cloudflare.Client`, because the two
+halves are separately authorised and separately reachable: creating a
+database is an account-level REST operation, while running a statement
+can go through a Worker binding with no account credential at all. A
+service that only queries should hold a `Driver` and no `Admin`.
+
+**Database per tenant.** D1's 10 GB ceiling is what makes this a real
+design rather than an eccentric one, and provisioning was the half
+drops could not supply before. Names are unique within an account, so
+`admin.FindByName(ctx, tenant)` is the lookup that means the UUID
+never has to be stored anywhere.
+
+**Time Travel** is D1's point-in-time restore, and it is worth taking
+a bookmark before a migration:
+
+```go
+before, _ := admin.Bookmark(ctx, databaseID)
+// … run the migration …
+res, err := admin.Restore(ctx, databaseID, d1.RestoreOptions{Bookmark: before})
+```
+
+`admin.BookmarkAt(ctx, id, t)` answers for a moment nobody thought to
+mark at the time — bookmarks are derivable from a timestamp. A restore
+is in place and destructive: everything written after the restore
+point is gone, and `res.PreviousBookmark` is the only way back, so
+store it before doing anything else with the result. `Restore` refuses
+a bookmark and a timestamp together rather than picking one, because
+the half ignored decides which data survives.
+
+Time Travel reaches back thirty days on a paid plan, seven on the free
+one, and it dies with the database. It is not a backup.
+
+**Export and import** are. Both are jobs D1 polls, and both are one
+call here:
+
+```go
+exp, err := admin.ExportTo(ctx, databaseID, w, d1.ExportOptions{})
+res, err := admin.ImportFile(ctx, databaseID, "dump.sql")
+```
+
+`ExportTo` writes the SQL to any `io.Writer` — the signed URL D1 hands
+back is good for about an hour, which is exactly long enough to be
+stale by the time a two-step API's caller uses it. `Import` hides the
+three round trips D1 requires (hash, presigned upload to R2, ingest)
+and `ImportFile` hashes by streaming, so a dump larger than memory
+never enters it. `exp.Bookmark` names the state the dump captured, and
+`res.FinalBookmark` names the state directly after the import
+succeeded.
+
+[R2](#r2) is where the dump goes.
+
 ### The limits that change how you write queries
 
 `d1.Published` carries them as values so a test can assert against a
@@ -182,6 +321,20 @@ driver handles all four of the ways that bites:
   no order: a positional `Scan(&id, &name)` would have to guess which
   key a destination meant, and a join projecting two columns of the
   same name would lose one.
+
+The bridge transport has one wrinkle the REST one does not, and it is
+worth knowing before a join goes through it. D1's Worker API exposes
+the projected column names exactly through `raw()` and the statement's
+metadata through `all()`, and there is no call that returns both. The
+handler takes `all()`, because losing the metadata is the silent and
+severe half: `changes()` is what `RowsAffected()` answers, so the
+conditional `UPDATE … WHERE version = ?` that stands in for the
+transaction D1 does not have would report that it lost the race every
+single time. The cost is that a projection with two columns of the
+same name loses the second — which fails loudly, a positional `Scan`
+coming up a column short, and is fixed by aliasing:
+`SELECT a.id AS a_id, b.id AS b_id`. The REST transport returns both
+and needs neither the compromise nor the caveat.
 
 ### Errors
 
@@ -272,6 +425,90 @@ Adopt it before the collection grows past the ceiling, not after.
 **Writes are asynchronous.** An upsert returns a mutation id, and a
 query issued immediately afterwards may not see it.
 
+### Creating the index
+
+`vectorize.Admin` makes and removes the indexes themselves.
+
+```go
+admin := vectorize.NewAdmin(cf)
+info, err := admin.Create(ctx, vectorize.CreateOptions{
+    Name:   "tenders",
+    Preset: vectorize.Preset(workersai.ModelBGEBaseEN),
+})
+index := admin.Index(info.Name)
+```
+
+An index fixes its **dimension and metric at creation** and neither
+can be changed afterwards — an index is rebuilt, not resized — so this
+call is where both are decided. A preset decides them from the name of
+an embedding model, which is the pairing that matters: a dimension
+mismatch is refused on every write, loudly, but a *model* mismatch at
+the same dimension is accepted and simply returns the wrong
+neighbours.
+
+`Create` refuses a preset alongside an explicit dimension or metric
+rather than picking one, because the half that lost would be
+discovered by a search that ranked wrongly rather than by an error.
+
+`Index.ListVectors` walks the index's identifiers a page at a time.
+It is the enumeration a delete-by-filter would need and Vectorize does
+not have — identifiers only, with a cursor that expires, which is the
+honest cost of the operation.
+
+---
+
+## Workers AI
+
+Vectorize stores embeddings and `mirror` keeps them in step with a
+table. Neither produces one: `mirror.Embedder` has always been a
+function the caller supplies, because drops cannot guess how a row
+becomes a vector. This is Cloudflare's answer to that question, on the
+same account and the same token as the index it feeds.
+
+```go
+ai := workersai.New(cf, workersai.ModelBGEBaseEN)
+vec, err := ai.EmbedOne(ctx, "a tender for street lighting")
+```
+
+### It has to agree with the index
+
+`workersai.Model` values are the same strings `vectorize.Preset`
+uses, on purpose: the model and the index are one decision, and this
+is what lets it be made once, in code, rather than in two
+configuration files.
+
+```go
+admin.Create(ctx, vectorize.CreateOptions{Name: "tenders", Preset: vectorize.Preset(model)})
+```
+
+### Feeding a mirror
+
+```go
+embed := func(ctx context.Context, ch mirror.Change) ([]float32, error) {
+    body, _ := ch.Row["body"].(string)
+    if body == "" {
+        return nil, nil        // a nil vector skips the row
+    }
+    return ai.EmbedOne(ctx, body)
+}
+sink, err := mirror.NewQdrantSink(cli, "tenders", embed)
+```
+
+### Limits
+
+A hundred texts per request and about 512 tokens each, for the BGE
+models. `Embed` chunks a longer slice and reports how many requests it
+took in `Result.Requests` — which is what Workers AI bills on. The
+token ceiling it cannot help with: truncation happens at the model and
+is not reported, so a document longer than the window is embedded from
+its beginning and the tail simply does not influence the vector. Split
+long documents into passages, which is also what makes a search return
+the paragraph rather than the file.
+
+An empty string is refused rather than embedded. The vector that comes
+back for one is a real vector — the model's opinion of nothing — and
+it will be somebody's nearest neighbour.
+
 ---
 
 ## Workers KV
@@ -314,15 +551,325 @@ one round trip and the binary case is correct rather than fast.
 
 ---
 
+## R2
+
+R2 is object storage, and drops runs no queries against it. What it is
+to a library like this one is where the artefacts go: a D1 export that
+has to outlive Time Travel's thirty days, a schema dump kept beside a
+migration, a large document whose row holds only the key to it.
+
+```go
+backups := r2.New(cf).Bucket("backups")
+_, err := backups.PutFile(ctx, "d1/2026-09-15/tenants.sql", path, r2.PutOptions{
+    ContentType:  "application/sql",
+    StorageClass: r2.InfrequentAccess,
+})
+```
+
+### Which R2 API this is, and what it costs
+
+R2 has three front doors and this package uses the least famous of
+them: Cloudflare's own REST API, at
+`/accounts/{account}/r2/buckets/…`. That is a deliberate choice with a
+real cost, so both halves are worth stating.
+
+What it buys is that R2 becomes one more thing the account's API token
+reaches. No SigV4 signing, no second set of credentials to mint and
+rotate, no second SDK — the same `cloudflare.Client` carries it, with
+the same retry policy and the same hook, so an R2 write appears in a
+log next to the D1 statement that produced it.
+
+What it costs is the ceiling. This endpoint takes objects up to
+**300 MB** and has **no multipart upload**, so there is no resuming a
+failed one and no going above the limit by splitting it.
+`r2.MaxObjectSize` is the number, `r2.ErrObjectTooLarge` is what
+`PutFile` returns *before* it starts sending, and R2's S3-compatible
+API — with an S3 SDK and R2 access keys rather than an API token — is
+the answer for anything bigger. A database dump reaches 300 MB long
+before a 10 GB D1 database does, so check rather than assume.
+
+### The backup that D1 actually needs
+
+Time Travel reaches back thirty days and dies with the database. This
+is the archive that does not:
+
+```go
+f, _ := os.Create(path)
+exp, err := admin.ExportTo(ctx, databaseID, f, d1.ExportOptions{})
+f.Close()
+
+key := fmt.Sprintf("d1/%s/%s.sql", time.Now().UTC().Format("2006-01-02"), exp.Bookmark)
+_, err = backups.PutFile(ctx, key, path, r2.PutOptions{StorageClass: r2.InfrequentAccess})
+```
+
+Through a file rather than in memory, because `PutFile` streams and
+takes the length from the file — which is also what makes the size
+check possible before a byte is sent. `InfrequentAccess` is the class
+for this: cheap to keep, charged to read, and a backup is read
+approximately never.
+
+### Keys are paths
+
+An object key may contain slashes and they are not escaped away, so
+`"d1/2026-09-15/tenants.sql"` addresses that key and `List` with a
+prefix and a delimiter walks it as though it were a directory.
+
+Everything else in a key *is* escaped, including the two segments
+`url.PathEscape` leaves alone. `.` and `..` are legal path characters,
+so a key segment of `..` would travel as a dot segment, and anything
+between the process and R2 is entitled by RFC 3986 to resolve it away
+— a key of `../../secrets` would then address a different URL than the
+one it names. They are percent-encoded, which still names the same key
+because a percent-encoded dot is not a dot segment. A key built from a
+tenant's name cannot climb out of the prefix it was put under.
+
+### Retention
+
+A bucket of database dumps grows forever unless something removes
+them, and R2 will do it:
+
+```go
+backups.SetLifecycle(ctx, []r2.LifecycleRule{
+    r2.CoolAfter("cool",     "d1/", 30*24*time.Hour),
+    r2.DeleteAfter("retain", "d1/", 365*24*time.Hour),
+})
+```
+
+`SetLifecycle` **replaces** the policy. R2 has no add-one-rule
+endpoint, so whatever is not in the slice is gone — a caller adding a
+rule to a bucket somebody else also configures has to read the current
+set, append, and write it back, and has to accept that two of them
+doing it at once is last-write-wins, because there is no version to
+make the write conditional on. `ClearLifecycle` is the spelling for
+removing the policy on purpose.
+
+A rule with no transition is accepted by R2 and does nothing, which is
+the worst way for a retention policy to be wrong, so drops refuses it
+(`ErrEmptyRule`). So are two rules sharing an ID, since R2 addresses
+rules by it and only one of them would survive.
+
+`AbortIncompleteUploadsAfter` is worth setting on any bucket an S3
+client writes to: a multipart upload that was started and never
+finished is invisible to a listing and billed anyway.
+
+### Handing a bucket out
+
+`TemporaryCredentials` mints a scoped, expiring S3 credential — one
+prefix, read-only, fifteen minutes — for a browser uploading directly
+or a partner fetching one day's export:
+
+```go
+creds, err := r2.New(cf).TemporaryCredentials(ctx, r2.CredentialRequest{
+    Bucket:            "backups",
+    ParentAccessKeyID: parentKey,   // an R2 access key, not the API token
+    Permission:        r2.ObjectReadOnly,
+    TTL:               15 * time.Minute,
+    Prefixes:          []string{"d1/2026-09-15/"},
+})
+```
+
+The credential is for an **S3 client**, not for this package:
+everything here authenticates with the account's API token against
+Cloudflare's REST API. And it is derived from an R2 access key — the
+kind minted for the S3 API — which it cannot outlive.
+
+### Consistency
+
+R2 is strongly consistent for reads after a write of an object, which
+is what makes it usable as the durable half of a pipeline — unlike
+Workers KV, whose sixty-second propagation is the reason that package
+is a cache and this one is not.
+
+---
+
+## Queues
+
+drops already has an outbox (`pg.Outbox`): the pattern where a change
+and the intent to publish it are written in one transaction, so the
+two cannot disagree. What the outbox needs on the other side is
+somewhere durable to publish *to*, and on Cloudflare that is a Queue.
+
+```go
+q := queues.New(cf).Queue(queueID)
+err := q.Publish(ctx, queues.JSON(event))
+```
+
+### Only the pull consumer is reachable from Go
+
+A Queue is consumed either by a Worker — Cloudflare pushes batches
+into it — or by a pull consumer, which asks over HTTP. Only the second
+works from a Go process outside Cloudflare, so it is the one this
+package implements.
+
+The queue has to have one before `Pull` returns anything, and it is a
+property of the queue rather than of a request. A queue without one
+answers `Pull` with an empty batch, which is **indistinguishable from
+an empty queue** — no error, no warning, just nothing to do.
+
+So the call that belongs at boot is:
+
+```go
+_, err := q.EnsurePullConsumer(ctx, queues.ConsumerOptions{
+    Settings: queues.ConsumerSettings{
+        BatchSize:         100,
+        VisibilityTimeout: 2 * time.Minute,
+        MaxRetries:        10,
+    },
+    DeadLetterQueue: "changes-dlq",
+})
+```
+
+Afterwards the queue is consumable or the error says why.
+`EnsurePullConsumer` does not change an existing consumer's settings —
+a restarting peer should not quietly rewrite a running consumer's
+visibility timeout — so `UpdateConsumer` is the deliberate spelling
+for that, and `PullConsumer` answers the question a bare empty batch
+cannot.
+
+Leaving `DeadLetterQueue` empty is a decision rather than a default: a
+message that exhausts its retries with no dead-letter queue is
+discarded, and nothing anywhere records that it was.
+
+### Running the queue
+
+`UpdateSettings` changes the delivery delay and the retention period.
+`Pause` and `Resume` stop and start delivery without losing anything —
+publishes still succeed and the backlog grows — which is the lever to
+pull when a consumer is doing damage and the messages are worth
+keeping.
+
+`Purge` is the opposite, and its signature says so:
+
+```go
+err := q.Purge(ctx, queues.DeleteMessagesPermanently)
+```
+
+The confirmation is a parameter rather than a second method because a
+purge deletes every message with no undo and no dead-letter hop,
+including the ones already leased to a consumer. Putting the sentence
+at the call site is where a reviewer reads it.
+
+### Leases, not deletes
+
+A pulled message is not removed, it is leased: it carries a lease ID
+and stays invisible to other consumers for the visibility timeout,
+then comes back if nobody acknowledged it. A consumer that crashes
+mid-batch loses nothing, and one that succeeds must say so.
+
+```go
+batch, err := q.Pull(ctx, queues.PullOptions{BatchSize: 50, VisibilityTimeout: 2 * time.Minute})
+for _, m := range batch.Messages {
+    if err := handle(m); err != nil {
+        _ = batch.Retry(m, queues.DefaultBackoff(m.Attempts))
+        continue
+    }
+    _ = batch.Ack(m)
+}
+settled, err := batch.Settle(ctx)
+```
+
+Marking first and settling once is what turns a hundred decisions into
+one request. `settled.Warnings` carries the expired leases, which is
+how a visibility timeout that is too short for the work announces
+itself.
+
+`q.Consume` is that loop written once, for the case where the
+handler's error is the only decision. Returning `queues.ErrStop` from
+a handler acknowledges the message and ends the loop, which is the
+clean way out on a shutdown signal — cancelling the context abandons
+the batch mid-flight instead.
+
+At-least-once is the guarantee, so a handler *will* eventually see the
+same message twice. Making it idempotent is not optional.
+
+### As a mirror sink
+
+`mirror.QueuesSink` puts the change stream on a Queue, which is the
+mirror whose far end is not a store: a Worker that invalidates a
+cache, a job that re-indexes a document, a webhook to a system drops
+knows nothing about.
+
+```go
+sink, err := mirror.NewQueuesSink(q)
+pump := mirror.NewPump(source, sink)
+```
+
+It is deliberately **not** a `VersionAwareSink`, and the reason is
+structural rather than an omission. Version-awareness means a store
+can be asked to ignore a write older than what it already holds;
+ClickHouse can, because ReplacingMergeTree does the comparison in the
+engine. A queue holds nothing to compare against. So a fill-mode
+reseed refuses this sink, and the consumer has to deduplicate for
+itself — which is what `Change.Key` and `Change.Version` travel in
+every message for. A consumer that keeps the highest version it has
+seen per key is both deduplicated and protected against a redelivery
+arriving late.
+
+`WithQueuesEncoder` is where a row too wide for a message becomes a
+reference, and where columns that have no business leaving the
+database are dropped. Returning `nil` from an encoder drops the change
+entirely.
+
+### The limits that change a design
+
+`queues.Published` carries them as values. Two of them matter here:
+
+**128 KB per message.** A change event holding a row with a large text
+column will not fit. The shape that does is the key plus enough to act
+on it, with the consumer reading the row back. The check is local, and
+the error says so.
+
+**100 messages per request,** for both a batch publish and a pull, and
+256 KB per batch publish. `QueuesSink` chunks at the first and falls
+back to publishing one at a time when it meets the second — the byte
+ceiling cannot be predicted from the change count, and a sink that
+gave up there would stop the mirror on a wide table rather than on a
+row.
+
+---
+
 ## Hyperdrive
 
 Hyperdrive is not a database. It is a connection pooler and query
 cache in front of PostgreSQL or MySQL that you already run, so the
 dialect stays `drops/pg` or `drops/mysql` and the driver stays
-whatever it was. Nothing in this package talks to Cloudflare.
+whatever it was.
 
-It does the two things that go wrong when a schema written for a
-direct connection is pointed at a pooler.
+It does three things: it builds the connection string, it creates the
+configuration, and it tells you what stops working behind a pooler.
+
+### Creating the configuration
+
+The Hyperdrive in front of a database has to exist before a Worker can
+bind it, and creating it from the code that owns the database beats
+creating it by hand and writing the ID down somewhere:
+
+```go
+hc := hyperdrive.NewClient(cf)
+cfg, err := hc.Create(ctx, hyperdrive.NewConfig{
+    Name:     "app-primary",
+    Origin:   hyperdrive.Origin{Engine: hyperdrive.PostgreSQL, Host: host, Database: "app", User: "hyperdrive"},
+    Password: os.Getenv("ORIGIN_PASSWORD"),
+    Caching:  hyperdrive.Caching{MaxAge: 30, StaleWhileRevalidate: 5},
+})
+// bind cfg.ID in wrangler.toml
+```
+
+`Origin` carries no password, and that is deliberate: Cloudflare
+stores the credential and never returns it, so keeping it off the type
+that round-trips is what stops a read-modify-write from quietly
+blanking it. It is a separate argument on the two calls that can set
+one — `Create` and `Replace` — and `Replace` needs it again for the
+same reason. `SetCaching` is the one edit that does not, because it
+touches no origin at all.
+
+Creating a configuration does not make any of the features below work.
+`Check` is still the call that belongs at boot, and
+`Configuration.DirectConfig` builds the connection that goes *past*
+Hyperdrive to the origin, which is what logical replication and the
+rest of the list need.
+
+### The connection string, and what breaks behind the pooler
 
 `Config.DSN` builds the connection string from a binding's parts —
 percent-encoding the password, which matters more than it sounds: a

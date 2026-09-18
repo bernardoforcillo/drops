@@ -400,9 +400,16 @@ scan into a `time.Time`. Constraint failures keep SQLite's own
 message, so `errors.Is(err, sqlite.ErrUniqueViolation)` answers here
 exactly as it does against a file.
 
-[cloudflare.md](cloudflare.md) has the rest, including the two
-transports — the public REST API, and a Worker of yours holding the
-binding.
+One more difference decides whether a *deployment* ports, and it is
+not visible in a schema at all: D1 can serve reads from replicas, and
+a replica is allowed to be behind. A SQLite file cannot go backwards
+between two reads; a replicated D1 database can. `d1.Session` is what
+puts that right, and it needs the Worker-binding transport —
+Cloudflare does not offer sessions over the REST API.
+
+[cloudflare.md](cloudflare.md) has the rest: the two transports, the
+session, and `d1.Admin` for the databases themselves — which is what
+makes database-per-tenant a real option against D1's 10 GB ceiling.
 
 ## Porting between them
 

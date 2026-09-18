@@ -173,3 +173,114 @@ func jsonArray(values []string) (string, error) {
 	raw, err := json.Marshal(values)
 	return string(raw), err
 }
+
+// A replica is allowed to be behind the primary, so without a session
+// two consecutive reads can be served by two instances and the second
+// can see less than the first. A Session is a drops.Driver, so the
+// whole dialect runs inside one.
+func ExampleDriver_Session() {
+	// Sessions are a Worker binding feature, so they need the bridge.
+	drv, err := d1.NewBridge("http://d1.internal")
+	if err != nil {
+		log.Fatal(err)
+	}
+	sess, err := drv.Session(d1.FirstUnconstrained)
+	if err != nil {
+		// d1.ErrSessionsUnsupported here means the driver is the REST
+		// one: Cloudflare does not offer sessions over that API.
+		log.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	rows, err := sess.Query(context.Background(), "SELECT id, email FROM users WHERE id = ?", 42)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	defer rows.Close()
+
+	// Which instance answered, for when a read-your-writes bug is
+	// suspected.
+	if r, ok := rows.(*d1.Rows); ok {
+		fmt.Println("served by the primary:", r.Meta().ServedByPrimary)
+	}
+}
+
+// Carrying read-your-writes across the end of a request: the request
+// that wrote stores the bookmark, the one that reads resumes from it.
+func ExampleDriver_Resume() {
+	var drv *d1.Driver
+	ctx := context.Background()
+
+	// … in the request that writes:
+	writer, err := drv.Session(d1.FirstPrimary)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := writer.Exec(ctx, "UPDATE users SET email = ? WHERE id = ?", "ada@example.com", 42); err != nil {
+		log.Fatal(err)
+	}
+	bookmark := writer.Bookmark() // into a cookie, a header, a queue message
+
+	// … in the request that reads it back, possibly on another
+	// continent:
+	reader, err := drv.Resume(bookmark)
+	if err != nil {
+		log.Fatal(err)
+	}
+	rows, err := reader.Query(ctx, "SELECT email FROM users WHERE id = ?", 42)
+	if err != nil {
+		log.Fatal(err)
+	}
+	rows.Close()
+}
+
+// D1's 10 GB ceiling is what makes database-per-tenant a real design
+// rather than an eccentric one. Names are unique within an account,
+// so the tenant's identifier names the database and the UUID never
+// has to be stored anywhere.
+func ExampleAdmin_Create() {
+	cf, err := cloudflare.New("your-account-id", cloudflare.WithAPIToken("your-api-token"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	admin := d1.NewAdmin(cf)
+	ctx := context.Background()
+
+	db, err := admin.Create(ctx, d1.CreateOptions{
+		Name:            "tenant-42",
+		PrimaryLocation: d1.LocationWesternEurope,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	// The schema goes in through the dialect's migrations, like any
+	// other SQLite database.
+	drv := admin.Driver(db.UUID)
+	_ = drv
+}
+
+// The way back from a migration that went wrong.
+func ExampleAdmin_Restore() {
+	var admin *d1.Admin
+	ctx := context.Background()
+	const databaseID = "your-database-id"
+
+	before, err := admin.Bookmark(ctx, databaseID)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := runMigration(ctx); err != nil {
+		res, rErr := admin.Restore(ctx, databaseID, d1.RestoreOptions{Bookmark: before})
+		if rErr != nil {
+			log.Fatal(rErr)
+		}
+		// A restore is itself a change to the database's history, so
+		// this is the only handle on the state it replaced. Record it
+		// before anything else.
+		log.Printf("restored; undo with bookmark %s", res.PreviousBookmark)
+	}
+}
+
+func runMigration(context.Context) error { return nil }

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/cloudflare/d1"
 )
 
@@ -54,6 +55,12 @@ type callSpec struct {
 	SQL        string     `json:"sql"`
 	Args       []any      `json:"args"`
 	Statements []callSpec `json:"statements"`
+
+	// Session starts the call inside a session under this
+	// constraint; ResumeFrom starts it inside one resumed from this
+	// bookmark. At most one is set.
+	Session    string `json:"session"`
+	ResumeFrom string `json:"resumeFrom"`
 }
 
 type responseCase struct {
@@ -64,6 +71,7 @@ type responseCase struct {
 
 type expectation struct {
 	Kind         string   `json:"kind"`
+	Bookmark     string   `json:"bookmark"`
 	Columns      []string `json:"columns"`
 	RowCount     int      `json:"rowCount"`
 	RowsAffected int64    `json:"rowsAffected"`
@@ -248,19 +256,30 @@ func TestConformanceRequestBodies(t *testing.T) {
 				t.Fatalf("NewBridge: %v", err)
 			}
 			ctx := context.Background()
+
+			// A sessioned case runs the same op through a Session,
+			// which is a drops.Driver too — so the switch below is
+			// written once against the interface rather than twice.
+			var run drops.Driver = drv
+			batch := func() *d1.Batch { return d1.NewBatch(drv) }
+			if sess := openSession(t, drv, tc.Call); sess != nil {
+				run = sess
+				batch = sess.Batch
+			}
+
 			switch tc.Call.Op {
 			case "query":
-				rows, qErr := drv.Query(ctx, tc.Call.SQL, tc.Call.Args...)
+				rows, qErr := run.Query(ctx, tc.Call.SQL, tc.Call.Args...)
 				if qErr != nil {
 					t.Fatalf("Query: %v", qErr)
 				}
 				rows.Close()
 			case "exec":
-				if _, eErr := drv.Exec(ctx, tc.Call.SQL, tc.Call.Args...); eErr != nil {
+				if _, eErr := run.Exec(ctx, tc.Call.SQL, tc.Call.Args...); eErr != nil {
 					t.Fatalf("Exec: %v", eErr)
 				}
 			case "batch":
-				b := d1.NewBatch(drv)
+				b := batch()
 				for _, st := range tc.Call.Statements {
 					b.Add(st.SQL, st.Args...)
 				}
@@ -340,6 +359,21 @@ func TestConformanceResponses(t *testing.T) {
 					t.Errorf("columns = %v, fixture says %v", cols, tc.Expect.Columns)
 				}
 
+			case "bookmark":
+				drv := bridgeServer(t, string(tc.Body))
+				sess, err := drv.Session(d1.FirstUnconstrained)
+				if err != nil {
+					t.Fatalf("Session: %v", err)
+				}
+				rows, err := sess.Query(context.Background(), "SELECT 1")
+				if err != nil {
+					t.Fatalf("Query: %v", err)
+				}
+				rows.Close()
+				if got := sess.Bookmark(); got != tc.Expect.Bookmark {
+					t.Errorf("bookmark = %q, fixture says %q", got, tc.Expect.Bookmark)
+				}
+
 			default:
 				t.Fatalf("unknown expectation kind %q", tc.Expect.Kind)
 			}
@@ -374,6 +408,31 @@ func sentinelByName(t *testing.T, name string) error {
 }
 
 // Helpers ---------------------------------------------------------------
+
+// openSession builds the session a request fixture asks for, or nil
+// when it asks for none.
+func openSession(t *testing.T, drv *d1.Driver, call callSpec) *d1.Session {
+	t.Helper()
+	switch {
+	case call.Session != "" && call.ResumeFrom != "":
+		t.Fatalf("fixture sets both session and resumeFrom")
+		return nil
+	case call.Session != "":
+		sess, err := drv.Session(d1.Constraint(call.Session))
+		if err != nil {
+			t.Fatalf("Session(%q): %v", call.Session, err)
+		}
+		return sess
+	case call.ResumeFrom != "":
+		sess, err := drv.Resume(call.ResumeFrom)
+		if err != nil {
+			t.Fatalf("Resume(%q): %v", call.ResumeFrom, err)
+		}
+		return sess
+	default:
+		return nil
+	}
+}
 
 // bridgeServer stands a server up that replies with body, and returns
 // a bridge driver pointed at it.

@@ -185,6 +185,19 @@ func classify(status int, errs []Error) error {
 	return nil
 }
 
+// NewAPIError builds an [APIError] from a reply a backend read for
+// itself rather than through [Client.Do].
+//
+// It exists for the endpoints that do not answer with a Cloudflare
+// envelope — an R2 object read, a Workers KV value — where a failure
+// still has to arrive as the same type, matching the same sentinels,
+// as one from any other endpoint. A caller branching on
+// [ErrNotFound] should not have to know which kind of endpoint it
+// asked.
+func NewAPIError(method, path string, resp *Response, errs []Error) *APIError {
+	return newAPIError(Request{Method: method, Path: path}, resp, errs, nil)
+}
+
 // truncate caps s at n bytes, appending an ellipsis when it cut.
 func truncate(s string, n int) string {
 	if len(s) <= n {

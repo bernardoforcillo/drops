@@ -247,12 +247,6 @@ func (f *FindBuilder) IgnoreFilters(names ...string) *FindBuilder {
 	return f
 }
 
-// ignoresFilter reports whether this query named filter in an
-// IgnoreFilters call. Read by the entity layer for the filters it
-// builds per query rather than registering on the table — the tenant
-// guard — which nothing on the table can carry.
-func (f *FindBuilder) ignoresFilter(name string) bool { return f.sel.scope.ignores(name) }
-
 // HasEagerLoads reports whether any relations have been queued for
 // eager loading via With / WithRel. Used by Entity[T] to decide
 // whether the fast-scan path is safe — relation loaders need the

@@ -311,23 +311,6 @@ func (t *Table) setContextFilter(key string, fn ContextFilterFunc) {
 	t.scope.ctxFilters = appendShared(t.scope.ctxFilters, ctxFilter{key: key, fn: fn})
 }
 
-// setNamedContextFilter is setContextFilter for a filter a query may
-// bypass by name — the tenant axis, which [EntityQuery.IgnoreFilters]
-// drops with mysql.FilterTenant while leaving every other guard standing.
-func (t *Table) setNamedContextFilter(key, name string, fn ContextFilterFunc) {
-	t.setContextFilter(key, fn)
-	t.scope.mu.Lock()
-	defer t.scope.mu.Unlock()
-	next := make([]ctxFilter, len(t.scope.ctxFilters))
-	copy(next, t.scope.ctxFilters)
-	for i := range next {
-		if next[i].key == key {
-			next[i].name = name
-		}
-	}
-	t.scope.ctxFilters = next
-}
-
 // ctxFilterList returns the table's request-scoped filters through the
 // shared scope, so an alias resolves the axis its table carries now
 // rather than the one it carried when As was called. See [Table.As] for
@@ -766,7 +749,6 @@ func (t *Table) deleteHookList() []DeleteHook {
 
 func (t *Table) hasInsertHooks() bool { return len(t.insertHookList()) > 0 }
 func (t *Table) hasUpdateHooks() bool { return len(t.updateHookList()) > 0 }
-func (t *Table) hasDeleteHooks() bool { return len(t.deleteHookList()) > 0 }
 
 // OnInsert registers an INSERT hook, run before every INSERT renders.
 func (t *Table) OnInsert(h InsertHook) *Table {

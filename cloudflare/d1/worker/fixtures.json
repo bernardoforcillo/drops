@@ -1,5 +1,5 @@
 {
-  "protocol": 1,
+  "protocol": 2,
   "about": [
     "Conformance fixtures for the drops D1 wire protocol.",
     "",
@@ -72,6 +72,57 @@
       },
       "body": {
         "protocol": 1,
+        "statements": [
+          { "sql": "INSERT INTO a VALUES (?)", "params": [1] },
+          { "sql": "INSERT INTO b VALUES (?)", "params": [2] }
+        ]
+      }
+    },
+    {
+      "name": "an unsessioned request asks for protocol 1, which is the floor that serves it",
+      "call": { "op": "exec", "sql": "DELETE FROM t" },
+      "body": { "protocol": 1, "statements": [{ "sql": "DELETE FROM t" }] }
+    },
+    {
+      "name": "a session's first request carries its constraint and raises the floor to 2",
+      "call": { "op": "query", "sql": "SELECT 1", "session": "first-primary" },
+      "body": {
+        "protocol": 2,
+        "session": "first-primary",
+        "statements": [{ "sql": "SELECT 1" }]
+      }
+    },
+    {
+      "name": "an unconstrained session says so rather than omitting the field",
+      "call": { "op": "query", "sql": "SELECT 1", "session": "first-unconstrained" },
+      "body": {
+        "protocol": 2,
+        "session": "first-unconstrained",
+        "statements": [{ "sql": "SELECT 1" }]
+      }
+    },
+    {
+      "name": "a resumed session carries the bookmark where a constraint would go",
+      "call": { "op": "query", "sql": "SELECT 1", "resumeFrom": "0000000c-0000000a-00004ccc-1234" },
+      "body": {
+        "protocol": 2,
+        "session": "0000000c-0000000a-00004ccc-1234",
+        "statements": [{ "sql": "SELECT 1" }]
+      }
+    },
+    {
+      "name": "a session's batch travels sessioned too",
+      "call": {
+        "op": "batch",
+        "session": "first-primary",
+        "statements": [
+          { "sql": "INSERT INTO a VALUES (?)", "args": [1] },
+          { "sql": "INSERT INTO b VALUES (?)", "args": [2] }
+        ]
+      },
+      "body": {
+        "protocol": 2,
+        "session": "first-primary",
         "statements": [
           { "sql": "INSERT INTO a VALUES (?)", "params": [1] },
           { "sql": "INSERT INTO b VALUES (?)", "params": [2] }
@@ -154,6 +205,45 @@
       "name": "a handler speaking another protocol version is refused",
       "body": { "protocol": 99, "results": [] },
       "expect": { "kind": "error", "sentinel": "protocol" }
+    },
+    {
+      "name": "a session advances to the bookmark the reply carries",
+      "body": {
+        "protocol": 2,
+        "results": [{ "columns": ["n"], "rows": [[1]], "meta": { "served_by_primary": true } }],
+        "bookmark": "0000000c-0000000a-00004ccc-5678"
+      },
+      "expect": { "kind": "bookmark", "bookmark": "0000000c-0000000a-00004ccc-5678" }
+    },
+    {
+      "name": "a reply with no bookmark leaves the session where it was",
+      "body": {
+        "protocol": 2,
+        "results": [{ "columns": ["n"], "rows": [[1]], "meta": {} }]
+      },
+      "expect": { "kind": "bookmark", "bookmark": "" }
+    },
+    {
+      "name": "meta survives the bridge, so a write reports the rows it changed",
+      "body": {
+        "protocol": 2,
+        "results": [
+          {
+            "columns": [],
+            "rows": [],
+            "meta": {
+              "changes": 1,
+              "last_row_id": 42,
+              "rows_read": 7,
+              "rows_written": 1,
+              "served_by_primary": true,
+              "served_by_region": "WEUR",
+              "served_by_colo": "MXP"
+            }
+          }
+        ]
+      },
+      "expect": { "kind": "result", "rowsAffected": 1, "lastInsertID": 42, "rowsRead": 7 }
     }
   ]
 }

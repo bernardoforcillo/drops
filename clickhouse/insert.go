@@ -162,7 +162,8 @@ func alignRow(cols []*Column, values []ColumnValue) []drops.Expression {
 		if !ok {
 			continue
 		}
-		q := append(bound[k], v)
+		q := bound[k]
+		q = append(q, v)
 		if len(q) > n {
 			q = q[len(q)-n:]
 		}

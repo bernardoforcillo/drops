@@ -224,7 +224,8 @@ func (u *UpdateBuilder) resolveCtx(ctx context.Context) (*UpdateBuilder, error) 
 		if len(preds) > 0 {
 			all := make([]drops.Expression, 0, len(wheres)+len(preds))
 			all = append(all, wheres...)
-			wheres, changed = append(all, preds...), true
+			all = append(all, preds...)
+			wheres, changed = all, true
 		}
 		defaults, err := resolveTableDefaults(ctx, tables...)
 		if err != nil {

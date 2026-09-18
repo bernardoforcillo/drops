@@ -117,18 +117,6 @@ func (s filterScope) filtersOf(t *Table, defaults resolvedDefaults) []drops.Expr
 	return kept
 }
 
-// applyAll is apply over every table the statement names, in the order
-// it names them.
-func (s filterScope) applyAll(tables []*Table, wheres []drops.Expression, defaults resolvedDefaults) []drops.Expression {
-	for i := len(tables) - 1; i >= 0; i-- {
-		// Backwards, because each apply PREPENDS: walking the list in
-		// reverse leaves the filters in the order the statement names
-		// the tables.
-		wheres = s.apply(tables[i], wheres, defaults)
-	}
-	return wheres
-}
-
 // dropsContextFilters reports whether this statement's opt-out reaches
 // the request-time filters as well as the render-time ones.
 func (s filterScope) dropsContextFilters() bool { return s.unscoped && !s.keepCtx }

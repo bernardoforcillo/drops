@@ -10,7 +10,7 @@ import "github.com/bernardoforcillo/drops"
 // scoped as the statement it contains, and used to read every tenant's
 // rows.
 func funcCall(name string, args []any) drops.Expression {
-	return listOp(name+"(", ", ", ")", operandExprs(args))
+	return listOp(name+"(", ", ", operandExprs(args))
 }
 
 // Standard aggregates ---------------------------------------------

@@ -119,6 +119,7 @@ func TestExecutorsSendTheScopedStatement(t *testing.T) {
 	if _, err := db.Select().From(posts).Rows(ctx); err != nil {
 		t.Fatalf("Rows: %v", err)
 	}
+	//drops:lint ignore unfilteredwrite — the update carries no Where on purpose — the injected tenant guard is what this asserts
 	if _, err := db.Update(posts).Set(mysql.Bind(posts.Col("title"), "x")).Exec(ctx); err != nil {
 		t.Fatalf("Update: %v", err)
 	}

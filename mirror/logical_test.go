@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,10 @@ type pushStream struct {
 	mu   sync.Mutex
 	msgs chan pg.Message
 	acks []uint64
+
+	// reads counts calls to Next, which is what lets a test wait for
+	// the reader to have consumed what it pushed. See waitForReads.
+	reads atomic.Int64
 }
 
 func newPushStream() *pushStream {
@@ -24,6 +29,7 @@ func newPushStream() *pushStream {
 }
 
 func (s *pushStream) Next(ctx context.Context) (pg.Message, error) {
+	s.reads.Add(1)
 	select {
 	case m, open := <-s.msgs:
 		if !open {
@@ -33,6 +39,28 @@ func (s *pushStream) Next(ctx context.Context) (pg.Message, error) {
 	case <-ctx.Done():
 		return pg.Message{}, ctx.Err()
 	}
+}
+
+// waitForReads blocks until Next has been called n times.
+//
+// It is how a test that pushes more than one transaction knows both
+// are buffered before it fetches. The reassembler hands a completed
+// transaction to the source and only then asks for the next message,
+// so "Next has been called for the message after the last commit"
+// means "every transaction before it is in the source's buffer" —
+// which a sleep or a poll on Fetch cannot establish, because Fetch
+// drains what it finds and a short read is indistinguishable from an
+// empty one.
+func (s *pushStream) waitForReads(t *testing.T, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.reads.Load() >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("the reader made %d of the expected %d reads", s.reads.Load(), n)
 }
 
 func (s *pushStream) Ack(_ context.Context, lsn uint64) error {
@@ -227,19 +255,17 @@ func TestLogicalSourceBatchesAndAcksTheLastCommit(t *testing.T) {
 	stream.tx(80, row("orders", pg.OpInsert, map[string]any{"id": int64(1)}))
 	stream.tx(90, row("orders", pg.OpInsert, map[string]any{"id": int64(2)}))
 
-	// Give the reader a moment to buffer both.
-	deadline := time.Now().Add(time.Second)
-	var changes []mirror.Change
-	var commit func(context.Context) error
-	for time.Now().Before(deadline) {
-		c, cm, err := src.Fetch(context.Background(), 100)
-		if err != nil {
-			t.Fatal(err)
-		}
-		changes, commit = c, cm
-		if len(changes) == 2 {
-			break
-		}
+	// Six messages — begin, change, commit, twice — and then the read
+	// that finds nothing, which cannot happen until the second
+	// transaction has been handed to the source. Fetching before that
+	// point is what made this test flaky: it would take the first
+	// transaction alone, and the retry would find the buffer it had
+	// just drained.
+	stream.waitForReads(t, 7)
+
+	changes, commit, err := src.Fetch(context.Background(), 100)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(changes) != 2 {
 		t.Fatalf("got %d changes, want both transactions in one batch", len(changes))

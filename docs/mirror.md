@@ -157,6 +157,31 @@ it refuses to do:
 
 Use `Step` instead of `Run` to drive it from your own scheduler.
 
+### A sink whose far end is not a store
+
+`mirror.NewQueuesSink(q)` publishes each change to a
+[Cloudflare Queue](cloudflare.md#queues) instead of writing it
+anywhere. That is the mirror for the thing that is not a copy of the
+table: a Worker that invalidates a cache, a job that re-indexes a
+document, a webhook to a system drops knows nothing about. The pump,
+the outbox and the ordering are identical; only the far end differs.
+
+```go
+sink, _ := mirror.NewQueuesSink(queues.New(cf).Queue(queueID))
+```
+
+It is not a `VersionAwareSink`, and for the same structural reason
+`QdrantSink` is not — a queue holds nothing to compare a version
+against. So a fill-mode reseed refuses it, and the consumer has to
+deduplicate for itself. `Change.Key` and `Change.Version` travel in
+every message for exactly that: a consumer keeping the highest version
+it has seen per key is deduplicated against both the pump's retries
+and the queue's own at-least-once redeliveries.
+
+`WithQueuesEncoder` is where a row too wide for a 128 KB message
+becomes a reference, and where columns that have no business leaving
+the database are dropped. Returning `nil` drops the change entirely.
+
 ## What a delete looks like
 
 ClickHouse has no cheap row delete, so a mirrored delete is an ordinary
@@ -201,9 +226,11 @@ not. `ClickHouseSink` qualifies: a `ReplacingMergeTree` resolves by
 version, so a seeded row that arrives late still loses. `QdrantSink`
 does not, and cannot: Qdrant's upsert is last-write-wins with no
 version and no compare-and-set, so a seed applied after a live change
-would overwrite it, permanently and silently. Reseeding a Qdrant
-mirror therefore goes through repair mode, which is ordered by
-delivery rather than by comparison.
+would overwrite it, permanently and silently. `QueuesSink` does not
+either, and for a starker reason — a queue is not a store at all, so
+there is nothing there to lose the race against. Reseeding either
+therefore goes through repair mode, which is ordered by delivery
+rather than by comparison.
 
 `NewRepairReseeder` emits into the outbox, so the seed travels the
 ordinary path and a running pump delivers it. That is what overwrites

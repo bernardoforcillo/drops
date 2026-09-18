@@ -59,47 +59,6 @@ func writeAnd(b *drops.Builder, preds []drops.Expression) {
 	}
 }
 
-// bracketConjunct returns p parenthesised when leaving it bare in a
-// conjunction would let it reach past its own position, and p itself
-// otherwise. It is writeAnd's decision, taken once when the expression
-// is built rather than each time it is rendered.
-//
-// [And], [Or] and [Not] take it, because a connective is a clause in
-// miniature and used to join its operands with a bare separator:
-// And(drops.Raw("a OR b"), guard) reassociated to "a OR (b AND guard)"
-// precisely as the WHERE clause did, which left the tenant guard in the
-// statement binding nothing. Not was worse — NOT binds tighter than
-// every connective a caller can put inside it, so
-// Not(drops.Raw("a OR b")) rendered "(NOT a OR b)", which negates half
-// of what the caller wrote.
-//
-// Deciding at construction rather than at render is what keeps a
-// predicate tree affordable. The check reads the operand's rendered
-// text, so a nested tree checked at render time would render each
-// subtree once per level, per render, and a predicate built from user
-// input a dozen combinators deep would cost more to bracket than to
-// execute. The answer cannot change afterwards: it depends on the
-// operand's shape, and the only thing resolution substitutes is a
-// scoped copy of a statement — which adds bracketed conjuncts inside a
-// SELECT and so can neither introduce a top-level OR nor unbalance a
-// parenthesis.
-func bracketConjunct(p drops.Expression) drops.Expression {
-	if escapesConjunct(p) {
-		return parens(p)
-	}
-	return p
-}
-
-// bracketConjuncts applies bracketConjunct to a whole list, into a new
-// slice so the caller's variadic backing array is not written through.
-func bracketConjuncts(preds []drops.Expression) []drops.Expression {
-	out := make([]drops.Expression, len(preds))
-	for i, p := range preds {
-		out[i] = bracketConjunct(p)
-	}
-	return out
-}
-
 // escapesConjunct reports whether p, written bare between two " AND "s,
 // could reach past its own position in the clause.
 //

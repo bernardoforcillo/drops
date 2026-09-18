@@ -718,7 +718,7 @@ func (e *Entity[T]) scanOneFast(ctx context.Context, sel *SelectBuilder, dest *T
 }
 
 // scanAllFast runs sel and appends every row to dest via fastScan.
-func (e *Entity[T]) scanAllFast(db *DB, ctx context.Context, sel *SelectBuilder, dest *[]T) error {
+func (e *Entity[T]) scanAllFast(ctx context.Context, sel *SelectBuilder, dest *[]T) error {
 	rows, err := e.projectFast(sel).Rows(ctx)
 	if err != nil {
 		return err
@@ -1361,7 +1361,7 @@ func (q *EntityQuery[T]) All(ctx context.Context) ([]T, error) {
 	}
 	if q.e.fastScan != nil && !q.fb.HasEagerLoads() {
 		var out []T
-		err := q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &out)
+		err := q.e.scanAllFast(ctx, q.fb.Select(), &out)
 		return out, err
 	}
 	var out []T
@@ -1413,11 +1413,20 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 		return nil, err
 	}
 	if !ok {
+		// The scan fills rs through the pointer, so it has to finish
+		// before rs is read. Go orders the calls in a return
+		// statement but leaves the plain operand beside them
+		// unordered, so `return rs, scan(&rs)` reads a slice header
+		// the compiler is free to have copied first — today it does
+		// not, and nothing would say so if that changed.
 		var rs []T
+		var err error
 		if q.e.fastScan != nil {
-			return rs, q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &rs)
+			err = q.e.scanAllFast(ctx, q.fb.Select(), &rs)
+		} else {
+			err = q.fb.All(ctx, &rs)
 		}
-		return rs, q.fb.All(ctx, &rs)
+		return rs, err
 	}
 	var out []T
 	if hit, err := q.e.cache.readPK(ctx, key, &out); err == nil && hit {
@@ -1431,7 +1440,7 @@ func (q *EntityQuery[T]) allCached(ctx context.Context) ([]T, error) {
 		var rs []T
 		var rerr error
 		if q.e.fastScan != nil {
-			rerr = q.e.scanAllFast(q.fb.db, ctx, q.fb.Select(), &rs)
+			rerr = q.e.scanAllFast(ctx, q.fb.Select(), &rs)
 		} else {
 			rerr = q.fb.All(ctx, &rs)
 		}
@@ -1457,11 +1466,17 @@ func (q *EntityQuery[T]) oneCached(ctx context.Context) (T, error) {
 		return *new(T), err
 	}
 	if !ok {
+		// Sequenced for the reason [EntityQuery.allCached] gives: the
+		// scan writes through the pointer, so it must happen before
+		// the value beside it is read.
 		var t T
+		var err error
 		if q.e.fastScan != nil {
-			return t, q.e.scanOneFast(ctx, q.fb.Select(), &t)
+			err = q.e.scanOneFast(ctx, q.fb.Select(), &t)
+		} else {
+			err = q.fb.One(ctx, &t)
 		}
-		return t, q.fb.One(ctx, &t)
+		return t, err
 	}
 	key := base + ":one"
 	var out T

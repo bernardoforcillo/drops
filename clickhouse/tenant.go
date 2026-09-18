@@ -707,7 +707,9 @@ func (e *Entity[T]) ScopeByTenant(col ColRef) *Entity[T] {
 // context filter occupies, so an entity rebuilt per request replaces
 // its filter instead of stacking another copy onto the shared table.
 // See ctxFilter for why that is a pattern worth making idempotent.
-func entityFilterKey[T any](e *Entity[T]) string {
+// The entity itself is not read — it is there so that T is inferred
+// from the call rather than spelled out at every site.
+func entityFilterKey[T any](_ *Entity[T]) string {
 	var zero T
 	return "entity:" + reflect.TypeOf(zero).String() + ":tenant"
 }

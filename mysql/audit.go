@@ -123,14 +123,6 @@ func (e *Entity[T]) recordAudit(tx *DB, ctx context.Context, op string, row *T, 
 	})
 }
 
-// pkValue returns r's primary-key field via reflection.
-func (e *Entity[T]) pkValue(r *T) any {
-	if len(e.pkFields) == 0 {
-		return nil
-	}
-	return auditKey(e.pkValuesOf(r))
-}
-
 // ErrAuditTableMissing is returned when an audit operation fails because
 // the configured table does not exist.
 var ErrAuditTableMissing = errors.New("drops/mysql: audit table not present; create it via NewAuditTable + migration")

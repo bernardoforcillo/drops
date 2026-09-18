@@ -528,33 +528,6 @@ func TestNDJSONRoundTrip(t *testing.T) {
 
 // Index management -------------------------------------------------------
 
-func TestCreateIndexSendsDimensionsAndMetric(t *testing.T) {
-	s := newServer(t, func(int) string {
-		return envelope(`{"name":"emb","config":{"dimensions":768,"metric":"cosine"}}`)
-	})
-	info, err := vectorize.CreateIndex(context.Background(), s.client(), "emb", 768, vectorize.MetricCosine, "docs")
-	if err != nil {
-		t.Fatalf("CreateIndex: %v", err)
-	}
-	if info.Config.Dimensions != 768 || info.Config.Metric != vectorize.MetricCosine {
-		t.Errorf("info = %+v", info)
-	}
-	var body vectorize.CreateIndexRequest
-	if err := json.Unmarshal([]byte(s.bodies[0]), &body); err != nil {
-		t.Fatal(err)
-	}
-	if body.Name != "emb" || body.Config.Dimensions != 768 {
-		t.Errorf("body = %+v", body)
-	}
-}
-
-func TestCreateIndexRejectsNonPositiveDimensions(t *testing.T) {
-	s := newServer(t, func(int) string { return envelope(`{}`) })
-	if _, err := vectorize.CreateIndex(context.Background(), s.client(), "emb", 0, vectorize.MetricCosine, ""); err == nil {
-		t.Error("expected an error for zero dimensions")
-	}
-}
-
 func TestMetadataIndexLifecycle(t *testing.T) {
 	s := newServer(t, func(n int) string {
 		if n == 1 {

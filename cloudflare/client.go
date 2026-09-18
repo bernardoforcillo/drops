@@ -193,6 +193,24 @@ type Request struct {
 	// KV takes the value's own bytes.
 	Raw []byte
 
+	// Stream supplies the body as a reader instead of as bytes, for
+	// a payload there is no reason to hold in memory — an R2 object,
+	// a database dump on its way to one.
+	//
+	// It is called once per attempt and must return a fresh reader
+	// each time, because a retry has to send the body again and a
+	// reader that has been drained has nothing left to send. A
+	// source that genuinely cannot be re-opened belongs on a request
+	// marked not to be retried.
+	//
+	// Ignored when Raw or Body is set.
+	Stream func() (io.ReadCloser, error)
+
+	// ContentLength is the body's length in bytes, for a Stream that
+	// knows it. Leave it zero and the request is sent chunked, which
+	// some endpoints refuse.
+	ContentLength int64
+
 	// ContentType overrides the Content-Type header. Defaults to
 	// application/json when Body is set.
 	ContentType string
@@ -200,6 +218,13 @@ type Request struct {
 	// Accept overrides the Accept header. Defaults to
 	// application/json.
 	Accept string
+
+	// Header carries any other headers the endpoint needs — R2's
+	// cf-r2-jurisdiction and cf-r2-storage-class, a conditional
+	// If-None-Match. Authorization, Accept, Content-Type and
+	// User-Agent are set from the fields above and are not taken
+	// from here.
+	Header http.Header
 
 	// Idempotent overrides the method-based decision about whether a
 	// failed request may be tried again.
@@ -331,7 +356,7 @@ func (c *Client) DoRaw(ctx context.Context, req Request) (resp *Response, err er
 	start := time.Now()
 	defer func() { c.emit(ctx, req, start, err) }()
 
-	body, ctype, err := encodeBody(req)
+	src, err := encodeBody(req)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +368,7 @@ func (c *Client) DoRaw(ctx context.Context, req Request) (resp *Response, err er
 
 	attempts := c.retry.attempts()
 	for attempt := 1; ; attempt++ {
-		got, attemptErr := c.attempt(ctx, req, target, body, ctype)
+		got, attemptErr := c.attempt(ctx, req, target, src)
 
 		// A context that is done is the caller giving up, not the
 		// network failing: it is never worth another attempt.
@@ -389,22 +414,58 @@ func (c *Client) DoRaw(ctx context.Context, req Request) (resp *Response, err er
 // reply. The [Response] carries the headers the retry policy needs,
 // so the *http.Response does not escape this function and its body is
 // closed here.
-func (c *Client) attempt(ctx context.Context, req Request, target string, body []byte, ctype string) (*Response, error) {
+func (c *Client) attempt(ctx context.Context, req Request, target string, src bodySource) (*Response, error) {
 	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+	var streamed io.Closer
+	switch {
+	case src.open != nil:
+		rc, err := src.open()
+		if err != nil {
+			return nil, fmt.Errorf("drops/cloudflare: open request body: %w", err)
+		}
+		// http.Client closes the request body it is handed, so this
+		// closer is only for the path where the request is never
+		// built and the body would otherwise be leaked. Closing it
+		// unconditionally would close the file twice.
+		streamed = rc
+		reader = rc
+	case src.bytes != nil:
+		reader = bytes.NewReader(src.bytes)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, target, reader)
 	if err != nil {
+		if streamed != nil {
+			_ = streamed.Close()
+		}
 		return nil, fmt.Errorf("drops/cloudflare: build request: %w", err)
 	}
-	if body != nil {
-		httpReq.ContentLength = int64(len(body))
-		httpReq.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(body)), nil
+	if reader != nil {
+		if src.bytes != nil {
+			httpReq.ContentLength = int64(len(src.bytes))
+			body := src.bytes
+			httpReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(body)), nil
+			}
+		} else {
+			httpReq.ContentLength = src.length
+			httpReq.GetBody = src.open
 		}
-		if ctype != "" {
-			httpReq.Header.Set("Content-Type", ctype)
+		if src.ctype != "" {
+			httpReq.Header.Set("Content-Type", src.ctype)
+		}
+	}
+	for k, vs := range req.Header {
+		// The four headers this client owns are set below from the
+		// Request's own fields. Letting them through here would not
+		// override them, it would add a second value — two
+		// Content-Type headers on one request — so they are skipped
+		// rather than trusted, which is what the field's doc
+		// promises.
+		if reservedHeader(k) {
+			continue
+		}
+		for _, v := range vs {
+			httpReq.Header.Add(k, v)
 		}
 	}
 	accept := req.Accept
@@ -431,27 +492,52 @@ func (c *Client) attempt(ctx context.Context, req Request, target string, body [
 	return &Response{Status: httpResp.StatusCode, Header: httpResp.Header, Body: raw}, nil
 }
 
+// reservedHeader reports whether a header is set by this client from
+// a [Request] field rather than from [Request.Header].
+func reservedHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Authorization", "Accept", "Content-Type", "User-Agent":
+		return true
+	default:
+		return false
+	}
+}
+
+// bodySource is a request body ready to be sent, once per attempt.
+// Exactly one of bytes and open is set, or neither for a request
+// with no body.
+type bodySource struct {
+	bytes  []byte
+	open   func() (io.ReadCloser, error)
+	length int64
+	ctype  string
+}
+
 // encodeBody renders a Request's body and decides its content type.
-func encodeBody(req Request) (body []byte, ctype string, err error) {
+func encodeBody(req Request) (bodySource, error) {
+	ctype := req.ContentType
 	switch {
 	case req.Raw != nil:
-		ctype = req.ContentType
 		if ctype == "" {
 			ctype = "application/octet-stream"
 		}
-		return req.Raw, ctype, nil
+		return bodySource{bytes: req.Raw, ctype: ctype}, nil
 	case req.Body != nil:
-		raw, mErr := json.Marshal(req.Body)
-		if mErr != nil {
-			return nil, "", fmt.Errorf("drops/cloudflare: encode body: %w", mErr)
+		raw, err := json.Marshal(req.Body)
+		if err != nil {
+			return bodySource{}, fmt.Errorf("drops/cloudflare: encode body: %w", err)
 		}
-		ctype = req.ContentType
 		if ctype == "" {
 			ctype = "application/json"
 		}
-		return raw, ctype, nil
+		return bodySource{bytes: raw, ctype: ctype}, nil
+	case req.Stream != nil:
+		if ctype == "" {
+			ctype = "application/octet-stream"
+		}
+		return bodySource{open: req.Stream, length: req.ContentLength, ctype: ctype}, nil
 	default:
-		return nil, "", nil
+		return bodySource{}, nil
 	}
 }
 

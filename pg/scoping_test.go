@@ -476,27 +476,33 @@ func TestScopingReachesEveryExecutor(t *testing.T) {
 			return err
 		}},
 		{name: "Update.Exec", run: func(db *pg.DB, ctx context.Context, tbl *pg.Table, body *pg.Col[string], _ *pg.Entity[scopeNote]) error {
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			_, err := db.Update(tbl).Set(body.Val("x")).Exec(ctx)
 			return err
 		}},
 		{name: "Update.All", run: func(db *pg.DB, ctx context.Context, tbl *pg.Table, body *pg.Col[string], _ *pg.Entity[scopeNote]) error {
 			var out []scopeNote
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return db.Update(tbl).Set(body.Val("x")).Returning(tbl.Col("id")).All(ctx, &out)
 		}},
 		{name: "Update.One", run: func(db *pg.DB, ctx context.Context, tbl *pg.Table, body *pg.Col[string], _ *pg.Entity[scopeNote]) error {
 			var out scopeNote
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return db.Update(tbl).Set(body.Val("x")).Returning(tbl.Col("id")).One(ctx, &out)
 		}},
 		{name: "Delete.Exec", run: func(db *pg.DB, ctx context.Context, tbl *pg.Table, _ *pg.Col[string], _ *pg.Entity[scopeNote]) error {
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			_, err := db.Delete(tbl).Exec(ctx)
 			return err
 		}},
 		{name: "Delete.All", run: func(db *pg.DB, ctx context.Context, tbl *pg.Table, _ *pg.Col[string], _ *pg.Entity[scopeNote]) error {
 			var out []scopeNote
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return db.Delete(tbl).Returning(tbl.Col("id")).All(ctx, &out)
 		}},
 		{name: "Delete.One", run: func(db *pg.DB, ctx context.Context, tbl *pg.Table, _ *pg.Col[string], _ *pg.Entity[scopeNote]) error {
 			var out scopeNote
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return db.Delete(tbl).Returning(tbl.Col("id")).One(ctx, &out)
 		}},
 		{name: "Entity.Update", run: func(db *pg.DB, ctx context.Context, _ *pg.Table, _ *pg.Col[string], ent *pg.Entity[scopeNote]) error {
@@ -567,10 +573,12 @@ func TestTenantFilterFailsClosed(t *testing.T) {
 			return db.Find(tbl).All(ctx, &out)
 		}},
 		{"Update.Exec", func(db *pg.DB, ctx context.Context) error {
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			_, err := db.Update(tbl).Set(body.Val("x")).Exec(ctx)
 			return err
 		}},
 		{"Delete.Exec", func(db *pg.DB, ctx context.Context) error {
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			_, err := db.Delete(tbl).Exec(ctx)
 			return err
 		}},
@@ -722,9 +730,11 @@ func TestUnscopedClearsContextFilters(t *testing.T) {
 	if err := db.Select().From(tbl).Unscoped().All(ctx, &out); err != nil {
 		t.Fatalf("Select: %v", err)
 	}
+	//drops:lint ignore unfilteredwrite — Unscoped is the subject: the write is meant to reach the table with no predicate at all
 	if _, err := db.Update(tbl).Set(body.Val("x")).Unscoped().Exec(ctx); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
+	//drops:lint ignore unfilteredwrite — Unscoped is the subject: the delete is meant to reach the table with no predicate at all
 	if _, err := db.Delete(tbl).Unscoped().Exec(ctx); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -754,6 +764,7 @@ func TestPerParentLimitKeepsDefaultFilters(t *testing.T) {
 			db := pg.New(drv)
 
 			var users []scopeUser
+			//drops:lint ignore loopload — one eager load per subtest, not an iteration over rows
 			err := db.Find(s.users).WithRel("posts", func(c *pg.RelConfig) {
 				if tc.limit > 0 {
 					c.Limit(tc.limit)

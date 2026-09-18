@@ -23,15 +23,32 @@
 //
 //   - [github.com/bernardoforcillo/drops/cloudflare/d1] — D1, as a
 //     [github.com/bernardoforcillo/drops.Driver]. The SQLite dialect
-//     runs against it unchanged.
+//     runs against it unchanged. Its Admin type manages the databases
+//     themselves: provisioning, read replication, Time Travel,
+//     export and import.
 //   - [github.com/bernardoforcillo/drops/cloudflare/vectorize] —
 //     Vectorize, as a [github.com/bernardoforcillo/drops/vector.Store].
+//     Its Admin type creates the indexes, whose dimension and metric
+//     are fixed at creation.
+//   - [github.com/bernardoforcillo/drops/cloudflare/workersai] —
+//     Workers AI, which turns text into the vectors Vectorize stores.
+//     Its model names are Vectorize's preset names, so the index and
+//     the model that fills it can be chosen from one constant.
 //   - [github.com/bernardoforcillo/drops/cache/cloudflarekv] — Workers
 //     KV, as a [github.com/bernardoforcillo/drops/cache.Cache].
+//   - [github.com/bernardoforcillo/drops/cloudflare/r2] — R2, which is
+//     not a database but where the operations that produce a file put
+//     it: a D1 export that has to outlive Time Travel, a schema dump.
+//   - [github.com/bernardoforcillo/drops/cloudflare/queues] — Queues,
+//     the durable hop an outbox publishes to, and a
+//     [github.com/bernardoforcillo/drops/mirror.Sink] for the mirror
+//     whose far end is not a store. It creates the pull consumer a
+//     queue needs before it can be consumed at all.
 //   - [github.com/bernardoforcillo/drops/cloudflare/hyperdrive] —
 //     Hyperdrive, which is not a backend at all but a pooler in front
-//     of your own PostgreSQL or MySQL. It has no client here; what it
-//     has is a list of the drops features that stop working behind it.
+//     of your own PostgreSQL or MySQL. It has a client, for creating
+//     the configuration a Worker binds; what it mostly has is a list
+//     of the drops features that stop working behind one.
 //
 // # Credentials
 //
@@ -42,7 +59,8 @@
 // offered: it authenticates as the whole account with no way to scope
 // it down, so a leaked one is a leaked account. Mint a token with
 // only the permission the backend needs (D1:Edit, Vectorize:Edit,
-// Workers KV Storage:Edit) instead.
+// Workers KV Storage:Edit, Workers R2 Storage:Edit, Queues:Edit,
+// Hyperdrive:Edit, Workers AI:Read) instead.
 //
 // # Retries
 //
@@ -60,4 +78,13 @@
 // <path>", the same shape drops/qdrant emits. Chain it with
 // [github.com/bernardoforcillo/drops.LoggerHook] for request logging
 // that reads the same as the SQL backends'.
+//
+// # Bodies
+//
+// [Request.Body] is JSON-encoded and [Request.Raw] is sent verbatim.
+// [Request.Stream] is the third form, for a payload there is no
+// reason to hold in memory — an R2 object, a database dump on its way
+// to one. It is a factory rather than a reader because a retry has to
+// send the body again, and a reader that has been drained has nothing
+// left to send.
 package cloudflare

@@ -294,7 +294,7 @@ func (s *LogicalSource) decode(tx pg.Transaction) ([]Change, error) {
 			continue
 		}
 		row := m.New
-		op := OpInsert
+		var op Op
 		switch m.Op {
 		case pg.OpInsert:
 			op = OpInsert

@@ -192,15 +192,18 @@ func executorEntryPoints() []executorCase {
 
 		// update.go.
 		{name: "UpdateBuilder.Exec", run: func(f *execFixture, ctx context.Context) error {
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			_, err := f.db.Update(f.tbl).Set(f.name.Val("x")).Exec(ctx)
 			return err
 		}},
 		{name: "UpdateBuilder.All", run: func(f *execFixture, ctx context.Context) error {
 			var out []execRow
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return f.db.Update(f.tbl).Set(f.name.Val("x")).Returning(f.id).All(ctx, &out)
 		}},
 		{name: "UpdateBuilder.One", run: func(f *execFixture, ctx context.Context) error {
 			var out execRow
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return f.db.Update(f.tbl).Set(f.name.Val("x")).Returning(f.id).One(ctx, &out)
 		}},
 		{name: "UpdateBuilder.ToSQLCtx", run: func(f *execFixture, ctx context.Context) error {
@@ -209,15 +212,18 @@ func executorEntryPoints() []executorCase {
 
 		// delete.go.
 		{name: "DeleteBuilder.Exec", run: func(f *execFixture, ctx context.Context) error {
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			_, err := f.db.Delete(f.tbl).Exec(ctx)
 			return err
 		}},
 		{name: "DeleteBuilder.All", run: func(f *execFixture, ctx context.Context) error {
 			var out []execRow
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return f.db.Delete(f.tbl).Returning(f.id).All(ctx, &out)
 		}},
 		{name: "DeleteBuilder.One", run: func(f *execFixture, ctx context.Context) error {
 			var out execRow
+			//drops:lint ignore unfilteredwrite — the executor table runs each write with no Where on purpose — a guard that only reaches filtered statements is not a guard
 			return f.db.Delete(f.tbl).Returning(f.id).One(ctx, &out)
 		}},
 		{name: "DeleteBuilder.ToSQLCtx", run: func(f *execFixture, ctx context.Context) error {

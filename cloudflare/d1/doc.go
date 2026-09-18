@@ -52,6 +52,37 @@
 // the clearer spelling when the unit of work is already a list of
 // statements.
 //
+// # Read replication, and the session that makes it safe
+//
+// D1 can place read replicas around the world. A replica is allowed
+// to be behind the primary, so without a session two consecutive
+// reads may be served by two instances and the second may see less
+// than the first — and a read after a write may not see the write.
+//
+// [Session] is D1's answer, and this package's. Every request in a
+// session returns a bookmark, the next request carries it, and D1
+// refuses to serve that request from an instance that has not caught
+// up to it. A Session is itself a
+// [github.com/bernardoforcillo/drops.Driver], so the dialect runs
+// inside one unchanged:
+//
+//	sess, err := drv.Session(d1.FirstUnconstrained)
+//	db := sqlite.New(sess)
+//
+// Scope one to the unit the consistency is wanted over — an HTTP
+// request, a job, a page render. They are free: there is no
+// connection and nothing to close. To carry read-your-writes past the
+// end of one, hand [Session.Bookmark] to [Driver.Resume] at the start
+// of the next.
+//
+// Two things to know before designing around it. Sessions are a
+// Worker binding feature, so they need [NewBridge] and a Worker
+// holding the binding — [New], over the REST API, answers
+// [ErrSessionsUnsupported], because Cloudflare does not offer
+// sessions there. And a session gives sequential consistency, not
+// transactions: everything above about [Driver.Begin] still applies
+// inside one.
+//
 // # What the rows come back as
 //
 // D1 answers in JSON, which loses the type information SQLite had.
@@ -59,6 +90,20 @@
 // arrays rather than objects — so column order survives, and decodes
 // values with [encoding/json.Decoder.UseNumber] so an INTEGER
 // primary key past 2^53 is not rounded on the way through a float64.
+//
+// The bridge transport has one wrinkle the REST one does not. D1's
+// Worker API exposes the projected column names exactly through
+// raw(), and the statement's metadata — the row counts, the instance
+// that answered — through all(), and there is no call that returns
+// both. The handler takes all(), because losing the metadata is the
+// silent and severe half: changes() is what [Result.RowsAffected]
+// answers, so the conditional UPDATE that stands in for the
+// transaction D1 does not have would report that it lost the race
+// every single time. What that costs is a projection with two
+// columns of the same name, where the second is lost; the failure is
+// loud — a positional Scan comes up a column short — and the fix is
+// to alias one of them. The REST transport returns both and needs
+// neither the compromise nor the caveat.
 // [Rows.Scan] converts into the usual destinations, including
 // [database/sql.Scanner] and [time.Time]; scan.go says what converts
 // into what.

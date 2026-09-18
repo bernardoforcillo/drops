@@ -316,12 +316,6 @@ func parens(e drops.Expression) drops.Expression {
 	return &opExpr{parts: []string{"(", ")"}, operands: []drops.Expression{e}}
 }
 
-// suffixExpr renders e followed by literal SQL — " ASC", " IS NULL" —
-// holding e.
-func suffixExpr(e drops.Expression, suffix string) drops.Expression {
-	return &opExpr{parts: []string{"", suffix}, operands: []drops.Expression{e}}
-}
-
 // opBuilder lays out an [opExpr] a piece at a time, for the expressions
 // whose shape is not fixed: a CASE has a variable number of branches, a
 // window may name any of several clauses. Deciding that text while

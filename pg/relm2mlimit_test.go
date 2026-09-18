@@ -135,6 +135,7 @@ func TestManyToManyLimitCapsEachParent(t *testing.T) {
 			db := pg.New(m2mLimitDriver(tt.groupRows))
 
 			var got []m2mUser
+			//drops:lint ignore loopload — one eager load per subtest, not an iteration over rows
 			if err := db.Find(users).
 				WithRel("groups", tt.configure).
 				All(context.Background(), &got); err != nil {

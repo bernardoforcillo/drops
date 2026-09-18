@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -353,5 +354,163 @@ func TestRetryAfterParsesBothForms(t *testing.T) {
 	}
 	if _, ok := cloudflare.RetryAfter(http.Header{}); ok {
 		t.Error("absent header reported present")
+	}
+}
+
+// A streamed body is for the payloads there is no reason to hold in
+// memory — an R2 object, a database dump on its way to one.
+func TestStreamBodyIsSentWithItsLength(t *testing.T) {
+	const payload = "CREATE TABLE t (a);\n"
+	var got string
+	var length int64 = -1
+	var ctype string
+	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		got, length, ctype = string(raw), r.ContentLength, r.Header.Get("Content-Type")
+		fmt.Fprint(w, `{"success":true,"errors":[],"messages":[],"result":{}}`)
+	})
+
+	err := c.Do(context.Background(), cloudflare.Request{
+		Method:        http.MethodPut,
+		Path:          "/objects/dump.sql",
+		Stream:        func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(payload)), nil },
+		ContentLength: int64(len(payload)),
+		ContentType:   "application/sql",
+	}, nil)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if got != payload {
+		t.Errorf("body = %q", got)
+	}
+	if length != int64(len(payload)) {
+		t.Errorf("Content-Length = %d, want %d — a chunked upload is refused by some endpoints", length, len(payload))
+	}
+	if ctype != "application/sql" {
+		t.Errorf("Content-Type = %q", ctype)
+	}
+}
+
+// A retry has to send the body again, and a reader that has been
+// drained has nothing left to send — so Stream is a factory rather
+// than a reader, and it is called once per attempt.
+func TestStreamIsReopenedForEachAttempt(t *testing.T) {
+	var opens atomic.Int64
+	var bodies []string
+	var attempts atomic.Int64
+	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(raw))
+		if attempts.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, `{"success":true,"errors":[],"messages":[],"result":{}}`)
+	}, cloudflare.WithRetryPolicy(cloudflare.RetryPolicy{
+		MaxAttempts: 3,
+		Backoff:     func(int) time.Duration { return time.Millisecond },
+		RetryOn:     cloudflare.RetryableStatus,
+	}))
+
+	err := c.Do(context.Background(), cloudflare.Request{
+		// PUT is retryable by default, which is the case a stream
+		// has to survive.
+		Method: http.MethodPut,
+		Path:   "/objects/k",
+		Stream: func() (io.ReadCloser, error) {
+			opens.Add(1)
+			return io.NopCloser(strings.NewReader("payload")), nil
+		},
+		ContentLength: 7,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if opens.Load() != 3 {
+		t.Errorf("the stream was opened %d times, want one per attempt", opens.Load())
+	}
+	for i, b := range bodies {
+		if b != "payload" {
+			t.Errorf("attempt %d sent %q, want the whole body again", i+1, b)
+		}
+	}
+}
+
+func TestStreamOpenFailureIsReported(t *testing.T) {
+	c := newClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("a request was made despite the body failing to open")
+		fmt.Fprint(w, `{"success":true}`)
+	})
+	want := errors.New("no such file")
+	err := c.Do(context.Background(), cloudflare.Request{
+		Method: http.MethodPut,
+		Path:   "/objects/k",
+		Stream: func() (io.ReadCloser, error) { return nil, want },
+	}, nil)
+	if !errors.Is(err, want) {
+		t.Errorf("err = %v, want it to wrap the opener's", err)
+	}
+}
+
+// R2 needs cf-r2-jurisdiction and cf-r2-storage-class on requests the
+// shared client builds, so Request carries arbitrary headers.
+func TestRequestHeadersTravel(t *testing.T) {
+	var got http.Header
+	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		fmt.Fprint(w, `{"success":true,"errors":[],"messages":[],"result":{}}`)
+	})
+	err := c.Do(context.Background(), cloudflare.Request{
+		Method: http.MethodGet,
+		Path:   "/buckets",
+		Header: http.Header{
+			"Cf-R2-Jurisdiction": []string{"eu"},
+			"If-None-Match":      []string{`"abc"`},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if got.Get("Cf-R2-Jurisdiction") != "eu" || got.Get("If-None-Match") != `"abc"` {
+		t.Errorf("headers = %v", got)
+	}
+}
+
+// The four headers the client owns come from the Request's own
+// fields. A copy in Header would not override them — it would add a
+// second value, and two Content-Type headers on one request is not a
+// thing an endpoint has to accept.
+func TestReservedHeadersAreNotDuplicated(t *testing.T) {
+	var got http.Header
+	c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		fmt.Fprint(w, `{"success":true,"errors":[],"messages":[],"result":{}}`)
+	})
+	err := c.Do(context.Background(), cloudflare.Request{
+		Method:      http.MethodPost,
+		Path:        "/x",
+		Raw:         []byte("{}"),
+		ContentType: "application/json",
+		Accept:      "application/json",
+		Header: http.Header{
+			"content-type":  []string{"text/plain"},
+			"Authorization": []string{"Bearer stolen"},
+			"Accept":        []string{"text/csv"},
+			"User-Agent":    []string{"not-drops"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	for _, h := range []string{"Content-Type", "Authorization", "Accept", "User-Agent"} {
+		if n := len(got.Values(h)); n != 1 {
+			t.Errorf("%s has %d values (%v), want exactly 1", h, n, got.Values(h))
+		}
+	}
+	if got.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want the Request field's", got.Get("Content-Type"))
+	}
+	if got.Get("Authorization") != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want the client's own token", got.Get("Authorization"))
 	}
 }
